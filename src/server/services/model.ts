@@ -365,6 +365,9 @@ export class ModelService {
     }
 
     const combinedFindings = results.flatMap(r => r.parsed.comments);
+    // Merge every chunk's severity audit events (same .flatMap pattern as combinedFindings) so a
+    // multi-chunk file surfaces adjustments from all chunks, not just the primary chunk's.
+    const combinedSeverityAuditEvents = results.flatMap(r => r.parsed.severityAuditEvents);
     // Report the file with the most serious chunk's verdict/summary/correctness, not just the last
     // chunk's: taking `results[results.length - 1]` would let a clean final chunk mask real findings
     // from an earlier chunk of the same file (reporting verdict 'approve' while carrying its comments).
@@ -377,6 +380,7 @@ export class ModelService {
       parsed: {
         ...primaryResult.parsed,
         comments: combinedFindings,
+        severityAuditEvents: combinedSeverityAuditEvents,
       },
       reviewedLineCount: results.reduce((sum, r) => sum + r.reviewedLineCount, 0),
       wasPromptTruncated: chunks.length < totalChunkCount || results.length < chunks.length,
@@ -443,7 +447,7 @@ export class ModelService {
    * Poll a previously submitted async batch review. Returns 'pending' while still queued/running,
    * 'done' with the parsed review once complete, or 'failed' if the poll or parse errored.
    */
-  async pollReviewBatch(params: { model: string; requestId: string; file: any }): Promise<
+  async pollReviewBatch(params: { model: string; requestId: string; file: any; config?: RepoConfig }): Promise<
     | { status: 'pending' }
     | { status: 'done'; response: ModelResponse & { parsed: ReturnType<typeof parseFileReviewResponse>; reviewedLineCount: number; wasPromptTruncated: boolean; userPrompt: string } }
     | { status: 'failed'; error: unknown }
@@ -465,7 +469,13 @@ export class ModelService {
       if (this.tracker) {
         this.tracker.record(response.modelUsed, response.inputTokens, response.outputTokens);
       }
-      const parsed = parseFileReviewResponse(response.rawText, params.file);
+      // The async batch path is main-pass-only (see this method's contract). `config` is OPTIONAL in
+      // this plan: its only caller (review.ts:994) does not thread config until Plan 13-04, so fail
+      // open to engine-enabled when absent.
+      const parsed = parseFileReviewResponse(response.rawText, params.file, {
+        pass: 'main',
+        severityEngineEnabled: params.config?.review.severity_engine.enabled ?? true,
+      });
       return {
         status: 'done',
         response: {
@@ -585,7 +595,10 @@ export class ModelService {
           this.tracker.record(response.modelUsed, response.inputTokens, response.outputTokens);
         }
 
-        const parsed = parseFileReviewResponse(response.rawText, params.file);
+        const parsed = parseFileReviewResponse(response.rawText, params.file, {
+          pass: params.pass ?? 'main',
+          severityEngineEnabled: params.config.review.severity_engine.enabled,
+        });
         return {
           ...response,
           parsed,

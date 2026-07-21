@@ -115,9 +115,46 @@ unescaped newlines",
   "overall_explanation": "explanation"
 }`;
 
+    // Engine defaults ENABLED. This test stays green because "P3 Issue"/"Minor" carries no positive
+    // SEV-03 style-signal keyword, so the positive-predicate fix leaves it at P3 (a bare
+    // absence-of-defect-words no longer downgrades a real finding).
     const result = parseFileReviewResponse(rawOutput, mockFile);
     expect(result.comments[0].severity).toBe('P0');
     expect(result.comments[1].severity).toBe('P3');
+  });
+
+  it('severity engine DISABLED: raw priority mapping, no downgrade, empty severityAuditEvents', () => {
+    const rawOutput = `
+{
+  "findings": [{
+    "title": "Inconsistent naming convention",
+    "body": "Please rename for readability.",
+    "priority": 3,
+    "code_location": { "absolute_file_path": "test.ts", "line": 2 }
+  }],
+  "overall_correctness": "issues found",
+  "overall_explanation": "explanation"
+}`;
+    const result = parseFileReviewResponse(rawOutput, mockFile, { severityEngineEnabled: false });
+    expect(result.comments[0].severity).toBe('P3'); // raw priority mapping, no SEV-03 downgrade
+    expect(result.severityAuditEvents).toHaveLength(0);
+  });
+
+  it('severity engine ENABLED: an SEV-01 exploit keyword promotes to P0 and records a keyword_promotion event', () => {
+    const rawOutput = `
+{
+  "findings": [{
+    "title": "Possible SQL injection",
+    "body": "user input flows into the query unescaped.",
+    "priority": 2,
+    "code_location": { "absolute_file_path": "test.ts", "line": 2 }
+  }],
+  "overall_correctness": "issues found",
+  "overall_explanation": "explanation"
+}`;
+    const result = parseFileReviewResponse(rawOutput, mockFile, { severityEngineEnabled: true });
+    expect(result.comments[0].severity).toBe('P0');
+    expect(result.severityAuditEvents.some(e => e.stage === 'severity_adjusted' && (e as any).rule === 'keyword_promotion')).toBe(true);
   });
 
   it('handles findings targeting lines outside the diff by finding the closest line', () => {

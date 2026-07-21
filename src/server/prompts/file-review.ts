@@ -27,6 +27,7 @@ Your goal is to identify bugs, security vulnerabilities, performance bottlenecks
       "title": "<Plain title, NO tags/emoji>",
       "body": "<Explanation>",
       "priority": 0 | 1 | 2 | 3,
+      "category": "security" | "bugs" | "performance" | "correctness" | "quality",
       "confidence_score": number (0.0 to 1.0),
       "code_location": {
         "line": number,
@@ -86,6 +87,7 @@ export function buildFileReviewPrompts(input: {
       "title": "<Plain title>",
       "body": "<Technical explanation>",
       "priority": <0|1|2|3>,
+      "category": "security" | "bugs" | "performance" | "correctness" | "quality",
       "confidence_score": <float 0.0-1.0>,
       "code_location": {
         "absolute_file_path": "${sanitizeUntrusted(input.file.path)}",

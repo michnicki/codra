@@ -1,6 +1,7 @@
-import { criticPruneOutputSchema, fileReviewModelOutputSchema, parsedReviewCommentSchema, summaryModelOutputSchema, type ParsedReviewComment, reviewSeverities } from '@shared/schema';
+import { criticPruneOutputSchema, fileReviewModelOutputSchema, parsedReviewCommentSchema, summaryModelOutputSchema, type ParsedReviewComment, type JobAuditEvent, reviewSeverities } from '@shared/schema';
 import { z } from 'zod';
 import { logger } from './logger';
+import { applySeverityRules } from './severity';
 import { findClosestValidLine, findPositionForLine, getValidNewLines, getValidPositions } from './diff';
 import type { FileDiff } from './diff';
 import { jsonrepair } from 'jsonrepair';
@@ -252,12 +253,17 @@ function withSuggestion(body: string, codeSuggestion?: string) {
   return `${cleanBody}\n\n\`\`\`suggestion\n${cleanSuggestion}\n\`\`\``;
 }
 
-export function parseFileReviewResponse(raw: string, file: FileDiff): {
+export function parseFileReviewResponse(
+  raw: string,
+  file: FileDiff,
+  opts: { pass?: 'main' | 'security'; severityEngineEnabled?: boolean } = {},
+): {
   comments: ParsedReviewComment[];
   verdict: 'approve' | 'comment';
   fileSummary: string;
   overallCorrectness?: string;
   confidenceScore?: number;
+  severityAuditEvents: JobAuditEvent[];
 } {
   let extracted = '';
   try {
@@ -354,6 +360,10 @@ export function parseFileReviewResponse(raw: string, file: FileDiff): {
   const validPositions = getValidPositions(file);
 
   const orphanedComments: string[] = [];
+  // Accumulate the severity engine's audit events across every finding this call produces. Only
+  // findings that survive the orphan check (i.e. become a persisted comment) contribute events, so
+  // the trail never references a dropped, off-diff finding.
+  const severityAuditEvents: JobAuditEvent[] = [];
   const comments = (parsed.findings || [])
     .map((finding) => {
       // Codex style findings use start/end or line
@@ -414,12 +424,21 @@ export function parseFileReviewResponse(raw: string, file: FileDiff): {
         body = cleanText(body.slice(body.split('\n')[0].length));
       }
 
+      // Apply the deterministic severity/category engine (SEV-01/02/03/04). Category resolution is
+      // unconditional (D-02); severity rules run only when the engine is enabled. Defaults keep this
+      // a valid zero-opts call (pass 'main', engine enabled).
+      const ruled = applySeverityRules(
+        { severity, category: finding.category, title, body, pass: opts.pass ?? 'main' },
+        { enabled: opts.severityEngineEnabled ?? true },
+      );
+      severityAuditEvents.push(...ruled.auditEvents);
+
       return parsedReviewCommentSchema.parse({
         path: file.path,
         line: line,
         position,
-        severity,
-        category: 'quality', // Default for now
+        severity: ruled.severity,
+        category: ruled.category,
         title,
         body: withSuggestion(body, finding.code_suggestion),
         codeSuggestion: finding.code_suggestion,
@@ -443,6 +462,7 @@ export function parseFileReviewResponse(raw: string, file: FileDiff): {
     fileSummary: fileSummary,
     overallCorrectness: parsed.overall_correctness,
     confidenceScore: parsed.overall_confidence_score,
+    severityAuditEvents,
   };
 }
 

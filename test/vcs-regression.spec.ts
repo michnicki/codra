@@ -300,7 +300,7 @@ dbDescribe('VCS Regression Safety Net (NREG-01)', () => {
         // review chunk is still in flight, exactly as heartbeatAndCheckSuperseded expects to see.
         await queryRows(env, `UPDATE jobs SET status = 'superseded' WHERE id = $1`, [job.id]);
         return {
-          parsed: { comments: [], verdict: 'approve' as const, fileSummary: 'ok', overallCorrectness: 'no issues', confidenceScore: 0.9 },
+          parsed: { comments: [], verdict: 'approve' as const, fileSummary: 'ok', overallCorrectness: 'no issues', confidenceScore: 0.9, severityAuditEvents: [] },
           modelUsed: 'test-model', provider: 'test-provider', inputTokens: 1, outputTokens: 1, rawText: '{}', userPrompt: '',
           reviewedLineCount: 1, wasPromptTruncated: false,
         };
@@ -498,7 +498,7 @@ dbDescribe('VCS Regression Safety Net (NREG-01)', () => {
       const reviewSpy = vi.spyOn(ModelService.prototype, 'reviewFile').mockImplementationOnce(async () => {
         await queryRows(env, `UPDATE jobs SET status = 'superseded' WHERE id = $1`, [job.id]);
         return {
-          parsed: { comments: [], verdict: 'approve' as const, fileSummary: 'ok', overallCorrectness: 'no issues', confidenceScore: 0.9 },
+          parsed: { comments: [], verdict: 'approve' as const, fileSummary: 'ok', overallCorrectness: 'no issues', confidenceScore: 0.9, severityAuditEvents: [] },
           modelUsed: 'test-model', provider: 'test-provider', inputTokens: 1, outputTokens: 1, rawText: '{}', userPrompt: '',
           reviewedLineCount: 1, wasPromptTruncated: false,
         };
