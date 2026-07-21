@@ -1,6 +1,6 @@
 import type { AppBindings } from '@server/env';
 import { parseJsonColumn, queryRows } from './client';
-import { criticResultSchema, defaultRepoConfig, jobDetailSchema, jobSummarySchema, repoConfigSchema, type CriticResult, type RepoConfig } from '@shared/schema';
+import { criticResultSchema, defaultRepoConfig, jobAuditEventSchema, jobDetailSchema, jobSummarySchema, repoConfigSchema, type CriticResult, type JobAuditEvent, type RepoConfig } from '@shared/schema';
 import { logger } from '@server/core/logger';
 import { getOrCreateRepository } from './repositories';
 
@@ -71,6 +71,14 @@ export type JobRow = {
   // j.* / SELECT i.* the existing accessors already use.
   review_scope: 'all' | 'rest' | 'head' | null;
   scope_source_job_id: string | null;
+  // Phase 13 (migration 010, AUD-01): durable per-job audit trail. Both NULLABLE / defaulted and NOT
+  // written by insertJob's explicit column list, so every existing insert reads them back inert
+  // (audit === NULL, audit_truncated === false) until appendJobAuditEvents runs (NREG-01). `audit` is
+  // a raw JSONB array parsed on read; the per-element parse + exposure lives in getJobDetail ONLY
+  // (D-11 — never on mapJob's summary/lease-claim hot path). `audit_truncated` is the ring-buffer
+  // eviction flag set by appendJobAuditEvents when the 500-event cap trims the oldest entries.
+  audit: unknown;
+  audit_truncated: boolean | null;
 };
 
 type JobStep = {
@@ -557,6 +565,35 @@ export async function getJobDetail(env: Pick<AppBindings, 'HYPERDRIVE'>, jobId: 
 
   if (!row) return null;
 
+  // AUD-01 / D-11 fail-soft PER-ELEMENT audit read. This lives in getJobDetail ONLY (NOT mapJob), so
+  // listJobs and the workflow lease-claim (both via mapJob) never read, validate, or return the audit
+  // array — keeping the summary/list/lease-claim hot path audit-free (review fix: Codex, Divergent
+  // Views). Parse each element individually through jobAuditEventSchema.safeParse: a single malformed
+  // or future-`stage` event is dropped (and warned once) while every valid event is retained, so one
+  // bad entry never erases the whole trail (review fix: Codex MEDIUM — a whole-array safeParse would
+  // discard all valid audit evidence, and the "open union" would be closed at read time). Mirrors the
+  // critic_result degrade-and-warn posture in mapJob above.
+  const rawAudit = parseJsonColumn<unknown>(row.audit, []);
+  const auditEvents: JobAuditEvent[] = [];
+  let droppedAuditCount = 0;
+  if (Array.isArray(rawAudit)) {
+    for (const element of rawAudit) {
+      const parsed = jobAuditEventSchema.safeParse(element);
+      if (parsed.success) {
+        auditEvents.push(parsed.data);
+      } else {
+        droppedAuditCount += 1;
+      }
+    }
+  } else {
+    // A non-array stored value (should never happen — appendJobAuditEvents only ever writes arrays)
+    // degrades to an empty trail rather than throwing.
+    droppedAuditCount += 1;
+  }
+  if (droppedAuditCount > 0) {
+    logger.warn(`Ignoring ${droppedAuditCount} unparseable audit event(s) for job ${row.id}`);
+  }
+
   return jobDetailSchema.parse({
     ...mapJob(row),
     baseSha: bytesToHex(row.base_sha),
@@ -568,6 +605,9 @@ export async function getJobDetail(env: Pick<AppBindings, 'HYPERDRIVE'>, jobId: 
     retryOfJobId: row.retry_of_job_id,
     summaryModel: row.summary_model,
     files: parseJsonColumn(row.files_json, []),
+    // AUD-01: valid, per-element-parsed events (oldest first) + the ring-buffer eviction flag.
+    audit: auditEvents,
+    auditTruncated: row.audit_truncated ?? false,
   });
 }
 
@@ -1378,6 +1418,62 @@ export async function supersedeOlderJobs(
   );
 
   return rows.length;
+}
+
+/**
+ * AUD-01 (D-12/D-13/D-14): atomically append audit events onto jobs.audit, capped at the most-recent
+ * 500 by a server-side drop-oldest ring buffer, tracking eviction in jobs.audit_truncated.
+ *
+ * Concurrency (T-13-03-01 / lost-update safety): multiple (file, pass) units can complete and call
+ * this in the same Promise.all-chunked invocation. This is a SINGLE atomic `UPDATE ... SET audit =
+ * <expr over the old row>` — there is NO application-level read-modify-write, so every concurrent
+ * caller's events survive (each UPDATE serializes on the row and composes onto the prior value).
+ *
+ * Security (T-13-03-02): event content is bound as a single `$2` parameter (`JSON.stringify(events)`),
+ * never string-concatenated into the SQL text — mirroring updateJobCriticResult / completeJob's
+ * parameterized JSONB style. It is referenced as `$2::text::jsonb` (NOT `$2::jsonb`): postgres.js
+ * infers the bind OID from the first cast it sees, and `::jsonb` makes it send a double-encoded jsonb
+ * *string* scalar (the same double-encoding this codebase's config uses — see repo_configs), which
+ * would make jsonb_array_length/jsonb_array_elements fail with "cannot get array length of a scalar".
+ * Forcing `::text` first sends the raw JSON array text, so `::text::jsonb` parses to a real jsonb array.
+ *
+ * Ordering (review fix, OpenCode MEDIUM): the trim re-aggregates with an EXPLICIT ordinality so the
+ * stored array always ends oldest-first (ascending chronological / insertion order): the combined
+ * `old || new` array is expanded WITH ORDINALITY, the newest 500 selected via `ORDER BY ord DESC
+ * LIMIT 500`, then re-aggregated with `jsonb_agg(elem ORDER BY ord ASC)`.
+ *
+ * `audit_truncated` uses integer array lengths (jsonb_array_length), never a fractional threshold, so
+ * there is no rounding/precision mode at the 500 boundary; it is set once true and never cleared
+ * (`audit_truncated OR ...`). The 500-boundary case (total === 500) does NOT set the flag.
+ */
+export async function appendJobAuditEvents(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  events: JobAuditEvent[],
+): Promise<void> {
+  // No-op fast path: zero events means zero DB work (never issue an empty UPDATE).
+  if (events.length === 0) return;
+
+  await queryRows(
+    env,
+    `
+      UPDATE jobs
+      SET audit = (
+            SELECT COALESCE(jsonb_agg(elem ORDER BY ord ASC), '[]'::jsonb)
+            FROM (
+              SELECT elem, ord
+              FROM jsonb_array_elements(COALESCE(audit, '[]'::jsonb) || $2::text::jsonb)
+                WITH ORDINALITY AS combined(elem, ord)
+              ORDER BY ord DESC
+              LIMIT 500
+            ) recent
+          ),
+          audit_truncated = audit_truncated
+            OR (jsonb_array_length(COALESCE(audit, '[]'::jsonb)) + jsonb_array_length($2::text::jsonb) > 500)
+      WHERE id = $1
+    `,
+    [jobId, JSON.stringify(events)],
+  );
 }
 
 export async function getOtherRunningJobsCount(env: Pick<import('@server/env').AppBindings, 'HYPERDRIVE'>, excludeJobId: string): Promise<number> {
