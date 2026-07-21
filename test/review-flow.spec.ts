@@ -2,7 +2,8 @@ import { budgetAwareFileLimit, runReviewJob } from '@server/core/review';
 import { TokenTracker } from '@server/core/token-tracker';
 import { createTestEnv, generateMockDiff, hasConfiguredTestDatabaseUrl } from './helpers';
 import { vi } from 'vitest';
-import { findExistingJobForHead, getJobForProcessing, insertJob, mapJob, updateJobCriticResult, updateJobFileCount, updateJobStep, updateJobWalkthroughCommentRef } from '@server/db/jobs';
+import { findExistingJobForHead, getJobDetail, getJobForProcessing, insertJob, mapJob, updateJobCriticResult, updateJobFileCount, updateJobStep, updateJobWalkthroughCommentRef } from '@server/db/jobs';
+import { BitbucketAdapter } from '@server/vcs/bitbucket';
 import { getFileReviewsForJobs, upsertFileReview } from '@server/db/file-reviews';
 import { defaultRepoConfig, REVIEW_CONCURRENCY_LIMITS, type ParsedReviewComment, type RepoConfig } from '@shared/schema';
 import { runWithDb, queryRows } from '@server/db/client';
@@ -2463,12 +2464,15 @@ dbDescribe('Review Flow Lifecycle', () => {
       );
 
       const dupBody = 'User input flows into the SQL query without sanitization.';
+      // Phase 14 (always-on FILT-03 dedup): the duplicate shares the main finding's line (composite
+      // rule1 collapses same-path/same-line/same-category), while the genuinely-distinct XSS finding
+      // sits on a DIFFERENT line so it is not swept up by rule1's no-title-check same-line merge.
       const job = await seedReadyJob(repo, 70, {
         config: securityConfig(),
-        mainComments: [finding({ title: 'SQL injection in query', body: dupBody })],
+        mainComments: [finding({ title: 'SQL injection in query', body: dupBody, line: 1, position: 1 })],
         securityComments: [
-          finding({ title: 'SQL injection in query', body: dupBody }), // duplicate of the main finding
-          finding({ title: 'XSS in template render', body: 'Unescaped user data rendered into HTML.' }), // distinct
+          finding({ title: 'SQL injection in query', body: dupBody, line: 1, position: 1 }), // duplicate of the main finding
+          finding({ title: 'XSS in template render', body: 'Unescaped user data rendered into HTML.', line: 2, position: 2 }), // distinct (different line)
         ],
         commitChar: 'a',
       });
@@ -2612,7 +2616,7 @@ dbDescribe('Review Flow Lifecycle', () => {
         async (_o: any, _r: any, _p: any, input: any) => { reviewCommentCounts.push(input.comments.length); return { id: 456 }; },
       );
 
-      const mainFinding = finding({ title: 'Main finding', body: 'main body' });
+      const mainFinding = finding({ title: 'Main finding', body: 'main body', line: 1, position: 1 });
 
       // Run 1: security OFF, main finding only.
       const jobOff = await seedReadyJob(repo, 73, {
@@ -2626,11 +2630,13 @@ dbDescribe('Review Flow Lifecycle', () => {
         expect(res).toEqual({ action: 'ack' });
       });
 
-      // Run 2: security ON, same main finding + an extra distinct security finding.
+      // Run 2: security ON, same main finding + an extra distinct security finding. The security
+      // finding sits on a DIFFERENT line so always-on FILT-03 dedup (composite rule1) does not merge it
+      // into the main finding — preserving the non-vacuous [1, 2] posted-count invariant.
       const jobOn = await seedReadyJob(`${repo}-2`, 74, {
         config: walkthroughSecurityConfig(true),
         mainComments: [mainFinding],
-        securityComments: [finding({ title: 'Security finding', body: 'sec body' })],
+        securityComments: [finding({ title: 'Security finding', body: 'sec body', line: 2, position: 2 })],
         ref: '802',
         commitChar: 'b',
       });
@@ -2661,8 +2667,11 @@ dbDescribe('Review Flow Lifecycle', () => {
         async (_o: any, _r: any, _p: any, input: any) => { captured = input.comments; return { id: 456 }; },
       );
 
-      const a = finding({ title: 'Alpha finding', body: 'alpha' });
-      const b = finding({ title: 'Beta finding', body: 'beta' });
+      // Distinct findings on DISTINCT lines so always-on FILT-03 dedup (composite rule1 = same
+      // path/line/category, no title check) does not merge them — this test asserts the main-only set
+      // posts both, byte-identical to v1.0 modulo the now-always-on dedup of true same-line duplicates.
+      const a = finding({ title: 'Alpha finding', body: 'alpha', line: 1, position: 1 });
+      const b = finding({ title: 'Beta finding', body: 'beta', line: 2, position: 2 });
       const job = await seedReadyJob(repo, 75, {
         config: defaultRepoConfig, // security off, critic off, walkthrough off
         mainComments: [a, b],
@@ -2697,11 +2706,13 @@ dbDescribe('Review Flow Lifecycle', () => {
       const { VcsService } = await import('@server/services/vcs');
 
       const dupBody = 'user input flows into the query';
+      // The duplicate shares the main finding's line (collapses under always-on FILT-03 rule1); the
+      // distinct authz finding sits on a DIFFERENT line so it survives on BOTH providers identically.
       const seed = {
-        mainComments: [finding({ title: 'SQL injection', body: dupBody })],
+        mainComments: [finding({ title: 'SQL injection', body: dupBody, line: 1, position: 1 })],
         securityComments: [
-          finding({ title: 'SQL injection', body: dupBody }), // dup of the main finding -> collapses
-          finding({ title: 'Missing authz check', body: 'no permission check on the route' }), // distinct
+          finding({ title: 'SQL injection', body: dupBody, line: 1, position: 1 }), // dup of the main finding -> collapses
+          finding({ title: 'Missing authz check', body: 'no permission check on the route', line: 2, position: 2 }), // distinct (different line)
         ],
       };
 
@@ -2752,6 +2763,479 @@ dbDescribe('Review Flow Lifecycle', () => {
       // Non-vacuous: bitbucket really went through the provider override (emoji icon, not the GitHub <img>).
       expect(gh.some((c: any) => c.body.includes('<img'))).toBe(true);
       expect(bb.some((c: any) => c.body.includes('<img'))).toBe(false);
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    // Phase 14 (14-03) finalize-wiring cases A-F. Each seeds a ready job and runs the finalize phase
+    // through the reworked applyNoiseFilter wiring in runFinalizePhase.
+    const withDedup = (config: RepoConfig, enabled: boolean): RepoConfig => ({
+      ...config,
+      review: { ...config.review, dedup: { enabled } },
+    });
+    // security OFF, critic OFF, walkthrough OFF; dedup toggled per-case.
+    const mainOnlyConfig = (dedupEnabled: boolean, over: Partial<RepoConfig['review']> = {}): RepoConfig => ({
+      ...defaultRepoConfig,
+      review: {
+        ...defaultRepoConfig.review,
+        dedup: { enabled: dedupEnabled },
+        passes: { ...defaultRepoConfig.review.passes, security: { enabled: false }, critic: { enabled: false } },
+        ...over,
+      },
+    });
+
+    it('Case A (FILT-03 always-on main-only): two near-dup main-pass findings post ONCE with dedup default-on', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const repo = `test-repo-${Date.now()}-14-03-A`;
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+      );
+      let captured: any[] = [];
+      const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+        async (_o: any, _r: any, _p: any, input: any) => { captured = input.comments; return { id: 456 }; },
+      );
+
+      // Same path + equal non-null line + same category -> composite rule1 merges regardless of title
+      // (titles also overlap, word-Jaccard >= 0.2). Today (pre-v1.2, security-off) these post twice.
+      const job = await seedReadyJob(repo, 140, {
+        config: mainOnlyConfig(true),
+        mainComments: [
+          finding({ title: 'SQL injection here', body: 'user input reaches the query', line: 5, position: 5 }),
+          finding({ title: 'SQL injection found', body: 'unsanitized input in the query', line: 5, position: 5 }),
+        ],
+        commitChar: 'a',
+      });
+
+      await runWithDb(env, async () => {
+        const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-14-03-A', phase: 'finalize' });
+        expect(res).toEqual({ action: 'ack' });
+      });
+
+      expect(captured).toHaveLength(1);
+
+      createSpy.mockRestore();
+      getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('Case B (NREG-01 DEDUP revert + always-on cap/sort still applied under dedup.enabled:false)', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+      );
+
+      // B1: two near-dup MAIN findings, dedup.enabled:false, security OFF -> posts TWO (main-only dedup
+      // did not run — pre-v1.2 behavior). dedup.enabled:false is a DEDUP-dimension revert (SC3), NOT a
+      // whole-finalize pre-v1.2 revert.
+      let b1captured: any[] = [];
+      const b1create = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+        async (_o: any, _r: any, _p: any, input: any) => { b1captured = input.comments; return { id: 456 }; },
+      );
+      const b1job = await seedReadyJob(`test-repo-${Date.now()}-14-03-B1`, 141, {
+        config: mainOnlyConfig(false),
+        mainComments: [
+          finding({ title: 'SQL injection here', body: 'user input reaches the query', line: 5, position: 5 }),
+          finding({ title: 'SQL injection found', body: 'unsanitized input in the query', line: 5, position: 5 }),
+        ],
+        commitChar: 'a',
+      });
+      await runWithDb(env, async () => {
+        const res = await runReviewJob(env, { jobId: b1job.id, deliveryId: 'delivery-14-03-B1', phase: 'finalize' });
+        expect(res).toEqual({ action: 'ack' });
+      });
+      expect(b1captured).toHaveLength(2);
+      b1create.mockRestore();
+
+      // B2: security-ON legacy companion — two identical findings across main+security with
+      // dedup.enabled:false collapse via the legacy pre-chain dedupeFindings exactly as pre-v1.2.
+      let b2captured: any[] = [];
+      const b2create = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+        async (_o: any, _r: any, _p: any, input: any) => { b2captured = input.comments; return { id: 456 }; },
+      );
+      const dupBody = 'user input flows into the SQL query without sanitization.';
+      const b2job = await seedReadyJob(`test-repo-${Date.now()}-14-03-B2`, 142, {
+        config: withDedup(securityConfig(), false),
+        mainComments: [finding({ title: 'SQL injection in query', body: dupBody, line: 5, position: 5 })],
+        securityComments: [finding({ title: 'SQL injection in query', body: dupBody, line: 5, position: 5 })],
+        commitChar: 'b',
+      });
+      await runWithDb(env, async () => {
+        const res = await runReviewJob(env, { jobId: b2job.id, deliveryId: 'delivery-14-03-B2', phase: 'finalize' });
+        expect(res).toEqual({ action: 'ack' });
+      });
+      expect(b2captured).toHaveLength(1); // legacy dedupeFindings collapsed the cross-pass duplicate.
+      b2create.mockRestore();
+
+      // B3: cap-exceeding + mixed-severity + varied-confidence, dedup.enabled:false. Proves the always-on
+      // FILT-01 tiered cap AND the FR-180 confidence-desc sort STILL apply under the flag (review #5), and
+      // the footer trimmed-count equals dropped.cap.length only (review #3).
+      let b3captured: any[] = [];
+      let b3body = '';
+      const b3create = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+        async (_o: any, _r: any, _p: any, input: any) => { b3captured = input.comments; b3body = input.body; return { id: 456 }; },
+      );
+      const p0s = [0, 1, 2].map((i) =>
+        finding({ severity: 'P0', category: 'security', confidence: 0.9, title: `P0 crit ${i}`, line: 10 + i, position: 10 + i }),
+      );
+      const p3s = [
+        finding({ severity: 'P3', category: 'bugs', confidence: 0.95, title: 'P3 high', line: 20, position: 20 }),
+        finding({ severity: 'P3', category: 'bugs', confidence: 0.9, title: 'P3 mid1', line: 21, position: 21 }),
+        finding({ severity: 'P3', category: 'bugs', confidence: 0.88, title: 'P3 mid2', line: 22, position: 22 }),
+        finding({ severity: 'P3', category: 'bugs', confidence: 0.75, title: 'P3 low', line: 23, position: 23 }),
+      ];
+      const nits = [0, 1, 2, 3, 4, 5].map((i) =>
+        finding({ severity: 'nit', category: 'quality', confidence: 0.9, title: `nit ${i}`, line: 30 + i, position: 30 + i }),
+      );
+      const b3job = await seedReadyJob(`test-repo-${Date.now()}-14-03-B3`, 143, {
+        config: mainOnlyConfig(false, { max_comments: 3 }), // effectiveMaxComments = min(3, 10) = 3
+        mainComments: [...p0s, ...p3s, ...nits],
+        commitChar: 'c',
+      });
+      await runWithDb(env, async () => {
+        const res = await runReviewJob(env, { jobId: b3job.id, deliveryId: 'delivery-14-03-B3', phase: 'finalize' });
+        expect(res).toEqual({ action: 'ack' });
+      });
+      // (a) all 3 P0 post — the tiered cap exempts P0/P1/P2 EVEN under dedup.enabled:false.
+      expect(b3captured.filter((c: any) => c.body.includes('P0 crit'))).toHaveLength(3);
+      // (b) the highest-confidence P3 is kept and the lowest-confidence P3 is trimmed — the FR-180
+      // confidence-desc sort applies under the flag. Capped list = 4 P3 + 6 nit, cap 3 keeps the 3
+      // highest-confidence P3 (0.95/0.90/0.88), drops P3-low (0.75) + all nit.
+      expect(b3captured.some((c: any) => c.body.includes('P3 high'))).toBe(true);
+      expect(b3captured.some((c: any) => c.body.includes('P3 low'))).toBe(false);
+      expect(b3captured.some((c: any) => c.body.includes('nit '))).toBe(false);
+      expect(b3captured).toHaveLength(6); // 3 P0 (exempt) + 3 P3 (capped kept)
+      // (c) footer trimmed-count == dropped.cap.length (7 = 1 P3 + 6 nit), NOT the P0s or floor drops.
+      expect(b3body).toContain('7 comments trimmed to 3');
+      b3create.mockRestore();
+
+      getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('Case C (FILT-04 audit round-trip + per-effective-floor + retry idempotency)', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+      );
+      const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockResolvedValue({ id: 456 } as any);
+
+      // security ON, dedup ON, category_confidence.security 0.85, global min_confidence 0.7,
+      // min_severity P3 (drops nit), max_comments 2 (forces a P3 cap drop).
+      const cConfig: RepoConfig = {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          min_confidence: 0.7,
+          min_severity: 'P3',
+          max_comments: 2,
+          category_confidence: { security: 0.85 },
+          dedup: { enabled: true },
+          passes: { ...defaultRepoConfig.review.passes, security: { enabled: true }, critic: { enabled: false } },
+        },
+      };
+      const secDrop = finding({ category: 'security', severity: 'P1', confidence: 0.8, title: 'Auth bypass sec', line: 10, position: 10, body: 'auth check missing' });
+      const mainFindings = [
+        finding({ category: 'bugs', severity: 'P1', confidence: 0.65, title: 'Low conf bug', line: 11, position: 11, body: 'possibly a bug' }),
+        finding({ category: 'bugs', severity: 'P1', confidence: 0.75, title: 'Null deref bug', line: 12, position: 12, body: 'null pointer' }),
+        finding({ category: 'quality', severity: 'nit', confidence: 0.9, title: 'Rename var nit', line: 13, position: 13, body: 'naming' }),
+        finding({ category: 'bugs', severity: 'P3', confidence: 0.9, title: 'Magic alpha', line: 14, position: 14, body: 'magic number a' }),
+        finding({ category: 'bugs', severity: 'P3', confidence: 0.9, title: 'Magic beta', line: 15, position: 15, body: 'magic number b' }),
+        finding({ category: 'bugs', severity: 'P3', confidence: 0.9, title: 'Magic gamma', line: 16, position: 16, body: 'magic number c' }),
+        // equal-line + different category + title word-Jaccard >= 0.2 -> composite rule2 (non-null sims).
+        finding({ category: 'security', severity: 'P2', confidence: 0.95, title: 'Race condition here', line: 17, position: 17, body: 'data race' }),
+        finding({ category: 'bugs', severity: 'P2', confidence: 0.95, title: 'Race condition found', line: 17, position: 17, body: 'data race too' }),
+      ];
+
+      const cJob = await seedReadyJob(`test-repo-${Date.now()}-14-03-C`, 144, {
+        config: cConfig,
+        mainComments: mainFindings,
+        securityComments: [secDrop],
+        commitChar: 'a',
+      });
+      await runWithDb(env, async () => {
+        const res = await runReviewJob(env, { jobId: cJob.id, deliveryId: 'delivery-14-03-C', phase: 'finalize' });
+        expect(res).toEqual({ action: 'ack' });
+      });
+
+      const detail = await getJobDetail(env, cJob.id);
+      const audit: any[] = detail!.audit;
+      const filtered: any[] = audit.filter((e: any) => e.stage === 'filtered');
+      const deduped: any[] = audit.filter((e: any) => e.stage === 'deduped');
+      const confFloor: any[] = filtered.filter((e: any) => e.rule === 'confidence_floor');
+      const sevFloor: any[] = filtered.filter((e: any) => e.rule === 'severity_floor');
+      const cap: any[] = filtered.filter((e: any) => e.rule === 'cap');
+
+      // Two DISTINCT effective floors -> TWO confidence_floor events (review finding #2): the security
+      // drop is audited at 0.85 (the category floor), NOT the 0.7 global floor.
+      expect(confFloor).toHaveLength(2);
+      const floorThresholds = confFloor.map((e: any) => e.threshold).sort();
+      expect(floorThresholds).toEqual([0.7, 0.85]);
+      const secFloorEvent = confFloor.find((e: any) => e.threshold === 0.85);
+      expect(secFloorEvent.sample.some((s: any) => s.title === 'Auth bypass sec' && s.category === 'security')).toBe(true);
+      const globalFloorEvent = confFloor.find((e: any) => e.threshold === 0.7);
+      expect(globalFloorEvent.sample.some((s: any) => s.title === 'Low conf bug')).toBe(true);
+
+      // one severity_floor event (nit below min_severity P3) + one cap event (1 P3 over max_comments 2).
+      expect(sevFloor).toHaveLength(1);
+      expect(sevFloor[0].threshold).toBe('P3');
+      expect(sevFloor[0].sample.some((s: any) => s.title === 'Rename var nit' && s.severity === 'nit')).toBe(true);
+      expect(cap).toHaveLength(1);
+      expect(cap[0].threshold).toBe(2);
+      expect(cap[0].sample.every((s: any) => s.severity === 'P3')).toBe(true);
+
+      // one deduped event (rule2 merge) carrying non-null similarity scores.
+      expect(deduped).toHaveLength(1);
+      expect(deduped[0].rule).toBe('rule2');
+      expect(typeof deduped[0].titleSimilarity).toBe('number');
+      expect(deduped[0].survivor).toBeDefined();
+      expect(deduped[0].suppressed).toBeDefined();
+
+      // Privacy: no event leaks a raw finding body / diff / code field. Every sample entry admits only
+      // { path, line, title } + non-sensitive metric scalars.
+      const serialized = JSON.stringify(audit);
+      expect(serialized).not.toContain('auth check missing');
+      expect(serialized).not.toContain('null pointer');
+      for (const e of filtered) {
+        for (const s of e.sample) {
+          expect(s).not.toHaveProperty('body');
+          expect(s).not.toHaveProperty('existingCode');
+          expect(s).not.toHaveProperty('codeSuggestion');
+        }
+      }
+
+      // Walkthrough path (walkthrough off here) records nothing: the ONLY finalize drop events are the
+      // 5 posting-path events (2 confidence + 1 severity + 1 cap + 1 dedup).
+      expect(filtered.length + deduped.length).toBe(5);
+
+      // Retry idempotency (review finding #7): a finalize retry PAST the posting stage
+      // (completingStarted -> finalizeRetriedPastPost) must NOT re-append drop events.
+      const retryJob = await seedReadyJob(`test-repo-${Date.now()}-14-03-C-retry`, 145, {
+        config: cConfig,
+        mainComments: mainFindings,
+        securityComments: [secDrop],
+        completingStarted: true,
+        commitChar: 'a',
+      });
+      await runWithDb(env, async () => {
+        const res = await runReviewJob(env, { jobId: retryJob.id, deliveryId: 'delivery-14-03-C-retry', phase: 'finalize' });
+        expect(res).toEqual({ action: 'ack' });
+      });
+      const retryDetail = await getJobDetail(env, retryJob.id);
+      const retryDrops = retryDetail!.audit.filter((e: any) => e.stage === 'filtered' || e.stage === 'deduped');
+      expect(retryDrops).toHaveLength(0); // gate skipped emission -> at-most-once holds.
+
+      createSpy.mockRestore();
+      getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('Case D (SC5 both-paths-agree on the main-pass subset — same transformation over different sets)', async () => {
+      // SC5 = both finalize paths run the SAME applyNoiseFilter over their respective candidate sets;
+      // it does NOT mean identical totals (the walkthrough is intentionally main-only, the posted set
+      // includes security). We assert agreement on the MAIN-PASS SUBSET: the walkthrough (main-only)
+      // keeps exactly the main-pass findings, while the posted union additionally includes the security
+      // finding.
+      const { GitHubService } = await import('@server/services/github');
+      const repo = `test-repo-${Date.now()}-14-03-D`;
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+      );
+      let posted: any[] = [];
+      const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+        async (_o: any, _r: any, _p: any, input: any) => { posted = input.comments; return { id: 456 }; },
+      );
+      let walkBody = '';
+      const editSpy = vi.spyOn(GitHubService.prototype, 'updateIssueComment').mockImplementation(
+        async (_o: any, _r: any, _id: any, body: string) => { walkBody = body; return { id: 700 }; },
+      );
+
+      const job = await seedReadyJob(repo, 146, {
+        config: walkthroughSecurityConfig(true), // walkthrough on, security on, dedup default on
+        mainComments: [
+          finding({ severity: 'P1', title: 'Main P1 finding', body: 'main one', line: 1, position: 1 }),
+          finding({ severity: 'P3', title: 'Main P3 finding', body: 'main two', line: 2, position: 2 }),
+        ],
+        securityComments: [
+          finding({ severity: 'P0', title: 'Security P0 finding', body: 'sec crit', line: 3, position: 3 }),
+        ],
+        ref: '810',
+        commitChar: 'a',
+      });
+      await runWithDb(env, async () => {
+        const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-14-03-D', phase: 'finalize' });
+        expect(res).toEqual({ action: 'ack' });
+      });
+
+      // Posted union includes the security P0 (total counts include security).
+      expect(posted).toHaveLength(3);
+      expect(posted.some((c: any) => c.body.includes('Security P0 finding'))).toBe(true);
+      // Main-pass subset severities among the posted set: {P1, P3}.
+      const mainPosted = posted.filter((c: any) => c.body.includes('Main P'));
+      expect(mainPosted).toHaveLength(2);
+      // The walkthrough (main-only, SAME filter) severity totals line agrees on the main-pass subset:
+      // it shows P1 ×1 and P3 ×1 and does NOT show the security-only P0.
+      expect(walkBody).toContain('P1 ×1');
+      expect(walkBody).toContain('P3 ×1');
+      expect(walkBody).not.toContain('P0 ×');
+
+      editSpy.mockRestore();
+      createSpy.mockRestore();
+      getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('Case E (NREG-02 provider-agnostic filter output + Bitbucket per-comment posting-budget visibility)', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { VcsService } = await import('@server/services/vcs');
+
+      // E1 — filter-output parity: run the SAME finalize fixture under github and a bitbucket-presenting
+      // provider and assert the posted inline-comment SET is identical (the pure FR-180 chain is
+      // provider-agnostic). E1 uses the renamed-adapter shim only to flip the provider name/formatting;
+      // the genuine per-comment posting loop is exercised directly in E2 below (review finding #10a).
+      const seed = {
+        mainComments: [
+          finding({ title: 'SQL injection', body: 'user input flows into the query', line: 5, position: 5 }),
+          finding({ title: 'Missing authz check', body: 'no permission check on the route', line: 6, position: 6 }),
+        ],
+      };
+      const capture = async (repo: string, prNumber: number, commitChar: string, asBitbucket: boolean) => {
+        const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+          generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+        );
+        let captured: any[] = [];
+        const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+          async (_o: any, _r: any, _p: any, input: any) => { captured = input.comments; return { id: 456 }; },
+        );
+        let forRepoSpy: any = null;
+        if (asBitbucket) {
+          forRepoSpy = vi.spyOn(VcsService, 'forRepo').mockImplementation(async (e: any, j: any, t: any) => {
+            const { GithubAdapter } = await import('@server/vcs/github');
+            const adapter = new GithubAdapter(e, j.installationId ?? '', t);
+            Object.defineProperty(adapter, 'name', { value: 'bitbucket', configurable: true });
+            Object.defineProperty(adapter, 'capabilities', { value: { supportsMermaid: false }, configurable: true });
+            return adapter;
+          });
+        }
+        const job = await seedReadyJob(repo, prNumber, { config: mainOnlyConfig(true), ...seed, commitChar });
+        await runWithDb(env, async () => {
+          const res = await runReviewJob(env, { jobId: job.id, deliveryId: `delivery-14-03-E-${asBitbucket ? 'bb' : 'gh'}`, phase: 'finalize' });
+          expect(res).toEqual({ action: 'ack' });
+        });
+        createSpy.mockRestore();
+        getDiffSpy.mockRestore();
+        if (forRepoSpy) forRepoSpy.mockRestore();
+        return captured;
+      };
+      const gh = await capture(`test-repo-${Date.now()}-14-03-E-gh`, 147, 'a', false);
+      const bb = await capture(`test-repo-${Date.now()}-14-03-E-bb`, 148, 'b', true);
+      expect(gh).toHaveLength(2);
+      expect(bb.map((c: any) => c.path)).toEqual(gh.map((c: any) => c.path));
+      for (const title of ['SQL injection', 'Missing authz check']) {
+        expect(gh.filter((c: any) => c.body.includes(title))).toHaveLength(1);
+        expect(bb.filter((c: any) => c.body.includes(title))).toHaveLength(1);
+      }
+
+      // E2 — Bitbucket posting-budget visibility (review finding #6). Construct a REAL BitbucketAdapter
+      // against a mocked Bitbucket REST client so its genuine per-comment posting loop
+      // (bitbucket.ts:261-281) is exercised — NOT the E1 rename shim. A high-severity-heavy review
+      // (>50 P0/P1, all above the floors) posts ONE postPullRequestComment per inline comment, which
+      // can exceed the Cloudflare 50-subrequest/invocation budget. The mitigation (chunked/continuation-
+      // safe Bitbucket posting) is DEFERRED to the VcsProvider-seam scope (Phase 17/18) — threat
+      // T-14-03-04. FILT-01's always-post-P0/P1/P2 is authoritative and NOT weakened here.
+      let postCalls = 0;
+      const mockClient: any = {
+        async listPullRequestComments() { return []; },
+        async getPullRequestDiff() {
+          return generateMockDiff([{ path: 'src/app.ts', content: 'a\nb\nc' }]);
+        },
+        async postPullRequestComment() { postCalls += 1; return { id: postCalls }; },
+        async approvePullRequest() { /* not called for verdict 'comment' */ },
+      };
+      const bbJob = {
+        id: 'bb-budget-job',
+        owner: 'ws',
+        repo: 'repo',
+        prNumber: 1,
+        repositoryWorkspace: 'ws',
+      };
+      // Private constructor is a compile-time guard only; Reflect.construct builds a genuine instance.
+      const adapter = Reflect.construct(BitbucketAdapter as any, [env, mockClient, bbJob]) as BitbucketAdapter;
+      const inlineComments = Array.from({ length: 55 }, (_v, i) => ({
+        path: 'src/app.ts',
+        position: 1, // resolves to the first added diff line; distinct bodies keep them all un-dedup'd.
+        body: `high-severity finding ${i}`,
+      }));
+      const ref = await adapter.submitReview('ws', 'repo', 1, {
+        commitSha: sha('a'),
+        verdict: 'comment',
+        summaryBody: 'summary',
+        jobIdHint: bbJob.id,
+        comments: inlineComments,
+      });
+      expect(ref.ref).toBeDefined();
+      // One post per inline comment (55) + one summary post = 56 > 50 -> exceeds the Cloudflare
+      // per-invocation subrequest budget on Bitbucket (deferred to Phase 17/18, T-14-03-04).
+      expect(postCalls).toBe(56);
+      expect(postCalls).toBeGreaterThan(50);
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('Case F (FILT-03 critic-branch: critic-kept set gets in-chain composite dedup when enabled)', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+      );
+
+      // Two near-duplicate critic-KEPT findings (same path, equal line, same category -> rule1).
+      const keptDup = [
+        finding({ title: 'SQL injection here', body: 'user input reaches the query', line: 5, position: 5 }),
+        finding({ title: 'SQL injection found', body: 'unsanitized input in the query', line: 5, position: 5 }),
+      ];
+      const criticResult = {
+        kept: keptDup,
+        pruned: [],
+        model: 'critic-model',
+        inputTokens: 11,
+        outputTokens: 7,
+        skipped: false,
+        dedupedCount: 2,
+      };
+
+      // F1: dedup.enabled default true -> the critic-kept set gets composite dedup IN-CHAIN: posts ONE
+      // comment and emits one deduped audit event (review finding #1).
+      let f1captured: any[] = [];
+      const f1create = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+        async (_o: any, _r: any, _p: any, input: any) => { f1captured = input.comments; return { id: 456 }; },
+      );
+      const f1job = await seedReadyJob(`test-repo-${Date.now()}-14-03-F1`, 149, {
+        config: criticEnabledConfig(false),
+        mainComments: keptDup,
+        criticResult,
+        commitChar: 'a',
+      });
+      await runWithDb(env, async () => {
+        const res = await runReviewJob(env, { jobId: f1job.id, deliveryId: 'delivery-14-03-F1', phase: 'finalize' });
+        expect(res).toEqual({ action: 'ack' });
+      });
+      expect(f1captured).toHaveLength(1);
+      const f1detail = await getJobDetail(env, f1job.id);
+      expect(f1detail!.audit.filter((e: any) => e.stage === 'deduped')).toHaveLength(1);
+      f1create.mockRestore();
+
+      // F2: dedup.enabled:false -> the critic-kept set is consumed as-is (byte-identical to today's
+      // direct criticResult.kept consumption): posts TWO. Known accepted gap: legacy critic-STAGE merges
+      // (security+critic, review.ts:2020) are not Phase-14-audited (out of scope, Phase 19).
+      let f2captured: any[] = [];
+      const f2create = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+        async (_o: any, _r: any, _p: any, input: any) => { f2captured = input.comments; return { id: 456 }; },
+      );
+      const f2job = await seedReadyJob(`test-repo-${Date.now()}-14-03-F2`, 150, {
+        config: withDedup(criticEnabledConfig(false), false),
+        mainComments: keptDup,
+        criticResult,
+        commitChar: 'b',
+      });
+      await runWithDb(env, async () => {
+        const res = await runReviewJob(env, { jobId: f2job.id, deliveryId: 'delivery-14-03-F2', phase: 'finalize' });
+        expect(res).toEqual({ action: 'ack' });
+      });
+      expect(f2captured).toHaveLength(2);
+      f2create.mockRestore();
+
+      getDiffSpy.mockRestore();
     }, REVIEW_FLOW_TIMEOUT_MS);
   });
 });
