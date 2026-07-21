@@ -1,5 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { insertJob, getJobDetail, appendJobAuditEvents } from '@server/db/jobs';
+import * as jobsModule from '@server/db/jobs';
+import { recordUnitAudit } from '@server/core/audit';
 import { queryRows } from '@server/db/client';
 import { defaultRepoConfig, type JobAuditEvent } from '@shared/schema';
 import { logger } from '@server/core/logger';
@@ -163,5 +165,48 @@ dbDescribe('appendJobAuditEvents / getJobDetail audit read (AUD-01)', () => {
     expect(detail!.audit).toHaveLength(1);
     expect(detail!.audit[0].stage).toBe('drafted');
     expect((detail!.audit[0] as { file: string }).file).toBe('valid.ts');
+  });
+});
+
+dbDescribe('recordUnitAudit best-effort recorder (AUD-01, T-13-03-04)', () => {
+  const env = createTestEnv();
+
+  it('(8) FAILED-WRITE: recordUnitAudit resolves (never throws) and warns when appendJobAuditEvents rejects', async () => {
+    const job = await freshJob(env, 'failed-write');
+
+    // Force the single append to reject, proving the recorder swallows the failure (best-effort):
+    // a broken/slow audit write must never propagate to the caller's review-persist path.
+    const appendSpy = vi
+      .spyOn(jobsModule, 'appendJobAuditEvents')
+      .mockRejectedValue(new Error('simulated audit-write failure'));
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    await expect(recordUnitAudit(env, job.id, 'a.ts', 'main')).resolves.toBeUndefined();
+    expect(warnSpy).toHaveBeenCalled();
+
+    appendSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it('(8b) SUCCESS: recordUnitAudit issues exactly one combined append (drafted + severity events)', async () => {
+    const job = await freshJob(env, 'combined');
+
+    await recordUnitAudit(env, job.id, 'b.ts', 'security', [
+      {
+        stage: 'severity_adjusted',
+        rule: 'sql-injection',
+        matched: 'string-concat-query',
+        from: 'P2',
+        to: 'P0',
+        timestamp: new Date().toISOString(),
+      },
+    ]);
+
+    const detail = await getJobDetail(env, job.id);
+    expect(detail!.audit).toHaveLength(2);
+    expect(detail!.audit[0].stage).toBe('drafted');
+    expect((detail!.audit[0] as { file: string; pass: string }).file).toBe('b.ts');
+    expect((detail!.audit[0] as { pass: string }).pass).toBe('security');
+    expect(detail!.audit[1].stage).toBe('severity_adjusted');
   });
 });
