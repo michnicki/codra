@@ -30,10 +30,11 @@ import {
 } from '@server/db/jobs';
 import { filterReviewableFiles, parseUnifiedDiff, partitionReviewableFiles } from './diff';
 import { insertSkippedFiles, listSkippedFilesForHead, type SkippedFilesHeadKey } from '@server/db/skipped-files';
-import { dedupeFindings, SEVERITY_RANK } from './dedup';
+import { dedupeComposite, dedupeFindings, SEVERITY_RANK } from './dedup';
+import { applyNoiseFilter, type NoiseFilterOptions } from './noise-filter';
 import { parseCriticPruneResponse, parseSummaryResponse, parseWalkthroughDiagram } from './model-output';
 import { buildWalkthroughData, editWalkthroughComment, postWalkthroughPlaceholder } from './walkthrough';
-import { recordUnitAudit } from './audit';
+import { buildFinalizeDropEvents, recordFinalizeDrops, recordUnitAudit } from './audit';
 
 import { VcsService } from '../services/vcs';
 import type { VcsProvider, VcsPullRequest, VcsUpdateStatusCheckInput } from '../vcs/types';
@@ -1561,13 +1562,32 @@ async function runFinalizePhase(
   //   (iii) else                        -> the v1.0 main-only flatMap, byte-identical to the
   //         pre-multipass engine (NREG-01).
   // Pruned findings are never re-surfaced here (D-08): they live only in jobs.critic_result.pruned.
+  //
+  // Phase 14 (FILT-03) escape-hatch routing [D-04/D-05, review findings #1/#5]. `dedup.enabled`
+  // defaults true and governs the DEDUP dimension ONLY — it selects which dedup function runs inside
+  // applyNoiseFilter; the always-on FILT-01 tiered cap, FILT-02 per-category floors, and the FR-180
+  // confidence-desc sort apply regardless of the flag.
+  //   dedupEnabled === true (default): chosenDedup = dedupeComposite, which runs IN-CHAIN (FR-180
+  //     position) on WHICHEVER candidate set is selected — INCLUDING the critic-kept set. So ALL THREE
+  //     candidate branches stay UN-deduped at selection time (the legacy pre-chain dedupeFindings call
+  //     is dropped for the security branch); a critic review's kept set now gets always-on composite
+  //     dedup at finalize (FILT-03 "every review") and any merges emit `deduped` audit events (FILT-04).
+  //   dedupEnabled === false: preserve TODAY's exact DEDUP behavior — the legacy security-gated
+  //     dedupeFindings(union) stays in its pre-chain position for the non-critic security path ONLY
+  //     (RESEARCH Pitfall 1 / A6 — preserves survivor-vs-floor ordering); critic-kept and main-only are
+  //     consumed as-is; a no-op dedup is passed into applyNoiseFilter so the floors/sort/cap still run
+  //     but no re-dedup happens. This is a provable pre-v1.2 revert of the DEDUP dimension (SC3).
+  const dedupEnabled = config.review.dedup?.enabled ?? true;
+  const chosenDedup: NoiseFilterOptions['dedup'] = dedupEnabled
+    ? dedupeComposite
+    : (comments) => ({ survivors: comments, merges: [] });
   let reviewedComments: ParsedReviewComment[];
   if (job.criticResult) {
     reviewedComments = job.criticResult.kept;
   } else if (securityEnabled) {
-    reviewedComments = dedupeFindings(
-      reviews.flatMap((review) => review.parsed_comments as ParsedReviewComment[]),
-    );
+    reviewedComments = dedupEnabled
+      ? reviews.flatMap((review) => review.parsed_comments as ParsedReviewComment[])
+      : dedupeFindings(reviews.flatMap((review) => review.parsed_comments as ParsedReviewComment[]));
   } else {
     reviewedComments = reviews.flatMap((review) => review.parsed_comments as ParsedReviewComment[]);
   }
@@ -1600,15 +1620,22 @@ async function runFinalizePhase(
   const { maxComments: globalMaxComments } = await getReviewSettings(env);
   const effectiveMaxComments = Math.min(config.review.max_comments, globalMaxComments);
 
-  let finalComments = reviewedComments
-    .filter(c => (severityRanks[c.severity] ?? 4) <= minRank)
-    .filter(c => passesConfidenceFloor(c, config.review.min_confidence));
-  finalComments.sort((a, b) => (severityRanks[a.severity] ?? 4) - (severityRanks[b.severity] ?? 4));
-
-  const omittedCount = reviewedComments.length - Math.min(finalComments.length, effectiveMaxComments);
-  if (finalComments.length > effectiveMaxComments) {
-    finalComments = finalComments.slice(0, effectiveMaxComments);
-  }
+  // FR-180 always-on noise filter (FILT-01/02 + FR-180 sort + escape-hatched FILT-03 dedup). Both
+  // finalize paths call the SAME applyNoiseFilter over their respective candidate sets (SC5). The
+  // posting path keeps `dropped` for the posting-path-only audit emission below; omittedCount is the
+  // tiered-cap trim count ONLY (dropped.cap.length) — the "N comments trimmed to {max}" footer counts
+  // P3/nit cap trims exclusively, NOT confidence/severity/dedup drops nor the exempt P0/P1/P2
+  // (Pitfall 2 / A4 / review finding #3).
+  const noiseFilterOptions: NoiseFilterOptions = {
+    minConfidence: config.review.min_confidence,
+    categoryConfidence: config.review.category_confidence,
+    minSeverity: config.review.min_severity,
+    effectiveMaxComments,
+    dedup: chosenDedup,
+  };
+  const postingResult = applyNoiseFilter(reviewedComments, noiseFilterOptions);
+  const finalComments = postingResult.kept;
+  const omittedCount = postingResult.dropped.cap.length;
 
   // Pitfall 3 (corrected): buildWalkthroughData ALREADY filters its `reviews` arg to pass==='main'
   // internally (walkthrough.ts), but it derives per-file counts and global severity counts from its
@@ -1622,14 +1649,13 @@ async function runFinalizePhase(
   // as inline comments but must not change the overall approve/comment verdict). When both toggles are
   // off, mainReviews === reviews and reviewedComments is the main-only flatMap, so mainFinalComments
   // is element-wise identical to finalComments (NREG-01).
+  // SC5: the walkthrough path runs the IDENTICAL applyNoiseFilter (same transformation, same escape-
+  // hatched dedup) over the main-pass candidate set. D-11: its `dropped` is DISCARDED and nothing is
+  // recorded — audit suppression is caller-side, the pure fn has no I/O to suppress. Agreement with the
+  // posting path is asserted on the MAIN-PASS SUBSET (the walkthrough is intentionally main-only;
+  // posted totals include security).
   const mainCandidateComments = mainReviews.flatMap((review) => review.parsed_comments as ParsedReviewComment[]);
-  let mainFinalComments = mainCandidateComments
-    .filter(c => (severityRanks[c.severity] ?? 4) <= minRank)
-    .filter(c => passesConfidenceFloor(c, config.review.min_confidence));
-  mainFinalComments.sort((a, b) => (severityRanks[a.severity] ?? 4) - (severityRanks[b.severity] ?? 4));
-  if (mainFinalComments.length > effectiveMaxComments) {
-    mainFinalComments = mainFinalComments.slice(0, effectiveMaxComments);
-  }
+  const mainFinalComments = applyNoiseFilter(mainCandidateComments, noiseFilterOptions).kept;
 
   const verdictSummary = formatter.summarizeVerdict(mainFinalComments, hasFailures);
   await updateJobStep(env, job.id, 'Generating Summary', { status: 'done' });
@@ -1730,6 +1756,27 @@ async function runFinalizePhase(
     (step) => step.name === 'Completing' && (step.status === 'running' || step.status === 'done'),
   );
   await updateJobStep(env, job.id, 'Completing', { status: 'running' });
+
+  // FILT-04 / review finding #7: emit finalize drop audit events on the POSTING path ONLY and
+  // AT-MOST-ONCE across finalize retries. Gated on !finalizeRetriedPastPost and positioned AFTER the
+  // 'Completing' running transition was persisted: appendJobAuditEvents has no idempotency key and
+  // always concatenates, so a finalize retry that already reached posting (finalizeRetriedPastPost ===
+  // true) MUST skip re-appending or it would double the drop trail. buildFinalizeDropEvents derives the
+  // per-record confidence threshold from each DropRecord's effectiveFloor (review finding #2), so it
+  // takes only { severityFloor, cap }. recordFinalizeDrops is best-effort (never rethrows), so a broken
+  // audit write can never fail the already-posting review. The walkthrough path emits nothing (D-11).
+  // A crash between this persisted 'Completing' transition and the recorder loses these events (best-
+  // effort telemetry, accepted) while at-most-once still holds.
+  if (!finalizeRetriedPastPost) {
+    await recordFinalizeDrops(
+      env,
+      job.id,
+      buildFinalizeDropEvents(postingResult.dropped, {
+        severityFloor: config.review.min_severity,
+        cap: effectiveMaxComments,
+      }),
+    );
+  }
   // The interface omits botLogin (Pitfall 5) -- the adapter injects env.BOT_USERNAME internally.
   const existingReview = finalizeRetriedPastPost
     ? await vcs.findExistingReviewForCommit(job.owner, job.repo, job.prNumber, pr.headSha)
@@ -2017,6 +2064,11 @@ async function runCriticPhase(
   // deduping it would change the main-only finding set — an NREG-01 violation (Pitfall 4).
   const candidateSet = reviews.flatMap((review) => review.parsed_comments as ParsedReviewComment[]);
   const securityEnabled = config.review.passes?.security?.enabled ?? false;
+  // Phase 14: intentionally unchanged — critic dedup runs in the critic phase (Phase 19 scope); its
+  // legacy merges are not Phase-14-audited (14-03 known gap). When security+critic are both on, this
+  // legacy dedupeFindings pre-dedups BEFORE persisting criticResult.kept, so those critic-stage merges
+  // emit no Phase-14 `deduped` event — the finalize composite dedup only audits merges among the
+  // already-pruned kept set.
   const dedupedSet = securityEnabled ? dedupeFindings(candidateSet) : candidateSet;
 
   // (5) SKIP conditions (D-06): a trivially small set isn't worth a round-trip, and an oversized set
