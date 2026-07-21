@@ -84,11 +84,37 @@ export function trigramJaccardSimilarity(a: string, b: string): number {
 }
 
 /**
+ * Word-set (token) Jaccard similarity for the Phase 14 composite dedup (FILT-03 / D-01). Tokenizes
+ * via `normalizeForDedup` (D-03: NO new normalizer) then a plain space-split, and scores
+ * |A∩B| / |A∪B| over the resulting WORD sets — deliberately NOT the char-trigram measure the legacy
+ * `dedupeFindings` path uses. Word-set Jaccard is the PRD's near-duplicate measure; it tolerates
+ * reordered / reworded phrasings of the same finding better than character trigrams, which is why
+ * the composite rule thresholds (0.2 / 0.6 / 0.8, body 0.5) sit far below the trigram path's 0.7.
+ *
+ * Empty-set rule (ADDRESSES REVIEW FINDING #8a): returns 0 whenever EITHER token set is empty,
+ * INCLUDING both-empty. This INTENTIONALLY DIFFERS from the frozen `trigramJaccardSimilarity` (which
+ * returns 1 for two equal-empty strings): the composite rules 2/3/4 gate on a POSITIVE threshold, so
+ * a title of pure punctuation (which normalizes to '') must never satisfy them and spuriously merge.
+ * `wordJaccardSimilarity` is a NEW, non-frozen function, so it does not inherit the trigram rule.
+ */
+export function wordJaccardSimilarity(a: string, b: string): number {
+  const setA = new Set(normalizeForDedup(a).split(' ').filter(Boolean));
+  const setB = new Set(normalizeForDedup(b).split(' ').filter(Boolean));
+  if (setA.size === 0 || setB.size === 0) return 0; // includes both-empty -> 0 (finding #8a)
+  let intersection = 0;
+  for (const token of setA) {
+    if (setB.has(token)) intersection++;
+  }
+  return intersection / (setA.size + setB.size - intersection);
+}
+
+/**
  * D-04 survivor selection: higher severity wins; equal severity -> higher confidence
  * (confidence ?? -1, so an explicit score always beats null); remaining tie -> keep the existing
- * (stably-earlier) finding.
+ * (stably-earlier) finding. EXPORTED (was private) so the Phase 14 composite tie-break reuses the
+ * exact same rule rather than re-deriving it (behavior-neutral change; D-04).
  */
-function pickSurvivor(existing: ParsedReviewComment, candidate: ParsedReviewComment): ParsedReviewComment {
+export function pickSurvivor(existing: ParsedReviewComment, candidate: ParsedReviewComment): ParsedReviewComment {
   const rankExisting = SEVERITY_RANK[existing.severity] ?? SEVERITY_RANK.nit;
   const rankCandidate = SEVERITY_RANK[candidate.severity] ?? SEVERITY_RANK.nit;
   if (rankCandidate < rankExisting) return candidate;
@@ -151,4 +177,126 @@ export function dedupeFindings(findings: ParsedReviewComment[]): ParsedReviewCom
   }
 
   return survivors;
+}
+
+/**
+ * One near-duplicate merge decided by `dedupeComposite`. The finalize audit builder (Plan 14-02)
+ * projects each record into a `deduped` audit event. `titleSimilarity` / `bodySimilarity` are the
+ * word-Jaccard scores that CAUSED the merge (ADDRESSES REVIEW FINDING #4 — non-sensitive decision
+ * metadata, never raw finding content); either is `null` where its rule did not consult that measure
+ * (rule1 has no title check; only rule4 uses a body measure).
+ */
+export type MergeRecord = {
+  survivor: ParsedReviewComment;
+  suppressed: ParsedReviewComment;
+  rule: 'rule1' | 'rule2' | 'rule3' | 'rule4';
+  titleSimilarity: number | null;
+  bodySimilarity: number | null;
+};
+
+type CompositeMatch = Omit<MergeRecord, 'survivor' | 'suppressed'>;
+
+/**
+ * Evaluate the FILT-03 4-rule table (D-02) for one already-kept survivor against one candidate, both
+ * word-Jaccard based (NOT the legacy char-trigram measure). Returns the first matching rule with the
+ * similarity scores it consulted, or `null` for no merge. Rule evaluation:
+ *
+ *   same path, equal-line branch (both lines NON-NULL & exactly equal, OR both null):
+ *     - rule1 (no title check) fires ONLY when both lines are non-null-equal AND same category.
+ *       ADDRESSES REVIEW FINDING #8b: a null line is NOT an "exact same line" per D-02, and a
+ *       text-free both-null merge would be MORE aggressive than the legacy path — so rule1 is
+ *       restricted to non-null-equal lines.
+ *     - otherwise rule2 if title word-Jaccard >= 0.2. This is the ONLY branch two both-null findings
+ *       can merge through, so every null-line merge still requires a title (text) check.
+ *   same path, different-line branch (incl. exactly-one-null, A3): rule3 if title >= 0.6.
+ *   different path (line-independent): rule4 if title >= 0.8 AND body >= 0.5.
+ *
+ * Thresholds are inclusive (>=). They are word-Jaccard values per D-01 and sit below the frozen
+ * char-trigram 0.7 because word-set Jaccard is a coarser, more forgiving measure of the same-issue
+ * relationship (a reworded restatement shares more words than character trigrams).
+ */
+function matchCompositeRule(survivor: ParsedReviewComment, candidate: ParsedReviewComment): CompositeMatch | null {
+  const titleSim = wordJaccardSimilarity(survivor.title, candidate.title);
+
+  if (survivor.path === candidate.path) {
+    const lineS = survivor.line ?? null;
+    const lineC = candidate.line ?? null;
+    const bothNonNullEqual = lineS !== null && lineC !== null && lineS === lineC;
+    const bothNull = lineS === null && lineC === null;
+
+    if (bothNonNullEqual || bothNull) {
+      // Equal-line branch. rule1 is line-null-excluded (finding #8b).
+      if (bothNonNullEqual && survivor.category === candidate.category) {
+        return { rule: 'rule1', titleSimilarity: null, bodySimilarity: null };
+      }
+      if (titleSim >= 0.2) {
+        return { rule: 'rule2', titleSimilarity: titleSim, bodySimilarity: null };
+      }
+      return null;
+    }
+
+    // Different-line branch (includes exactly-one-null, A3).
+    if (titleSim >= 0.6) {
+      return { rule: 'rule3', titleSimilarity: titleSim, bodySimilarity: null };
+    }
+    return null;
+  }
+
+  // Cross-path branch (line-independent).
+  const bodySim = wordJaccardSimilarity(survivor.body, candidate.body);
+  if (titleSim >= 0.8 && bodySim >= 0.5) {
+    return { rule: 'rule4', titleSimilarity: titleSim, bodySimilarity: bodySim };
+  }
+  return null;
+}
+
+/**
+ * Phase 14 composite near-duplicate suppressor (FILT-03 / D-01/D-02/D-03). A PURE function (no I/O,
+ * never throws) mirroring `dedupeFindings`'s greedy single pass over stable input order: each finding
+ * is compared against the already-kept survivors and, on the FIRST matching rule, resolved by the
+ * D-04 tie-break (`pickSurvivor`) IN PLACE — the winner occupies the survivor's slot so a later
+ * higher-severity finding replaces an earlier survivor without reordering. Unlike the legacy path
+ * this DOES merge cross-path (rule4). It is entirely ADDITIVE beside the frozen legacy path — nothing
+ * calls it yet (Wave 2/3 wires it), so this lands with zero behavior change (NREG-01 byte-identity of
+ * the legacy path is preserved).
+ *
+ * Returns `{ survivors, merges }`: survivors in stable input order, and one `MergeRecord` per merge
+ * (carrying the rule + the word-Jaccard scores that caused it) so the finalize audit builder can emit
+ * one `deduped` event per merge (D-07).
+ */
+export function dedupeComposite(findings: ParsedReviewComment[]): {
+  survivors: ParsedReviewComment[];
+  merges: MergeRecord[];
+} {
+  const merges: MergeRecord[] = [];
+  if (findings.length <= 1) return { survivors: [...findings], merges };
+
+  const survivors: ParsedReviewComment[] = [];
+
+  for (const finding of findings) {
+    let merged = false;
+
+    for (let i = 0; i < survivors.length; i++) {
+      const survivor = survivors[i];
+      const match = matchCompositeRule(survivor, finding);
+      if (!match) continue;
+
+      const winner = pickSurvivor(survivor, finding);
+      const suppressed = winner === survivor ? finding : survivor;
+      survivors[i] = winner;
+      merges.push({
+        survivor: winner,
+        suppressed,
+        rule: match.rule,
+        titleSimilarity: match.titleSimilarity,
+        bodySimilarity: match.bodySimilarity,
+      });
+      merged = true;
+      break;
+    }
+
+    if (!merged) survivors.push(finding);
+  }
+
+  return { survivors, merges };
 }
