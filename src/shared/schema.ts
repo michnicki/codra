@@ -6,6 +6,22 @@ export const fileStatuses = ['pending', 'done', 'skipped', 'failed'] as const;
 export const reviewVerdicts = ['approve', 'comment'] as const;
 export const reviewSeverities = ['P0', 'P1', 'P2', 'P3', 'nit'] as const;
 export const reviewCategories = ['security', 'bugs', 'performance', 'correctness', 'quality'] as const; // Keeping for DB compatibility but will deprecate usage in prompts
+export type ReviewSeverity = typeof reviewSeverities[number];
+export type ReviewCategory = typeof reviewCategories[number];
+
+// v1.2 severity-band map (SEV-04). Maps every review severity to its PRD display band. Per the
+// REQUIREMENTS.md standing decision the PRD bands are: blocker = P0/P1, warning = P2, suggestion =
+// P3, nitpick = nit (no historical-row migration). Review fix (OpenCode LOW): P0 and P1 MUST resolve
+// to the IDENTICAL 'blocker' band — a Record<ReviewSeverity, ...> alone permitted them to diverge,
+// so both are written to the literal string 'blocker' here AND asserted equal in the contract test.
+// `as const satisfies` locks the exact value shape so the type checker rejects any drift.
+export const severityBandMap = {
+  P0: 'blocker',
+  P1: 'blocker',
+  P2: 'warning',
+  P3: 'suggestion',
+  nit: 'nitpick',
+} as const satisfies Record<ReviewSeverity, 'blocker' | 'warning' | 'suggestion' | 'nitpick'>;
 export const llmApiFormats = ['openai', 'anthropic', 'gemini', 'cloudflare-workers-ai'] as const;
 export const vcsProviders = ['github', 'bitbucket'] as const;
 export type VcsProvider = typeof vcsProviders[number];
@@ -26,10 +42,16 @@ export const parsedReviewCommentSchema = z.object({
   line: z.number().int().positive().nullable().optional(),
   position: z.number().int().positive().nullable().optional(),
   severity: z.enum(reviewSeverities),
-  category: z.enum(reviewCategories).default('quality'),
+  // D-05: default changed 'quality' -> 'correctness'. Now that category is meaningful (v1.2 severity
+  // engine) rather than a universal catch-all, 'correctness' is the neutral fail-open default.
+  category: z.enum(reviewCategories).default('correctness'),
   title: z.string().min(1),
   body: z.string().min(1),
   codeSuggestion: z.string().min(1).nullable().optional(),
+  // v1.2: the ORIGINAL code the finding refers to (used by later phases for dedup / fix-verification
+  // context). nullable + optional following the same fail-open convention as codeSuggestion/confidence
+  // so a provider that omits it is representable and never throws the parse.
+  existingCode: z.string().nullable().optional(),
   // Per-finding model confidence (0..1). Threaded parse -> persist -> reconstruct -> finalize.
   // nullable + optional so a provider that omits it is representable and treated fail-open.
   confidence: z.number().min(0).max(1).nullable().optional(),
@@ -42,6 +64,11 @@ export const fileReviewModelOutputSchema = z.object({
       body: z.string().min(1),
       confidence_score: z.number().min(0).max(1).optional(),
       priority: z.number().int().min(0).max(3).optional(),
+      // v1.2: the model-emitted category, kept as a LOOSE z.string() (NOT z.enum(reviewCategories))
+      // on purpose — an enum here would throw the ENTIRE per-file parse when the model returns free
+      // text or an invalid value. D-06 requires exact-match-or-fail-open, which is resolved downstream
+      // in core/severity.ts (Plan 13-02), not at parse time.
+      category: z.string().optional(),
       code_location: z.object({
         absolute_file_path: z.string(),
         line_range: z.object({
@@ -138,8 +165,17 @@ export const reviewConfigSchema = z.object({
           input_char_budget: z.number().int().positive().optional(),
         })
         .default({ enabled: false }),
+      // v1.2 ensemble pass (PASS-02, consumed by Phase 19). `runs: 1` is the INERT default — no
+      // extra ensemble model calls fire at the default, so NREG-01 holds. Bounds guard against an
+      // authenticated-but-malicious config write (T-13-01-01): runs 1-5, temperature 0-2.
+      ensemble: z
+        .object({
+          runs: z.number().int().min(1).max(5).default(1),
+          temperature: z.number().min(0).max(2).default(0.7),
+        })
+        .default({ runs: 1, temperature: 0.7 }),
     })
-    .default({ security: { enabled: false }, critic: { enabled: false } }),
+    .default({ security: { enabled: false }, critic: { enabled: false }, ensemble: { runs: 1, temperature: 0.7 } }),
   interactive: z
     .object({
       commands: z
@@ -169,6 +205,36 @@ export const reviewConfigSchema = z.object({
       commands: { enabled: false, bitbucket_allowed_account_ids: [], bitbucket_bot_account_id: null },
       qa: { enabled: false, rate_limit_per_hour: 10 },
     }),
+  // v1.2 severity/category engine + lifecycle toggle blocks (SEV-01..04, consumed by Phases 14/18/19).
+  // Follows the existing uniform `{ enabled: boolean }` toggle-block shape.
+  // DELIBERATE DEFAULT EXCEPTION (D-01/D-02): every other Phase-7 toggle defaults `false` for NREG-01
+  // inertness, but `severity_engine.enabled` and `dedup.enabled` default `true` — they are documented
+  // correctness-fix / always-on exceptions (FILT-03), not new opt-in features.
+  severity_engine: z.object({ enabled: z.boolean().default(true) }).default({ enabled: true }),
+  dedup: z.object({ enabled: z.boolean().default(true) }).default({ enabled: true }),
+  // Per-category confidence-floor overrides (FILT-02, consumed by Phase 14). MUST be z.partialRecord,
+  // NOT z.record: under this repo's Zod 4 (4.4.3) `z.record(z.enum(reviewCategories), ...)` demands
+  // EVERY enum key, so a sparse override like `{ security: 0.85 }` throws for the other four
+  // categories. z.partialRecord accepts the sparse object and leaves absent keys genuinely absent.
+  // Empty {} is the inert default (no per-category override; global `min_confidence` still governs).
+  // Value bounds 0-1 guard against an out-of-range malicious config write (T-13-01-01).
+  category_confidence: z.partialRecord(z.enum(reviewCategories), z.number().min(0).max(1)).default({}),
+  // Phase 19 fix-threading toggles (THR-01/THR-02). Both default false for NREG-01 inertness.
+  threads: z
+    .object({
+      verify_fixes: z.boolean().default(false),
+      auto_resolve: z.boolean().default(false),
+    })
+    .default({ verify_fixes: false, auto_resolve: false }),
+  // Phase 18 incremental-round toggles. `incremental` defaults false per ROADMAP Phase 18's stated
+  // default; `escalate_floors` defaults true but is inert at the schema level since it only takes
+  // effect once `rounds.incremental` is also true (Phase 18's concern, not this phase's).
+  rounds: z
+    .object({
+      incremental: z.boolean().default(false),
+      escalate_floors: z.boolean().default(true),
+    })
+    .default({ incremental: false, escalate_floors: true }),
 });
 
 export const repoConfigSchema = z.object({
@@ -196,15 +262,22 @@ export const repoConfigSchema = z.object({
       on_file_types: ['.ts', '.tsx', '.js'],
       command: 'npm run lint && npm run typecheck',
     },
-    // Mirror the Phase 7 toggle blocks all-off in the inline literal default too, so
-    // `repoConfigSchema.parse({})` yields every toggle false regardless of Zod default
-    // short-circuit semantics for the nested `review` object (RESEARCH Open Q2).
+    // Mirror the toggle blocks in the inline literal default too, so `repoConfigSchema.parse({})`
+    // yields each toggle at its documented default regardless of Zod default short-circuit semantics
+    // for the nested `review` object (RESEARCH Open Q2). All Phase-7 toggles remain OFF here, but the
+    // two documented always-on v1.2 exceptions — `severity_engine.enabled` and `dedup.enabled` —
+    // deliberately default `true` (D-01/D-02, FILT-03), so this is no longer an "all-off" literal.
     walkthrough: { enabled: false, sequence_diagram: { enabled: true } },
-    passes: { security: { enabled: false }, critic: { enabled: false } },
+    passes: { security: { enabled: false }, critic: { enabled: false }, ensemble: { runs: 1, temperature: 0.7 } },
     interactive: {
       commands: { enabled: false, bitbucket_allowed_account_ids: [], bitbucket_bot_account_id: null },
       qa: { enabled: false, rate_limit_per_hour: 10 },
     },
+    severity_engine: { enabled: true },
+    dedup: { enabled: true },
+    category_confidence: {},
+    threads: { verify_fixes: false, auto_resolve: false },
+    rounds: { incremental: false, escalate_floors: true },
   }),
   model: z
     .object({
@@ -484,6 +557,38 @@ export const fileReviewRecordSchema = z.object({
   createdAt: dateStringSchema,
 });
 
+// v1.2 job audit trail (AUD-01). A discriminated union on `stage` — two variants this phase:
+//   - `drafted`: a per-file review pass was drafted. REUSES the canonical fileReviewPassSchema for
+//     its `pass` field (Codex LOW: pass validation was previously duplicated inline) (D-10).
+//   - `severity_adjusted`: a severity rule promoted/demoted a finding (D-09).
+// Each variant ends with `.passthrough()`, mirroring criticResultSchema's additive-extension
+// precedent (D-08) so Phases 14/15/18/19 can ADD new fields non-breakingly. This union deliberately
+// REJECTS an unknown `stage` at the single-event level so a malformed event is detectable (Codex
+// MEDIUM): AUD-01's "open event union" is served by later phases ADDING new `stage` variants AND by
+// Plan 13-03's READ side parsing the stored array PER-ELEMENT so one unknown/future event never
+// erases the whole trail — do NOT loosen this schema to a catch-all here.
+export const jobAuditEventSchema = z.discriminatedUnion('stage', [
+  z
+    .object({
+      stage: z.literal('drafted'),
+      file: z.string(),
+      pass: fileReviewPassSchema,
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  z
+    .object({
+      stage: z.literal('severity_adjusted'),
+      rule: z.string(),
+      matched: z.string(),
+      from: z.enum(reviewSeverities),
+      to: z.enum(reviewSeverities),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+]);
+export type JobAuditEvent = z.infer<typeof jobAuditEventSchema>;
+
 export const jobDetailSchema = jobSummarySchema.extend({
   baseSha: z.string(),
   headRef: z.string().nullable(),
@@ -494,6 +599,14 @@ export const jobDetailSchema = jobSummarySchema.extend({
   retryOfJobId: z.uuid().nullable(),
   summaryModel: z.string().nullable(),
   files: z.array(fileReviewRecordSchema),
+  // v1.2 audit trail (D-11). These live on the DETAIL contract ONLY, never on jobSummarySchema.
+  // Review fix (Codex, Divergent Views): jobSummarySchema is mapped by listJobs (every row on a
+  // 100-job page) AND by the workflow lease-claim (getJobForProcessing) via mapJob — placing the
+  // audit array there would fetch + Zod-validate up to ~50,000 events per page and on every lease
+  // claim. On jobDetailSchema (a single-job getJobDetail read) the array is parsed exactly once when
+  // a user opens one job. Defaults ([] / false) so a pre-Phase-13 job object with neither key parses.
+  audit: z.array(jobAuditEventSchema).default([]),
+  auditTruncated: z.boolean().default(false),
 });
 
 export const repoConfigRecordSchema = z.object({

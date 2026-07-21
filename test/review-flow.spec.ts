@@ -997,6 +997,7 @@ dbDescribe('Review Flow Lifecycle', () => {
       review: {
         ...defaultRepoConfig.review,
         passes: {
+          ...defaultRepoConfig.review.passes,
           security: { enabled: overrides?.security ?? false },
           critic: {
             enabled: true,
@@ -2348,7 +2349,7 @@ dbDescribe('Review Flow Lifecycle', () => {
       ...defaultRepoConfig,
       review: {
         ...defaultRepoConfig.review,
-        passes: { security: { enabled: true }, critic: { enabled: false } },
+        passes: { ...defaultRepoConfig.review.passes, security: { enabled: true }, critic: { enabled: false } },
       },
     });
 
@@ -2357,7 +2358,7 @@ dbDescribe('Review Flow Lifecycle', () => {
       ...defaultRepoConfig,
       review: {
         ...defaultRepoConfig.review,
-        passes: { security: { enabled: security }, critic: { enabled: true } },
+        passes: { ...defaultRepoConfig.review.passes, security: { enabled: security }, critic: { enabled: true } },
       },
     });
 
@@ -2367,7 +2368,7 @@ dbDescribe('Review Flow Lifecycle', () => {
       review: {
         ...defaultRepoConfig.review,
         walkthrough: { enabled: true, sequence_diagram: { enabled: false } },
-        passes: { security: { enabled: security }, critic: { enabled: false } },
+        passes: { ...defaultRepoConfig.review.passes, security: { enabled: security }, critic: { enabled: false } },
       },
     });
 

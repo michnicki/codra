@@ -50,6 +50,8 @@ const JOB: JobDetail = {
   summaryMarkdown: null,
   reviewId: null,
   summaryModel: null,
+  audit: [],
+  auditTruncated: false,
   files: [
     {
       id: '33333333-3333-3333-3333-333333333333',
