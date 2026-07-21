@@ -74,4 +74,15 @@ describe('per-(file,pass)-unit budget re-derivation (MP-05)', () => {
     // slider is silently capped -- this is the guard, not a re-assertion of budgetAwareFileLimit.
     expect(Math.floor(freshHeadroom / ESTIMATED_SUBREQUESTS_PER_FILE)).toBeGreaterThanOrEqual(maxLevel);
   });
+
+  it('keeps the max concurrent units within budget INCLUDING the per-unit audit append (Phase 13)', () => {
+    // Phase 13 deliberate re-derivation (Codex HIGH): each completed (file,pass) unit now also issues
+    // ONE combined audit append (recordUnitAudit) on top of the persisted-review write, so the real
+    // worst-case per-unit cost is ESTIMATED_SUBREQUESTS_PER_FILE + 1 (== 6). This must STILL fit the
+    // fresh safe budget at max concurrency: 4 units × 6 == 24 <= 25. Encoding the `+ 1` here proves
+    // the budget model was re-derived non-silently for the audit write rather than assumed away; it
+    // fails the moment either ESTIMATED_SUBREQUESTS_PER_FILE or the max concurrency is nudged up.
+    const concurrentUnits = budgetAwareFileLimit(freshHeadroom, maxLevel);
+    expect(concurrentUnits * (ESTIMATED_SUBREQUESTS_PER_FILE + 1)).toBeLessThanOrEqual(freshHeadroom);
+  });
 });

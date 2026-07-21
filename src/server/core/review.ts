@@ -1,6 +1,6 @@
 import { logger } from './logger';
 import { isSupportedGitHubWebhookEvent, type GitHubWebhookEventName, type GitHubWebhookPayload, type IssueCommentWebhookPayload, type PullRequestWebhookPayload } from '@shared/github';
-import { defaultRepoConfig, normalizeModelId, reviewUnitKey, type CriticResult, type FileReviewPass, type ParsedReviewComment, type RepoConfig, type ReviewJobMessage } from '@shared/schema';
+import { defaultRepoConfig, normalizeModelId, reviewUnitKey, type CriticResult, type FileReviewPass, type JobAuditEvent, type ParsedReviewComment, type RepoConfig, type ReviewJobMessage } from '@shared/schema';
 import { isTimeoutMessage, matchesAnyTransientSubstring } from '@shared/transient-errors';
 import type { AppBindings } from '@server/env';
 import { bulkInheritFileReviews, bulkMarkFilesFailed, getFileReviewsForJobs, recordRetryableFileReviewFailure, upsertFileReview } from '@server/db/file-reviews';
@@ -33,6 +33,7 @@ import { insertSkippedFiles, listSkippedFilesForHead, type SkippedFilesHeadKey }
 import { dedupeFindings, SEVERITY_RANK } from './dedup';
 import { parseCriticPruneResponse, parseSummaryResponse, parseWalkthroughDiagram } from './model-output';
 import { buildWalkthroughData, editWalkthroughComment, postWalkthroughPlaceholder } from './walkthrough';
+import { recordUnitAudit } from './audit';
 
 import { VcsService } from '../services/vcs';
 import type { VcsProvider, VcsPullRequest, VcsUpdateStatusCheckInput } from '../vcs/types';
@@ -124,6 +125,18 @@ const DIFF_CACHE_TTL_SECONDS = 6 * 60 * 60;
 // (ModelService.resolveModel), so the recurring cost per unit is ~1 provider call per model
 // tried plus the persisted-review write -- roughly 5 in the worst case rather than 9. Lower
 // estimate => more units reviewed in parallel per chunk within the same 50-subrequest cap.
+//
+// PHASE 13 AUDIT-WRITE RE-DERIVATION (Codex HIGH, deliberate — the standing v1.2 decision forbids
+// silently changing this budget): each completed (file,pass) unit now ALSO issues ONE combined audit
+// append (core/audit.ts recordUnitAudit — a single DB write batching the unit's drafted + severity
+// events, 13-03/13-04) ON TOP OF the persisted-review write. So the true worst-case per-unit cost is
+// ~6, not ~5. The constant is KEPT AT 5 anyway, on purpose: at a fresh budget the max concurrency (4)
+// runs cost 4 × 6 == 24, still <= the 25-subrequest safe budget (SAFE_MARGIN), so 4 concurrent units
+// remain safe. Bumping the estimate to 6 to "account for" the audit write would make floor(22/6) == 3
+// after even a 3-subrequest getPullRequest preamble and SILENTLY cap the concurrency slider below its
+// max -- the exact "concurrency slider is dead above medium" regression chunk-concurrency.spec.ts
+// guards -- for zero safety benefit (24 <= 25 already holds). This audit-append re-derivation is
+// pinned non-silently by chunk-concurrency.spec.ts's `ESTIMATED_SUBREQUESTS_PER_FILE + 1` assertion.
 //
 // This is a per-(file,pass)-UNIT cost that governs CONCURRENCY (how many units run in one chunk),
 // NOT a per-file cost. Phase 10's security pass is modelled as a SEPARATE (file,'security') unit
@@ -995,6 +1008,9 @@ async function runReviewPhase(
           model: awaitingReview.async_model ?? awaitingReview.model_used,
           requestId: awaitingReview.async_request_id!,
           file,
+          // thread config so the async-batch parse path resolves the severity_engine.enabled escape
+          // hatch from this repo's config, matching the sync path (13-04)
+          config,
         });
         if (poll.status === 'pending') {
           awaitingAsync += 1;
@@ -1225,6 +1241,10 @@ async function persistCompletedReview(
       fileSummary: string;
       overallCorrectness?: string;
       confidenceScore?: number;
+      // The severity engine's per-finding audit events for this unit (13-02). Optional so existing
+      // mocks that return a `parsed` object without this field stay structurally valid; recordUnitAudit
+      // treats undefined/missing as "no extra events" (13-04).
+      severityAuditEvents?: JobAuditEvent[];
     };
   },
   // Defaults to 'main' (NREG-01). Threaded from the poll call site (IN-03) so a completed row is
@@ -1254,6 +1274,11 @@ async function persistCompletedReview(
     asyncRequestId: null,
     asyncModel: null,
   });
+
+  // AUD-01: record this completed (file, pass) unit's audit trail — one combined drafted+severity
+  // append via a SINGLE recordUnitAudit call (13-03/13-04). Best-effort: recordUnitAudit swallows and
+  // logs any failure, so a broken audit write can NEVER fail this async-batch persist or the job.
+  await recordUnitAudit(env, job.id, file.path, pass, response.parsed.severityAuditEvents);
 }
 
 /**
@@ -1346,6 +1371,11 @@ async function reviewAndPersistFile(
       confidenceScore: response.parsed.confidenceScore,
       errorMessage: null,
     });
+
+    // AUD-01: record this completed (file, pass) unit's audit trail — one combined drafted+severity
+    // append via a SINGLE recordUnitAudit call (13-03/13-04). Best-effort: recordUnitAudit swallows and
+    // logs any failure, so a broken audit write can NEVER fail this synchronous persist or the job.
+    await recordUnitAudit(env, job.id, file.path, pass, response.parsed.severityAuditEvents);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown file review error';
     const modelId = config.model?.main ?? 'unconfigured';
