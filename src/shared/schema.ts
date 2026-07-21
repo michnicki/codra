@@ -586,6 +586,52 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
       timestamp: dateStringSchema,
     })
     .passthrough(),
+  // Phase 14 FILT-04 drop events. `filtered` is an AGGREGATE event (one per rule; for
+  // confidence_floor one per DISTINCT effective floor — 14-02 finding #2) recording how many
+  // findings a noise-filter rule dropped, with a bounded (<=20 downstream) `sample` of the
+  // findings it dropped. `deduped` is a PER-MERGE event (one per near-duplicate merge). Both are
+  // additive per D-06 (the two variants above are byte-unchanged) and privacy-bounded per the
+  // Phase 13 T-13-03-03 posture: the `sample` / `survivor` / `suppressed` identifiers admit ONLY
+  // { path, line, title } and NEVER body / diff / existingCode / codeSuggestion. The extra
+  // severity/category/confidence (on filtered.sample) and titleSimilarity/bodySimilarity (on
+  // deduped) fields are non-sensitive DECISION METRICS — "the values that dropped it" — added for
+  // FILT-04 explainability (review finding #4), not raw finding content.
+  z
+    .object({
+      stage: z.literal('filtered'),
+      rule: z.enum(['confidence_floor', 'severity_floor', 'cap']),
+      count: z.number().int(),
+      // The effective threshold the rule applied: the confidence floor max(global, category) as a
+      // float, a min_severity band, or the effectiveMaxComments integer.
+      threshold: z.union([z.number(), z.enum(reviewSeverities)]),
+      sample: z.array(
+        z.object({
+          path: z.string(),
+          line: z.number().nullable().optional(),
+          title: z.string(),
+          // Non-sensitive decision metrics explaining WHY each sampled finding fell below the rule
+          // (review finding #4) — optional; never body/diff/existingCode/codeSuggestion.
+          severity: z.enum(reviewSeverities).optional(),
+          category: z.enum(reviewCategories).optional(),
+          confidence: z.number().min(0).max(1).nullable().optional(),
+        }),
+      ),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  z
+    .object({
+      stage: z.literal('deduped'),
+      rule: z.enum(['rule1', 'rule2', 'rule3', 'rule4']),
+      survivor: z.object({ path: z.string(), line: z.number().nullable().optional(), title: z.string() }),
+      suppressed: z.object({ path: z.string(), line: z.number().nullable().optional(), title: z.string() }),
+      // The word-Jaccard scores that caused the merge (review finding #4) — nullable because rule1
+      // has no title check and only rule4 uses a body measure.
+      titleSimilarity: z.number().nullable().optional(),
+      bodySimilarity: z.number().nullable().optional(),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
 ]);
 export type JobAuditEvent = z.infer<typeof jobAuditEventSchema>;
 
