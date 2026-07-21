@@ -60,6 +60,30 @@ describe('applySeverityRules — SEV-01 keyword promotion (PRD FR-170, D-01)', (
     expect(applySeverityRules(base({ severity: 'P3', title: 'the class xssns wrapper' }), enabled).severity).toBe('P3');
     expect(applySeverityRules(base({ severity: 'P3', title: 'Fix the XSS filter' }), enabled).severity).toBe('P0');
   });
+
+  // WR-01: `eval(`/`exec(` now require a LEADING word boundary, so an identifier that merely ENDS in
+  // the literal sequence (retrieval(/medieval(/…exec() must NOT trip a spurious P0 promotion.
+  it('WR-01: identifiers ending in the eval(/exec( sequence do NOT promote (retrieval(/medieval(/queryExec()', () => {
+    expect(applySeverityRules(base({ severity: 'P3', title: 'the data retrieval( call', body: '' }), enabled).severity).toBe('P3');
+    expect(applySeverityRules(base({ severity: 'P3', title: 'a medieval( helper', body: '' }), enabled).severity).toBe('P3');
+    // '...exec(' with a leading word char (queryExec() must not match 'exec('
+    expect(applySeverityRules(base({ severity: 'P3', title: 'calls queryExec( on the pool', body: '' }), enabled).severity).toBe('P3');
+  });
+
+  it('WR-01: a genuine eval(/exec( call still promotes to P0 in all boundary positions, including eval()', () => {
+    // leading space
+    expect(applySeverityRules(base({ severity: 'P3', body: 'this uses eval( on input' }), enabled).severity).toBe('P0');
+    // assignment / operator boundary
+    expect(applySeverityRules(base({ severity: 'P3', body: 'x = eval(userInput)' }), enabled).severity).toBe('P0');
+    // start of string
+    expect(applySeverityRules(base({ severity: 'P3', title: 'eval( is called here' }), enabled).severity).toBe('P0');
+    // empty-arg call eval() — trailing \b would have wrongly failed this
+    expect(applySeverityRules(base({ severity: 'P3', body: 'code calls eval() directly' }), enabled).severity).toBe('P0');
+    // exec( with a preceding operator/space boundary
+    const ex = applySeverityRules(base({ severity: 'P3', body: 'child.exec( cmd )' }), enabled);
+    expect(ex.severity).toBe('P0');
+    expect(ex.auditEvents[0]).toMatchObject({ rule: 'keyword_promotion', matched: 'exec(' });
+  });
 });
 
 describe('applySeverityRules — SEV-02 security cap (PRD FR-171, D-06)', () => {

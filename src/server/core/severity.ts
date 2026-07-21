@@ -6,9 +6,10 @@ import { reviewCategories, type ReviewSeverity, type ReviewCategory, type JobAud
 // T-13-02-01), so matching is bounded and non-backtracking.
 
 // SEV-01 exploit-class keywords (PRD FR-170). A word-bounded match on title+body PROMOTES a finding
-// to P0 regardless of its model-assigned severity. `eval(`/`exec(` keep the trailing `(` — the paren
-// is itself a non-word boundary so `matchesTerm` uses a plain substring test for those two (so
-// 'evaluate('/'executed' cannot match); every other term is matched WORD-BOUNDED (case-insensitive),
+// to P0 regardless of its model-assigned severity. `eval(`/`exec(` keep the trailing `(`; the paren
+// bounds the right side, and `matchesTerm` adds a LEADING `\b` for them (so 'evaluate('/'executed'
+// AND identifiers ending in the sequence like 'retrieval('/'medieval(' cannot match, while 'eval('
+// and 'eval()' do — review fix WR-01). Every other term is matched WORD-BOUNDED (case-insensitive),
 // so bare 'rce'/'csrf'/'ssrf' require `\b` boundaries ('force'/'farce' do NOT trip 'rce').
 export const SEV01_EXPLOIT_KEYWORDS = [
   'sql injection',
@@ -81,15 +82,18 @@ function escapeRegExp(term: string): string {
   return term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// Word-bounded, case-insensitive match of a single keyword/phrase against `text`. Terms ending in
-// `(` (only 'eval('/'exec(') use a plain substring test — the `(` already bounds them. Every other
-// term (single word OR multi-word phrase like 'default key') uses a non-backtracking
-// `\b<escaped-literal>\b` regex.
+// Word-bounded, case-insensitive match of a single keyword/phrase against `text`. Every term uses a
+// non-backtracking regex over fixed literals (regex-escaped) — no catastrophic backtracking.
 function matchesTerm(text: string, term: string): boolean {
-  if (term.endsWith('(')) {
-    return text.toLowerCase().includes(term.toLowerCase());
-  }
-  return new RegExp(String.raw`\b` + escapeRegExp(term) + String.raw`\b`, 'i').test(text);
+  const escaped = escapeRegExp(term);
+  // '('-terminated terms (eval(/exec() need a LEADING word boundary but no trailing one:
+  // the '(' already bounds the right side, and a trailing \b would fail to match 'eval()'.
+  // Leading \b prevents false positives on identifiers ending in the sequence
+  // (e.g. 'retrieval(' must NOT match 'eval(') — review fix WR-01.
+  const pattern = term.endsWith('(')
+    ? String.raw`\b` + escaped
+    : String.raw`\b` + escaped + String.raw`\b`;
+  return new RegExp(pattern, 'i').test(text);
 }
 
 // Returns the first term in `terms` that matches `text` (word-bounded), or undefined. The returned
