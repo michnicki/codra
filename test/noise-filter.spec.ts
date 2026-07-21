@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import type { ParsedReviewComment, ReviewCategory, ReviewSeverity } from '@shared/schema';
+import type { JobAuditEvent, ParsedReviewComment, ReviewCategory, ReviewSeverity } from '@shared/schema';
 import type { MergeRecord } from '@server/core/dedup';
 import {
   applyNoiseFilter,
+  type DropRecord,
   type NoiseFilterOptions,
+  type NoiseFilterResult,
 } from '@server/core/noise-filter';
+import { buildFinalizeDropEvents } from '@server/core/audit';
 
 // Pure, no-DB unit spec (mirrors test/dedup.spec.ts): applyNoiseFilter is a zero-cost deterministic
 // function, so every FR-180 chain edge the plan pins is asserted here against the real export with a
@@ -247,5 +250,130 @@ describe('applyNoiseFilter — DropRecord privacy', () => {
       ['category', 'confidence', 'effectiveFloor', 'line', 'path', 'severity', 'title'].sort(),
     );
     expect(JSON.stringify(rec)).not.toContain('SECRET');
+  });
+});
+
+describe('buildFinalizeDropEvents (FILT-04, D-07)', () => {
+  // The audit union is `.passthrough()`, so a boolean filter does not narrow `.sample`; a type
+  // predicate narrows the array element to the `filtered` variant for clean typed assertions.
+  type FilteredEvent = Extract<JobAuditEvent, { stage: 'filtered' }>;
+  const filteredEvents = (events: JobAuditEvent[]): FilteredEvent[] =>
+    events.filter((e): e is FilteredEvent => e.stage === 'filtered');
+
+  function dropRecord(overrides: Partial<DropRecord> = {}): DropRecord {
+    return { path: 'src/a.ts', line: 5, title: 'a title', severity: 'P3', ...overrides };
+  }
+
+  function emptyDropped(): NoiseFilterResult['dropped'] {
+    return { confidenceFloor: [], severityFloor: [], cap: [], merges: [] };
+  }
+
+  it('empty dropped -> []', () => {
+    expect(buildFinalizeDropEvents(emptyDropped(), { severityFloor: 'nit', cap: 3 })).toEqual([]);
+  });
+
+  it('emits one confidence_floor event PER DISTINCT effective floor with correct per-group threshold/count (review finding #2)', () => {
+    const dropped = emptyDropped();
+    dropped.confidenceFloor = [
+      dropRecord({ effectiveFloor: 0.85, category: 'security', confidence: 0.8, title: 'sec1' }),
+      dropRecord({ effectiveFloor: 0.85, category: 'security', confidence: 0.7, title: 'sec2' }),
+      dropRecord({ effectiveFloor: 0.7, category: 'bugs', confidence: 0.6, title: 'bug1' }),
+    ];
+    const events = buildFinalizeDropEvents(dropped, { severityFloor: 'nit', cap: 3 });
+    const confEvents = filteredEvents(events).filter((e) => e.rule === 'confidence_floor');
+    expect(confEvents).toHaveLength(2);
+
+    const at85 = confEvents.find((e) => e.threshold === 0.85);
+    const at70 = confEvents.find((e) => e.threshold === 0.7);
+    expect(at85?.count).toBe(2);
+    expect(at70?.count).toBe(1);
+    // Sample entries carry the finding's own category/confidence (review finding #4).
+    expect(at85?.sample[0]).toMatchObject({ title: 'sec1', category: 'security', confidence: 0.8 });
+  });
+
+  it('emits one severity_floor and one cap event with the passed thresholds and per-entry severity', () => {
+    const dropped = emptyDropped();
+    dropped.severityFloor = [dropRecord({ severity: 'P3', title: 'sev1' })];
+    dropped.cap = [dropRecord({ severity: 'nit', title: 'cap1' }), dropRecord({ severity: 'nit', title: 'cap2' })];
+    const events = buildFinalizeDropEvents(dropped, { severityFloor: 'P2', cap: 5 });
+
+    const sev = filteredEvents(events).find((e) => e.rule === 'severity_floor');
+    expect(sev?.threshold).toBe('P2');
+    expect(sev?.count).toBe(1);
+    expect(sev?.sample[0]).toMatchObject({ title: 'sev1', severity: 'P3' });
+
+    const cap = filteredEvents(events).find((e) => e.rule === 'cap');
+    expect(cap?.threshold).toBe(5);
+    expect(cap?.count).toBe(2);
+    expect(cap?.sample[0]).toMatchObject({ severity: 'nit' });
+  });
+
+  it('caps every sample at 20 entries even when a rule drops more', () => {
+    const dropped = emptyDropped();
+    dropped.cap = Array.from({ length: 35 }, (_, i) => dropRecord({ severity: 'nit', title: `c${i}` }));
+    const events = buildFinalizeDropEvents(dropped, { severityFloor: 'nit', cap: 3 });
+    const cap = filteredEvents(events).find((e) => e.rule === 'cap');
+    expect(cap?.count).toBe(35); // count is the true drop count
+    expect(cap?.sample).toHaveLength(20); // sample is bounded to 20
+  });
+
+  it('clamps sample titles to <=100 chars (Codex LOW — parsedReviewComment.title is unbounded)', () => {
+    const dropped = emptyDropped();
+    dropped.severityFloor = [dropRecord({ title: 'x'.repeat(250) })];
+    const events = buildFinalizeDropEvents(dropped, { severityFloor: 'nit', cap: 3 });
+    const sev = filteredEvents(events).find((e) => e.rule === 'severity_floor');
+    expect(sev?.sample[0].title).toHaveLength(100);
+  });
+
+  it('emits one deduped event per merge carrying titleSimilarity/bodySimilarity (review finding #4)', () => {
+    const dropped = emptyDropped();
+    dropped.merges = [
+      {
+        survivor: finding({ path: 'src/x.ts', line: 3, title: 'keep' }),
+        suppressed: finding({ path: 'src/x.ts', line: 4, title: 'drop' }),
+        rule: 'rule3',
+        titleSimilarity: 0.7,
+        bodySimilarity: null,
+      },
+    ];
+    const events = buildFinalizeDropEvents(dropped, { severityFloor: 'nit', cap: 3 });
+    const dedup = events.filter((e) => e.stage === 'deduped');
+    expect(dedup).toHaveLength(1);
+    expect(dedup[0]).toMatchObject({
+      rule: 'rule3',
+      survivor: { path: 'src/x.ts', line: 3, title: 'keep' },
+      suppressed: { path: 'src/x.ts', line: 4, title: 'drop' },
+      titleSimilarity: 0.7,
+      bodySimilarity: null,
+    });
+  });
+
+  it('no event object carries body/diff/existingCode/codeSuggestion', () => {
+    const dropped = emptyDropped();
+    dropped.confidenceFloor = [dropRecord({ effectiveFloor: 0.9, confidence: 0.1 })];
+    dropped.severityFloor = [dropRecord()];
+    dropped.cap = [dropRecord({ severity: 'nit' })];
+    dropped.merges = [
+      {
+        survivor: finding({ body: 'SECRET', existingCode: 'SECRET', codeSuggestion: 'SECRET' }),
+        suppressed: finding({ body: 'SECRET' }),
+        rule: 'rule4',
+        titleSimilarity: 0.9,
+        bodySimilarity: 0.6,
+      },
+    ];
+    const events = buildFinalizeDropEvents(dropped, { severityFloor: 'nit', cap: 3 });
+    const serialized = JSON.stringify(events);
+    // No raw finding content leaks. (Note: `bodySimilarity` is a legitimate non-sensitive metric on
+    // deduped events, so we assert on the raw VALUE and on the sensitive KEYS, not the substring 'body'.)
+    expect(serialized).not.toContain('SECRET');
+    expect(serialized).not.toContain('existingCode');
+    expect(serialized).not.toContain('codeSuggestion');
+    // No sample/identifier object exposes a raw `body` field.
+    for (const event of events) {
+      if (event.stage === 'filtered') {
+        for (const s of event.sample) expect(s).not.toHaveProperty('body');
+      }
+    }
   });
 });
