@@ -73,8 +73,43 @@ export const SEV03_STYLE_SIGNALS = [
 
 // SEV-03 defect signals. Any word-bounded match here BLOCKS the style-only downgrade — a finding
 // that mentions a defect keyword keeps its model-assigned severity even if it also mentions a style
-// keyword.
-export const SEV03_DEFECT_SIGNALS = ['bug', 'error', 'crash', 'security', 'vulnerability'] as const;
+// keyword. This list is deliberately WIDER than ROADMAP SC2's literal 5-word wording
+// (bug/error/crash/security/vulnerability, which remain a subset) — review fix WR-02. Rationale:
+// SEV03_STYLE_SIGNALS contains broad everyday words (format/comment/indent/naming/convention/…), so a
+// genuine defect that merely *mentions* one (e.g. "format string produces incorrect output") was being
+// downgraded to 'nit' and could then be dropped entirely by the finalize `min_severity` filter, silently
+// hiding a real finding. Widening the defect vocabulary is a strictly-SAFER change: it can only PREVENT
+// downgrades, never add them, so the style-only downgrade now fires only for genuinely cosmetic
+// findings. Matching is word-bounded and case-insensitive (see matchesTerm); keep entries lowercase.
+export const SEV03_DEFECT_SIGNALS = [
+  // ROADMAP SC2 literal five (do not remove — SC2 is a subset of this list):
+  'bug',
+  'error',
+  'crash',
+  'security',
+  'vulnerability',
+  // Common real-defect vocabulary added by WR-02:
+  'incorrect',
+  'wrong',
+  'fail',
+  'failure',
+  'null',
+  'undefined',
+  'leak',
+  'race',
+  'deadlock',
+  'overflow',
+  'corrupt',
+  'exception',
+  'unhandled',
+  'regression',
+  'broken',
+  'infinite loop',
+  'off-by-one',
+  'data loss',
+  'dereference',
+  'panic',
+] as const;
 
 // Escape regex metacharacters so a keyword is always treated as a literal — no attacker-influenced
 // regex construct, no catastrophic backtracking (DoS hardening, threat T-13-02-01).

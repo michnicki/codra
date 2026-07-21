@@ -131,6 +131,37 @@ describe('applySeverityRules — SEV-03 style-only downgrade (PRD FR-172, positi
     expect(out.severity).toBe('P2');
     expect(out.auditEvents).toHaveLength(0);
   });
+
+  // WR-02: a genuine defect that incidentally contains a broad style word (format/comment/indent/…)
+  // but none of the original five defect words must NOT be downgraded to nit (where min_severity could
+  // then drop it). The widened SEV03_DEFECT_SIGNALS list blocks the downgrade.
+  it('WR-02: "format string produces incorrect output" is NOT downgraded (style word + widened defect vocab)', () => {
+    const out = applySeverityRules(base({ severity: 'P2', category: 'quality', title: 'format string produces incorrect output' }), enabled);
+    expect(out.severity).toBe('P2');
+    expect(out.auditEvents).toHaveLength(0);
+  });
+
+  it('WR-02: a comment-mentioning defect (unchecked null return) is NOT downgraded', () => {
+    const out = applySeverityRules(base({ severity: 'P1', category: 'quality', title: 'misleading comment', body: 'this comment hides an unchecked null return' }), enabled);
+    expect(out.severity).toBe('P1');
+    expect(out.auditEvents).toHaveLength(0);
+  });
+
+  it('WR-02: newly-added defect words (race/deadlock/null dereference) block the downgrade even with a style keyword', () => {
+    // 'formatting' style signal + 'race'
+    expect(applySeverityRules(base({ severity: 'P2', category: 'quality', title: 'formatting hides a race on the cache', body: '' }), enabled).severity).toBe('P2');
+    // 'comment' style signal + 'deadlock'
+    expect(applySeverityRules(base({ severity: 'P2', category: 'quality', title: 'comment omits deadlock risk', body: '' }), enabled).severity).toBe('P2');
+    // 'indent' style signal + 'dereference' (null dereference)
+    expect(applySeverityRules(base({ severity: 'P2', category: 'quality', title: 'indentation obscures a null dereference', body: '' }), enabled).severity).toBe('P2');
+  });
+
+  it('WR-02: a purely cosmetic finding (no defect signal) is STILL downgraded to nit', () => {
+    expect(applySeverityRules(base({ severity: 'P3', category: 'quality', title: 'inconsistent indentation' }), enabled).severity).toBe('nit');
+    const out = applySeverityRules(base({ severity: 'P3', category: 'quality', title: 'variable naming convention' }), enabled);
+    expect(out.severity).toBe('nit');
+    expect(out.auditEvents[0]).toMatchObject({ rule: 'style_only_downgrade', to: 'nit' });
+  });
 });
 
 describe('applySeverityRules — SEV-04 category resolution (D-05/D-06/D-07)', () => {
