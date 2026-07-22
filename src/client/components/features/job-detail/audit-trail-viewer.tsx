@@ -139,8 +139,10 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
           <MetricLine label="skipped" value={`${event.count} files`} />
           {event.sample.length > 0 && (
             <ul className="mt-2 flex flex-col gap-1.5 border-t border-border/30 pt-2">
-              {event.sample.map((s, i) => (
-                <li key={i}>
+              {event.sample.map((s) => (
+                // A file is sampled at most once per skip event, so its path is a stable
+                // unique key (IN-03) — no need for the array index.
+                <li key={s.path}>
                   <SampleIdentifier path={s.path} line={s.line} title={s.title} />
                 </li>
               ))}
@@ -172,9 +174,10 @@ function DraftedGroup({ group }: { group: AuditStageGroup }) {
         Drafted — {group.count} events
       </summary>
       <ul className="flex flex-col gap-1 border-t border-border/30 px-3 py-2">
-        {group.events.map((event, index) =>
+        {group.events.map((event) =>
           event.stage === 'drafted' ? (
-            <li key={index} className="text-xs">
+            // A file is drafted once per pass, so file:pass is a stable key (IN-03).
+            <li key={`${event.file}:${event.pass}`} className="text-xs">
               <span className="font-mono break-all text-foreground/90">{event.file}</span>
               <span className="text-muted-foreground"> · {event.pass}</span>
             </li>
