@@ -56,6 +56,72 @@ describe('v1.2 schema contracts (Phase 13 Plan 01)', () => {
     expect(jobAuditEventSchema.safeParse({ stage: 'unknown_stage' }).success).toBe(false);
   });
 
+  it('(c2) jobAuditEventSchema accepts file_skipped + evidence_missing; still rejects an unknown stage (Phase 15 D-11/D-17)', () => {
+    const ts = new Date().toISOString();
+    // file_skipped: generated (minimal sample — path only)
+    expect(
+      jobAuditEventSchema.safeParse({
+        stage: 'file_skipped',
+        reason: 'generated',
+        count: 1,
+        sample: [{ path: 'a.ts' }],
+        timestamp: ts,
+      }).success,
+    ).toBe(true);
+    // file_skipped: over_cap (sample carries the consistency-only line/title fields)
+    expect(
+      jobAuditEventSchema.safeParse({
+        stage: 'file_skipped',
+        reason: 'over_cap',
+        count: 5,
+        sample: [{ path: 'b.ts', line: 3, title: 'x' }],
+        timestamp: ts,
+      }).success,
+    ).toBe(true);
+    // evidence_missing: both reason discriminators parse
+    expect(
+      jobAuditEventSchema.safeParse({
+        stage: 'evidence_missing',
+        reason: 'not_in_hunk',
+        path: 'c.ts',
+        line: 4,
+        title: 't',
+        timestamp: ts,
+      }).success,
+    ).toBe(true);
+    expect(
+      jobAuditEventSchema.safeParse({
+        stage: 'evidence_missing',
+        reason: 'absent',
+        path: 'd.ts',
+        title: 't2',
+        timestamp: ts,
+      }).success,
+    ).toBe(true);
+    // The union stays a discriminatedUnion — an unknown stage is still rejected per-event.
+    expect(jobAuditEventSchema.safeParse({ stage: 'nonexistent_stage' }).success).toBe(false);
+    // The four pre-existing variants remain unchanged (drafted/severity_adjusted/filtered/deduped).
+    expect(
+      jobAuditEventSchema.safeParse({
+        stage: 'filtered',
+        rule: 'confidence_floor',
+        count: 2,
+        threshold: 0.7,
+        sample: [{ path: 'e.ts', title: 't' }],
+        timestamp: ts,
+      }).success,
+    ).toBe(true);
+    expect(
+      jobAuditEventSchema.safeParse({
+        stage: 'deduped',
+        rule: 'rule1',
+        survivor: { path: 'f.ts', title: 's' },
+        suppressed: { path: 'f.ts', title: 'd' },
+        timestamp: ts,
+      }).success,
+    ).toBe(true);
+  });
+
   it('(d) a pre-v1.2 config fixture (no v1.2 keys) still parses without throwing (NREG-01)', () => {
     expect(() => reviewConfigSchema.parse({})).not.toThrow();
     // Fixture carrying ONLY pre-existing keys — no v1.2 key present anywhere.

@@ -640,6 +640,46 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
       timestamp: dateStringSchema,
     })
     .passthrough(),
+  // Phase 15 drop events. Both additive per D-08 (the four variants above stay byte-unchanged) and
+  // privacy-bounded per the Phase 13 T-13-03-03 posture: the sample / identifier objects admit ONLY
+  // { path, line?, title? } and NEVER body / diff / existingCode / codeSuggestion. Privacy is
+  // ultimately enforced by exact PRODUCER construction (audit.ts 15-05 / model-output.ts 15-04); the
+  // .passthrough() here preserves additive-compat but does not by itself strip an extra top-level key.
+  //
+  // `file_skipped` (D-11/D-12): an AGGREGATE event — priority file selection skipped `count` files for
+  // one `reason`, with a bounded `sample` of the skipped paths. `reason` is `generated` (content-based
+  // generated-file detector) or `over_cap` (below the priority cut). `skip_glob` is deliberately NOT a
+  // reason value (D-12) — glob-skipped files never enter the selection routine. NOTE: `line` and
+  // `title` on the sample are kept ONLY for event-shape consistency with the other audit variants —
+  // they are unused for file-level skips (a skipped file has no finding line or title) (Antigravity LOW).
+  z
+    .object({
+      stage: z.literal('file_skipped'),
+      reason: z.enum(['generated', 'over_cap']),
+      count: z.number().int(),
+      sample: z.array(
+        z.object({
+          path: z.string(),
+          line: z.number().nullable().optional(),
+          title: z.string().optional(),
+        }),
+      ),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // `evidence_missing` (D-17, EVID-01): a PER-FINDING event — the soft evidence gate could not confirm
+  // a finding's model-emitted `existing_code` against the cleaned hunk. `reason` discriminates `absent`
+  // (no/empty evidence string emitted) from `not_in_hunk` (evidence present but not found in the diff).
+  z
+    .object({
+      stage: z.literal('evidence_missing'),
+      reason: z.enum(['absent', 'not_in_hunk']),
+      path: z.string(),
+      line: z.number().nullable().optional(),
+      title: z.string(),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
 ]);
 export type JobAuditEvent = z.infer<typeof jobAuditEventSchema>;
 
