@@ -288,3 +288,135 @@ describe('JobDetailPage severity summary, category/confidence, and critic panel'
     expect(screen.queryByText('Critic')).not.toBeInTheDocument();
   });
 });
+
+// AUD-02 SC3 (Plan 16-06): the audit-trail viewer at the bottom of job detail. Renders job.audit
+// grouped by stage (via groupAuditByStage), decision groups expanded with reasons + sample
+// identifiers, the high-volume drafted group collapsed to a count, and the truncation banner when
+// auditTruncated is true. All render-only over the already-fetched jobDetail payload.
+describe('JobDetailPage audit trail viewer', () => {
+  const okResponse = <T,>(data: T) => ({
+    status: 200 as const,
+    etag: null,
+    lastModified: null,
+    notModified: false as const,
+    data,
+  });
+
+  const AUDIT_EVENTS: JobDetail['audit'] = [
+    { stage: 'drafted', file: 'src/a.ts', pass: 'main', timestamp: new Date().toISOString() },
+    { stage: 'drafted', file: 'src/b.ts', pass: 'main', timestamp: new Date().toISOString() },
+    {
+      stage: 'filtered',
+      rule: 'confidence_floor',
+      count: 1,
+      threshold: 0.5,
+      sample: [{ path: 'src/filtered.ts', line: 12, title: 'low confidence finding' }],
+      timestamp: new Date().toISOString(),
+    },
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  async function openAuditTrail(user: ReturnType<typeof userEvent.setup>) {
+    const heading = await screen.findByText('Audit trail');
+    const details = heading.closest('details') as HTMLDetailsElement;
+    expect(details.open).toBe(false); // (c) outer section starts collapsed
+    await user.click(heading);
+    expect(details.open).toBe(true);
+    return details;
+  }
+
+  it('groups events by stage with the filtered decision group expanded (reason + sample path) after opening the collapsed section', async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.getJob).mockResolvedValue(okResponse({ job: { ...JOB, audit: AUDIT_EVENTS } }));
+
+    renderJobDetail();
+    await openAuditTrail(user);
+
+    // (a) decision group expanded: rule (drop reason) + a sample path are visible immediately.
+    expect(screen.getByText('src/filtered.ts')).toBeVisible();
+    expect(screen.getByText('confidence_floor')).toBeVisible();
+  });
+
+  it('renders the drafted group collapsed to a count and reveals per-file rows only after toggling', async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.getJob).mockResolvedValue(okResponse({ job: { ...JOB, audit: AUDIT_EVENTS } }));
+
+    renderJobDetail();
+    await openAuditTrail(user);
+
+    // (b) drafted collapse asserted via the nested <details>.open, not mere presence.
+    const draftedSummary = screen.getByText(/Drafted — 2 events/);
+    const draftedDetails = draftedSummary.closest('details') as HTMLDetailsElement;
+    expect(draftedDetails.open).toBe(false);
+    expect(screen.getByText('src/a.ts')).not.toBeVisible();
+
+    await user.click(draftedSummary);
+    expect(draftedDetails.open).toBe(true);
+    expect(screen.getByText('src/a.ts')).toBeVisible();
+  });
+
+  it('keeps decision group content hidden until the outer section is opened', async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.getJob).mockResolvedValue(okResponse({ job: { ...JOB, audit: AUDIT_EVENTS } }));
+
+    renderJobDetail();
+
+    // (c) before opening: the outer details is closed and its decision-group content is not visible.
+    const heading = await screen.findByText('Audit trail');
+    const details = heading.closest('details') as HTMLDetailsElement;
+    expect(details.open).toBe(false);
+    expect(screen.getByText('src/filtered.ts')).not.toBeVisible();
+
+    await user.click(heading);
+    expect(details.open).toBe(true);
+    expect(screen.getByText('src/filtered.ts')).toBeVisible();
+  });
+
+  it('renders the truncation banner when auditTruncated is true', async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.getJob).mockResolvedValue(
+      okResponse({ job: { ...JOB, audit: AUDIT_EVENTS, auditTruncated: true } }),
+    );
+
+    renderJobDetail();
+    await openAuditTrail(user);
+
+    // (d) truncation banner present.
+    expect(
+      screen.getByText('Showing the latest 500 events — older events were evicted.'),
+    ).toBeVisible();
+  });
+
+  it('renders the truncation banner AND the empty line together when audit is empty but truncated (REVIEW #9)', async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.getJob).mockResolvedValue(
+      okResponse({ job: { ...JOB, audit: [], auditTruncated: true } }),
+    );
+
+    renderJobDetail();
+    await openAuditTrail(user);
+
+    // (e) banner is NOT gated behind the non-empty audit array — both co-occur.
+    expect(
+      screen.getByText('Showing the latest 500 events — older events were evicted.'),
+    ).toBeVisible();
+    expect(screen.getByText('No audit events recorded for this review.')).toBeVisible();
+  });
+
+  it('renders only the neutral empty line when audit is empty and not truncated', async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.getJob).mockResolvedValue(okResponse({ job: { ...JOB, audit: [], auditTruncated: false } }));
+
+    renderJobDetail();
+    await openAuditTrail(user);
+
+    // (f) empty-only: the neutral line shows, the truncation banner does not.
+    expect(screen.getByText('No audit events recorded for this review.')).toBeVisible();
+    expect(
+      screen.queryByText('Showing the latest 500 events — older events were evicted.'),
+    ).not.toBeInTheDocument();
+  });
+});

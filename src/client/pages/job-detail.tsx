@@ -7,6 +7,7 @@ import { JobReviewOverview } from '@client/components/features/job-detail/job-re
 import { JobSeveritySummary } from '@client/components/features/job-detail/job-severity-summary';
 import { CriticPanel } from '@client/components/features/job-detail/critic-panel';
 import { JobFindingsList } from '@client/components/features/job-detail/job-findings-list';
+import { AuditTrailViewer } from '@client/components/features/job-detail/audit-trail-viewer';
 import { JobDetailSkeleton } from '@client/components/features/job-detail/job-skeleton';
 import { Alert } from '@client/components/ui/alert';
 
@@ -56,6 +57,9 @@ export function JobDetailPage() {
       <CriticPanel job={job} />
 
       <JobFindingsList job={job} />
+
+      {/* AUD-02 SC3 / D-08: collapsed audit trail at the bottom, below Findings */}
+      <AuditTrailViewer job={job} />
     </section>
   );
 }
