@@ -389,6 +389,26 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     expect(result.comments[0].existingCode == null).toBe(true);
   });
 
+  it('needle with leading +/- diff markers still matches the (prefix-stripped) hunk (WR-02)', () => {
+    // The haystack is built from diff-prefix-stripped hunk content. The model is only ASKED not to add
+    // a +/- marker; when it disobeys, each needle line must be stripped so it is normalized the same
+    // way -> recognized as in-hunk, NOT a false not_in_hunk.
+    const result = parseFileReviewResponse(
+      rawWith('-const older = 1;\n+const Value = compute();'),
+      evidenceFile,
+    );
+    expect(result.comments).toHaveLength(1);
+    expect(evidenceEvents(result)).toHaveLength(0);
+  });
+
+  it('genuinely absent needle still emits not_in_hunk even with a leading diff marker (WR-02)', () => {
+    const result = parseFileReviewResponse(rawWith('+someTotallyUnrelatedIdentifier()'), evidenceFile);
+    expect(result.comments).toHaveLength(1);
+    const events = evidenceEvents(result);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'not_in_hunk' });
+  });
+
   it('maps existing_code into the parsed comment existingCode field', () => {
     const result = parseFileReviewResponse(rawWith('const Value = compute();'), evidenceFile);
     expect(result.comments[0].existingCode).toBe('const Value = compute();');

@@ -277,6 +277,20 @@ export function normalizeForEvidence(s: string): string {
   return s.replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
+/**
+ * WR-02: The evidence haystack is built from hunk `content`, which is already diff-prefix-stripped
+ * (diff.ts strips the leading +/-/space marker). The needle (`existing_code`) is only produced by the
+ * model, which is merely ASKED not to prepend a `+`/`-` marker. When it disobeys (common), the needle
+ * keeps that leading char and fails the `includes()` test, producing a FALSE `not_in_hunk` that
+ * inflates the exact count EVID-02 reads as a go/no-go signal. Strip a single leading `+`/`-` from EACH
+ * line (evidence may be multi-line) so the needle is normalized the same way the haystack already is.
+ * Whitespace markers need no handling — normalizeForEvidence collapses/trims them anyway. Audit-only:
+ * no posting behavior changes.
+ */
+function stripLeadingDiffMarkers(s: string): string {
+  return s.split('\n').map((line) => line.replace(/^[+-]/, '')).join('\n');
+}
+
 function withSuggestion(body: string, codeSuggestion?: string) {
   if (!codeSuggestion) return body;
 
@@ -485,7 +499,11 @@ export function parseFileReviewResponse(
       // telemetry into the SAME severityAuditEvents accumulator (D-18), never a new returned field, and
       // NEVER carries body/diff/existingCode/codeSuggestion (privacy posture; T-15-04-01).
       const evidence = finding.existing_code;
-      if (evidence == null || normalizeForEvidence(evidence).length === 0) {
+      // WR-02: strip a leading +/- diff marker from each needle line BEFORE normalizeForEvidence, the
+      // same way the haystack is already diff-prefix-stripped. Computed once and used for both the
+      // absent/whitespace check and the includes() check so the needle is normalized identically.
+      const needle = evidence == null ? '' : normalizeForEvidence(stripLeadingDiffMarkers(evidence));
+      if (evidence == null || needle.length === 0) {
         // null / undefined / whitespace-only -> `absent`. A JSON `null` reaches here (never a parse
         // failure) because fileReviewModelOutputSchema.existing_code is nullable().optional() (15-01).
         severityAuditEvents.push({
@@ -496,7 +514,7 @@ export function parseFileReviewResponse(
           title: clampAuditTitle(title),
           timestamp: new Date().toISOString(),
         });
-      } else if (!evidenceHaystack.includes(normalizeForEvidence(evidence))) {
+      } else if (!evidenceHaystack.includes(needle)) {
         severityAuditEvents.push({
           stage: 'evidence_missing',
           reason: 'not_in_hunk',
