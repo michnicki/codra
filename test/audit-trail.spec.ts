@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { insertJob, getJobDetail, appendJobAuditEvents } from '@server/db/jobs';
 import * as jobsModule from '@server/db/jobs';
-import { recordUnitAudit } from '@server/core/audit';
+import { buildFileSkipEvents, recordFileSkips, recordUnitAudit } from '@server/core/audit';
+import type { FileDiff } from '@server/core/diff';
 import { queryRows } from '@server/db/client';
 import { defaultRepoConfig, type JobAuditEvent } from '@shared/schema';
 import { logger } from '@server/core/logger';
@@ -208,5 +209,132 @@ dbDescribe('recordUnitAudit best-effort recorder (AUD-01, T-13-03-04)', () => {
     expect((detail!.audit[0] as { file: string; pass: string }).file).toBe('b.ts');
     expect((detail!.audit[0] as { pass: string }).pass).toBe('security');
     expect(detail!.audit[1].stage).toBe('severity_adjusted');
+  });
+});
+
+// PRIO-03 / D-11 / D-12: buildFileSkipEvents is a PURE builder (no I/O) mapping selectReviewableFiles'
+// drop metadata into `file_skipped` audit events — per-file for `generated`, one bounded aggregate for
+// `over_cap`, `skip_glob` NEVER emitted. These cases need no DB (plain describe).
+const fileDiff = (path: string): FileDiff => ({
+  path,
+  previousPath: null,
+  isNew: true,
+  isDeleted: false,
+  isBinary: false,
+  lineCount: 1,
+  hunks: [],
+});
+
+describe('buildFileSkipEvents pure drop-event builder (PRIO-03, D-11/D-12)', () => {
+  it('emits ONE per-file generated event (count:1, sample:[{path}]) for each generated file', () => {
+    const events = buildFileSkipEvents({ generated: [fileDiff('a.ts'), fileDiff('b.ts')], overCap: [] });
+
+    expect(events).toHaveLength(2);
+    for (const event of events) {
+      expect(event.stage).toBe('file_skipped');
+      expect((event as { reason: string }).reason).toBe('generated');
+      expect((event as { count: number }).count).toBe(1);
+      expect((event as { sample: unknown[] }).sample).toHaveLength(1);
+    }
+    expect((events[0] as { sample: { path: string }[] }).sample[0].path).toBe('a.ts');
+    expect((events[1] as { sample: { path: string }[] }).sample[0].path).toBe('b.ts');
+  });
+
+  it('emits exactly ONE over_cap aggregate: count === full overCap length, sample.length === min(20,count) in overCap order', () => {
+    const overCap = Array.from({ length: 30 }, (_, i) => fileDiff(`over-${String(i).padStart(2, '0')}.ts`));
+    const events = buildFileSkipEvents({ generated: [], overCap });
+
+    expect(events).toHaveLength(1);
+    const event = events[0] as { reason: string; count: number; sample: { path: string }[] };
+    expect(event.reason).toBe('over_cap');
+    // count carries the COMPLETE overCap length — no dropped file is invisible in the aggregate.
+    expect(event.count).toBe(30);
+    // sample bounded to ≤20 (FILT-04 reuse), drawn from the FIRST 20 of overCap in its existing
+    // descending-priority order (highest-priority OMITTED named first, RESEARCH Open-Q1).
+    expect(event.sample).toHaveLength(20);
+    expect(event.sample.map((s) => s.path)).toEqual(overCap.slice(0, 20).map((f) => f.path));
+  });
+
+  it('emits generated per-file AND one over_cap aggregate together', () => {
+    const events = buildFileSkipEvents({ generated: [fileDiff('g.ts')], overCap: [fileDiff('o1.ts'), fileDiff('o2.ts')] });
+
+    expect(events).toHaveLength(2);
+    expect((events[0] as { reason: string }).reason).toBe('generated');
+    expect((events[1] as { reason: string; count: number }).reason).toBe('over_cap');
+    expect((events[1] as { count: number }).count).toBe(2);
+  });
+
+  it('emits [] for empty dropped (no generated, no overCap) — empty-input edge', () => {
+    expect(buildFileSkipEvents({ generated: [], overCap: [] })).toEqual([]);
+  });
+
+  it('never emits a skip_glob event (D-12 — glob skips are intentionally silent)', () => {
+    const events = buildFileSkipEvents({
+      generated: [fileDiff('gen.ts')],
+      overCap: [fileDiff('cap.ts')],
+    });
+    for (const event of events) {
+      expect((event as { reason: string }).reason).not.toBe('skip_glob');
+    }
+  });
+
+  it('PRODUCER-PRIVACY: every emitted sample entry has ONLY the `path` key — no body/diff/existingCode/codeSuggestion', () => {
+    const overCap = Array.from({ length: 3 }, (_, i) => fileDiff(`c-${i}.ts`));
+    const events = buildFileSkipEvents({ generated: [fileDiff('gen.ts')], overCap });
+
+    for (const event of events) {
+      for (const entry of (event as { sample: Record<string, unknown>[] }).sample) {
+        expect(Object.keys(entry)).toEqual(['path']);
+        expect(entry).not.toHaveProperty('body');
+        expect(entry).not.toHaveProperty('diff');
+        expect(entry).not.toHaveProperty('existingCode');
+        expect(entry).not.toHaveProperty('codeSuggestion');
+      }
+    }
+  });
+});
+
+dbDescribe('recordFileSkips best-effort recorder (PRIO-03, D-12)', () => {
+  const env = createTestEnv();
+
+  it('(9) FAILED-WRITE: recordFileSkips resolves (never throws) and warns when appendJobAuditEvents rejects', async () => {
+    const events = buildFileSkipEvents({ generated: [fileDiff('gen.ts')], overCap: [] });
+
+    // Mirror case (8): force the single append to reject and prove the recorder swallows it (best-effort).
+    const appendSpy = vi
+      .spyOn(jobsModule, 'appendJobAuditEvents')
+      .mockRejectedValue(new Error('simulated audit-write failure'));
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    await expect(recordFileSkips(env, 'job-does-not-matter', events)).resolves.toBeUndefined();
+    expect(warnSpy).toHaveBeenCalled();
+
+    appendSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it('(9b) TIMESTAMP-STAMP: recordFileSkips stamps a timestamp on any event lacking one before appending', async () => {
+    // An event deliberately missing `timestamp` (cast around the schema) must be stamped defensively.
+    const eventMissingTimestamp = {
+      stage: 'file_skipped',
+      reason: 'over_cap',
+      count: 1,
+      sample: [{ path: 'x.ts' }],
+    } as unknown as JobAuditEvent;
+
+    let appended: JobAuditEvent[] | undefined;
+    const appendSpy = vi
+      .spyOn(jobsModule, 'appendJobAuditEvents')
+      .mockImplementation(async (_env, _jobId, evs) => {
+        appended = evs;
+      });
+
+    await recordFileSkips(env, 'job-does-not-matter', [eventMissingTimestamp]);
+
+    expect(appended).toBeDefined();
+    expect(appended).toHaveLength(1);
+    expect(appended![0].timestamp).toBeTruthy();
+
+    appendSpy.mockRestore();
   });
 });
