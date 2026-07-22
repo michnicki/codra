@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { ReposPage } from '@client/pages/repos';
 import { api } from '@client/lib/api';
 import { renderPage } from './render';
-import type { RepoConfigRecord } from '@shared/schema';
+import { defaultRepoConfig, type RepoConfigRecord } from '@shared/schema';
 
 const navigateMock = vi.fn();
 
@@ -33,8 +33,12 @@ type InteractiveOverride = {
 };
 
 function makeParsedJson(over: InteractiveOverride = {}) {
+  // Seed from the FULL default review so the expanded modal (which mounts ReviewSettingsPanel and
+  // dereferences every nested review key) mounts without crashing (REVIEW #10). Only the interactive
+  // block is overridden on top of the full default.
   return {
     review: {
+      ...defaultRepoConfig.review,
       interactive: {
         commands: {
           enabled: false,
