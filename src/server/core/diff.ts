@@ -1,5 +1,6 @@
 import picomatch from 'picomatch';
 import type { RepoConfig } from '@shared/schema';
+import { scoreFile } from './priority';
 
 export type DiffLineKind = 'context' | 'add' | 'del';
 
@@ -307,15 +308,75 @@ export function isGeneratedFile(file: FileDiff): boolean {
   return GENERATION_MARKERS.some((marker) => text.includes(marker));
 }
 
-export function filterReviewableFiles(files: FileDiff[], config: RepoConfig['review']) {
+/** The result of the single shared selection routine (D-04). `dropped` is consumed by the Plan 15-05
+ * prepare-phase recorder; the pure module RETURNS it rather than emitting audit events. */
+export type FileSelectionResult = {
+  kept: FileDiff[];
+  dropped: {
+    // Content-detected generated files (enabled branch only). Excluded from BOTH kept and overCap
+    // so they never enter the review-rest skipped_files queue (they'd be wrongly re-reviewed).
+    generated: FileDiff[];
+    // The remainder past max_files. In BOTH branches this is `sorted.slice(max_files)` — the legacy
+    // remainder — so partitionReviewableFiles().omitted (= overCap) and the review-rest
+    // reconstruction (`[...kept, ...omitted]`, review.ts:2301) stay byte-identical (Codex 15-03 HIGH).
+    overCap: FileDiff[];
+  };
+};
+
+/**
+ * The ONE selection routine both public selectors (filterReviewableFiles / partitionReviewableFiles)
+ * delegate to (D-04 two-path consistency). Both branches first apply the identical glob filter
+ * (drop deleted/binary, default skip matchers, custom skip_files). Then:
+ *
+ *  - `file_selection.enabled` (D-02): partition out isGeneratedFile matches into dropped.generated,
+ *    sort the remainder by scoreFile DESCENDING (path.localeCompare tiebreak), keep the top max_files.
+ *  - disabled (D-03): a FROZEN, byte-identical copy of the legacy sort — the generated detector is
+ *    NOT run and overCap PRESERVES the legacy remainder so review-rest reconstruction is unbroken.
+ *    The "zero file_skipped events when disabled" guarantee is enforced downstream (15-05) by gating
+ *    emission on file_selection.enabled, NEVER by erasing overCap here.
+ *
+ * Pure / I/O-free: it RETURNS drop metadata; it does NOT import db/env/logger or emit audit events.
+ */
+export function selectReviewableFiles(files: FileDiff[], config: RepoConfig['review']): FileSelectionResult {
   const customMatchers = config.skip_files.map((pattern) => picomatch(pattern, { dot: true }));
 
-  return files
+  const filtered = files
     .filter((file) => !file.isDeleted && !file.isBinary)
     .filter((file) => !defaultSkipMatchers.some((matcher) => matcher(file.path)))
-    .filter((file) => !customMatchers.some((matcher) => matcher(file.path)))
-    .sort((left, right) => Number(left.isNew) - Number(right.isNew) || left.path.localeCompare(right.path))
-    .slice(0, config.max_files);
+    .filter((file) => !customMatchers.some((matcher) => matcher(file.path)));
+
+  if (config.file_selection.enabled) {
+    const generated: FileDiff[] = [];
+    const candidates: FileDiff[] = [];
+    for (const file of filtered) {
+      if (isGeneratedFile(file)) generated.push(file);
+      else candidates.push(file);
+    }
+    // Descending scoreFile; `left.path.localeCompare(right.path)` is the deterministic tiebreak,
+    // mirroring the legacy sort's secondary key so equal-score ordering stays stable.
+    const sorted = candidates.sort(
+      (left, right) => scoreFile(right) - scoreFile(left) || left.path.localeCompare(right.path),
+    );
+    return {
+      kept: sorted.slice(0, config.max_files),
+      dropped: { generated, overCap: sorted.slice(config.max_files) },
+    };
+  }
+
+  // FROZEN legacy branch (D-03): character-for-character the pre-phase sort — a provable byte-identical
+  // revert. Do NOT run the generated detector here.
+  const sorted = filtered.sort(
+    (left, right) => Number(left.isNew) - Number(right.isNew) || left.path.localeCompare(right.path),
+  );
+  return {
+    kept: sorted.slice(0, config.max_files),
+    // overCap PRESERVES the legacy remainder (NOT []) — see FileSelectionResult.overCap (Codex 15-03 HIGH).
+    dropped: { generated: [], overCap: sorted.slice(config.max_files) },
+  };
+}
+
+export function filterReviewableFiles(files: FileDiff[], config: RepoConfig['review']) {
+  return selectReviewableFiles(files, config).kept;
 }
 
 /**
@@ -323,28 +384,19 @@ export function filterReviewableFiles(files: FileDiff[], config: RepoConfig['rev
  * skipped-for-size bookkeeping (skipped_files table) can record exactly the files a full review
  * DROPPED, and a later `review-rest` run can re-review them.
  *
- * `kept` is byte-identical to `filterReviewableFiles(files, config)` -- it applies the SAME
- * filter+sort+slice(0, max_files). `omitted` is the remainder the slice discarded (the same
- * filter+sort, then everything AT or AFTER max_files). This is a wrapper: it does NOT change
- * `filterReviewableFiles`'s signature or return, so the hot review path stays byte-identical when
- * the commands feature is off (NREG-01, Pitfall 4). Only new callers on the commands path use this.
+ * Now delegates to the single shared selectReviewableFiles routine (D-04): `kept` is
+ * `selectReviewableFiles(...).kept` and `omitted` is `dropped.overCap`. Generated files (enabled
+ * branch) are in dropped.generated and appear in NEITHER kept NOR omitted — they must never enter the
+ * review-rest skipped_files queue (T-15-03-03). When file_selection is disabled the routine's frozen
+ * legacy branch keeps this byte-identical to the pre-phase behavior, so `[...kept, ...omitted]` still
+ * reconstructs the full legacy remainder (review.ts:2301, Codex 15-03 HIGH).
  */
 export function partitionReviewableFiles(
   files: FileDiff[],
   config: RepoConfig['review'],
 ): { kept: FileDiff[]; omitted: FileDiff[] } {
-  const customMatchers = config.skip_files.map((pattern) => picomatch(pattern, { dot: true }));
-
-  const sorted = files
-    .filter((file) => !file.isDeleted && !file.isBinary)
-    .filter((file) => !defaultSkipMatchers.some((matcher) => matcher(file.path)))
-    .filter((file) => !customMatchers.some((matcher) => matcher(file.path)))
-    .sort((left, right) => Number(left.isNew) - Number(right.isNew) || left.path.localeCompare(right.path));
-
-  return {
-    kept: sorted.slice(0, config.max_files),
-    omitted: sorted.slice(config.max_files),
-  };
+  const { kept, dropped } = selectReviewableFiles(files, config);
+  return { kept, omitted: dropped.overCap };
 }
 
 export function truncateFileDiff(file: FileDiff, maxLines: number): FileDiff {
