@@ -447,7 +447,7 @@ export class ModelService {
    * Poll a previously submitted async batch review. Returns 'pending' while still queued/running,
    * 'done' with the parsed review once complete, or 'failed' if the poll or parse errored.
    */
-  async pollReviewBatch(params: { model: string; requestId: string; file: any; config?: RepoConfig }): Promise<
+  async pollReviewBatch(params: { model: string; requestId: string; file: any; config?: RepoConfig; compactPrompt?: boolean }): Promise<
     | { status: 'pending' }
     | { status: 'done'; response: ModelResponse & { parsed: ReturnType<typeof parseFileReviewResponse>; reviewedLineCount: number; wasPromptTruncated: boolean; userPrompt: string } }
     | { status: 'failed'; error: unknown }
@@ -469,10 +469,25 @@ export class ModelService {
       if (this.tracker) {
         this.tracker.record(response.modelUsed, response.inputTokens, response.outputTokens);
       }
-      // The async batch path is main-pass-only (see this method's contract). `config` is OPTIONAL in
-      // this plan: its only caller (review.ts:994) does not thread config until Plan 13-04, so fail
-      // open to engine-enabled when absent.
-      const parsed = parseFileReviewResponse(response.rawText, params.file, {
+      // EVID-01 (Codex 15-04 HIGH): reconstruct the EXACT bounded file the model actually saw before
+      // parsing. submitReviewBatch truncated the file to `modelLineCap` (compact-aware) and submitted
+      // ONLY that prefix; parsing the FULL untruncated params.file here would let evidence present only
+      // in the truncated-away tail falsely pass the soft evidence gate (it would never emit not_in_hunk).
+      // Reproduce the SAME modelLineCap formula so the evidence haystack matches the submitted prefix.
+      // When config is absent (the type allows it; no caller omits it today) fall back to params.file
+      // unchanged — no worse than the pre-EVID-01 behavior.
+      let fileForParse = params.file;
+      if (params.config) {
+        const configuredLineCap = params.config.review.max_diff_lines_per_file;
+        const modelLineCap = params.compactPrompt
+          ? Math.min(configuredLineCap, COMPACT_REVIEW_PROMPT_LINE_CAP)
+          : configuredLineCap;
+        fileForParse = truncateFileDiff(params.file, modelLineCap);
+      }
+
+      // The async batch path is main-pass-only (see this method's contract). `config` is OPTIONAL:
+      // fail open to engine-enabled when absent.
+      const parsed = parseFileReviewResponse(response.rawText, fileForParse, {
         pass: 'main',
         severityEngineEnabled: params.config?.review.severity_engine.enabled ?? true,
       });
@@ -482,8 +497,8 @@ export class ModelService {
           ...response,
           parsed,
           userPrompt: '',
-          reviewedLineCount: params.file.lineCount,
-          wasPromptTruncated: params.file.isTruncated === true,
+          reviewedLineCount: fileForParse.lineCount,
+          wasPromptTruncated: fileForParse.isTruncated === true,
         },
       };
     } catch (error) {

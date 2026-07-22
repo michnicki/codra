@@ -1012,6 +1012,10 @@ async function runReviewPhase(
           // thread config so the async-batch parse path resolves the severity_engine.enabled escape
           // hatch from this repo's config, matching the sync path (13-04)
           config,
+          // EVID-01 (Codex 15-04 HIGH): the same compact-prompt derivation submitReviewBatch used, so
+          // pollReviewBatch reconstructs the EXACT bounded (truncated) file the model saw before the
+          // evidence gate builds its haystack — truncated-away evidence correctly emits not_in_hunk.
+          compactPrompt: (awaitingReview.transient_error_count ?? existingReview?.transient_error_count ?? 0) > 0,
         });
         if (poll.status === 'pending') {
           awaitingAsync += 1;

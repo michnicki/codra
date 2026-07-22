@@ -1,5 +1,5 @@
 import { normalizeForEvidence, parseCriticPruneResponse, parseFileReviewResponse, parseWalkthroughDiagram } from '@server/core/model-output';
-import type { FileDiff } from '@server/core/diff';
+import { truncateFileDiff, type FileDiff } from '@server/core/diff';
 
 describe('Model Output Parsing Deep Dive', () => {
   const mockFile: FileDiff = {
@@ -385,6 +385,66 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
 describe('normalizeForEvidence (D-16)', () => {
   it('collapses whitespace runs, trims, and lower-cases', () => {
     expect(normalizeForEvidence('  Foo\n   BAR ')).toBe('foo bar');
+  });
+});
+
+describe('EVID-01 async-path bounded reconstruction (Task 4, Codex 15-04 HIGH)', () => {
+  // pollReviewBatch reconstructs truncateFileDiff(params.file, modelLineCap) before parsing so the
+  // evidence haystack never contains code beyond the submitted prefix. This proves the MECHANISM:
+  // evidence present ONLY in the truncated-away tail emits not_in_hunk against the bounded file, but
+  // would FALSELY pass against the full file.
+  const bigFile: FileDiff = {
+    path: 'src/big.ts',
+    previousPath: null,
+    isNew: false,
+    isDeleted: false,
+    isBinary: false,
+    lineCount: 4,
+    hunks: [
+      {
+        header: '@@ -1,4 +1,4 @@',
+        lines: [
+          { kind: 'add', content: 'const target = risky();', newLineNumber: 1, position: 1 },
+          { kind: 'context', content: 'padding line;', newLineNumber: 2, position: 2 },
+          { kind: 'context', content: 'const evidenceOnly = secretPattern();', newLineNumber: 3, position: 3 },
+          { kind: 'context', content: 'trailing line;', newLineNumber: 4, position: 4 },
+        ],
+      },
+    ],
+  };
+
+  // Finding at line 1 (survives the orphan check in BOTH the full and bounded file) whose evidence
+  // string lives ONLY on line 3 (beyond a 2-line cap).
+  const raw = JSON.stringify({
+    findings: [
+      {
+        title: 'Risky call',
+        body: 'The risky call is unguarded.',
+        priority: 1,
+        code_location: { absolute_file_path: 'src/big.ts', line: 1 },
+        existing_code: 'const evidenceOnly = secretPattern();',
+      },
+    ],
+    overall_correctness: 'patch is incorrect',
+    overall_explanation: 'issue',
+  });
+
+  const evidenceEvents = (r: ReturnType<typeof parseFileReviewResponse>) =>
+    r.severityAuditEvents.filter((e) => e.stage === 'evidence_missing');
+
+  it('FULL file: evidence in the tail falsely passes (no not_in_hunk)', () => {
+    const result = parseFileReviewResponse(raw, bigFile);
+    expect(result.comments).toHaveLength(1);
+    expect(evidenceEvents(result)).toHaveLength(0);
+  });
+
+  it('BOUNDED file (truncated to the submitted prefix): tail evidence correctly emits not_in_hunk', () => {
+    const bounded = truncateFileDiff(bigFile, 2);
+    const result = parseFileReviewResponse(raw, bounded);
+    expect(result.comments).toHaveLength(1);
+    const events = evidenceEvents(result);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'not_in_hunk' });
   });
 });
 
