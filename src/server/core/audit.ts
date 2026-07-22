@@ -1,6 +1,7 @@
 import type { AppBindings } from '@server/env';
 import { appendJobAuditEvents } from '@server/db/jobs';
 import type { FileReviewPass, JobAuditEvent, ReviewSeverity } from '@shared/schema';
+import type { FileSelectionResult } from './diff';
 import type { DropRecord, NoiseFilterResult } from './noise-filter';
 import { logger } from './logger';
 
@@ -194,5 +195,78 @@ export async function recordFinalizeDrops(
     await appendJobAuditEvents(env, jobId, stamped);
   } catch (error) {
     logger.warn(`Failed to record finalize drop audit events for job ${jobId}`, error);
+  }
+}
+
+/**
+ * PURE file-skip drop-event builder (PRIO-03 / D-11 / D-12). Maps the `selectReviewableFiles`
+ * (core/diff.ts) drop metadata into the `file_skipped` audit variant — no I/O, never throws.
+ * Emission rules:
+ *   - generated: one PER-FILE `file_skipped` / `generated` event per dropped generated file
+ *     (count:1, sample:[{ path }]). A generated file is a distinct low-volume drop reason, so it is
+ *     surfaced individually rather than aggregated (D-12).
+ *   - overCap: ONE aggregate `file_skipped` / `over_cap` event whose `count` is the COMPLETE
+ *     overCap length (no dropped file is invisible in the aggregate) and whose `sample` is the FIRST
+ *     20 of overCap. `selectReviewableFiles` already sorts overCap in descending-priority order, so
+ *     the sample names the HIGHEST-PRIORITY OMITTED files — the near-miss files a reviewer most wants
+ *     to know were dropped (RESEARCH Open-Q1 resolution, which SUPERSEDES CONTEXT D-12's imprecise
+ *     "lowest-priority dropped files are named" phrasing; the two are reconciled here to the
+ *     highest-priority-omitted interpretation). Sample bounded to ≤20 (FILT-04 reuse).
+ *   - skip_glob is NEVER emitted (D-12): glob-skipped files are user-configured, expected, and would
+ *     flood the 500-event ring buffer; they never enter selectReviewableFiles' drop metadata anyway.
+ *
+ * PRIVACY (T-15-05-01): a file identifier is `{ path }` ONLY — a skipped file has no finding line or
+ * title, and no event ever carries body/diff/existingCode/codeSuggestion.
+ */
+export function buildFileSkipEvents(dropped: FileSelectionResult['dropped']): JobAuditEvent[] {
+  const events: JobAuditEvent[] = [];
+  const timestamp = new Date().toISOString();
+
+  // One per-file event per generated file (low-volume, D-12): count:1, path-only sample.
+  for (const file of dropped.generated) {
+    events.push({
+      stage: 'file_skipped',
+      reason: 'generated',
+      count: 1,
+      sample: [{ path: file.path }],
+      timestamp,
+    });
+  }
+
+  // One bounded aggregate for the over-cap remainder (D-12). count = COMPLETE overCap length so the
+  // aggregate visibility is total; sample = first 20 (highest-priority OMITTED, already ordered by the
+  // selector) so the named files are the near-miss ones (RESEARCH Open-Q1, superseding D-12's phrasing).
+  if (dropped.overCap.length > 0) {
+    events.push({
+      stage: 'file_skipped',
+      reason: 'over_cap',
+      count: dropped.overCap.length,
+      sample: dropped.overCap.slice(0, 20).map((file) => ({ path: file.path })),
+      timestamp,
+    });
+  }
+
+  return events;
+}
+
+/**
+ * Job-level file-skip recorder (PRIO-03 / D-12). A VERBATIM clone of `recordFinalizeDrops`: wraps a
+ * SINGLE `appendJobAuditEvents` in try/catch, defensively stamps a timestamp on any event that arrived
+ * without one, logs a failure via `logger.warn`, and NEVER rethrows — the audit trail is decision
+ * telemetry, never a hard dependency of the prepare phase (T-15-05-02). A prepare run batches ALL its
+ * file_skipped events into this one append. Do NOT reintroduce granular per-event recorders.
+ */
+export async function recordFileSkips(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  events: JobAuditEvent[],
+): Promise<void> {
+  try {
+    const stamped = events.map((event) =>
+      event.timestamp ? event : { ...event, timestamp: new Date().toISOString() },
+    );
+    await appendJobAuditEvents(env, jobId, stamped);
+  } catch (error) {
+    logger.warn(`Failed to record file-skip audit events for job ${jobId}`, error);
   }
 }
