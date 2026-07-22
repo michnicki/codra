@@ -336,7 +336,8 @@ describe('JobDetailPage audit trail viewer', () => {
     await openAuditTrail(user);
 
     // (a) decision group expanded: rule (drop reason) + a sample path are visible immediately.
-    expect(screen.getByText('src/filtered.ts')).toBeVisible();
+    // SampleIdentifier renders `path:line` (src/filtered.ts:12), so match the path prefix.
+    expect(screen.getByText(/src\/filtered\.ts/)).toBeVisible();
     expect(screen.getByText('confidence_floor')).toBeVisible();
   });
 
@@ -368,11 +369,11 @@ describe('JobDetailPage audit trail viewer', () => {
     const heading = await screen.findByText('Audit trail');
     const details = heading.closest('details') as HTMLDetailsElement;
     expect(details.open).toBe(false);
-    expect(screen.getByText('src/filtered.ts')).not.toBeVisible();
+    expect(screen.getByText(/src\/filtered\.ts/)).not.toBeVisible();
 
     await user.click(heading);
     expect(details.open).toBe(true);
-    expect(screen.getByText('src/filtered.ts')).toBeVisible();
+    expect(screen.getByText(/src\/filtered\.ts/)).toBeVisible();
   });
 
   it('renders the truncation banner when auditTruncated is true', async () => {
