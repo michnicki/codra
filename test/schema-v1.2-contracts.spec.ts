@@ -18,6 +18,8 @@ describe('v1.2 schema contracts (Phase 13 Plan 01)', () => {
     const review = repoConfigSchema.parse({}).review;
     expect(review.severity_engine.enabled).toBe(true);
     expect(review.dedup.enabled).toBe(true);
+    // Phase 15 PRIO-01/PRIO-02: file_selection is the third documented default-ON exception (D-01/D-02).
+    expect(review.file_selection.enabled).toBe(true);
     expect(review.passes.ensemble.runs).toBe(1);
     expect(review.passes.ensemble.temperature).toBe(0.7);
     expect(review.threads.verify_fixes).toBe(false);

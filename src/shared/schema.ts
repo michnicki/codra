@@ -212,6 +212,13 @@ export const reviewConfigSchema = z.object({
   // correctness-fix / always-on exceptions (FILT-03), not new opt-in features.
   severity_engine: z.object({ enabled: z.boolean().default(true) }).default({ enabled: true }),
   dedup: z.object({ enabled: z.boolean().default(true) }).default({ enabled: true }),
+  // Priority file selection + generated-file detection toggle (PRIO-01/PRIO-02, consumed by Plan 15-03's
+  // core/diff.ts selection routine). DELIBERATE DEFAULT EXCEPTION (D-01/D-02): defaults `true` — it is
+  // the documented NREG-01 always-on exception #3, alongside severity_engine and dedup, framed as a
+  // correctness improvement (review the highest-signal files first, skip generated noise) rather than a
+  // new opt-in feature. ONE combined key governs BOTH the priority sort AND the generated detector
+  // (D-02) — deliberately NOT split into two toggles; the single escape hatch reverts both at once.
+  file_selection: z.object({ enabled: z.boolean().default(true) }).default({ enabled: true }),
   // Per-category confidence-floor overrides (FILT-02, consumed by Phase 14). MUST be z.partialRecord,
   // NOT z.record: under this repo's Zod 4 (4.4.3) `z.record(z.enum(reviewCategories), ...)` demands
   // EVERY enum key, so a sparse override like `{ security: 0.85 }` throws for the other four
@@ -275,6 +282,7 @@ export const repoConfigSchema = z.object({
     },
     severity_engine: { enabled: true },
     dedup: { enabled: true },
+    file_selection: { enabled: true },
     category_confidence: {},
     threads: { verify_fixes: false, auto_resolve: false },
     rounds: { incremental: false, escalate_floors: true },

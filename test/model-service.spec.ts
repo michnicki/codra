@@ -547,6 +547,7 @@ describe('ModelService', () => {
             },
             severity_engine: { enabled: true },
             dedup: { enabled: true },
+            file_selection: { enabled: true },
             category_confidence: {},
             threads: { verify_fixes: false, auto_resolve: false },
             rounds: { incremental: false, escalate_floors: true },
