@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import { defaultRepoConfig } from '@shared/schema';
-import { mergeReviewPatch, buildCategoryConfidence } from '@client/lib/review-config-draft';
+import {
+  mergeReviewPatch,
+  buildCategoryConfidence,
+  stringSetEqual,
+  categoryConfidenceEqual,
+} from '@client/lib/review-config-draft';
 
 describe('mergeReviewPatch', () => {
   const current = defaultRepoConfig.review;
@@ -119,5 +124,49 @@ describe('buildCategoryConfidence', () => {
     expect(full).toEqual({ security: 0.1, bugs: 0.2, performance: 0.3, correctness: 0.4, quality: 0.5 });
     // a sparse edit never back-fills absent categories
     expect(Object.keys(buildCategoryConfidence({ bugs: '0.5' }))).toEqual(['bugs']);
+  });
+});
+
+describe('stringSetEqual', () => {
+  it('is order-insensitive', () => {
+    expect(stringSetEqual(['opened', 'synchronize'], ['synchronize', 'opened'])).toBe(true);
+  });
+
+  it('detects genuine membership differences', () => {
+    expect(stringSetEqual(['opened'], ['opened', 'synchronize'])).toBe(false);
+  });
+
+  it('treats empty arrays as equal', () => {
+    expect(stringSetEqual([], [])).toBe(true);
+  });
+
+  it('uses deduped set semantics', () => {
+    expect(stringSetEqual(['a', 'a'], ['a'])).toBe(true);
+  });
+});
+
+describe('categoryConfidenceEqual', () => {
+  it('compares matching sparse maps as equal', () => {
+    expect(categoryConfidenceEqual({ security: 0.85 }, { security: 0.85 })).toBe(true);
+  });
+
+  it('detects a differing value', () => {
+    expect(categoryConfidenceEqual({ security: 0.85 }, { security: 0.9 })).toBe(false);
+  });
+
+  it('treats empty and undefined as the empty override map', () => {
+    expect(categoryConfidenceEqual({}, {})).toBe(true);
+    expect(categoryConfidenceEqual(undefined, undefined)).toBe(true);
+    expect(categoryConfidenceEqual(undefined, {})).toBe(true);
+  });
+
+  it('detects a present-vs-absent key difference', () => {
+    expect(categoryConfidenceEqual({ security: 0.85 }, {})).toBe(false);
+  });
+
+  it('is key-order independent', () => {
+    expect(
+      categoryConfidenceEqual({ security: 0.85, bugs: 0.5 }, { bugs: 0.5, security: 0.85 }),
+    ).toBe(true);
   });
 });
