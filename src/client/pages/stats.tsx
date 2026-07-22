@@ -19,7 +19,13 @@ import { useIsDarkMode } from '@client/hooks/use-is-dark-mode';
 import { usePolling } from '@client/hooks/use-polling';
 import { api } from '@client/lib/api';
 import { fmtNumber } from '@client/lib/utils';
-import { barPercent, normalizeCategoryCounts, normalizeSeverityCounts } from '@client/lib/stats-metrics';
+import {
+  barPercent,
+  formatConfidencePercent,
+  formatPerfDuration,
+  normalizeCategoryCounts,
+  normalizeSeverityCounts,
+} from '@client/lib/stats-metrics';
 import type { ReviewCategory, ReviewSeverity, StatsPayload } from '@shared/schema';
 
 const CHART = {
@@ -347,6 +353,24 @@ function MetricsGrid({ stats, isDark }: { stats: StatsPayload; isDark: boolean }
             ))}
           </div>
         </GraphShell>
+      </div>
+
+      {/* D-12 performance KPI tiles. Value pinned at a single display size (text-2xl) per the
+          UI-SPEC Dimension-4 FLAG; a null metric renders '—' via the stats-metrics formatters. */}
+      <div className="grid gap-4 sm:gap-5 sm:grid-cols-3">
+        {[
+          { label: 'Avg duration', value: formatPerfDuration(stats.performance.avgDurationMs) },
+          { label: 'p95 duration', value: formatPerfDuration(stats.performance.p95DurationMs) },
+          { label: 'Avg confidence', value: formatConfidencePercent(stats.performance.avgConfidence) },
+        ].map((tile) => (
+          <article
+            key={tile.label}
+            className="flex flex-col gap-1 overflow-hidden rounded-lg border border-border bg-card px-4 py-4 shadow-[var(--shadow-md)] sm:px-5"
+          >
+            <span className="text-xs uppercase tracking-wide text-muted-foreground">{tile.label}</span>
+            <span className="break-words text-2xl font-bold tabular-nums text-foreground">{tile.value}</span>
+          </article>
+        ))}
       </div>
     </div>
   );
