@@ -10,6 +10,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
+import type { TooltipContentProps } from 'recharts';
 import { PageHeaderActions } from '@client/components/shared/page-header-actions';
 import { VcsProviderMark } from '@client/components/shared/vcs-provider-mark';
 import { PageHeader } from '@client/components/layout/page-header';
@@ -83,7 +84,10 @@ function modelName(model: string) {
   return model.split('/').pop()?.replace(/-/g, ' ') ?? model;
 }
 
-function ChartTooltip({ active, payload, label }: any) {
+// IN-01: typed against recharts' tooltip content contract (Partial — the props are
+// injected by recharts when this element is cloned into <Tooltip content={...} />), so a
+// rename of a payload field (dataKey/name/value/color) is caught by tsc.
+function ChartTooltip({ active, payload, label }: Partial<TooltipContentProps<number, string>>) {
   if (!active || !payload?.length) return null;
 
   return (
@@ -94,8 +98,11 @@ function ChartTooltip({ active, payload, label }: any) {
         </p>
       )}
       <div className="space-y-1.5">
-        {payload.map((item: any) => (
-          <div key={item.dataKey ?? item.name} className="flex min-w-32 items-center gap-2">
+        {payload.map((item, index) => (
+          <div
+            key={typeof item.dataKey === 'string' ? item.dataKey : (item.name ?? index)}
+            className="flex min-w-32 items-center gap-2"
+          >
             <span
               className="h-2 w-2 shrink-0 rounded-full"
               style={{ backgroundColor: item.color }}
