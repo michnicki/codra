@@ -19,7 +19,8 @@ import { useIsDarkMode } from '@client/hooks/use-is-dark-mode';
 import { usePolling } from '@client/hooks/use-polling';
 import { api } from '@client/lib/api';
 import { fmtNumber } from '@client/lib/utils';
-import type { StatsPayload } from '@shared/schema';
+import { barPercent, normalizeCategoryCounts, normalizeSeverityCounts } from '@client/lib/stats-metrics';
+import type { ReviewCategory, ReviewSeverity, StatsPayload } from '@shared/schema';
 
 const CHART = {
   primary: '#65a30d',
@@ -32,6 +33,29 @@ const CHART = {
   dangerDark: '#f87171',
   quiet: '#94a3b8',
   quietDark: '#64748b',
+};
+
+// D-11 severity distribution bar fills — the established severity-tag/severityConfig ramp expressed
+// as Tailwind semantic bg utilities (P0 danger … nit quiet). NOT a new palette, NOT recharts. P2 is
+// the lighter amber tier of the ramp (a dimmed --warning) so the P1→P2 step reads as in the severity-tag.
+const SEVERITY_BAR_COLOR: Record<ReviewSeverity, string> = {
+  P0: 'bg-danger',
+  P1: 'bg-warning',
+  P2: 'bg-warning/60',
+  P3: 'bg-info',
+  nit: 'bg-muted-foreground',
+};
+
+// D-11 category distribution bar fills — reuse the .category-tag color mapping verbatim
+// (security→danger, performance→info, bugs→warning, correctness→success, quality→purple) for
+// cross-surface consistency. quality has no semantic token, so use its exact category-tag oklch
+// (light + dark) rather than invent a new categorical color.
+const CATEGORY_BAR_COLOR: Record<ReviewCategory, string> = {
+  security: 'bg-danger',
+  bugs: 'bg-warning',
+  performance: 'bg-info',
+  correctness: 'bg-success',
+  quality: 'bg-[oklch(56%_0.16_295)] dark:bg-[oklch(70%_0.14_295)]',
 };
 
 function formatDay(value: string) {
@@ -113,6 +137,14 @@ function MetricsGrid({ stats, isDark }: { stats: StatsPayload; isDark: boolean }
   const quietColor = isDark ? CHART.quietDark : CHART.quiet;
   const repoMax = Math.max(...stats.topRepos.map((repo) => repo.jobs), 1);
   const modelMax = Math.max(...stats.models.map((model) => model.calls), 1);
+
+  // REVIEW #1: db/stats.ts GROUP BYs severity/category and omits zero-count bands from the payload,
+  // so map through the normalizers (zero-fill from the static enums) — never stats.severities /
+  // stats.categories directly — so every band (incl. an entirely empty array) still renders at 0.
+  const severityRows = normalizeSeverityCounts(stats.severities);
+  const categoryRows = normalizeCategoryCounts(stats.categories);
+  const severityMax = Math.max(...severityRows.map((row) => row.count), 1);
+  const categoryMax = Math.max(...categoryRows.map((row) => row.count), 1);
 
   // Theme-aware chart chrome. CSS variables don't reliably resolve inside
   // Recharts SVG text, so use explicit colors keyed off the active theme.
@@ -269,6 +301,48 @@ function MetricsGrid({ stats, isDark }: { stats: StatsPayload; isDark: boolean }
                   </div>
                 </div>
                 <span className="text-right text-xs font-bold tabular-nums text-foreground">{model.calls}</span>
+              </div>
+            ))}
+          </div>
+        </GraphShell>
+
+        <GraphShell title="Severity distribution">
+          <div className="space-y-4 px-4 pb-5 pt-4 sm:px-5 sm:pb-6 sm:pt-5">
+            {severityRows.map((row) => (
+              <div key={row.severity} className="grid grid-cols-[minmax(0,1fr)_3rem] items-center gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center justify-between gap-3 text-sm">
+                    <span className="truncate font-semibold uppercase text-foreground">{row.severity}</span>
+                  </div>
+                  <div className="mt-2 h-2 overflow-hidden rounded-full bg-secondary">
+                    <div
+                      className={`h-full rounded-full ${SEVERITY_BAR_COLOR[row.severity]}`}
+                      style={{ width: `${barPercent(row.count, severityMax)}%` }}
+                    />
+                  </div>
+                </div>
+                <span className="text-right text-xs font-bold tabular-nums text-foreground">{row.count}</span>
+              </div>
+            ))}
+          </div>
+        </GraphShell>
+
+        <GraphShell title="Category distribution">
+          <div className="space-y-4 px-4 pb-5 pt-4 sm:px-5 sm:pb-6 sm:pt-5">
+            {categoryRows.map((row) => (
+              <div key={row.category} className="grid grid-cols-[minmax(0,1fr)_3rem] items-center gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center justify-between gap-3 text-sm">
+                    <span className="truncate font-semibold capitalize text-foreground">{row.category}</span>
+                  </div>
+                  <div className="mt-2 h-2 overflow-hidden rounded-full bg-secondary">
+                    <div
+                      className={`h-full rounded-full ${CATEGORY_BAR_COLOR[row.category]}`}
+                      style={{ width: `${barPercent(row.count, categoryMax)}%` }}
+                    />
+                  </div>
+                </div>
+                <span className="text-right text-xs font-bold tabular-nums text-foreground">{row.count}</span>
               </div>
             ))}
           </div>
