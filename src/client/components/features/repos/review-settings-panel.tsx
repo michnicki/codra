@@ -50,6 +50,54 @@ function orderedListEqual(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((value, index) => value === b[index]);
 }
 
+// IN-02: per-field bound check for a numeric input. A field is valid only when its
+// parsed value is finite and within the documented [min,max]. Empty (parseNum → NaN)
+// counts as invalid so the inline hint stays consistent with the form-level `valid`
+// gate (an empty numeric field already fails reviewConfigSchema and blocks Apply).
+function numFieldValid(raw: string, min: number, max: number): boolean {
+  const n = parseNum(raw);
+  return Number.isFinite(n) && n >= min && n <= max;
+}
+
+interface NumberFieldProps {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  min: number;
+  max: number;
+  step?: number;
+  ariaLabel: string;
+  className?: string;
+}
+
+// IN-02: numeric field with per-field inline validation feedback, mirroring the
+// mention_trigger pattern (aria-invalid + a short destructive hint) so a user faced with
+// a greyed-out Apply can see exactly which field is out of its documented bound.
+function NumberField({ label, value, onChange, min, max, step, ariaLabel, className }: NumberFieldProps) {
+  const valid = numFieldValid(value, min, max);
+  return (
+    <label className="flex flex-col gap-1.5">
+      <span className="text-sm font-medium text-foreground">{label}</span>
+      <Input
+        type="number"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        aria-label={ariaLabel}
+        aria-invalid={!valid}
+        className={className}
+      />
+      {!valid && (
+        <span className="text-xs text-destructive">
+          Enter a value between {min} and {max}.
+        </span>
+      )}
+    </label>
+  );
+}
+
 function toggleValue<T extends string>(list: T[], value: T): T[] {
   return list.includes(value) ? list.filter((entry) => entry !== value) : [...list, value];
 }
@@ -412,73 +460,55 @@ export function ReviewSettingsPanel({ repo, onChange }: ReviewSettingsPanelProps
           description="Bound review size and how findings are filtered before posting."
         />
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <label className="flex flex-col gap-1.5">
-            <span className="text-sm font-medium text-foreground">Max files</span>
-            <Input
-              type="number"
-              min={1}
-              max={150}
-              value={maxFiles}
-              onChange={(event) => setMaxFiles(event.target.value)}
-              aria-label="Max files"
-            />
-          </label>
-          <label className="flex flex-col gap-1.5">
-            <span className="text-sm font-medium text-foreground">Max comments</span>
-            <Input
-              type="number"
-              min={1}
-              max={150}
-              value={maxComments}
-              onChange={(event) => setMaxComments(event.target.value)}
-              aria-label="Max comments"
-            />
-          </label>
-          <label className="flex flex-col gap-1.5">
-            <span className="text-sm font-medium text-foreground">Large file threshold (lines)</span>
-            <Input
-              type="number"
-              min={1}
-              max={5000}
-              value={largeFileThreshold}
-              onChange={(event) => setLargeFileThreshold(event.target.value)}
-              aria-label="Large file threshold lines"
-            />
-          </label>
-          <label className="flex flex-col gap-1.5">
-            <span className="text-sm font-medium text-foreground">Max diff lines per file</span>
-            <Input
-              type="number"
-              min={1}
-              max={5000}
-              value={maxDiffLines}
-              onChange={(event) => setMaxDiffLines(event.target.value)}
-              aria-label="Max diff lines per file"
-            />
-          </label>
-          <label className="flex flex-col gap-1.5">
-            <span className="text-sm font-medium text-foreground">Max total diff characters</span>
-            <Input
-              type="number"
-              min={1}
-              max={500000}
-              value={maxTotalDiffChars}
-              onChange={(event) => setMaxTotalDiffChars(event.target.value)}
-              aria-label="Max total diff characters"
-            />
-          </label>
-          <label className="flex flex-col gap-1.5">
-            <span className="text-sm font-medium text-foreground">Minimum confidence</span>
-            <Input
-              type="number"
-              min={0}
-              max={1}
-              step={0.05}
-              value={minConfidence}
-              onChange={(event) => setMinConfidence(event.target.value)}
-              aria-label="Minimum confidence"
-            />
-          </label>
+          <NumberField
+            label="Max files"
+            value={maxFiles}
+            onChange={setMaxFiles}
+            min={1}
+            max={150}
+            ariaLabel="Max files"
+          />
+          <NumberField
+            label="Max comments"
+            value={maxComments}
+            onChange={setMaxComments}
+            min={1}
+            max={150}
+            ariaLabel="Max comments"
+          />
+          <NumberField
+            label="Large file threshold (lines)"
+            value={largeFileThreshold}
+            onChange={setLargeFileThreshold}
+            min={1}
+            max={5000}
+            ariaLabel="Large file threshold lines"
+          />
+          <NumberField
+            label="Max diff lines per file"
+            value={maxDiffLines}
+            onChange={setMaxDiffLines}
+            min={1}
+            max={5000}
+            ariaLabel="Max diff lines per file"
+          />
+          <NumberField
+            label="Max total diff characters"
+            value={maxTotalDiffChars}
+            onChange={setMaxTotalDiffChars}
+            min={1}
+            max={500000}
+            ariaLabel="Max total diff characters"
+          />
+          <NumberField
+            label="Minimum confidence"
+            value={minConfidence}
+            onChange={setMinConfidence}
+            min={0}
+            max={1}
+            step={0.05}
+            ariaLabel="Minimum confidence"
+          />
         </div>
         <Select
           label="Minimum severity"
@@ -618,18 +648,15 @@ export function ReviewSettingsPanel({ repo, onChange }: ReviewSettingsPanelProps
               <p className="text-warning text-xs">Disabling reverts a v1.2 correctness improvement.</p>
             </div>
             <div className="flex flex-col gap-1.5">
-              <label className="flex flex-col gap-1.5">
-                <span className="text-sm font-medium text-foreground">Ensemble runs</span>
-                <Input
-                  type="number"
-                  min={1}
-                  max={5}
-                  value={ensembleRuns}
-                  onChange={(event) => setEnsembleRuns(event.target.value)}
-                  aria-label="Ensemble runs"
-                  className="max-w-[160px]"
-                />
-              </label>
+              <NumberField
+                label="Ensemble runs"
+                value={ensembleRuns}
+                onChange={setEnsembleRuns}
+                min={1}
+                max={5}
+                ariaLabel="Ensemble runs"
+                className="max-w-[160px]"
+              />
               <p className="text-warning text-xs">
                 Higher runs increase model cost and the per-invocation subrequest budget.
               </p>
