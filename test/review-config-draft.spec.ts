@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { defaultRepoConfig } from '@shared/schema';
-import { mergeReviewPatch } from '@client/lib/review-config-draft';
+import { mergeReviewPatch, buildCategoryConfidence } from '@client/lib/review-config-draft';
 
 describe('mergeReviewPatch', () => {
   const current = defaultRepoConfig.review;
@@ -78,5 +78,46 @@ describe('mergeReviewPatch', () => {
     expect(result).not.toBe(current);
     const result2 = mergeReviewPatch(current, undefined as never, undefined as never);
     expect(result2).toEqual(current);
+  });
+});
+
+describe('buildCategoryConfidence', () => {
+  it('omits an empty-string category (inherit global min_confidence)', () => {
+    expect(buildCategoryConfidence({ security: '0.85', bugs: '' })).toEqual({ security: 0.85 });
+    // never emits the empty key
+    expect(Object.keys(buildCategoryConfidence({ security: '0.85', bugs: '' }))).toEqual(['security']);
+  });
+
+  it('omits a whitespace-only category', () => {
+    expect(buildCategoryConfidence({ security: '  ' })).toEqual({});
+  });
+
+  it('keeps 0 and 1 inclusive bounds', () => {
+    expect(buildCategoryConfidence({ performance: '1', correctness: '0' })).toEqual({
+      performance: 1,
+      correctness: 0,
+    });
+  });
+
+  it('drops an out-of-range value (not clamped)', () => {
+    expect(buildCategoryConfidence({ quality: '1.5' })).toEqual({});
+  });
+
+  it('drops a non-numeric value', () => {
+    expect(buildCategoryConfidence({ security: 'abc' })).toEqual({});
+  });
+
+  it('empty input yields empty; a full five-key input keeps all five without backfilling on sparse', () => {
+    expect(buildCategoryConfidence({})).toEqual({});
+    const full = buildCategoryConfidence({
+      security: '0.1',
+      bugs: '0.2',
+      performance: '0.3',
+      correctness: '0.4',
+      quality: '0.5',
+    });
+    expect(full).toEqual({ security: 0.1, bugs: 0.2, performance: 0.3, correctness: 0.4, quality: 0.5 });
+    // a sparse edit never back-fills absent categories
+    expect(Object.keys(buildCategoryConfidence({ bugs: '0.5' }))).toEqual(['bugs']);
   });
 });
