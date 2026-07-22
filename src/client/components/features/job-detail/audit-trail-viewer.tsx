@@ -19,10 +19,7 @@ const STAGE_LABELS: Record<JobAuditEvent['stage'], string> = {
 // A count pill mirroring the job-findings-list / critic-panel count-badge idiom.
 function CountBadge({ count }: { count: number }) {
   return (
-    <span
-      className="rounded-full px-2 py-0.5 text-[10px] font-bold"
-      style={{ background: 'var(--primary)', color: 'var(--primary-foreground)' }}
-    >
+    <span className="rounded-full px-2 py-0.5 text-[10px] font-bold bg-secondary text-secondary-foreground">
       {count}
     </span>
   );
@@ -217,7 +214,7 @@ export function AuditTrailViewer({ job }: AuditTrailViewerProps) {
     <details className="group surface surface-static surface-static-shadow overflow-hidden">
       <summary className="flex cursor-pointer list-none items-center gap-2.5 px-5 py-4 [&::-webkit-details-marker]:hidden">
         <ChevronRight size={15} className="shrink-0 text-muted-foreground transition-transform group-open:rotate-90" />
-        <ScrollText size={14} strokeWidth={1.75} className="text-primary" />
+        <ScrollText size={14} strokeWidth={1.75} className="text-muted-foreground" />
         <h2 className="text-sm font-semibold text-foreground">Audit trail</h2>
         {job.audit.length > 0 && <CountBadge count={job.audit.length} />}
       </summary>

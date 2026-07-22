@@ -11,7 +11,7 @@ function CriticShell({ children }: { children: React.ReactNode }) {
   return (
     <div className="surface surface-static surface-static-shadow overflow-hidden">
       <div className="flex items-center gap-2.5 px-5 py-4 border-b border-border">
-        <Sparkles size={14} strokeWidth={1.75} className="text-primary" />
+        <Sparkles size={14} strokeWidth={1.75} className="text-muted-foreground" />
         <span className="text-sm font-semibold text-foreground">Critic</span>
       </div>
       <div className="px-5 py-5">{children}</div>
