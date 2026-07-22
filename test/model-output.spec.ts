@@ -345,6 +345,50 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'absent' });
   });
 
+  it('array existing_code: no parse throw, joined + evidence-checked, comment still posts (CR-01, D-14)', () => {
+    // "line(s)" in the prompt invites an ARRAY of strings for multi-line evidence. It must NOT throw
+    // the whole-file parse; it is joined by '\n' and evidence-checked against the hunk. Both lines are
+    // present in the haystack ("const older = 1;" line 1, "const Value = compute();" line 2), so this
+    // is an exact in-hunk match -> NO evidence_missing event, and the finding still posts.
+    const result = parseFileReviewResponse(
+      rawWith(['const older = 1;', 'const Value = compute();']),
+      evidenceFile,
+    );
+    expect(result.comments).toHaveLength(1);
+    expect(evidenceEvents(result)).toHaveLength(0);
+    expect(result.comments[0].existingCode).toBe('const older = 1;\nconst Value = compute();');
+  });
+
+  it('array existing_code not in hunk: joined + evidence-checked -> not_in_hunk, comment still posts (CR-01)', () => {
+    const result = parseFileReviewResponse(
+      rawWith(['totallyUnrelated();', 'alsoAbsent();']),
+      evidenceFile,
+    );
+    expect(result.comments).toHaveLength(1);
+    const events = evidenceEvents(result);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'not_in_hunk' });
+  });
+
+  it('number existing_code: no parse throw, degrades to absent, comment still posts (CR-01, D-14)', () => {
+    const result = parseFileReviewResponse(rawWith(42), evidenceFile);
+    expect(result.comments).toHaveLength(1);
+    const events = evidenceEvents(result);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'absent' });
+    // Non-string scalar coerced to undefined -> parsed comment existingCode is null (schema fail-open).
+    expect(result.comments[0].existingCode == null).toBe(true);
+  });
+
+  it('object existing_code: no parse throw, degrades to absent, comment still posts (CR-01, D-14)', () => {
+    const result = parseFileReviewResponse(rawWith({ some: 'object' }), evidenceFile);
+    expect(result.comments).toHaveLength(1);
+    const events = evidenceEvents(result);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'absent' });
+    expect(result.comments[0].existingCode == null).toBe(true);
+  });
+
   it('maps existing_code into the parsed comment existingCode field', () => {
     const result = parseFileReviewResponse(rawWith('const Value = compute();'), evidenceFile);
     expect(result.comments[0].existingCode).toBe('const Value = compute();');

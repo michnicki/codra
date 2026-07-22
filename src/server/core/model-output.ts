@@ -161,6 +161,24 @@ function coerceReviewNumber(value: unknown) {
   return undefined;
 }
 
+// CR-01 (D-14 fail-open): the file-review/security-review prompts ask the model to quote the "exact
+// unchanged original line(s)" in `existing_code`. "line(s)" invites a model to return an ARRAY of
+// strings (or, less often, a number/object) for multi-line evidence. But fileReviewModelOutputSchema
+// types existing_code as z.string().nullable().optional(), so a non-string-non-null value would throw
+// a ZodError in fileReviewModelOutputSchema.parse — rethrown as 'Response schema mismatch', aborting
+// the parse of the WHOLE file and losing EVERY finding for it. That breaks EVID-01's soft-gate
+// guarantee that findings must ALWAYS still post. Coerce here so the value can never fail validation:
+//   string  -> keep as-is
+//   Array   -> keep only string elements, joined by '\n' (multi-line array evidence stays checkable)
+//   null    -> keep null (schema allows; flows to the `absent` telemetry branch)
+//   else    -> undefined (number/object/boolean -> `absent`, never a parse throw)
+function coerceExistingCode(value: unknown): string | null | undefined {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.filter((x): x is string => typeof x === 'string').join('\n');
+  if (value === null) return null;
+  return undefined;
+}
+
 function normalizeFinding(finding: unknown) {
   if (!finding || typeof finding !== 'object') return null;
   const f = finding as Record<string, unknown>;
@@ -189,6 +207,9 @@ function normalizeFinding(finding: unknown) {
     ...f,
     title: f.title || 'Code finding',
     priority: priority === undefined ? undefined : Math.max(0, Math.min(3, Math.trunc(priority as number))),
+    // CR-01: coerce so a non-string existing_code (array/number/object) can never fail schema
+    // validation and abort the whole-file parse (D-14 fail-open).
+    existing_code: coerceExistingCode(f.existing_code),
     code_location: codeLocation,
     confidence_score: typeof f.confidence_score === 'number'
       ? Math.max(0, Math.min(1, f.confidence_score > 1 ? f.confidence_score / 10 : f.confidence_score))
