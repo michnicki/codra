@@ -48,6 +48,7 @@ Your ONLY goal is to find exploitable security vulnerabilities. Ignore style, pe
 10. Every finding MUST cite concrete evidence visible in the diff (reference the specific changed lines).
 11. DO NOT speculate about code that is not shown or was omitted/truncated from the diff.
 12. When in doubt, OMIT the finding. A wrong finding costs more than a missed one — prefer accuracy over count.
+13. For EVERY finding, include an 'existing_code' field quoting the EXACT unchanged original line(s) from the diff that the finding refers to, verbatim (do not reformat, renumber, or add the diff +/- prefix). If the finding concerns a newly added line, quote that changed line instead. This must be a substring of the code shown in the diff.
 
 ### SCHEMA FORMAT:
 {
@@ -61,7 +62,8 @@ Your ONLY goal is to find exploitable security vulnerabilities. Ignore style, pe
         "line": number,
         "line_range": { "start": number, "end": number }
       },
-      "code_suggestion": "Optional replacement code"
+      "code_suggestion": "Optional replacement code",
+      "existing_code": "<exact unchanged original line(s) the finding refers to>"
     }
   ],
   "overall_explanation": "Summary",
@@ -106,6 +108,7 @@ export function buildSecurityReviewPrompts(input: {
     'Skew severity toward P0/P1 for directly exploitable vulnerabilities. Ignore style and non-security nits.',
     'Review only the diff shown below. If the diff note says it was truncated, do not infer issues from omitted lines.',
     'Set confidence_score honestly: 0.7 or above ONLY when the vulnerability is backed by concrete evidence visible in the changed lines. When in doubt, omit the finding — a wrong finding costs more than a missed one, so prefer accuracy over count.',
+    "For EVERY finding, include 'existing_code' quoting the EXACT unchanged original line(s) from the diff below that the finding refers to (verbatim, no reformatting or +/- prefix); if it refers to a newly added line, quote that line. It must be a substring of the diff shown.",
     '',
     `## Output JSON Schema (STRICTLY REQUIRED)`,
     `{
@@ -120,7 +123,8 @@ export function buildSecurityReviewPrompts(input: {
         "line": <int>,
         "line_range": {"start": <int>, "end": <int>}
       },
-      "code_suggestion": "string"
+      "code_suggestion": "string",
+      "existing_code": "string"
     }
   ],
   "overall_correctness": "patch is correct" | "patch is incorrect",

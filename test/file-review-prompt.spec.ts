@@ -1,4 +1,4 @@
-import { buildFileReviewPrompts, UNTRUSTED_DIFF_END } from '@server/prompts/file-review';
+import { buildFileReviewPrompts, fileReviewSystemPromptBase, UNTRUSTED_DIFF_END } from '@server/prompts/file-review';
 import type { FileDiff } from '@server/core/diff';
 import { defaultRepoConfig, reviewConfigSchema } from '@shared/schema';
 
@@ -42,6 +42,21 @@ describe('File Review Prompt — per-finding confidence', () => {
     });
 
     expect(result.systemPrompt.toLowerCase()).toContain('when in doubt');
+  });
+
+  it('requests existing_code (EVID-01 evidence field) in both the system and user prompts', () => {
+    // The soft evidence gate (Plan 15-04) checks finding.existing_code against the cleaned hunk;
+    // both prompt blocks that feed parseFileReviewResponse must request it (D-15, ungated).
+    const result = buildFileReviewPrompts({
+      file,
+      prTitle: 'Example PR',
+      prDescription: null,
+      config: defaultRepoConfig.review,
+    });
+
+    expect(fileReviewSystemPromptBase).toContain('existing_code');
+    expect(result.systemPrompt).toContain('existing_code');
+    expect(result.userPrompt).toContain('existing_code');
   });
 });
 
