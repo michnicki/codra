@@ -28,13 +28,13 @@ import {
   updateJobStatusCheckRef,
   updateJobStep,
 } from '@server/db/jobs';
-import { filterReviewableFiles, parseUnifiedDiff, partitionReviewableFiles } from './diff';
+import { filterReviewableFiles, parseUnifiedDiff, partitionReviewableFiles, selectReviewableFiles, type FileDiff, type FileSelectionResult } from './diff';
 import { insertSkippedFiles, listSkippedFilesForHead, type SkippedFilesHeadKey } from '@server/db/skipped-files';
 import { dedupeComposite, dedupeFindings } from './dedup';
 import { applyNoiseFilter, type NoiseFilterOptions } from './noise-filter';
 import { parseCriticPruneResponse, parseSummaryResponse, parseWalkthroughDiagram } from './model-output';
 import { buildWalkthroughData, editWalkthroughComment, postWalkthroughPlaceholder } from './walkthrough';
-import { buildFinalizeDropEvents, recordFinalizeDrops, recordUnitAudit } from './audit';
+import { buildFileSkipEvents, buildFinalizeDropEvents, recordFileSkips, recordFinalizeDrops, recordUnitAudit } from './audit';
 
 import { VcsService } from '../services/vcs';
 import type { VcsProvider, VcsPullRequest, VcsUpdateStatusCheckInput } from '../vcs/types';
@@ -818,20 +818,36 @@ async function runPreparePhase(
     }
   }
 
-  const files = await getJobDiffFiles(env, job, vcs, config);
+  // Single-parse selection for the NON-rest path (Antigravity/Codex 15-05 MEDIUM): derive BOTH
+  // `files = kept` and the drop metadata from ONE selectReviewableFiles call instead of re-parsing the
+  // cached diff 2-3× (the former CMD-02 producer re-fetched + re-partitioned on its own). `kept` is
+  // byte-identical to what getJobDiffFiles->getDiffFiles->filterReviewableFiles returns for non-rest.
+  // The 'rest' path stays unchanged (getJobDiffFiles reconstructs the set from skipped_files) and emits
+  // NO file_skipped events (a review-rest job consumes prior skips, it does not re-record drops).
+  let files: FileDiff[];
+  let dropped: FileSelectionResult['dropped'] | null = null;
+  if (job.reviewScope === 'rest') {
+    files = await getJobDiffFiles(env, job, vcs, config);
+  } else {
+    const rawDiff = await getCachedRawDiff(env, job, vcs);
+    const selection = selectReviewableFiles(parseUnifiedDiff(rawDiff, config.review), config.review);
+    files = selection.kept;
+    dropped = selection.dropped;
+  }
 
   // CMD-02 / D-10 skipped-for-size producer: when the commands feature is active, persist the files
   // this full review DROPPED past max_files so a later `review-rest` job (a different job_id) can
   // re-review exactly them via listSkippedFilesForHead by PR identity + head. Only for a NORMAL full
   // review (scope !== 'rest' -- a review-rest job CONSUMES the skips, it must not re-record them) and
-  // only when we have a concrete head to key on. Best-effort: a bookkeeping-write failure must never
-  // block enqueuing the review phase. When the feature is off this whole block is skipped, so the
-  // disabled path is byte-identical (NREG-01).
+  // only when we have a concrete head to key on. It now consumes the already-computed `dropped.overCap`
+  // (no re-parse). Generated files are in `dropped.generated`, NOT overCap, so a generated file is
+  // NEVER inserted into the review-rest queue (T-15-03-03 / would be wrongly re-reviewed). Best-effort:
+  // a bookkeeping-write failure must never block enqueuing the review phase. When the feature is off
+  // this whole block is skipped, so the disabled path is byte-identical (NREG-01).
   const commandsEnabled = config.review.interactive?.commands?.enabled ?? false;
-  if (commandsEnabled && job.reviewScope !== 'rest' && job.commitSha) {
+  if (commandsEnabled && dropped && job.commitSha) {
     try {
-      const rawDiff = await getCachedRawDiff(env, job, vcs);
-      const { omitted } = partitionReviewableFiles(parseUnifiedDiff(rawDiff, config.review), config.review);
+      const omitted = dropped.overCap;
       if (omitted.length > 0) {
         await insertSkippedFiles(env, {
           jobId: job.id,
@@ -842,6 +858,17 @@ async function runPreparePhase(
     } catch (error) {
       logger.warn(`Failed to record skipped-for-size files for job ${job.id}; review-rest may be unavailable for this head`, error instanceof Error ? error : new Error(String(error)));
     }
+  }
+
+  // PRIO-03 (D-11/D-12/D-13): surface a per-file reason for every drop THIS PHASE owns via the
+  // file_skipped audit variant, INDEPENDENT of the commands feature (the CMD-02 producer above is
+  // commands-gated; this deliberately is not — over_cap events appear with commands off). Gated on
+  // file_selection.enabled so the DISABLED path emits ZERO file_skipped events even though the selector
+  // still preserves `dropped.overCap` for review-rest reconstruction (Codex 15-03 HIGH — suppress
+  // EMISSION here, never the data). Prepare-only, non-'rest' (implied by `dropped` being non-null).
+  // Best-effort: recordFileSkips swallows failures and never blocks enqueuing the review phase.
+  if (dropped && config.review.file_selection.enabled) {
+    await recordFileSkips(env, job.id, buildFileSkipEvents(dropped));
   }
 
   await completePreparationStep(env, job.id, files.length);
