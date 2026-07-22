@@ -541,7 +541,8 @@ export async function getJobDetail(env: Pick<AppBindings, 'HYPERDRIVE'>, jobId: 
                         'category', rc.category,
                         'title', rc.title,
                         'body', rc.body,
-                        'codeSuggestion', rc.code_suggestion
+                        'codeSuggestion', rc.code_suggestion,
+                        'confidence', rc.confidence
                       )
                       ORDER BY rc.id ASC
                     ) FROM review_comments rc WHERE rc.file_review_id = fr.id
