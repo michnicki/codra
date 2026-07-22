@@ -17,6 +17,8 @@ import {
 import {
   buildCategoryConfidence,
   categoryConfidenceEqual,
+  categoryConfidenceValid,
+  categoryConfidenceValueValid,
   stringSetEqual,
   type ReviewSettingsDraft,
 } from '@client/lib/review-config-draft';
@@ -268,7 +270,11 @@ export function ReviewSettingsPanel({ repo, onChange }: ReviewSettingsPanelProps
   // Enable-but-empty mention_trigger is INVALID (REVIEW #8): a whitespace-only value
   // would pass schema.min(1) but must never round-trip, so guard it here explicitly.
   const mentionValid = !mentionEnabled || mentionValue.trim().length > 0;
-  const valid = reviewConfigSchema.safeParse(review).success && mentionValid;
+  // WR-02: an out-of-range per-category confidence override must BLOCK Apply (like
+  // min_confidence) instead of being silently dropped by buildCategoryConfidence and
+  // resetting the category to "inherit global" on save.
+  const valid =
+    reviewConfigSchema.safeParse(review).success && mentionValid && categoryConfidenceValid(categoryInputs);
 
   const dirty =
     !stringSetEqual(onEvents, current.on) ||
@@ -632,22 +638,31 @@ export function ReviewSettingsPanel({ repo, onChange }: ReviewSettingsPanelProps
               <p className="text-sm font-medium text-foreground">Per-category confidence</p>
               <p className="text-xs text-muted-foreground">Empty = inherit the global minimum confidence.</p>
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                {reviewCategories.map((category) => (
-                  <label key={category} className="flex flex-col gap-1.5">
-                    <span className="text-xs font-medium capitalize text-foreground">{category}</span>
-                    <Input
-                      type="number"
-                      min={0}
-                      max={1}
-                      step={0.05}
-                      value={categoryInputs[category] ?? ''}
-                      onChange={(event) =>
-                        setCategoryInputs((inputs) => ({ ...inputs, [category]: event.target.value }))
-                      }
-                      aria-label={`${category} confidence override`}
-                    />
-                  </label>
-                ))}
+                {reviewCategories.map((category) => {
+                  const categoryValid = categoryConfidenceValueValid(categoryInputs[category] ?? '');
+                  return (
+                    <label key={category} className="flex flex-col gap-1.5">
+                      <span className="text-xs font-medium capitalize text-foreground">{category}</span>
+                      <Input
+                        type="number"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={categoryInputs[category] ?? ''}
+                        onChange={(event) =>
+                          setCategoryInputs((inputs) => ({ ...inputs, [category]: event.target.value }))
+                        }
+                        aria-label={`${category} confidence override`}
+                        aria-invalid={!categoryValid}
+                      />
+                      {!categoryValid && (
+                        <span className="text-xs text-destructive">
+                          Enter a value between 0 and 1, or leave empty to inherit.
+                        </span>
+                      )}
+                    </label>
+                  );
+                })}
               </div>
             </div>
             <ToggleRow

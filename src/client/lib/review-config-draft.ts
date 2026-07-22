@@ -63,6 +63,30 @@ export function buildCategoryConfidence(
 }
 
 /**
+ * Per-field validity probe for a SINGLE category_confidence input string (WR-02).
+ * Distinguishes "empty = inherit the global min_confidence" (valid) from "present but
+ * out-of-range/non-numeric" (invalid). Mirrors the 0..1-inclusive bounds
+ * buildCategoryConfidence keeps, so the panel can mark the offending input
+ * aria-invalid instead of silently dropping it.
+ */
+export function categoryConfidenceValueValid(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (trimmed === '') return true; // empty = inherit
+  const n = Number(trimmed);
+  return Number.isFinite(n) && n >= 0 && n <= 1;
+}
+
+/**
+ * Whole-map validity gate for the per-category confidence editor (WR-02). Feeds the
+ * ReviewSettingsPanel's `valid` flag so an out-of-range per-category override BLOCKS
+ * Apply (matching the global min_confidence field) rather than letting Apply silently
+ * reset the category to "inherit global" — the opposite of the user's intent.
+ */
+export function categoryConfidenceValid(inputs: Record<string, string>): boolean {
+  return Object.values(inputs).every(categoryConfidenceValueValid);
+}
+
+/**
  * Order-insensitive, deduped set comparator for string arrays. Replaces the
  * order-sensitive stringArraysEqual (repos.tsx:81) for `on`/`focus` dirty tracking
  * so reordering the selected triggers/categories does NOT read as dirty (REVIEW #8).

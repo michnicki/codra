@@ -3,6 +3,8 @@ import { defaultRepoConfig } from '@shared/schema';
 import {
   mergeReviewPatch,
   buildCategoryConfidence,
+  categoryConfidenceValid,
+  categoryConfidenceValueValid,
   stringSetEqual,
   categoryConfidenceEqual,
 } from '@client/lib/review-config-draft';
@@ -124,6 +126,46 @@ describe('buildCategoryConfidence', () => {
     expect(full).toEqual({ security: 0.1, bugs: 0.2, performance: 0.3, correctness: 0.4, quality: 0.5 });
     // a sparse edit never back-fills absent categories
     expect(Object.keys(buildCategoryConfidence({ bugs: '0.5' }))).toEqual(['bugs']);
+  });
+});
+
+describe('categoryConfidenceValueValid (WR-02)', () => {
+  it('treats empty/whitespace as valid (inherit global)', () => {
+    expect(categoryConfidenceValueValid('')).toBe(true);
+    expect(categoryConfidenceValueValid('   ')).toBe(true);
+  });
+
+  it('accepts an in-range 0..1 value inclusive', () => {
+    expect(categoryConfidenceValueValid('0')).toBe(true);
+    expect(categoryConfidenceValueValid('0.5')).toBe(true);
+    expect(categoryConfidenceValueValid('1')).toBe(true);
+  });
+
+  it('rejects an out-of-range value instead of silently dropping it', () => {
+    expect(categoryConfidenceValueValid('2')).toBe(false);
+    expect(categoryConfidenceValueValid('-0.1')).toBe(false);
+    expect(categoryConfidenceValueValid('1.5')).toBe(false);
+  });
+
+  it('rejects non-finite / non-numeric input', () => {
+    expect(categoryConfidenceValueValid('abc')).toBe(false);
+    expect(categoryConfidenceValueValid('NaN')).toBe(false);
+    expect(categoryConfidenceValueValid('Infinity')).toBe(false);
+  });
+});
+
+describe('categoryConfidenceValid (WR-02)', () => {
+  it('is valid when every input is empty or in range', () => {
+    expect(categoryConfidenceValid({ security: '0.85', bugs: '', performance: '0' })).toBe(true);
+    expect(categoryConfidenceValid({})).toBe(true);
+  });
+
+  it('BLOCKS the draft when any single input is out of range (Apply gate)', () => {
+    expect(categoryConfidenceValid({ security: '0.85', bugs: '2' })).toBe(false);
+  });
+
+  it('BLOCKS the draft on a non-numeric input', () => {
+    expect(categoryConfidenceValid({ quality: 'abc' })).toBe(false);
   });
 });
 
