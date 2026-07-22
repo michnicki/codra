@@ -55,6 +55,12 @@ dbDescribe('getJobDetail per-finding confidence round-trip (SC2 / REVIEW #2)', (
     const detail = await getJobDetail(env, job.id);
     expect(detail).not.toBeNull();
 
+    // WR-01 regression guard: getJobDetail must SELECT r.vcs_provider AS "repositoryVcsProvider"
+    // (it was the only job query omitting it). Before the fix the column was dropped, so this
+    // resolved to undefined and every Bitbucket detail page rendered the GitHub mark + a broken
+    // github.com PR link. A populated value here proves the field survives the DB round-trip.
+    expect(detail!.repositoryVcsProvider).toBe('github');
+
     const comments = detail!.files[0].parsedComments;
     const confident = comments.find((c) => c.title === 'confident finding');
     const unconfident = comments.find((c) => c.title === 'no-confidence finding');

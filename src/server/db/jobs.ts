@@ -511,6 +511,8 @@ export async function getJobDetail(env: Pick<AppBindings, 'HYPERDRIVE'>, jobId: 
         r.owner,
         r.repo,
         r.installation_id,
+        r.vcs_provider AS "repositoryVcsProvider",
+        r.workspace AS "repositoryWorkspace",
         COALESCE(
           (
             SELECT JSON_AGG(
