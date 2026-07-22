@@ -1,4 +1,4 @@
-import { parseCriticPruneResponse, parseFileReviewResponse, parseWalkthroughDiagram } from '@server/core/model-output';
+import { normalizeForEvidence, parseCriticPruneResponse, parseFileReviewResponse, parseWalkthroughDiagram } from '@server/core/model-output';
 import type { FileDiff } from '@server/core/diff';
 
 describe('Model Output Parsing Deep Dive', () => {
@@ -137,7 +137,10 @@ unescaped newlines",
 }`;
     const result = parseFileReviewResponse(rawOutput, mockFile, { severityEngineEnabled: false });
     expect(result.comments[0].severity).toBe('P3'); // raw priority mapping, no SEV-03 downgrade
-    expect(result.severityAuditEvents).toHaveLength(0);
+    // The severity engine produced no events; severityAuditEvents is the shared accumulator (D-18) and
+    // now also rides EVID-01 evidence events, so assert specifically that NO severity_adjusted event
+    // was recorded (this finding has no existing_code, so exactly one evidence_missing{absent} rides).
+    expect(result.severityAuditEvents.some((e) => e.stage === 'severity_adjusted')).toBe(false);
   });
 
   it('severity engine ENABLED: an SEV-01 exploit keyword promotes to P0 and records a keyword_promotion event', () => {
@@ -244,6 +247,144 @@ export function nextOwner(owner: string) {
     const result = parseFileReviewResponse(rawOutput, mockFile);
     expect(result.comments).toHaveLength(1);
     expect(result.comments[0].confidence == null).toBe(true);
+  });
+});
+
+describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
+  // mockFile hunk line 2 is the add line "new line" (position 2), so a finding at line 2 survives the
+  // orphan check and becomes a persisted comment. Evidence is checked against the cleaned-hunk
+  // haystack = "older\nnew line\nother".
+  const evidenceFile: FileDiff = {
+    path: 'src/evid.ts',
+    previousPath: null,
+    isNew: false,
+    isDeleted: false,
+    isBinary: false,
+    lineCount: 3,
+    hunks: [
+      {
+        header: '@@ -1,2 +1,3 @@',
+        lines: [
+          { kind: 'context', content: 'const older = 1;', newLineNumber: 1, position: 1 },
+          { kind: 'add', content: 'const Value = compute();', newLineNumber: 2, position: 2 },
+          { kind: 'context', content: 'return older;', newLineNumber: 3, position: 3 },
+        ],
+      },
+    ],
+  };
+
+  const rawWith = (existingCode: unknown) =>
+    JSON.stringify({
+      findings: [
+        {
+          title: 'Uses computed value',
+          body: 'The computed value is not validated before use.',
+          priority: 2,
+          category: 'correctness',
+          code_location: { absolute_file_path: 'src/evid.ts', line: 2 },
+          ...(existingCode === '__OMIT__' ? {} : { existing_code: existingCode }),
+        },
+      ],
+      overall_correctness: 'patch is incorrect',
+      overall_explanation: 'Found an issue',
+      overall_confidence_score: 0.8,
+    });
+
+  const evidenceEvents = (r: ReturnType<typeof parseFileReviewResponse>) =>
+    r.severityAuditEvents.filter((e) => e.stage === 'evidence_missing');
+
+  it('exact substring match: no evidence_missing event, comment still posts', () => {
+    const result = parseFileReviewResponse(rawWith('const Value = compute();'), evidenceFile);
+    expect(result.comments).toHaveLength(1);
+    expect(evidenceEvents(result)).toHaveLength(0);
+  });
+
+  it('whitespace-only difference still matches (normalizeForEvidence collapses runs)', () => {
+    const result = parseFileReviewResponse(rawWith('   const   Value =   compute();  '), evidenceFile);
+    expect(result.comments).toHaveLength(1);
+    expect(evidenceEvents(result)).toHaveLength(0);
+  });
+
+  it('case-only difference still matches (case-INSENSITIVE, OpenCode C4)', () => {
+    const result = parseFileReviewResponse(rawWith('CONST value = COMPUTE();'), evidenceFile);
+    expect(result.comments).toHaveLength(1);
+    expect(evidenceEvents(result)).toHaveLength(0);
+  });
+
+  it('non-substring evidence: one evidence_missing{not_in_hunk}, comment still posts', () => {
+    const result = parseFileReviewResponse(rawWith('someTotallyUnrelatedIdentifier()'), evidenceFile);
+    expect(result.comments).toHaveLength(1);
+    const events = evidenceEvents(result);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'not_in_hunk', path: 'src/evid.ts', line: 2 });
+  });
+
+  it('omitted existing_code: one evidence_missing{absent}, comment still posts', () => {
+    const result = parseFileReviewResponse(rawWith('__OMIT__'), evidenceFile);
+    expect(result.comments).toHaveLength(1);
+    const events = evidenceEvents(result);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'absent' });
+  });
+
+  it('empty-string existing_code: one evidence_missing{absent}, comment still posts', () => {
+    const result = parseFileReviewResponse(rawWith('   '), evidenceFile);
+    expect(result.comments).toHaveLength(1);
+    expect(evidenceEvents(result)).toEqual([
+      expect.objectContaining({ stage: 'evidence_missing', reason: 'absent' }),
+    ]);
+  });
+
+  it('JSON null existing_code: no parse throw, comment still posts, one evidence_missing{absent}', () => {
+    // Codex 15-01 HIGH: existing_code is nullable().optional(), so a JSON null must NOT throw the
+    // per-file parse before the evidence check runs.
+    const result = parseFileReviewResponse(rawWith(null), evidenceFile);
+    expect(result.comments).toHaveLength(1);
+    const events = evidenceEvents(result);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'absent' });
+  });
+
+  it('maps existing_code into the parsed comment existingCode field', () => {
+    const result = parseFileReviewResponse(rawWith('const Value = compute();'), evidenceFile);
+    expect(result.comments[0].existingCode).toBe('const Value = compute();');
+  });
+
+  it('the evidence_missing event carries NO body/diff/existingCode/codeSuggestion (privacy)', () => {
+    const result = parseFileReviewResponse(rawWith('someTotallyUnrelatedIdentifier()'), evidenceFile);
+    const event = evidenceEvents(result)[0];
+    const keys = Object.keys(event);
+    expect(keys).not.toContain('body');
+    expect(keys).not.toContain('diff');
+    expect(keys).not.toContain('existingCode');
+    expect(keys).not.toContain('codeSuggestion');
+    expect(keys.sort()).toEqual(['line', 'path', 'reason', 'stage', 'timestamp', 'title']);
+  });
+
+  it('off-diff finding contributes NO evidence_missing event (checked only after orphan survival)', () => {
+    // line 999 is not a valid diff line -> the finding is orphaned (no comment), so no evidence event.
+    const raw = JSON.stringify({
+      findings: [
+        {
+          title: 'Off-diff finding',
+          body: 'This references a line not in the diff.',
+          priority: 2,
+          code_location: { absolute_file_path: 'src/evid.ts', line: 999 },
+          existing_code: 'not present anywhere',
+        },
+      ],
+      overall_correctness: 'patch is incorrect',
+      overall_explanation: 'off diff',
+    });
+    const result = parseFileReviewResponse(raw, evidenceFile);
+    expect(result.comments).toHaveLength(0);
+    expect(evidenceEvents(result)).toHaveLength(0);
+  });
+});
+
+describe('normalizeForEvidence (D-16)', () => {
+  it('collapses whitespace runs, trims, and lower-cases', () => {
+    expect(normalizeForEvidence('  Foo\n   BAR ')).toBe('foo bar');
   });
 });
 

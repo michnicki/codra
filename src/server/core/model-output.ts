@@ -2,6 +2,7 @@ import { criticPruneOutputSchema, fileReviewModelOutputSchema, parsedReviewComme
 import { z } from 'zod';
 import { logger } from './logger';
 import { applySeverityRules } from './severity';
+import { clampAuditTitle } from './audit';
 import { findClosestValidLine, findPositionForLine, getValidNewLines, getValidPositions } from './diff';
 import type { FileDiff } from './diff';
 import { jsonrepair } from 'jsonrepair';
@@ -241,6 +242,20 @@ function preprocessJson(json: string): string {
   return result;
 }
 
+/**
+ * Normalizer for the soft evidence gate (EVID-01, D-16). Collapses every whitespace run to a single
+ * space, trims, AND lower-cases — the substring match is therefore whitespace- AND case-INSENSITIVE,
+ * so trivial `Const` vs `const` / indentation differences do NOT inflate the `not_in_hunk` count and
+ * pollute the EVID-02 go/no-go signal (OpenCode C4 / Antigravity). No Unicode normalization.
+ *
+ * This is DELIBERATELY NOT `cleanText` (D-16 Anti-Pattern): cleanText strips leading tag/emoji
+ * prefixes (SECURITY/BUG/P0/…), which are meaningless for diff-line evidence and would corrupt the
+ * haystack/needle comparison. Never reuse cleanText here.
+ */
+export function normalizeForEvidence(s: string): string {
+  return s.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
 function withSuggestion(body: string, codeSuggestion?: string) {
   if (!codeSuggestion) return body;
 
@@ -364,6 +379,16 @@ export function parseFileReviewResponse(
   // findings that survive the orphan check (i.e. become a persisted comment) contribute events, so
   // the trail never references a dropped, off-diff finding.
   const severityAuditEvents: JobAuditEvent[] = [];
+
+  // EVID-01 soft evidence gate (D-16). Build the cleaned-hunk haystack ONCE for this file: concat of
+  // ALL hunk lines (context + add + del) content — hunk `content` is already diff-prefix-stripped
+  // (diff.ts) — then normalizeForEvidence. Per surviving finding, we test whether its normalized
+  // existing_code is a substring of this haystack. This is audit-only (D-14): a miss NEVER drops or
+  // penalizes the finding, it only emits an `evidence_missing` telemetry event.
+  const evidenceHaystack = normalizeForEvidence(
+    file.hunks.flatMap((h) => h.lines).map((l) => l.content).join('\n'),
+  );
+
   const comments = (parsed.findings || [])
     .map((finding) => {
       // Codex style findings use start/end or line
@@ -433,6 +458,34 @@ export function parseFileReviewResponse(
       );
       severityAuditEvents.push(...ruled.auditEvents);
 
+      // EVID-01 soft evidence gate (D-14/D-16/D-17/D-18): only findings that SURVIVED the orphan check
+      // (they become a persisted comment) reach here, so the trail never references an off-diff finding.
+      // The finding ALWAYS still posts below regardless of the evidence outcome — this block only pushes
+      // telemetry into the SAME severityAuditEvents accumulator (D-18), never a new returned field, and
+      // NEVER carries body/diff/existingCode/codeSuggestion (privacy posture; T-15-04-01).
+      const evidence = finding.existing_code;
+      if (evidence == null || normalizeForEvidence(evidence).length === 0) {
+        // null / undefined / whitespace-only -> `absent`. A JSON `null` reaches here (never a parse
+        // failure) because fileReviewModelOutputSchema.existing_code is nullable().optional() (15-01).
+        severityAuditEvents.push({
+          stage: 'evidence_missing',
+          reason: 'absent',
+          path: file.path,
+          line,
+          title: clampAuditTitle(title),
+          timestamp: new Date().toISOString(),
+        });
+      } else if (!evidenceHaystack.includes(normalizeForEvidence(evidence))) {
+        severityAuditEvents.push({
+          stage: 'evidence_missing',
+          reason: 'not_in_hunk',
+          path: file.path,
+          line,
+          title: clampAuditTitle(title),
+          timestamp: new Date().toISOString(),
+        });
+      }
+
       return parsedReviewCommentSchema.parse({
         path: file.path,
         line: line,
@@ -442,6 +495,9 @@ export function parseFileReviewResponse(
         title,
         body: withSuggestion(body, finding.code_suggestion),
         codeSuggestion: finding.code_suggestion,
+        // EVID-01 (D-15): map the model-emitted evidence into the parsed comment's existingCode field.
+        // `?? null` because parsedReviewCommentSchema.existingCode is nullable().optional().
+        existingCode: finding.existing_code ?? null,
         // Already validated/clamped by fileReviewModelOutputSchema + normalizeFinding.
         // Absent -> undefined, which parsedReviewCommentSchema accepts (fail-open at finalize).
         confidence: finding.confidence_score,
