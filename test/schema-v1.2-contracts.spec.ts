@@ -3,6 +3,7 @@ import {
   repoConfigSchema,
   reviewConfigSchema,
   parsedReviewCommentSchema,
+  fileReviewModelOutputSchema,
   jobAuditEventSchema,
   jobSummarySchema,
   jobDetailSchema,
@@ -120,6 +121,35 @@ describe('v1.2 schema contracts (Phase 13 Plan 01)', () => {
         timestamp: ts,
       }).success,
     ).toBe(true);
+  });
+
+  it('(c3) fileReviewModelOutputSchema.existing_code parses fail-open: string, null, AND omission (D-15, Codex HIGH)', () => {
+    const base = {
+      title: 't',
+      body: 'b',
+      code_location: { absolute_file_path: 'a', line: 1 },
+    };
+    // A string value parses.
+    expect(
+      fileReviewModelOutputSchema.parse({
+        findings: [{ ...base, existing_code: 'x' }],
+        overall_correctness: 'patch is correct',
+      }).findings[0].existing_code,
+    ).toBe('x');
+    // JSON `null` parses (the load-bearing Codex 15-01 HIGH case — bare .optional() would throw here).
+    expect(
+      fileReviewModelOutputSchema.parse({
+        findings: [{ ...base, existing_code: null }],
+        overall_correctness: 'patch is correct',
+      }).findings[0].existing_code,
+    ).toBeNull();
+    // Omission parses (fail-open).
+    expect(() =>
+      fileReviewModelOutputSchema.parse({
+        findings: [base],
+        overall_correctness: 'patch is correct',
+      }),
+    ).not.toThrow();
   });
 
   it('(d) a pre-v1.2 config fixture (no v1.2 keys) still parses without throwing (NREG-01)', () => {

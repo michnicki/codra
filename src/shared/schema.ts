@@ -78,6 +78,14 @@ export const fileReviewModelOutputSchema = z.object({
         line: z.number().int().positive().optional(),
       }),
       code_suggestion: z.string().optional(),
+      // v1.2 EVID-01 (D-15): the model-emitted evidence string the soft evidence gate (Plan 15-04)
+      // checks against the cleaned hunk. NULLABLE-AND-OPTIONAL, not bare .optional() (Codex 15-01 HIGH):
+      // this per-file parse (model-output.ts) runs BEFORE the evidence check, so a bare .optional()
+      // would throw the WHOLE response on a JSON `existing_code: null` and break the fail-open 'still
+      // posts' soft-gate guarantee. null AND omission both flow to the `absent` branch (15-04), never a
+      // parse failure — mirroring the loose/fail-open posture of `category` above and the already
+      // nullable parsedReviewCommentSchema.existingCode.
+      existing_code: z.string().nullable().optional(),
     }),
   ),
   overall_correctness: z.string().optional().default('patch is correct'),
