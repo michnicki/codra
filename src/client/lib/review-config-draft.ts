@@ -1,4 +1,4 @@
-import type { RepoConfig } from '@shared/schema';
+import type { RepoConfig, ReviewCategory } from '@shared/schema';
 
 // Pure, node-testable config-editing transforms for the UI-01 repo-config editor.
 // This module MUST NOT import React, DOM, or motion — it loads in the node vitest
@@ -37,4 +37,27 @@ export function mergeReviewPatch(
     ...(settingsFields ?? {}),
     ...(interactive ? { interactive } : {}),
   };
+}
+
+/**
+ * Sparse `z.partialRecord` builder for the per-category confidence overrides
+ * (category_confidence, schema.ts:236). For each raw string input: trim, skip when
+ * empty/whitespace (inherit the global min_confidence), parse with Number(), and
+ * keep only when the value is finite and within 0..1 inclusive. Out-of-range and
+ * non-numeric inputs are DROPPED (never clamped to 0). Absent categories are never
+ * back-filled — a sparse edit stays sparse (Zod 4 z.partialRecord contract).
+ */
+export function buildCategoryConfidence(
+  inputs: Record<string, string>,
+): Partial<Record<ReviewCategory, number>> {
+  const out: Partial<Record<ReviewCategory, number>> = {};
+  for (const [category, raw] of Object.entries(inputs)) {
+    const trimmed = raw.trim();
+    if (trimmed === '') continue;
+    const n = Number(trimmed);
+    if (Number.isFinite(n) && n >= 0 && n <= 1) {
+      out[category as ReviewCategory] = n;
+    }
+  }
+  return out;
 }
