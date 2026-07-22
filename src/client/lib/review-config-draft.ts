@@ -61,3 +61,37 @@ export function buildCategoryConfidence(
   }
   return out;
 }
+
+/**
+ * Order-insensitive, deduped set comparator for string arrays. Replaces the
+ * order-sensitive stringArraysEqual (repos.tsx:81) for `on`/`focus` dirty tracking
+ * so reordering the selected triggers/categories does NOT read as dirty (REVIEW #8).
+ */
+export function stringSetEqual(a: readonly string[], b: readonly string[]): boolean {
+  const setA = new Set(a);
+  const setB = new Set(b);
+  if (setA.size !== setB.size) return false;
+  for (const value of setA) {
+    if (!setB.has(value)) return false;
+  }
+  return true;
+}
+
+/**
+ * Nested comparator for the sparse category_confidence override map (REVIEW #8).
+ * Treats undefined as the empty override map, unions the keys of both, and returns
+ * false if any key's value differs — so a no-op category-confidence edit does not
+ * mark the draft dirty and key order is irrelevant.
+ */
+export function categoryConfidenceEqual(
+  a: Partial<Record<ReviewCategory, number>> | undefined,
+  b: Partial<Record<ReviewCategory, number>> | undefined,
+): boolean {
+  const objA = a ?? {};
+  const objB = b ?? {};
+  const keys = new Set([...Object.keys(objA), ...Object.keys(objB)]);
+  for (const key of keys) {
+    if (objA[key as ReviewCategory] !== objB[key as ReviewCategory]) return false;
+  }
+  return true;
+}
