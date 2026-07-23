@@ -9,10 +9,12 @@ import {
   REPORT_RESULT,
 } from '@server/bitbucket/constants';
 import type {
+  VcsCapabilities,
   VcsCreateStatusCheckInput,
   VcsProvider,
   VcsPullRequest,
   VcsReviewComment,
+  VcsReviewThread,
   VcsSubmitReviewInput,
   VcsUpdateStatusCheckInput,
 } from './types';
@@ -111,8 +113,20 @@ function parsePrCommentRef(ref: string): { prId: number; commentId: number } {
 export class BitbucketAdapter implements VcsProvider {
   readonly name = 'bitbucket' as const;
   // Bitbucket Cloud does not render Mermaid diagrams in PR markdown, so the walkthrough formatter
-  // MUST NOT emit one for Bitbucket PRs (D-09). Required member on VcsProvider; inert this phase.
-  readonly capabilities = { supportsMermaid: false } as const;
+  // MUST NOT emit one for Bitbucket PRs (D-09). `supportsThreadListing` is static-true (the
+  // comments endpoint is always available). `supportsThreadResolution` is OBSERVED-DOWNGRADE
+  // (D-04): it starts optimistic (true) and the first real 403/404/501 from POST /resolve flips
+  // the private backing boolean to false, cached for the rest of the invocation. Exposed via a
+  // class getter so the mutable field can be read through the immutable interface shape. Plan
+  // 17-02 wires the real POST /resolve plumbing behind the neutral stub.
+  private threadResolutionSupported = true;
+  get capabilities(): VcsCapabilities {
+    return {
+      supportsMermaid: false,
+      supportsThreadListing: true,
+      supportsThreadResolution: this.threadResolutionSupported,
+    };
+  }
   // Bitbucket Cloud has no native PR-labels feature (Pattern 2). The interface marks `labels`
   // optional; this adapter intentionally does NOT assign the property so callers must feature-
   // detect `if (vcs.labels)` (mirrors `GithubAdapter` which DOES assign it).
@@ -166,6 +180,35 @@ export class BitbucketAdapter implements VcsProvider {
 
   async getPullRequestDiff(owner: string, repo: string, prNumber: number): Promise<string> {
     return this.client.getPullRequestDiff(owner, repo, prNumber);
+  }
+
+  // PROV-01 (D-08): content primitive. PLAN-02-IMPL — Task 3 replaces this stub with the
+  // BitbucketClient.getFileContent delegate (`/src/{ref}/{path}`).
+  async getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null> {
+    void owner; void repo; void path; void ref;
+    return null;
+  }
+
+  // PROV-01 (D-09): compare-diff primitive. PLAN-02-IMPL — Task 3 replaces this stub with the
+  // BitbucketClient.getCompareDiff delegate (`HEAD..BASE` + `context=3&topic=true`).
+  async getCompareDiff(owner: string, repo: string, base: string, head: string): Promise<string> {
+    void owner; void repo; void base; void head;
+    return '';
+  }
+
+  // PROV-02 (D-05/D-06/D-07): unresolved-bot-thread listing. PLAN-02-IMPL — Plan 17-02 replaces
+  // this stub with the comments-page filter (root + unresolved + immutable bot account_id).
+  async getUnresolvedBotThreads(owner: string, repo: string, prNumber: number): Promise<VcsReviewThread[]> {
+    void owner; void repo; void prNumber;
+    return [];
+  }
+
+  // PROV-02 (D-04): resolve a thread. PLAN-02-IMPL — Plan 17-02 replaces this stub with the
+  // POST /comments/{id}/resolve call. The first 403/404/501 flips `threadResolutionSupported`
+  // to false; subsequent calls short-circuit without a request.
+  async resolveThread(owner: string, repo: string, ref: string): Promise<boolean> {
+    void owner; void repo; void ref;
+    return false;
   }
 
   async createStatusCheck(

@@ -1,9 +1,11 @@
 import { GitHubService } from '../services/github';
 import type { AppBindings } from '../env';
 import type {
+  VcsCapabilities,
   VcsCreateStatusCheckInput,
   VcsProvider,
   VcsPullRequest,
+  VcsReviewThread,
   VcsSubmitReviewInput,
   VcsUpdateStatusCheckInput,
 } from './types';
@@ -23,7 +25,14 @@ export class GithubAdapter implements VcsProvider {
   readonly name = 'github' as const;
   // GitHub renders Mermaid fenced code blocks in markdown, so the walkthrough formatter may emit a
   // Mermaid diagram for GitHub PRs (D-09). Required member on VcsProvider; inert this phase.
-  readonly capabilities = { supportsMermaid: true } as const;
+  // GitHub's GraphQL `reviewThreads` and `resolveReviewThread` are always available with the
+  // installation token (D-03/D-04), so the two thread flags are static-true (R-2); Plan 17-02
+  // wires the GraphQL plumbing behind these neutral stubs.
+  readonly capabilities: VcsCapabilities = {
+    supportsMermaid: true,
+    supportsThreadListing: true,
+    supportsThreadResolution: true,
+  };
   private gh: GitHubService;
 
   constructor(
@@ -53,6 +62,34 @@ export class GithubAdapter implements VcsProvider {
 
   async getPullRequestDiff(owner: string, repo: string, prNumber: number): Promise<string> {
     return this.gh.getPullRequestDiff(owner, repo, prNumber);
+  }
+
+  // PROV-01 (D-08): content primitive. PLAN-02-IMPL — Task 2 replaces this stub with the
+  // GitHubService.getRepoFileContent delegate (`ref` aware via `?ref=`).
+  async getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null> {
+    void owner; void repo; void path; void ref;
+    return null;
+  }
+
+  // PROV-01 (D-09): compare-diff primitive. PLAN-02-IMPL — Task 2 replaces this stub with the
+  // GitHubService.getCompareDiff delegate (`BASE...HEAD` + `application/vnd.github.diff`).
+  async getCompareDiff(owner: string, repo: string, base: string, head: string): Promise<string> {
+    void owner; void repo; void base; void head;
+    return '';
+  }
+
+  // PROV-02 (D-05/D-06/D-07): unresolved-bot-thread listing. PLAN-02-IMPL — Plan 17-02 replaces
+  // this stub with the GraphQL `reviewThreads` query + bot-id filter via `resolveBotUserIdentity`.
+  async getUnresolvedBotThreads(owner: string, repo: string, prNumber: number): Promise<VcsReviewThread[]> {
+    void owner; void repo; void prNumber;
+    return [];
+  }
+
+  // PROV-02 (D-04): resolve a thread. PLAN-02-IMPL — Plan 17-02 replaces this stub with the
+  // GraphQL `resolveReviewThread` mutation. GitHub's flag is static-true (no observed-downgrade).
+  async resolveThread(owner: string, repo: string, ref: string): Promise<boolean> {
+    void owner; void repo; void ref;
+    return false;
   }
 
   async createStatusCheck(
