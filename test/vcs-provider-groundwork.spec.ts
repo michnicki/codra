@@ -1109,7 +1109,7 @@ describe('PROV-02: Bitbucket thread listing and resolution', () => {
     }
   });
 
-  it('rejects malformed refs and flips `supportsThreadResolution` on 403/404/501', async () => {
+  it('rejects malformed refs and flips `supportsThreadResolution` on 403', async () => {
     const mock = installBitbucketFetchMock({
       resolveCommentStatuses: [{ status: 403 }],
     });
@@ -1129,6 +1129,8 @@ describe('PROV-02: Bitbucket thread listing and resolution', () => {
       // Now try with a valid ref -> 403 -> flips capability.
       await expect(adapter.resolveThread(WORKSPACE, BB_REPO, `${BB_PR_NUMBER}:7`)).resolves.toBe(false);
       expect(adapter.capabilities.supportsThreadResolution).toBe(false);
+      // Listing stays true (D-04: downgrade is target-specific, not a blanket capability wipe).
+      expect(adapter.capabilities.supportsThreadListing).toBe(true);
 
       // Second call must short-circuit (no resolve request) thanks to the downgrade.
       const callsBefore = mock.calls.length;
@@ -1140,7 +1142,80 @@ describe('PROV-02: Bitbucket thread listing and resolution', () => {
     }
   });
 
-  it('returns false on 500/501 WITHOUT flipping the capability and uses exactly one request', async () => {
+  // PROV-02 (D-04): 404 is a documented downgrade trigger (the resolve endpoint reports the
+  // comment-thread id is unknown / the API doesn't have a resolve target here). The first 404
+  // flips supportsThreadResolution to false and supportsThreadListing stays true; the second
+  // call short-circuits with zero additional POST /resolve requests.
+  it('resolveThread flips `supportsThreadResolution` on 404 (downgrade trigger)', async () => {
+    const mock = installBitbucketFetchMock({
+      resolveCommentStatuses: [{ status: 404 }],
+    });
+
+    try {
+      const env = createTestEnv();
+      const client = new BitbucketClient(env, 'test-token-bearer');
+      const adapter = new (BitbucketAdapter as unknown as new (
+        env: ReturnType<typeof createTestEnv>,
+        client: BitbucketClient,
+        jobArg: ReturnType<typeof buildBitbucketFixture>,
+      ) => BitbucketAdapter)(env, client, buildBitbucketFixture());
+
+      // Malformed ref -> throws at the seam.
+      await expect(adapter.resolveThread(WORKSPACE, BB_REPO, 'not-a-valid-ref')).rejects.toThrow();
+
+      // Valid ref -> 404 -> flips capability.
+      await expect(adapter.resolveThread(WORKSPACE, BB_REPO, `${BB_PR_NUMBER}:7`)).resolves.toBe(false);
+      expect(adapter.capabilities.supportsThreadResolution).toBe(false);
+      expect(adapter.capabilities.supportsThreadListing).toBe(true);
+
+      // Second call short-circuits (no additional POST /resolve).
+      await expect(adapter.resolveThread(WORKSPACE, BB_REPO, `${BB_PR_NUMBER}:7`)).resolves.toBe(false);
+      const resolveCalls = mock.calls.filter((call) => call.method === 'POST' && /\/comments\/\d+\/resolve/.test(call.path));
+      expect(resolveCalls).toHaveLength(1);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  // PROV-02 (D-04): 501 IS a documented downgrade trigger (Not Implemented — the workspace
+  // / repo does not have the resolve endpoint, or the API contract is unimplemented). The
+  // first 501 flips supportsThreadResolution to false (listing stays true); the second call
+  // short-circuits with zero additional POST /resolve requests.
+  it('resolveThread flips `supportsThreadResolution` on 501 (downgrade trigger)', async () => {
+    const mock = installBitbucketFetchMock({
+      resolveCommentStatuses: [{ status: 501 }],
+    });
+
+    try {
+      const env = createTestEnv();
+      const client = new BitbucketClient(env, 'test-token-bearer');
+      const adapter = new (BitbucketAdapter as unknown as new (
+        env: ReturnType<typeof createTestEnv>,
+        client: BitbucketClient,
+        jobArg: ReturnType<typeof buildBitbucketFixture>,
+      ) => BitbucketAdapter)(env, client, buildBitbucketFixture());
+
+      // Malformed ref -> throws at the seam.
+      await expect(adapter.resolveThread(WORKSPACE, BB_REPO, 'not-a-valid-ref')).rejects.toThrow();
+
+      // Valid ref -> 501 -> flips capability.
+      await expect(adapter.resolveThread(WORKSPACE, BB_REPO, `${BB_PR_NUMBER}:7`)).resolves.toBe(false);
+      expect(adapter.capabilities.supportsThreadResolution).toBe(false);
+      expect(adapter.capabilities.supportsThreadListing).toBe(true);
+
+      // Second call short-circuits (no additional POST /resolve).
+      await expect(adapter.resolveThread(WORKSPACE, BB_REPO, `${BB_PR_NUMBER}:7`)).resolves.toBe(false);
+      const resolveCalls = mock.calls.filter((call) => call.method === 'POST' && /\/comments\/\d+\/resolve/.test(call.path));
+      expect(resolveCalls).toHaveLength(1);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  // PROV-02 (D-04): 500 is NOT a downgrade trigger. The first 500 returns false WITHOUT
+  // flipping the capability (`supportsThreadResolution` stays optimistic, `supportsThreadListing`
+  // stays true). Exactly one POST /resolve is issued for the 500 attempt — no retry.
+  it('returns false on 500 WITHOUT flipping the capability and uses exactly one request', async () => {
     const mock = installBitbucketFetchMock({
       resolveCommentStatuses: [{ status: 500 }],
     });
@@ -1157,6 +1232,7 @@ describe('PROV-02: Bitbucket thread listing and resolution', () => {
       await expect(adapter.resolveThread(WORKSPACE, BB_REPO, `${BB_PR_NUMBER}:7`)).resolves.toBe(false);
       // Capability stays optimistic (D-04: 500 is NOT a downgrade trigger).
       expect(adapter.capabilities.supportsThreadResolution).toBe(true);
+      expect(adapter.capabilities.supportsThreadListing).toBe(true);
       // Exactly one POST /resolve issued for the 500 attempt — no retry.
       const resolveCalls = mock.calls.filter((call) => call.method === 'POST' && /\/comments\/\d+\/resolve/.test(call.path));
       expect(resolveCalls).toHaveLength(1);
