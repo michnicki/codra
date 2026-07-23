@@ -846,7 +846,7 @@ async function runPreparePhase(
   // `rounds.incremental` toggle. The resolved round / mode are persisted on the job and emitted as
   // a `rounds.detected` audit event so the signal is observable at defaults. Consumer paths
   // (compare-diff selection, floor escalation, thread suppression) are separately gated on the
-  // durable `rounds.incremental` snapshot. Thread listing here is detection input only: it runs at
+  // durable `rounds.incremental` snapshot. Thread listing here is a detection input only: it runs at
   // most once and only when no prior anchor exists, because an anchor already resolves round 2+.
   // The review-rest short-circuit (D-03) skips state + thread calls entirely.
   //
@@ -2568,10 +2568,10 @@ async function resolveRoundContextForJob(
 
   // Thread listing is needed only for the thread-only round-detection branch. Read the durable anchor
   // first; when it exists, it already proves round 2+ and a listing would add provider cost without
-  // changing the decision. When the anchor is absent, detection lists independently of the incremental
-  // consumer toggle so unresolved bot threads can still make the observable round counter advance.
+  // changing the decision. The durable consumer toggle also gates this call so default-disabled jobs
+  // preserve NREG-01's zero-provider-call contract; enabled jobs can still detect thread-only rounds.
   let unresolvedThreads: import('@server/vcs/types').VcsReviewThread[] = [];
-  if (!priorState?.last_reviewed_sha && vcs.capabilities.supportsThreadListing) {
+  if (roundsIncremental && !priorState?.last_reviewed_sha && vcs.capabilities.supportsThreadListing) {
     try {
       unresolvedThreads = await vcs.getUnresolvedBotThreads(job.owner, job.repo, job.prNumber);
     } catch (error) {
