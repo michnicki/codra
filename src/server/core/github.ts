@@ -469,6 +469,206 @@ export class GitHubClient {
     });
   }
 
+  // --- PROV-02 GraphQL plumbing (review-thread listing + resolution) ---
+  //
+  // The thread family (D-05..D-07) is exposed only via GraphQL -- the REST review-comment endpoint
+  // cannot list resolved threads or call resolveReviewThread. This is the project's FIRST GraphQL
+  // path; the helper is hand-rolled to satisfy the zero-new-deps constraint (PROJECT.md). Variables
+  // travel as a JSON object so owner/repo/PR/thread-id NEVER cross into query text (T-17-02-01 --
+  // Tampering).
+
+  /**
+   * Thin POST-to-/graphql helper. JSON-serializes `{ query, variables }`, sets
+   * `content-type: application/json`, and runs through the same `request()` so installation-token
+   * auth and subrequest tracking stay consistent with the REST surface. The returned body is the
+   * raw `{ data, errors }` envelope -- callers inspect `errors` themselves.
+   */
+  async graphql<T = unknown>(query: string, variables: Record<string, unknown>): Promise<T> {
+    return withRetry('graphql', async () => {
+      const response = await this.requestAndCheck(
+        '/graphql',
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ query, variables }),
+        },
+        'application/vnd.github+json',
+      );
+      return (await response.json()) as T;
+    });
+  }
+
+  /**
+   * PROV-02 (D-05/D-06/D-07/R-2): cursor-paged thread-list walk. Each page is a single GraphQL
+   * request carrying `comments(first: 1)` alongside the thread nodes (the nested connection does
+   * NOT add an extra HTTP call -- R-9). A GraphQL `errors` envelope OR an absent/empty
+   * `data.repository.pullRequest.reviewThreads.nodes` is treated as a traversal failure (Pitfall 5);
+   * the catch is the adapter's, not this client's -- preserve provider detail for the adapter's
+   * neutral return (D-02). Bounded by `MAX_THREAD_LIST_PAGES` (R-9): a large PR can otherwise tip
+   * over Cloudflare's 50-subrequest cap before the consumer can review.
+   *
+   * `MAX_THREAD_LIST_PAGES = 10` is a TUNED EMPIRICAL CAP, not an API feature:
+   *   - 100 threads per page x 10 pages = 1000 threads, well above any realistic PR.
+   *   - Each page is exactly 1 GraphQL subrequest (`comments(first:1)` rides inside it -- R-9).
+   *   - 10 + the existing token-fetch / bot-identity / potential resolve calls leaves headroom
+   *     inside the Workers 50/invocation cap (token-tracker.ts:SAFE_MARGIN=25 + this=10 + bot=1).
+   * Going higher risks subrequest exhaustion during a long diff. Going lower risks silently
+   * dropping legitimate threads on the largest PRs the bot services.
+   */
+  static readonly MAX_THREAD_LIST_PAGES = 10;
+
+  async getReviewThreads(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    tracker?: { hasRemainingSafeBudget?(needed?: number): boolean },
+  ): Promise<unknown[]> {
+    const maxPages = GitHubClient.MAX_THREAD_LIST_PAGES;
+    const collected: unknown[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < maxPages; page += 1) {
+      // R-9 / token-tracker: consult the live budget before issuing the next page so a near-limit
+      // tracker fails closed at the boundary rather than mid-pagination. `hasRemainingSafeBudget`
+      // is optional because legacy callers / tests can omit it; falling back to "always proceed"
+      // matches the R-9 "track-aware but not gated" semantics.
+      if (tracker?.hasRemainingSafeBudget && !tracker.hasRemainingSafeBudget(1)) {
+        throw new GitHubError(
+          503,
+          `GitHub thread pagination exceeded safe subrequest budget on page ${page + 1}/${maxPages}`,
+          '/graphql',
+          `GitHub thread list aborted: safe subrequest budget exhausted at page ${page + 1}`,
+        );
+      }
+      const variables: Record<string, unknown> = {
+        owner,
+        repo,
+        number: prNumber,
+        after: cursor,
+      };
+      const data = await this.graphql<{
+        repository?: {
+          pullRequest?: {
+            reviewThreads?: {
+              nodes?: unknown[];
+              pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+            };
+          };
+        };
+        errors?: Array<{ message?: string }>;
+      }>(
+        `query ListReviewThreads($owner: String!, $repo: String!, $number: Int!, $after: String) {
+          repository(owner: $owner, name: $repo) {
+            pullRequest(number: $number) {
+              reviewThreads(first: 100, after: $after) {
+                nodes {
+                  id
+                  path
+                  line
+                  startLine
+                  originalLine
+                  originalStartLine
+                  isResolved
+                  isOutdated
+                  comments(first: 1) {
+                    nodes {
+                      body
+                      replyTo { id }
+                      author {
+                        __typename
+                        ... on Bot { databaseId }
+                        ... on User { databaseId }
+                      }
+                    }
+                  }
+                }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        }`,
+        variables,
+      );
+
+      // Treat a non-empty errors envelope as a failure (Pitfall 5 -- data MUST be inspected).
+      if (data?.errors?.length) {
+        throw new GitHubError(
+          200,
+          `GraphQL reviewThreads returned errors (page ${page + 1})`,
+          '/graphql',
+          `GitHub GraphQL reviewThreads query reported errors`,
+        );
+      }
+
+      // GraphQL responses wrap the payload under a top-level `data` key. The client reads
+      // `data.data` so the same envelope-shape (`{ data, errors }`) is honored across queries.
+      const payload = (data as { data?: unknown })?.data as {
+        repository?: {
+          pullRequest?: {
+            reviewThreads?: {
+              nodes?: unknown[];
+              pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+            };
+          };
+        };
+      } | null | undefined;
+      const nodes = payload?.repository?.pullRequest?.reviewThreads?.nodes ?? null;
+      const pageInfo = payload?.repository?.pullRequest?.reviewThreads?.pageInfo;
+
+      if (!nodes) {
+        throw new GitHubError(
+          200,
+          `GraphQL reviewThreads returned no reviewThreads nodes (page ${page + 1})`,
+          '/graphql',
+          `GitHub GraphQL reviewThreads returned no thread data`,
+        );
+      }
+
+      for (const node of nodes) collected.push(node);
+      if (!pageInfo?.hasNextPage || !pageInfo.endCursor) {
+        return collected;
+      }
+      cursor = pageInfo.endCursor;
+    }
+    // Cap reached with `hasNextPage: true` still outstanding. FAIL-CLOSED (R-9): the adapter
+    // converts this throw to [] rather than returning a partial thread set.
+    throw new GitHubError(
+      503,
+      `GitHub thread pagination exceeded MAX_THREAD_LIST_PAGES (${maxPages}); aborting partial traversal`,
+      '/graphql',
+      `GitHub thread list exceeded MAX_THREAD_LIST_PAGES=${maxPages}`,
+    );
+  }
+
+  /**
+   * PROV-02: mark a review thread resolved via `resolveReviewThread` (R-2). Returns the (possibly
+   * absent) resolved `thread` payload so the adapter can decide success vs. failure. The threadId
+   * travels as a GraphQL variable (T-17-02-01) -- NEVER interpolated into query text.
+   */
+  async resolveReviewThread(threadId: string): Promise<unknown> {
+    const envelope = await this.graphql<{
+      data?: {
+        resolveReviewThread?: { thread?: { id?: string; isResolved?: boolean } | null };
+      };
+      errors?: Array<{ message?: string }>;
+    }>(
+      `mutation ResolveReviewThread($threadId: ID!) {
+        resolveReviewThread(input: { threadId: $threadId }) {
+          thread { id isResolved }
+        }
+      }`,
+      { threadId },
+    );
+    if (envelope?.errors?.length || !envelope?.data?.resolveReviewThread?.thread) {
+      throw new GitHubError(
+        200,
+        'GitHub resolveReviewThread returned an errors envelope or no thread payload',
+        '/graphql',
+        `GitHub GraphQL resolveReviewThread reported failure`,
+      );
+    }
+    return envelope.data.resolveReviewThread.thread;
+  }
+
   async createCheckRun(
     owner: string,
     repo: string,

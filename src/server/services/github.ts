@@ -33,6 +33,25 @@ export class GitHubService {
     return this.client.getCompareDiff(owner, repo, base, head);
   }
 
+  // PROV-02: GraphQL thread listing (D-05..D-07, R-2). Cursor-paged via the client; the optional
+  // tracker is forwarded so the search consumer (Phase 19) can gate pagination near the Workers
+  // subrequest cap (R-9). REQUIRED here so the vi.mock('@server/services/github') seam intercepts.
+  async getReviewThreads(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    tracker?: { hasRemainingSafeBudget?(needed?: number): boolean },
+  ) {
+    return this.client.getReviewThreads(owner, repo, prNumber, tracker);
+  }
+
+  // PROV-02: resolve a review thread (R-2). Returns the resolved thread payload on success;
+  // throws `GitHubError` on any GraphQL errors envelope or missing data so the adapter can
+  // convert to a neutral `false`. REQUIRED here so the vi.mock seam intercepts.
+  async resolveReviewThread(threadId: string) {
+    return this.client.resolveReviewThread(threadId);
+  }
+
   async createCheckRun(owner: string, repo: string, params: { headSha: string; title: string; summary: string }) {
     return this.client.createCheckRun(owner, repo, params);
   }

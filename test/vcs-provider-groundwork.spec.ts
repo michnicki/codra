@@ -374,3 +374,285 @@ describe('PROV-01: Bitbucket content and compare primitives', () => {
     }
   });
 });
+
+// --- PROV-02: GitHub unresolved-bot-thread listing + resolution ---
+
+const GH_BOT_USER_ID = 99_999;
+const GH_OTHER_USER_ID = 12_345;
+
+function makeBotThread(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 'PRRT_kwDOAbcDefg01',
+    path: 'src/file.ts',
+    line: 12,
+    startLine: 12,
+    originalLine: null,
+    originalStartLine: null,
+    isResolved: false,
+    isOutdated: false,
+    comments: {
+      nodes: [
+        {
+          body: 'Bot root finding body',
+          replyTo: null,
+          author: { __typename: 'Bot', databaseId: GH_BOT_USER_ID },
+        },
+      ],
+    },
+    ...overrides,
+  };
+}
+
+describe('PROV-02: GitHub thread listing and resolution', () => {
+  it('getUnresolvedBotThreads traverses two pages and returns ONLY unresolved bot root threads', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const mock = installGitHubFetchMock({
+      ...buildGitHubFixtures(),
+      threadListResponses: [
+        {
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  nodes: [
+                    makeBotThread({ id: 'PRRT_page1_a', line: 5, startLine: 5 }),
+                    // Human (non-bot) thread: should be filtered.
+                    makeBotThread({
+                      id: 'PRRT_page1_human',
+                      comments: { nodes: [{ body: 'human', replyTo: null, author: { __typename: 'User', databaseId: GH_OTHER_USER_ID } }] },
+                    }),
+                    // Resolved: should be filtered (D-06).
+                    makeBotThread({ id: 'PRRT_page1_resolved', isResolved: true }),
+                    // Reply (not root): should be filtered.
+                    makeBotThread({
+                      id: 'PRRT_page1_reply',
+                      comments: { nodes: [{ body: 'reply', replyTo: { id: 'x' }, author: { __typename: 'Bot', databaseId: GH_BOT_USER_ID } }] },
+                    }),
+                  ],
+                  pageInfo: { hasNextPage: true, endCursor: 'CURSOR_1' },
+                },
+              },
+            },
+          },
+        },
+        {
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  nodes: [makeBotThread({ id: 'PRRT_page2_a', line: 30, startLine: 28 })],
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                },
+              },
+            },
+          },
+        },
+      ],
+    });
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      const threads = await adapter.getUnresolvedBotThreads(OWNER, REPO, PR_NUMBER);
+      expect(threads).toEqual([
+        {
+          ref: 'PRRT_page1_a',
+          path: 'src/file.ts',
+          lineStart: 5,
+          lineEnd: 5,
+          rootBody: 'Bot root finding body',
+          outdated: false,
+        },
+        {
+          ref: 'PRRT_page2_a',
+          path: 'src/file.ts',
+          lineStart: 28,
+          lineEnd: 30,
+          rootBody: 'Bot root finding body',
+          outdated: false,
+        },
+      ]);
+      // Two GraphQL pages must have been called.
+      const graphqlCalls = mock.calls.filter(
+        (call) => call.method === 'POST' && call.path === '/graphql',
+      );
+      expect(graphqlCalls).toHaveLength(2);
+      // After the first page the `after` variable must be the cursor; the second must be null.
+      expect(graphqlCalls[0].body?.variables?.after).toBeNull();
+      expect(graphqlCalls[1].body?.variables?.after).toBe('CURSOR_1');
+    } finally {
+      mock.restore();
+    }
+  });
+
+  it('returns [] when a later page fails (fail-closed pagination)', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const mock = installGitHubFetchMock({
+      ...buildGitHubFixtures(),
+      threadListResponses: [
+        {
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  nodes: [makeBotThread({ id: 'PRRT_first' })],
+                  pageInfo: { hasNextPage: true, endCursor: 'CURSOR_1' },
+                },
+              },
+            },
+          },
+        },
+      ],
+      threadListNonRetriable: true,
+    });
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      await expect(adapter.getUnresolvedBotThreads(OWNER, REPO, PR_NUMBER)).resolves.toEqual([]);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  it('returns [] when the GraphQL envelope carries `errors`', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const mock = installGitHubFetchMock({
+      ...buildGitHubFixtures(),
+      threadListResponses: [{ errors: [{ message: 'something went wrong' }] }],
+    });
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      await expect(adapter.getUnresolvedBotThreads(OWNER, REPO, PR_NUMBER)).resolves.toEqual([]);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  it('maps the R-3 current/original fallback for outdated threads and skips malformed ranges', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const mock = installGitHubFetchMock({
+      ...buildGitHubFixtures(),
+      threadListResponses: [
+        {
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  nodes: [
+                    // Outdated: only original anchors available -> fallback range + outdated true.
+                    makeBotThread({
+                      id: 'PRRT_outdated',
+                      line: null,
+                      startLine: null,
+                      originalLine: 7,
+                      originalStartLine: 5,
+                      isOutdated: true,
+                    }),
+                    // No anchors at all -> skipped rather than fabricated.
+                    makeBotThread({
+                      id: 'PRRT_no_anchors',
+                      line: null,
+                      startLine: null,
+                      originalLine: null,
+                      originalStartLine: null,
+                    }),
+                    // Empty path -> skipped.
+                    makeBotThread({ id: 'PRRT_empty_path', path: '' }),
+                    // Empty root body -> skipped.
+                    makeBotThread({ id: 'PRRT_empty_body', comments: { nodes: [{ body: '', replyTo: null, author: { __typename: 'Bot', databaseId: GH_BOT_USER_ID } }] } }),
+                  ],
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                },
+              },
+            },
+          },
+        },
+      ],
+    });
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      const threads = await adapter.getUnresolvedBotThreads(OWNER, REPO, PR_NUMBER);
+      expect(threads).toEqual([
+        {
+          ref: 'PRRT_outdated',
+          path: 'src/file.ts',
+          lineStart: 5,
+          lineEnd: 7,
+          rootBody: 'Bot root finding body',
+          outdated: true,
+        },
+      ]);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  it('resolveThread posts the ref as a GraphQL variable and returns true on success', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const mock = installGitHubFetchMock({
+      ...buildGitHubFixtures(),
+      resolveReviewThreadResponse: { status: 200, data: { resolveReviewThread: { thread: { id: 'PRRT_x', isResolved: true } } } },
+    });
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      await expect(adapter.resolveThread(OWNER, REPO, 'PRRT_x')).resolves.toBe(true);
+      const mutationCall = mock.calls.find(
+        (call) => call.method === 'POST' && call.path === '/graphql' && /ResolveReviewThread/.test(JSON.stringify(call.body?.query ?? '')),
+      );
+      expect(mutationCall).toBeDefined();
+      // Ref travels as a variable, never in query text (T-17-02-01).
+      expect(mutationCall?.body?.query).not.toContain('PRRT_x');
+      expect(mutationCall?.body?.variables?.threadId).toBe('PRRT_x');
+    } finally {
+      mock.restore();
+    }
+  });
+
+  it('resolveThread returns false on GraphQL errors and does not change the static capability', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const mock = installGitHubFetchMock({
+      ...buildGitHubFixtures(),
+      resolveReviewThreadResponse: { status: 200, errors: [{ message: 'mutation denied' }] },
+    });
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      await expect(adapter.resolveThread(OWNER, REPO, 'PRRT_x')).resolves.toBe(false);
+      // Capability stays static-true (D-04: only Bitbucket downgrades).
+      expect(adapter.capabilities.supportsThreadResolution).toBe(true);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  it('resolveThread rejects malformed/overlong refs BEFORE any HTTP request', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const mock = installGitHubFetchMock(buildGitHubFixtures());
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      // Empty / whitespace / control character
+      await expect(adapter.resolveThread(OWNER, REPO, '')).rejects.toThrow();
+      await expect(adapter.resolveThread(OWNER, REPO, '   ')).rejects.toThrow();
+      await expect(adapter.resolveThread(OWNER, REPO, 'PRRT_x\n')).rejects.toThrow();
+      // Overlong
+      await expect(adapter.resolveThread(OWNER, REPO, 'a'.repeat(300))).rejects.toThrow();
+      // No GraphQL calls must have been issued (the rejections are pre-wire).
+      const graphqlCalls = mock.calls.filter(
+        (call) => call.method === 'POST' && call.path === '/graphql',
+      );
+      expect(graphqlCalls).toHaveLength(0);
+    } finally {
+      mock.restore();
+    }
+  });
+});
