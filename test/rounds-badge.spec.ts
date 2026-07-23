@@ -123,6 +123,39 @@ describe('round audit display contract', () => {
     ]);
   });
 
+  it('rounds.escalated carries droppedAtEffectiveFloor through jobAuditEventSchema passthrough (defined and undefined both round-trip)', () => {
+    const timestamp = '2026-07-23T12:00:00.000Z';
+    const baseEscalated = {
+      stage: 'rounds.escalated',
+      from: { minConfidence: 0.7, minSeverity: 'P3' },
+      to: { minConfidence: 0.8, minSeverity: 'P2' },
+      effective: { minConfidence: 0.9, minSeverity: 'P2' },
+      round: 2,
+      timestamp,
+    };
+
+    // (a) When the producer wrote droppedAtEffectiveFloor, the parsed event exposes it
+    // (proves the .passthrough() carries the field end-to-end through the schema).
+    const parsedWithDropped = jobAuditEventSchema.parse({ ...baseEscalated, droppedAtEffectiveFloor: 3 });
+    expect((parsedWithDropped as JobAuditEvent & { droppedAtEffectiveFloor?: number }).droppedAtEffectiveFloor).toBe(3);
+
+    // (b) When the producer omitted droppedAtEffectiveFloor (legacy producer case), the parsed
+    // event leaves the field undefined — matches rounds.ts:363-365 conditional spread.
+    const parsedWithoutDropped = jobAuditEventSchema.parse(baseEscalated);
+    expect((parsedWithoutDropped as JobAuditEvent & { droppedAtEffectiveFloor?: number }).droppedAtEffectiveFloor).toBeUndefined();
+
+    // Both events flow through groupAuditByStage and the resulting group is unchanged:
+    // adding the field does NOT alter the display-stage grouping (still single 'rounds' group).
+    const grouped = groupAuditByStage([parsedWithDropped, parsedWithoutDropped]);
+    expect(grouped).toEqual([
+      {
+        stage: 'rounds',
+        count: 2,
+        events: [parsedWithDropped, parsedWithoutDropped],
+      },
+    ]);
+  });
+
   it('omits the rounds group when no rounds events exist', () => {
     expect(groupAuditByStage([])).toEqual([]);
   });

@@ -203,6 +203,9 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
             label="severity"
             value={`${event.from.minSeverity} → ${event.to.minSeverity} (effective ${event.effective.minSeverity})`}
           />
+          {event.droppedAtEffectiveFloor != null && (
+            <MetricLine label="dropped" value={String(event.droppedAtEffectiveFloor)} />
+          )}
         </li>
       );
     case 'rounds.suppressed':
