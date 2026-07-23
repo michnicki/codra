@@ -443,12 +443,32 @@ export class GitHubClient {
         );
       }
 
-      const data = (await response.json()) as { content?: string; encoding?: string };
-      if (!data.content) {
-        return null;
+      const data = (await response.json()) as { content?: unknown; encoding?: unknown };
+      // D-08 contract: null is reserved for 404 only. A valid 200 with empty string content
+      // is a real (empty) file, NOT the absent-file signal. A malformed successful payload
+      // (missing/non-string content or non-base64 encoding) must throw so the consumer can
+      // distinguish "the endpoint is lying" from "the file is gone".
+      if (typeof data.content !== 'string') {
+        throw new GitHubError(
+          200,
+          `GitHub repo file fetch returned a malformed payload (content is ${data.content === undefined ? 'missing' : typeof data.content})`,
+          path,
+          `GitHub repo file fetch succeeded but content is not a string`,
+        );
+      }
+      if (data.encoding !== 'base64') {
+        throw new GitHubError(
+          200,
+          `GitHub repo file fetch returned a malformed payload (unsupported encoding: ${String(data.encoding)})`,
+          path,
+          `GitHub repo file fetch succeeded but encoding is not 'base64'`,
+        );
+      }
+      if (data.content === '') {
+        return '';
       }
 
-      return data.encoding === 'base64' ? atob(data.content.replace(/\n/g, '')) : data.content;
+      return atob(data.content.replace(/\n/g, ''));
     });
   }
 

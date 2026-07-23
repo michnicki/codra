@@ -124,6 +124,47 @@ describe('PROV-01: GitHub content and compare primitives', () => {
     }
   });
 
+  // PROV-01 (D-08): 200 with empty `content` is a valid empty file, NOT an absent-file signal.
+  // The null sentinel is reserved for 404 only; a valid 200 empty body must return the literal
+  // empty string so consumers (e.g. Phase 19 verify-fixes) distinguish "file is empty" from
+  // "file is gone".
+  it("getFileContent returns the empty string '' on a 200-empty response (D-08)", async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const mock = installGitHubFetchMock({
+      ...buildGitHubFixtures(),
+      contentResponses: { status: 200, body: { content: '', encoding: 'base64' } },
+    });
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      const result = await adapter.getFileContent(OWNER, REPO, 'src/empty.ts', 'main');
+      expect(result).toBe('');
+    } finally {
+      mock.restore();
+    }
+  });
+
+  // PROV-01 (D-08): a malformed successful payload (missing `content` or non-string) is NOT the
+  // absent-file signal. The current contract puts `null` behind the 404 branch only; a 200 with no
+  // `content` field must be rejected loudly so a downstream consumer cannot mistake it for a
+  // missing file.
+  it('getFileContent throws GitHubError on a 200 response with missing/non-string content', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const mock = installGitHubFetchMock({
+      ...buildGitHubFixtures(),
+      contentResponses: { status: 200, body: { content: null, encoding: 'base64' } },
+    });
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      await expect(adapter.getFileContent(OWNER, REPO, 'src/malformed.ts', 'main')).rejects.toBeInstanceOf(GitHubError);
+    } finally {
+      mock.restore();
+    }
+  });
+
   it('getFileContent throws GitHubError on a non-404 content failure (401)', async () => {
     const env = createTestEnv();
     await seedInstallationToken(env, INSTALLATION_ID);
