@@ -157,6 +157,8 @@ export function resolveRoundContext(input: ResolveRoundInputs): ResolvedRoundCon
  */
 export type ComposeRoundFloorsOptions = {
   reviewRound: number;
+  reviewMode?: ReviewMode;
+  roundsIncremental?: boolean;
   base: { minConfidence: number; minSeverity: ReviewSeverity; categoryConfidence: Partial<Record<ParsedReviewComment['category'], number>> };
   escalateFloors: boolean;
 };
@@ -172,8 +174,13 @@ export type ComposedFloors = {
 };
 
 export function composeRoundFloors(opts: ComposeRoundFloorsOptions): ComposedFloors {
-  // D-12: disable round escalation entirely. Floor config is unchanged.
-  if (!opts.escalateFloors || opts.reviewRound < 2) {
+  const modeEligible = (opts.reviewMode ?? 'incremental') === 'incremental' || opts.reviewMode === 'fallback';
+  const escalationEligible =
+    (opts.roundsIncremental ?? true) && modeEligible && opts.escalateFloors && opts.reviewRound >= 2;
+
+  // D-09/D-12: only durable incremental round consumers can raise floors. Full, rest, and
+  // no_changes modes stay byte-identical even if their persisted round number is 2+.
+  if (!escalationEligible) {
     return {
       minConfidence: opts.base.minConfidence,
       minSeverity: opts.base.minSeverity,
