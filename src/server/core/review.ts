@@ -52,6 +52,7 @@ import {
   buildRoundsNoChangesEvent,
   buildRoundsSuppressedEvent,
   composeRoundFloors,
+  isRoundSuppressionEligible,
   resolveRoundContext,
   selectDiffForRound,
   suppressByOpenThreads,
@@ -1872,10 +1873,11 @@ async function runFinalizePhase(
   // job. `roundsIncremental` is the prepare-time persisted snapshot, so a live config change cannot
   // activate or deactivate suppression halfway through a durable workflow. no_changes returned above;
   // full/rest modes and round 1 remain inert.
-  const suppressionEligible =
-    (job.reviewRound ?? 1) >= 2
-    && (job.roundsIncremental ?? false)
-    && (job.reviewMode === 'incremental' || job.reviewMode === 'fallback');
+  const suppressionEligible = isRoundSuppressionEligible({
+    reviewRound: job.reviewRound ?? 1,
+    reviewMode: job.reviewMode ?? 'full',
+    roundsIncremental: job.roundsIncremental ?? false,
+  });
   let unresolvedThreads: VcsReviewThread[] = [];
   let suppressionUnavailableReason: 'capability_unavailable' | 'listing_failed' | null = null;
   if (suppressionEligible) {

@@ -211,6 +211,16 @@ export function composeRoundFloors(opts: ComposeRoundFloorsOptions): ComposedFlo
   };
 }
 
+export function isRoundSuppressionEligible(input: {
+  reviewRound: number;
+  reviewMode: ReviewMode;
+  roundsIncremental: boolean;
+}): boolean {
+  return input.reviewRound >= 2
+    && input.roundsIncremental
+    && (input.reviewMode === 'incremental' || input.reviewMode === 'fallback');
+}
+
 // ───────────────────────────────────────────────────────────────────────────────────────
 // D-08 / D-09 RND-04 thread-overlap helper.
 // ───────────────────────────────────────────────────────────────────────────────────────

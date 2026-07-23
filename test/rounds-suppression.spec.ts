@@ -4,6 +4,7 @@ import type { MergeRecord } from '@server/core/dedup';
 import { applyNoiseFilter, type NoiseFilterOptions } from '@server/core/noise-filter';
 import {
   buildRoundsSuppressedEvent,
+  isRoundSuppressionEligible,
   overlapsOpenThread,
   suppressByOpenThreads,
 } from '@server/core/rounds';
@@ -58,6 +59,19 @@ function filterOptions(
     ...overrides,
   };
 }
+
+
+describe('isRoundSuppressionEligible', () => {
+  it('requires a durable enabled round-2+ incremental or fallback consumer', () => {
+    expect(isRoundSuppressionEligible({ reviewRound: 2, reviewMode: 'incremental', roundsIncremental: true })).toBe(true);
+    expect(isRoundSuppressionEligible({ reviewRound: 3, reviewMode: 'fallback', roundsIncremental: true })).toBe(true);
+    expect(isRoundSuppressionEligible({ reviewRound: 1, reviewMode: 'incremental', roundsIncremental: true })).toBe(false);
+    expect(isRoundSuppressionEligible({ reviewRound: 2, reviewMode: 'incremental', roundsIncremental: false })).toBe(false);
+    expect(isRoundSuppressionEligible({ reviewRound: 2, reviewMode: 'full', roundsIncremental: true })).toBe(false);
+    expect(isRoundSuppressionEligible({ reviewRound: 2, reviewMode: 'rest', roundsIncremental: true })).toBe(false);
+    expect(isRoundSuppressionEligible({ reviewRound: 2, reviewMode: 'no_changes', roundsIncremental: true })).toBe(false);
+  });
+});
 
 describe('overlapsOpenThread', () => {
   it('matches a finding point at either inclusive range boundary', () => {

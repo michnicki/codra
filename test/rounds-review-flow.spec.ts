@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { runReviewJob } from '@server/core/review';
+import { logger } from '@server/core/logger';
 import { getJobDetail, getJobForProcessing, insertJob, mapJob, setJobDiffSelection, setJobReviewRoundAndMode, updateJobFileCount, updateJobStep } from '@server/db/jobs';
 import { setLastReviewedSha, type PrReviewStateKey } from '@server/db/pr-review-state';
 import { upsertFileReview } from '@server/db/file-reviews';
@@ -51,6 +52,7 @@ async function seedRoundFinalizeJob(
     config?: RepoConfig;
     comments: ParsedReviewComment[];
     reviewMode?: 'incremental' | 'fallback';
+    reviewScope?: 'all' | 'rest' | 'head';
   },
 ) {
   const config = input.config ?? defaultRoundsConfig(true);
@@ -67,6 +69,7 @@ async function seedRoundFinalizeJob(
     headRef: 'feature',
     baseRef: 'main',
     configSnapshot: config,
+    reviewScope: input.reviewScope,
   });
   await updateJobFileCount(env, job.id, 1);
   await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
@@ -751,6 +754,46 @@ dbDescribe('Phase 18 Plan 02 — durable selection + no_changes placeholder inte
       effective: { minConfidence: 0.8, minSeverity: 'P2' },
       droppedAtEffectiveFloor: 1,
     });
+  }, 30000);
+
+  it('listing failure fails open and records a degraded suppression reason', async () => {
+    const env = createTestEnv();
+    const candidate: ParsedReviewComment = {
+      path: 'src/x.ts',
+      line: 1,
+      position: 1,
+      severity: 'P2',
+      category: 'quality',
+      title: 'uncertain thread data',
+      body: 'must remain visible when listing fails',
+      confidence: 0.9,
+    };
+    const job = await seedRoundFinalizeJob(env, {
+      repo: `repo-suppression-failure-${Date.now()}`,
+      comments: [candidate],
+    });
+
+    const provider = await VcsService.forRepo(env, { installationId: '123', repositoryVcsProvider: 'github' });
+    const listThreadsSpy = vi.spyOn(provider, 'getUnresolvedBotThreads').mockRejectedValue(new Error('thread API unavailable'));
+    vi.spyOn(VcsService, 'forRepo').mockResolvedValue(provider);
+
+    const warnSpy = vi.spyOn(logger, 'warn');
+    await runWithDb(env, async () => {
+      const result = await runReviewJob(env, {
+        jobId: job.id,
+        deliveryId: `delivery-suppression-failure-${Date.now()}`,
+        phase: 'finalize',
+      });
+      expect(result).toEqual({ action: 'ack' });
+    });
+
+    expect(listThreadsSpy).toHaveBeenCalledTimes(1);
+    expect(noiseFilterResults[0].kept).toHaveLength(1);
+    expect(noiseFilterResults[0].suppressed).toEqual([]);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`Open-thread suppression degraded for job ${job.id}`),
+      expect.objectContaining({ reason: 'listing_failed', provider: 'github' }),
+    );
   }, 30000);
 
   it('default-disabled byte identity: rounds.incremental:false never calls getCompareDiff', async () => {
