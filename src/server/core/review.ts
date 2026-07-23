@@ -47,6 +47,7 @@ import {
 } from './audit';
 import {
   buildRoundInputsFromConfig,
+  buildRoundsAnchorSkippedEvent,
   buildRoundsDetectedEvent,
   buildRoundsEscalatedEvent,
   buildRoundsNoChangesEvent,
@@ -2662,8 +2663,17 @@ async function finalizeNoChangesPlaceholder(
 
   // D-13 idempotent completion. completeJob is idempotent on the row state (re-running after
   // completion is a no-op), so a freeze/crash + retry of finalize lands the same done state +
-  // same payload. The audit event was emitted once in prepare; `recordRoundAudit` has its own
-  // append guard so even a retry that reaches the recorder would not duplicate the event.
+  // same payload.
+  //
+  // Re-emit risk on prepare-phase retry (NOT mitigated by recordRoundAudit — see audit.ts:287-300):
+  // `recordRoundAudit` -> `appendJobAuditEvents` concatenates events unconditionally; there is no
+  // per-stage `(job_id, stage)` idempotency guard. A prepare-phase subrequest-budget failure
+  // between the `rounds.detected` / `rounds.no_changes` emit and `enqueueJobPhase('finalize')`
+  // causes a re-run that re-emits both events. The duplicate is bounded by the 500-event ring
+  // buffer (Phase 13 D-12) and affects NO operational state (completeJob is idempotent, the
+  // anchor setter is monotonic, and the placeholder completion payload is identical). A future
+  // hardening pass could add a per-stage dedup check at the cost of one DB subrequest per emit
+  // — rejected for the finalize path to keep the subrequest budget intact.
   await completeJob(env, job.id, {
     verdict: 'comment',
     fileCount: 0,
@@ -2687,16 +2697,35 @@ async function finalizeNoChangesPlaceholder(
     repoSlug: job.repo,
     prNumber: job.prNumber,
   };
-  try {
-    await setLastReviewedSha(env, prReviewStateKey, {
-      headSha: job.roundsToSha ?? null,
-      reviewRound: job.reviewRound ?? 1,
-    });
-  } catch (error) {
-    logger.warn(
-      `Failed to advance anchor for no_changes finalize of job ${job.id}; next push will see the prior anchor`,
-      error instanceof Error ? error : new Error(String(error)),
-    );
+  // D-15 defensive guard: empty head SHA -> emit `rounds.anchor_skipped` audit event BEFORE
+  // calling the setter, so the audit trail makes the skip visible (D-15 rejected "log warning
+  // only" as an invisible skip). The setter still returns null on empty head (D-15 guard) so
+  // the anchor remains unwritten; the placeholder still completes with the existing neutral
+  // status check above.
+  const headSha = (job.roundsToSha ?? '').trim();
+  if (headSha.length === 0) {
+    try {
+      await recordRoundAudit(env, job.id, [
+        buildRoundsAnchorSkippedEvent({ reason: 'empty_head', round: job.reviewRound ?? null }),
+      ]);
+    } catch (error) {
+      logger.warn(
+        `Failed to record rounds.anchor_skipped audit for job ${job.id}`,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+  } else {
+    try {
+      await setLastReviewedSha(env, prReviewStateKey, {
+        headSha: job.roundsToSha ?? null,
+        reviewRound: job.reviewRound ?? 1,
+      });
+    } catch (error) {
+      logger.warn(
+        `Failed to advance anchor for no_changes finalize of job ${job.id}; next push will see the prior anchor`,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
   }
 
   // Diff cache cleanup (the cached diff is empty for no_changes, but mirror the existing

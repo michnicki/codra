@@ -2,7 +2,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { runReviewJob } from '@server/core/review';
 import { logger } from '@server/core/logger';
 import { getJobDetail, getJobForProcessing, insertJob, mapJob, setJobDiffSelection, setJobReviewRoundAndMode, updateJobFileCount, updateJobStep } from '@server/db/jobs';
-import { setLastReviewedSha, type PrReviewStateKey } from '@server/db/pr-review-state';
+import { setLastReviewedSha, getPrReviewState, type PrReviewStateKey } from '@server/db/pr-review-state';
 import { upsertFileReview } from '@server/db/file-reviews';
 import { runWithDb } from '@server/db/client';
 import { VcsService } from '@server/services/vcs';
@@ -419,6 +419,105 @@ dbDescribe('Phase 18 Plan 02 — durable selection + no_changes placeholder inte
     expect(lastCall[3].conclusion).toBe('neutral');
 
     // No submitReview was made (the placeholder posts no review).
+    expect(createReviewSpy).not.toHaveBeenCalled();
+  }, 30000);
+
+  it('empty-head finalize emits rounds.anchor_skipped and leaves pr_review_state unwritten (D-15 producer)', async () => {
+    // Phase 18 Plan 06 / Gap 1 closure: the defensive empty-head guard in setLastReviewedSha
+    // (D-15) returns null on empty head, but until Plan 06 no production code emitted the
+    // `rounds.anchor_skipped` audit event, so the skip was invisible to operators. This test
+    // seeds a job whose prepare-time head SHA is empty (the defensive edge case) and asserts
+    // the finalize phase produces the audit event AND preserves the existing completion path
+    // (D-05 / D-07 unchanged: status='done', no submitReview, anchor row never written).
+    const env = createTestEnv();
+    const config = defaultRoundsConfig(true);
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo: `repo-empty-head-${Date.now()}`,
+      prNumber: 6,
+      prTitle: 'Empty head PR',
+      prAuthor: 'author',
+      commitSha: sha('t'),
+      baseSha: sha('0'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: config,
+    });
+
+    const prReviewStateKey: PrReviewStateKey = {
+      vcsProvider: 'github',
+      workspace: 'test-owner',
+      repoSlug: job.repo,
+      prNumber: job.prNumber,
+    };
+    // Seed a prior anchor so the resolver picks round 2 (incremental) — the empty-head guard
+    // fires regardless of round context, but round 2 + incremental is the canonical path that
+    // exercises finalizeNoChangesPlaceholder.
+    await setLastReviewedSha(env, prReviewStateKey, { headSha: sha('a'), reviewRound: 1 });
+
+    const { GitHubService } = await import('@server/services/github');
+    vi.spyOn(GitHubService.prototype, 'getCompareDiff').mockResolvedValue('');
+    vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue('');
+    const updateCheckRunSpy = vi.spyOn(GitHubService.prototype, 'updateCheckRun').mockResolvedValue(undefined);
+    const createReviewSpy = vi.spyOn(GitHubService.prototype, 'createReview');
+
+    await runWithDb(env, async () => {
+      await runReviewJob(env, {
+        jobId: job.id,
+        deliveryId: `delivery-empty-head-prepare-${Date.now()}`,
+        phase: 'prepare',
+      });
+    });
+
+    // Force the persisted roundsToSha to empty so the finalize-time D-15 guard trips. In
+    // production this would happen if `pr.headSha` was empty/zero-length; the setter returns
+    // null in that case but the audit event is the observable signal for the operator.
+    await setJobDiffSelection(env, job.id, {
+      mode: 'no_changes',
+      fromSha: sha('a'),
+      toSha: '', // empty head -> D-15 defensive guard fires
+    });
+
+    await runWithDb(env, async () => {
+      const res = await runReviewJob(env, {
+        jobId: job.id,
+        deliveryId: `delivery-empty-head-finalize-${Date.now()}`,
+        phase: 'finalize',
+      });
+      expect(res.action).toBe('ack');
+    });
+
+    const detail = await getJobDetail(env, job.id);
+
+    // D-05 / D-07: completion path is UNCHANGED. Empty-head does not regress the placeholder.
+    expect(detail!.status).toBe('done');
+    expect(detail!.fileCount).toBe(0);
+    expect(detail!.commentCount).toBe(0);
+    expect(detail!.verdict).toBe('comment');
+
+    // D-15: the audit trail carries EXACTLY ONE `rounds.anchor_skipped` event with the locked
+    // shape. (The prepare-phase `rounds.detected` + finalize-phase `rounds.no_changes` events
+    // are unaffected; this assertion targets the NEW producer wired in Plan 06.)
+    const anchorSkippedEvents = detail!.audit.filter((e) => e.stage === 'rounds.anchor_skipped');
+    expect(anchorSkippedEvents).toHaveLength(1);
+    expect(anchorSkippedEvents[0]).toMatchObject({
+      stage: 'rounds.anchor_skipped',
+      reason: 'empty_head',
+      round: 2,
+    });
+
+    // The setter was NEVER called for the empty head: pr_review_state still reflects the
+    // PRIOR anchor (round 1 / sha('a')) — the empty-head defensive guard is honored end-to-end.
+    const state = await getPrReviewState(env, prReviewStateKey);
+    expect(state!.last_reviewed_sha).toBe(sha('a'));
+    expect(state!.last_review_round).toBe(1);
+
+    // Status check completed with neutral conclusion (D-05 unchanged).
+    expect(updateCheckRunSpy).toHaveBeenCalled();
+    // No submitReview (placeholder semantics preserved).
     expect(createReviewSpy).not.toHaveBeenCalled();
   }, 30000);
 
