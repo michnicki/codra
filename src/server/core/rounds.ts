@@ -386,3 +386,134 @@ export function buildRoundInputsFromConfig(input: {
     roundsIncremental: Boolean(input.config.review?.rounds?.incremental ?? false),
   };
 }
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// D-04 / D-05 / D-06 / D-07 incremental-diff selection (RND-02).
+// ───────────────────────────────────────────────────────────────────────────────────────
+
+import type { FileDiff } from './diff';
+
+/**
+ * The immutable selection descriptor for a single prepare run. Persisted on the job row as the
+ * durable record of "what diff source did this round select, from which exact bases, anchored to
+ * which exact head". A consumer (runReviewPhase / runFinalizePhase) reads the descriptor and:
+ *
+ *   - `incremental` / `fallback`: re-fetch the SAME compare range (not the full PR diff) and use
+ *     whatever raw diff the VCS provider returns. The selection is the durable fact; the cache
+ *     is a best-effort accelerator that is NEVER allowed to silently switch the source.
+ *   - `no_changes`: finalize the placeholder immediately (no model call, no review post, no
+ *     walkthrough edit). The review/finalize phases short-circuit on this descriptor.
+ *   - `full` / `rest`: the existing pre-Phase-18 paths — keep today's behavior byte-identically.
+ *
+ * `fromSha` / `toSha` are the EXACT prepare-time anchors (D-08): finalize never anchors a
+ * freshly-fetched live head. When `mode === 'no_changes'`, `fromSha` is the prior anchor and
+ * `toSha` is the prepare-time head so the audit `rounds.no_changes` event carries the locked
+ * `{ from, to }` shape.
+ */
+export type DiffSelectionDescriptor =
+  | { mode: 'full' }
+  | { mode: 'rest' }
+  | { mode: 'incremental' | 'fallback'; fromSha: string; toSha: string }
+  | { mode: 'no_changes'; fromSha: string; toSha: string };
+
+/**
+ * Inputs to `selectDiffForRound`. The caller supplies the resolved round context (D-01) plus
+ * the raw compare + full-diff results it has already fetched. The helper is PURE: it never
+ * makes a VCS call of its own; the caller does the I/O and passes the strings in. The decision
+ * tree (D-04 / D-05 / D-06 / D-07):
+ *
+ *   - mode === 'full' / 'rest'           -> return as-is (pre-Phase-18 paths, byte-identical).
+ *   - mode === 'fallback' (no anchor)    -> compare throws -> fetchFull; if non-empty, return
+ *                                            'fallback' with selected head; if empty, return
+ *                                            'no_changes' anchored to the prepare head.
+ *   - mode === 'incremental' (anchor)    -> compare throws -> fetchFull; if non-empty, return
+ *                                            'fallback' with the same (from, to) range; if empty,
+ *                                            return 'no_changes' with the same (from, to) range.
+ *                                          -> compare returns a NON-empty, parseable diff ->
+ *                                            return 'incremental' with the (from, to) range.
+ *                                          -> compare returns empty / whitespace / junk ->
+ *                                            a LEGITIMATE empty compare (per the Phase 17 D-09
+ *                                            contract: a successful '' is a valid "no changes"
+ *                                            answer, distinct from an HTTP error). The full diff
+ *                                            is NOT consulted (the caller did not fetch it).
+ *                                            Return 'no_changes' with the (from, to) range.
+ *
+ * Crucially (Codex/Antigravity HIGH consensus): a successful empty compare is NOT a fallback
+ * signal. Only a thrown compare (true HTTP/parse failure) falls back to the full diff. The full
+ * diff is then the final source: empty -> no_changes, non-empty -> fallback.
+ *
+ * `compareFiles` is the parsed result of the raw compare response after `parseUnifiedDiff`
+ * (Antigravity/Codex MEDIUM); a successful compare that parses to ZERO files is a legitimate
+ * empty compare, NOT a malformed one. The raw string is kept for the whitespace / junk branch.
+ *
+ * `compareThrew` is the loader's signal that the full diff was actually fetched as a fallback
+ * (default false). When true, the caller has already consulted `fullDiff` / `fullFiles` and the
+ * helper uses them. When false, the full diff is NEVER consulted and an empty/junk compare
+ * resolves to 'no_changes' — the plan's "no full fetch" guarantee.
+ */
+export type SelectDiffForRoundInputs = {
+  /** The resolved round context (mode + anchors + round). */
+  roundContext: Pick<ResolvedRoundContext, 'mode' | 'anchorSha'> & { round: number };
+  /** True iff the caller caught an exception from `vcs.getCompareDiff(...)` and fetched the full diff. */
+  compareThrew?: boolean;
+  /** The raw string returned by `vcs.getCompareDiff(anchor, head)`. Empty string is allowed. */
+  compareDiff: string;
+  /** The parsed files from `parseUnifiedDiff(compareDiff)`. Zero-length is legitimate. */
+  compareFiles: ReadonlyArray<FileDiff>;
+  /** The full PR diff returned by `vcs.getPullRequestDiff(...)`. Empty string is allowed. */
+  fullDiff: string;
+  /** The parsed files from `parseUnifiedDiff(fullDiff)`. Zero-length is the empty-full case. */
+  fullFiles: ReadonlyArray<FileDiff>;
+  /** The prepare-time head SHA (the one captured BEFORE the review started — D-08 anchored). */
+  toSha: string;
+};
+
+/**
+ * Pure selection helper (RND-02 / D-04..D-07). Returns the immutable selection descriptor the
+ * caller persists on the job row. NEVER throws — the thrown-compare path is modelled by the
+ * caller passing `compareThrew: true` AND the (caught) full diff as `fullDiff`. The helper
+ * classifies into one of the four cases documented on `DiffSelectionDescriptor`.
+ */
+export function selectDiffForRound(input: SelectDiffForRoundInputs): DiffSelectionDescriptor {
+  const { mode, anchorSha } = input.roundContext;
+  const compareThrew = input.compareThrew ?? false;
+
+  // Pre-Phase-18 paths: keep today's behavior byte-identically (NREG-01).
+  if (mode === 'full') return { mode: 'full' };
+  if (mode === 'rest') return { mode: 'rest' };
+
+  // 'fallback' (no anchor) has nothing to compare against — the caller requested the full diff
+  // (e.g. `rounds.incremental: false` after a prior anchor, or thread-only D-04). The "compare
+  // threw" shape is the caller passing `compareDiff = ''` and `compareFiles = []`; the helper
+  // passes the full diff through unchanged.
+  if (mode === 'fallback') {
+    if (input.fullFiles.length > 0) {
+      return { mode: 'fallback', fromSha: anchorSha ?? '', toSha: input.toSha };
+    }
+    return { mode: 'no_changes', fromSha: anchorSha ?? '', toSha: input.toSha };
+  }
+
+  // 'incremental' (anchor + rounds.incremental). The thrown-compare shape passes compareDiff='',
+  // compareFiles=[], compareThrew=true. Otherwise we inspect the parsed compare output:
+  if (input.compareFiles.length > 0) {
+    return {
+      mode: 'incremental',
+      fromSha: anchorSha ?? '',
+      toSha: input.toSha,
+    };
+  }
+
+  // Empty compare + compare did NOT throw -> a legitimate empty compare per Phase 17 D-09. The
+  // full diff was NOT fetched (the plan's "no full fetch" rule). Return no_changes immediately.
+  if (!compareThrew) {
+    return { mode: 'no_changes', fromSha: anchorSha ?? '', toSha: input.toSha };
+  }
+
+  // Compare threw and the caller fetched the full diff. The full diff is now the source:
+  // empty -> no_changes, non-empty -> fallback. The (from, to) range is preserved so the
+  // finalize phase re-fetches the SAME compare range, never a different live head.
+  if (input.fullFiles.length > 0) {
+    return { mode: 'fallback', fromSha: anchorSha ?? '', toSha: input.toSha };
+  }
+  return { mode: 'no_changes', fromSha: anchorSha ?? '', toSha: input.toSha };
+}
