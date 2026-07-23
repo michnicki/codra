@@ -88,6 +88,14 @@ export type JobRow = {
   review_round: number | null;
   review_mode: string | null;
   rounds_incremental: boolean;
+  // Phase 18 (migration 012, RND-02 / D-08 widened): the immutable diff-selection descriptor.
+  // rounds_from_sha is the prepare-time anchor SHA (the prior PR head, or '' for full / rest).
+  // rounds_to_sha is the prepare-time head SHA captured BEFORE the review started — finalize
+  // never anchors a freshly-fetched live head. Both NULLABLE so pre-Phase-18 rows read back
+  // without throwing, and the consumer helpers treat NULL as "no descriptor recorded" (the
+  // existing full-diff path stays byte-identical, NREG-01).
+  rounds_from_sha: string | null;
+  rounds_to_sha: string | null;
 };
 
 type JobStep = {
@@ -237,6 +245,13 @@ export function mapJob(row: JobRow) {
     reviewRound: row.review_round,
     reviewMode: row.review_mode,
     roundsIncremental: row.rounds_incremental,
+    // Phase 18 (RND-02 / D-08, migration 012): surface the immutable diff-selection descriptor.
+    // Both NULL when no descriptor was written (pre-Phase-18 rows + a fresh job whose prepare
+    // phase hasn't run yet). The consumer helpers (getCachedRawDiff / runFinalizePhase's no_changes
+    // branch) treat NULL as "no incremental selection recorded" and fall through to the existing
+    // full-diff path (NREG-01).
+    roundsFromSha: row.rounds_from_sha,
+    roundsToSha: row.rounds_to_sha,
   });
 }
 
@@ -1343,6 +1358,47 @@ export async function setJobReviewRoundAndMode(
       WHERE id = $1
     `,
     [jobId, state.reviewRound, state.reviewMode],
+  );
+}
+
+/**
+ * Phase 18 (RND-02 / D-08, migration 012): persist the IMMUTABLE diff-selection descriptor on
+ * the job row so the review/finalize phases re-fetch the EXACT same compare range the prepare
+ * phase selected (D-08: finalize never anchors a freshly-fetched live head). The descriptor
+ * is the durable fact; the KV diff cache is only a best-effort accelerator and is NEVER allowed
+ * to silently switch the source (Codex/Antigravity HIGH consensus — incremental-mode cache miss
+ * MUST NOT call the implicit full-diff helper).
+ *
+ * `fromSha` / `toSha` are populated for modes 'incremental' / 'fallback' / 'no_changes' (the
+ * cases where the prepare phase made a non-trivial selection against the prior anchor). For
+ * 'full' / 'rest' the descriptor is just the mode (the consumer uses the existing full-diff
+ * path, byte-identically with NREG-01). The writer is idempotent — re-calling with the same
+ * descriptor overwrites with the same values — and never throws into the caller (a failed
+ * write is logged + swallowed by the caller's try/catch so the prepare phase can continue).
+ * Single parameterized UPDATE; no string interpolation.
+ */
+export async function setJobDiffSelection(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  descriptor:
+    | { mode: 'full' | 'rest' }
+    | { mode: 'incremental' | 'fallback' | 'no_changes'; fromSha: string; toSha: string },
+): Promise<void> {
+  const fromSha: string | null = descriptor.mode === 'full' || descriptor.mode === 'rest'
+    ? null
+    : (descriptor as { fromSha: string; toSha: string }).fromSha;
+  const toSha: string | null = descriptor.mode === 'full' || descriptor.mode === 'rest'
+    ? null
+    : (descriptor as { fromSha: string; toSha: string }).toSha;
+  await queryRows(
+    env,
+    `
+      UPDATE jobs
+      SET rounds_from_sha = $2,
+          rounds_to_sha = $3
+      WHERE id = $1
+    `,
+    [jobId, fromSha, toSha],
   );
 }
 

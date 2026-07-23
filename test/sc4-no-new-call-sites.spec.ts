@@ -27,9 +27,14 @@ import { describe, expect, it } from 'vitest';
 // for thread-aware round detection. That call site is the documented Phase 18 consumer of the
 // Phase 17 seam primitive, scoped to one method call gated by config + capability. The scan
 // excludes it via SC4_ALLOWLISTED_REVIEW_CALL_SITES so the broader NREG-01 invariant stays tight
-// for every other primitive, including the three that Phase 18 does NOT yet consume
-// (`getFileContent`, `getCompareDiff`, `resolveThread`). A future phase that adds a new
-// `getCompareDiff` consumer must extend the carve-out and document why here.
+// for every other primitive, including the two that Phase 18 does NOT yet consume
+// (`getFileContent`, `resolveThread`). Phase 18 Plan 02 (RND-02) ALSO wires `getCompareDiff`
+// in `src/server/core/review.ts` (the prepare-time selection block, gated on
+// `rounds.incremental && hasAnchor`) and the typed `selectDiffForRound` signature in
+// `src/server/core/rounds.ts` references the seam primitive's name in JSDoc. The
+// `getCompareDiff` carve-out is build-time-only: the call site is gated so the consumer is
+// inert at defaults (NREG-01). A future phase that adds a new consumer must extend the
+// carve-out and document why here.
 
 const PROJECT_ROOT = join(__dirname, '..');
 
@@ -71,13 +76,16 @@ const SOURCE_SCAN_ALLOWLIST = new Set<string>([
 
 // Phase 18 carve-out: identifiers `getUnresolvedBotThreads` is permitted ONLY in
 // `src/server/core/review.ts` (the documented RND-01 / RND-04 round-detection + suppression
-// consumer). The other three Phase 17 primitives (`getFileContent`, `getCompareDiff`,
-// `resolveThread`) stay flagged everywhere because Phase 18 does NOT yet consume them -- any
-// future wiring must extend this carve-out explicitly. Stored as `{ file -> Set<identifier> }`
-// so the scan can verify the precise identifier allowed in each file rather than a blanket
-// file-level pass.
+// consumer). Phase 18 Plan 02 (RND-02) ALSO wires `getCompareDiff` in `src/server/core/review.ts`
+// (the prepare-time selection block, gated on `rounds.incremental && hasAnchor`) and the typed
+// `selectDiffForRound` signature in `src/server/core/rounds.ts` references the seam primitive's
+// name in JSDoc. The other two Phase 17 primitives (`getFileContent`, `resolveThread`) stay
+// flagged everywhere because Phase 18 does NOT yet consume them -- any future wiring must extend
+// this carve-out explicitly. Stored as `{ file -> Set<identifier> }` so the scan can verify
+// the precise identifier allowed in each file rather than a blanket file-level pass.
 const SC4_ALLOWLISTED_REVIEW_CALL_SITES = new Map<string, ReadonlySet<string>>([
-  ['src/server/core/review.ts', new Set(['getUnresolvedBotThreads'])],
+  ['src/server/core/review.ts', new Set(['getUnresolvedBotThreads', 'getCompareDiff'])],
+  ['src/server/core/rounds.ts', new Set(['getCompareDiff'])],
 ]);
 
 function collectProductionFiles(dir: string): string[] {

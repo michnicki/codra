@@ -20,6 +20,7 @@ import {
   markJobContinuationQueued,
   resetJobContinuationCount,
   releaseJobLease,
+  setJobDiffSelection,
   setJobPullRequestMeta,
   setJobReviewRoundAndMode,
   setJobWorkflowInstance,
@@ -29,7 +30,7 @@ import {
   updateJobStatusCheckRef,
   updateJobStep,
 } from '@server/db/jobs';
-import { getPrReviewState, type PrReviewStateKey } from '@server/db/pr-review-state';
+import { getPrReviewState, setLastReviewedSha, type PrReviewStateKey } from '@server/db/pr-review-state';
 import { filterReviewableFiles, parseUnifiedDiff, partitionReviewableFiles, selectReviewableFiles, type FileDiff, type FileSelectionResult } from './diff';
 import { insertSkippedFiles, listSkippedFilesForHead, type SkippedFilesHeadKey } from '@server/db/skipped-files';
 import { dedupeComposite, dedupeFindings } from './dedup';
@@ -47,7 +48,10 @@ import {
 import {
   buildRoundInputsFromConfig,
   buildRoundsDetectedEvent,
+  buildRoundsNoChangesEvent,
   resolveRoundContext,
+  selectDiffForRound,
+  type DiffSelectionDescriptor,
 } from './rounds';
 
 import { VcsService } from '../services/vcs';
@@ -931,10 +935,106 @@ async function runPreparePhase(
   // NO file_skipped events (a review-rest job consumes prior skips, it does not re-record drops).
   let files: FileDiff[];
   let dropped: FileSelectionResult['dropped'] | null = null;
+  // Phase 18 Plan 02 (RND-02): the durable, immutable diff-selection descriptor. Persisted on
+  // the job row IMMEDIATELY after the prepare-time resolver + compare-fetch + selectDiffForRound
+  // classify the diff source so review/finalize can re-fetch the EXACT same compare range on
+  // fresh-instance handoff / lease recovery (Codex/Antigravity HIGH: incremental-mode cache miss
+  // MUST NOT call the implicit full-diff helper). The descriptor is the durable fact; the
+  // cache is only a best-effort accelerator.
+  let selectionDescriptor: DiffSelectionDescriptor | null = null;
   if (job.reviewScope === 'rest') {
     files = await getJobDiffFiles(env, job, vcs, config);
   } else {
-    const rawDiff = await getCachedRawDiff(env, job, vcs);
+    // Build the descriptor against the prepare-time round context. The full diff is fetched on
+    // 'full' (the default round 1 path) AND on the thrown-compare fallback path for 'incremental'.
+    // 'fallback' mode (thread-only D-04 path) uses the full diff as the source directly.
+    const roundContextForSelection = await resolveRoundContextForJob(env, job, vcs, config);
+    let compareDiff = '';
+    let compareFiles: FileDiff[] = [];
+    let compareThrew = false;
+    let fullDiff = '';
+    let fullFiles: FileDiff[] = [];
+
+    // For incremental mode (anchor + rounds.incremental), attempt the compare fetch first.
+    if (roundContextForSelection.mode === 'incremental' && roundContextForSelection.anchorSha) {
+      try {
+        compareDiff = await vcs.getCompareDiff(job.owner, job.repo, roundContextForSelection.anchorSha, pr.headSha);
+        compareFiles = parseUnifiedDiff(compareDiff, config.review);
+      } catch (error) {
+        // Thrown compare -> fall back to the full diff. The LOGGER + the descriptor's
+        // compareThrew flag flag this case distinctly from a successful empty compare.
+        compareThrew = true;
+        logger.warn(
+          `getCompareDiff threw for job ${job.id}; falling back to full PR diff`,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      }
+    }
+
+    // Always fetch the full diff in fallback mode (D-04) and on the thrown-compare path
+    // (the only legal fallback triggers). 'full' mode also fetches the full diff (today's path).
+    // 'incremental' with a successful compare does NOT fetch the full diff (the plan's "no full
+    // fetch" rule for legitimate empty compares).
+    const needsFullDiff =
+      roundContextForSelection.mode === 'full' ||
+      roundContextForSelection.mode === 'fallback' ||
+      compareThrew;
+    if (needsFullDiff) {
+      fullDiff = await vcs.getPullRequestDiff(job.owner, job.repo, job.prNumber);
+      fullFiles = parseUnifiedDiff(fullDiff, config.review);
+    }
+
+    selectionDescriptor = selectDiffForRound({
+      roundContext: { ...roundContextForSelection, round: roundContextForSelection.round },
+      compareThrew,
+      compareDiff,
+      compareFiles,
+      fullDiff,
+      fullFiles,
+      toSha: pr.headSha,
+    });
+
+    // Persist the descriptor on the job row. Best-effort: a failed write is logged + swallowed
+    // so the prepare phase can continue (the descriptor is also captured in the audit trail,
+    // so an operational-state drift between jobs row and audit trail is recoverable).
+    try {
+      await setJobDiffSelection(env, job.id, selectionDescriptor);
+    } catch (error) {
+      logger.warn(
+        `Failed to persist diff-selection descriptor for job ${job.id}; finalize will re-resolve on next phase`,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+
+    // Now drive the file selection off the SELECTED source. `no_changes` short-circuits the
+    // review phase (placeholder finalize) — emit the audit event, skip file selection, and the
+    // review/finalize phases will see the no_changes descriptor and bail out cleanly.
+    if (selectionDescriptor.mode === 'no_changes') {
+      try {
+        await recordRoundAudit(env, job.id, [
+          buildRoundsNoChangesEvent({
+            from: selectionDescriptor.fromSha,
+            to: selectionDescriptor.toSha,
+            round: roundContextForSelection.round,
+          }),
+        ]);
+      } catch (error) {
+        logger.warn(
+          `Failed to record rounds.no_changes audit for job ${job.id}`,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      }
+      // Mark preparation complete with zero files; the gate below enqueues finalize, which
+      // short-circuits on the no_changes descriptor.
+      await completePreparationStep(env, job.id, 0);
+      heartbeatJobLease(env, job.id, leaseOwner, JOB_LEASE_SECONDS).catch(() => undefined);
+      await enqueueJobPhase(env, job.id, 'finalize');
+      return;
+    }
+
+    // Use the SELECTED raw diff for the file selection. The KV cache is keyed on the SELECTED
+    // mode + range so a cache miss never silently substitutes a different source (Codex HIGH).
+    const rawDiff = selectDiffForSelection(selectionDescriptor, compareDiff, fullDiff);
     const selection = selectReviewableFiles(parseUnifiedDiff(rawDiff, config.review), config.review);
     files = selection.kept;
     dropped = selection.dropped;
@@ -1622,6 +1722,19 @@ async function runFinalizePhase(
   formatter: FormatterService,
 ) {
   await updateJobStep(env, job.id, 'Generating Summary', { status: 'running' });
+
+  // Phase 18 Plan 02 (RND-02 / D-05 / D-13): the no_changes placeholder short-circuits the
+  // finalize phase. The audit event was already emitted in prepare; here we only need to:
+  //   (a) complete the provider status check with a neutral terminal result (D-05),
+  //   (b) complete the job with a NEUTRAL terminal payload (D-13: idempotent so retries do
+  //       not append duplicate audit events or repeat completion),
+  //   (c) advance the anchor once (D-07: round counter + anchor move in lockstep).
+  // NO submitReview, NO walkthrough edit, NO summary comment. The user sees nothing new on the
+  // PR; the audit trail shows the round happened.
+  if (job.reviewMode === 'no_changes') {
+    await finalizeNoChangesPlaceholder(env, job, vcs, leaseOwner);
+    return;
+  }
 
   const pr = await vcs.getPullRequest(job.owner, job.repo, job.prNumber);
   const config = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
@@ -2344,29 +2457,233 @@ function diffCacheKey(jobId: string) {
 }
 
 /**
+ * Phase 18 Plan 02 (RND-01 / D-01..D-06): re-resolve the round context for the prepare phase
+ * using the SAME inputs `resolveRoundContext` consumes (review scope, prior pr_review_state,
+ * unresolved bot threads, rounds.incremental). Centralized here so the diff-selection block
+ * above stays terse and the helper can be unit-tested in isolation. Returns the locked
+ * ResolvedRoundContext shape (mode + round + anchorSha + hasUnresolvedThreads +
+ * roundsIncremental).
+ */
+async function resolveRoundContextForJob(
+  env: AppBindings,
+  job: PersistedReviewJob,
+  vcs: VcsProvider,
+  config: RepoConfig,
+): Promise<import('@server/core/rounds').ResolvedRoundContext> {
+  const roundsIncremental = Boolean(config.review.rounds?.incremental ?? false);
+  if (job.reviewScope === 'rest') {
+    // D-03 short-circuit: review-rest is never subject to round detection.
+    return {
+      round: 1,
+      mode: 'rest',
+      roundsIncremental,
+      anchorSha: null,
+      hasUnresolvedThreads: false,
+    };
+  }
+
+  let unresolvedThreads: import('@server/vcs/types').VcsReviewThread[] = [];
+  if (roundsIncremental && vcs.capabilities.supportsThreadListing) {
+    try {
+      unresolvedThreads = await vcs.getUnresolvedBotThreads(job.owner, job.repo, job.prNumber);
+    } catch (error) {
+      logger.warn(
+        `Failed to list unresolved bot threads for job ${job.id}; treating as no threads (capability degradation)`,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+  }
+
+  const prReviewStateKey: PrReviewStateKey = {
+    vcsProvider: (job.repositoryVcsProvider ?? 'github') as 'github' | 'bitbucket',
+    workspace: job.repositoryWorkspace ?? job.owner,
+    repoSlug: job.repo,
+    prNumber: job.prNumber,
+  };
+  const priorState = await getPrReviewState(env, prReviewStateKey);
+
+  return resolveRoundContext({
+    reviewScope: job.reviewScope ?? null,
+    priorState,
+    unresolvedThreads,
+    roundsIncremental,
+  });
+}
+
+/**
+ * Phase 18 Plan 02 (RND-02 / D-08): pick the raw diff string for the SELECTED mode. The
+ * caller has already fetched both the compare diff and the full diff (when applicable) and
+ * passed the strings in; this helper just chooses which one to feed into the file selector.
+ * The 'no_changes' branch is excluded by the caller (no_changes short-circuits before the
+ * file selection runs).
+ */
+function selectDiffForSelection(
+  descriptor: DiffSelectionDescriptor,
+  compareDiff: string,
+  fullDiff: string,
+): string {
+  if (descriptor.mode === 'incremental') return compareDiff;
+  if (descriptor.mode === 'fallback') return fullDiff;
+  // 'full' or 'rest' round-trips through the same full diff (today's behavior).
+  return fullDiff;
+}
+
+/**
+ * Phase 18 Plan 02 (RND-02 / D-05 / D-07 / D-13): the no_changes placeholder finalize. When
+ * the prepare-time selector classified the diff as no_changes (a legitimate empty compare, a
+ * zero-file compare, or a thrown-compare + empty full diff), the finalize phase MUST:
+ *
+ *   1. Complete the provider status check with a NEUTRAL terminal result (D-05). The status
+ *      is updated to `completed` with the existing `neutral` conclusion; the user sees no new
+ *      content on the PR — the audit trail records the round.
+ *   2. Complete the job with a NEUTRAL terminal payload (idempotent, D-13). A retry MUST NOT
+ *      append a duplicate `rounds.no_changes` audit event or repeat the completion. The
+ *      existing `completeJob` is idempotent on the row state (re-running after completion is
+ *      a no-op), and the audit event was already emitted in prepare. The terminal payload is
+ *      verdict 'comment' (no findings => no approve), zero file/comment/token counts, no
+ *      review id, no summary model.
+ *   3. Advance the anchor once (D-07: round counter + anchor move in lockstep). The anchor
+ *      write uses the EXACT prepare-time head SHA captured on the descriptor (D-08), not the
+ *      live head. The setter is monotonic, so a stale redelivery is a no-op.
+ *   4. Drop the diff cache (the descriptor is no_changes; the cached diff is empty anyway,
+ *      but this mirrors the existing non-placeholder post-completion cleanup).
+ *
+ * NO submitReview, NO walkthrough edit, NO summary comment: the user sees nothing new on the PR.
+ * The lease is released on the standard path; the runFinalizePhase caller's completion boundary
+ * handles the lease return.
+ */
+async function finalizeNoChangesPlaceholder(
+  env: AppBindings,
+  job: PersistedReviewJob,
+  vcs: VcsProvider,
+  leaseOwner: string,
+) {
+  // Best-effort status check update. The status-check handler on every provider expects a
+  // terminal `completed` state; we send the existing neutral conclusion so the PR's status
+  // badge reflects "no findings, no error" and the check-run reconciliation sweep does not
+  // re-process this job.
+  const neutralStatusRef = job.statusCheckRef ?? (job.checkRunId !== null ? String(job.checkRunId) : '');
+  if (neutralStatusRef) {
+    try {
+      await vcs.updateStatusCheck(job.owner, job.repo, neutralStatusRef, {
+        status: 'completed',
+        conclusion: 'neutral',
+        title: 'No changes',
+        summary: 'Codra reviewed this push and found no changes to comment on.',
+      });
+      await markJobCheckRunCompleted(env, job.id);
+    } catch (error) {
+      logger.warn(
+        `Failed to update no_changes status check for job ${job.id}; completing anyway`,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+  }
+
+  // D-13 idempotent completion. completeJob is idempotent on the row state (re-running after
+  // completion is a no-op), so a freeze/crash + retry of finalize lands the same done state +
+  // same payload. The audit event was emitted once in prepare; `recordRoundAudit` has its own
+  // append guard so even a retry that reaches the recorder would not duplicate the event.
+  await completeJob(env, job.id, {
+    verdict: 'comment',
+    fileCount: 0,
+    commentCount: 0,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    summaryMarkdown: '',
+    reviewId: null,
+    summaryModel: null,
+    overallConfidenceScore: null,
+    overallCorrectness: null,
+    errorMessage: null,
+  });
+
+  // D-07: advance the anchor once. The empty head guard (D-15) is honored by the setter's
+  // own trim/null check; the recorded anchor is the EXACT prepare-time head SHA captured on
+  // the descriptor (D-08), not the live head.
+  const prReviewStateKey: PrReviewStateKey = {
+    vcsProvider: (job.repositoryVcsProvider ?? 'github') as 'github' | 'bitbucket',
+    workspace: job.repositoryWorkspace ?? job.owner,
+    repoSlug: job.repo,
+    prNumber: job.prNumber,
+  };
+  try {
+    await setLastReviewedSha(env, prReviewStateKey, {
+      headSha: job.roundsToSha ?? null,
+      reviewRound: job.reviewRound ?? 1,
+    });
+  } catch (error) {
+    logger.warn(
+      `Failed to advance anchor for no_changes finalize of job ${job.id}; next push will see the prior anchor`,
+      error instanceof Error ? error : new Error(String(error)),
+    );
+  }
+
+  // Diff cache cleanup (the cached diff is empty for no_changes, but mirror the existing
+  // post-completion cleanup to keep the cache footprint tight).
+  try {
+    await env.APP_KV.delete(`diff:${job.id}:no_changes`);
+  } catch (error) {
+    logger.warn(`Failed to delete cached diff for no_changes job ${job.id}`, error instanceof Error ? error : new Error(String(error)));
+  }
+
+  // Lease release is the caller's responsibility (runFinalizePhase's outer try/catch). The
+  // helper returns so the caller's normal completion path runs.
+  logger.info(`No-changes placeholder finalized for job ${job.id}`);
+  void leaseOwner;
+}
+
+/**
  * Fetches and parses the PR diff from the VCS only once per job (cached in KV) instead of once per
  * phase invocation. Extracted from getDiffFiles so both getDiffFiles and the scope-aware
  * getJobDiffFiles / the prepare-phase skipped-for-size producer share one cached fetch (the diff is
  * immutable for a job's head, so re-reading it from KV never hits the VCS again).
+ *
+ * Phase 18 Plan 02 (RND-02 / D-08): the function is now SELECTION-AWARE. The cache key is
+ * scoped to the (jobId, mode) tuple so an incremental-mode cache entry can never be silently
+ * hit by a full-diff request (Codex/Antigravity HIGH). When the persisted descriptor is
+ * 'incremental' or 'no_changes', the cache miss path re-fetches the compare range — NEVER the
+ * implicit full-diff helper. When the descriptor is 'full' / 'rest' / null, the cache miss
+ * falls back to the full PR diff (today's behavior, NREG-01).
  */
 async function getCachedRawDiff(
   env: AppBindings,
-  job: Pick<PersistedReviewJob, 'id' | 'owner' | 'repo' | 'prNumber'>,
-  vcs: Pick<VcsProvider, 'getPullRequestDiff'>,
+  job: Pick<PersistedReviewJob, 'id' | 'owner' | 'repo' | 'prNumber' | 'reviewMode' | 'roundsFromSha' | 'roundsToSha'>,
+  vcs: Pick<VcsProvider, 'getPullRequestDiff' | 'getCompareDiff'>,
 ): Promise<string> {
-  const cacheKey = diffCacheKey(job.id);
-  let rawDiff = await env.APP_KV.get(cacheKey);
+  const mode = job.reviewMode ?? 'full';
+  // Per-mode cache key so a 'full' cache entry can never satisfy an 'incremental' request.
+  const cacheKey = `diff:${job.id}:${mode}`;
 
-  if (!rawDiff) {
-    rawDiff = await vcs.getPullRequestDiff(job.owner, job.repo, job.prNumber);
+  // 'no_changes' short-circuits: the descriptor already classifies the diff as empty, so the
+  // consumer never inspects raw content. Return an empty string and skip the VCS round-trip.
+  if (mode === 'no_changes') return '';
+
+  // 'incremental' mode: re-fetch the EXACT compare range from the durable descriptor. The
+  // compare response is cached separately from the full diff so a misconfigured cache miss can
+  // never splice in a different source (Codex HIGH).
+  if (mode === 'incremental' && job.roundsFromSha && job.roundsToSha) {
+    const cached = await env.APP_KV.get(cacheKey);
+    if (cached !== null) return cached;
+    const compareDiff = await vcs.getCompareDiff(job.owner, job.repo, job.roundsFromSha, job.roundsToSha);
     try {
-      await env.APP_KV.put(cacheKey, rawDiff, { expirationTtl: DIFF_CACHE_TTL_SECONDS });
+      await env.APP_KV.put(cacheKey, compareDiff, { expirationTtl: DIFF_CACHE_TTL_SECONDS });
     } catch (error) {
-      logger.warn(`Failed to cache PR diff for job ${job.id}; it will be re-fetched on the next phase`, error instanceof Error ? error : new Error(String(error)));
+      logger.warn(`Failed to cache compare diff for job ${job.id}; it will be re-fetched on the next phase`, error instanceof Error ? error : new Error(String(error)));
     }
+    return compareDiff;
   }
 
-  return rawDiff;
+  // 'fallback' / 'full' / 'rest' / null: the full PR diff is the source. Today's cache path.
+  const cached = await env.APP_KV.get(cacheKey);
+  if (cached !== null) return cached;
+  const fullDiff = await vcs.getPullRequestDiff(job.owner, job.repo, job.prNumber);
+  try {
+    await env.APP_KV.put(cacheKey, fullDiff, { expirationTtl: DIFF_CACHE_TTL_SECONDS });
+  } catch (error) {
+    logger.warn(`Failed to cache PR diff for job ${job.id}; it will be re-fetched on the next phase`, error instanceof Error ? error : new Error(String(error)));
+  }
+  return fullDiff;
 }
 
 /**
@@ -2375,8 +2692,8 @@ async function getCachedRawDiff(
  */
 export async function getDiffFiles(
   env: AppBindings,
-  job: Pick<PersistedReviewJob, 'id' | 'owner' | 'repo' | 'prNumber'>,
-  vcs: Pick<VcsProvider, 'getPullRequestDiff'>,
+  job: Pick<PersistedReviewJob, 'id' | 'owner' | 'repo' | 'prNumber' | 'reviewMode' | 'roundsFromSha' | 'roundsToSha'>,
+  vcs: Pick<VcsProvider, 'getPullRequestDiff' | 'getCompareDiff'>,
   config: RepoConfig,
 ) {
   const rawDiff = await getCachedRawDiff(env, job, vcs);
@@ -2416,15 +2733,22 @@ function skippedFilesKeyForJob(
  *               against the current diff, bypassing the max_files slice for this run. A head with
  *               zero recorded skips yields an empty set -> a no-op review (NOT an error); Plan 06
  *               short-circuits before creating such a job, so this is defense-in-depth.
+ *  - 'no_changes' -> the selected diff was a LEGITIMATE empty compare (Plan 02 / D-05). Return
+ *               an empty reviewable set so the review/finalize phases short-circuit on the
+ *               no_changes placeholder path (no model call, no review post, no walkthrough edit).
  *  - 'all' / 'head' / undefined -> delegate to getDiffFiles unchanged (undefined is byte-identical
  *               to today, NREG-01).
  */
 export async function getJobDiffFiles(
   env: AppBindings,
   job: PersistedReviewJob,
-  vcs: Pick<VcsProvider, 'getPullRequestDiff'>,
+  vcs: Pick<VcsProvider, 'getPullRequestDiff' | 'getCompareDiff'>,
   config: RepoConfig,
 ) {
+  if (job.reviewMode === 'no_changes') {
+    return [];
+  }
+
   if (job.reviewScope === 'rest') {
     const restPaths = new Set(await listSkippedFilesForHead(env, skippedFilesKeyForJob(job)));
     if (restPaths.size === 0) return [];

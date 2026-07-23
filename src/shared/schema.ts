@@ -532,6 +532,14 @@ export const jobSummarySchema = z.object({
   reviewRound: z.number().int().min(1).nullable().optional(),
   reviewMode: reviewModeSchema.nullable().optional(),
   roundsIncremental: z.boolean().optional(),
+  // Phase 18 (migration 012, RND-02 / D-08): the immutable diff-selection descriptor (fromSha +
+  // toSha). Both nullable so pre-Phase-18 jobs read back as null/undefined and the consumer
+  // helpers fall through to the existing full-diff path (NREG-01). The `mode` column already
+  // encodes the selection (`'full' | 'incremental' | 'fallback' | 'no_changes' | 'rest'`); these
+  // two fields carry the anchor SHA range the consumer must re-fetch when mode is 'incremental' /
+  // 'fallback' / 'no_changes' (D-08: finalize never anchors a freshly-fetched live head).
+  roundsFromSha: z.string().nullable().optional(),
+  roundsToSha: z.string().nullable().optional(),
 });
 
 export const jobsQuerySchema = z.object({
