@@ -21,6 +21,15 @@ import { describe, expect, it } from 'vitest';
 // catches every future addition in `src/server` and keeps the protected set stable across
 // the post-refactor renaming (src/server/core/review-flow.ts was merged away; that path
 // is therefore intentionally NOT in the protected set).
+//
+// Phase 18 carve-out (RND-01 / RND-04): the round-detection block in src/server/core/review.ts
+// now wires `vcs.getUnresolvedBotThreads` (gated on `rounds.incremental && supportsThreadListing`)
+// for thread-aware round detection. That call site is the documented Phase 18 consumer of the
+// Phase 17 seam primitive, scoped to one method call gated by config + capability. The scan
+// excludes it via SC4_ALLOWLISTED_REVIEW_CALL_SITES so the broader NREG-01 invariant stays tight
+// for every other primitive, including the three that Phase 18 does NOT yet consume
+// (`getFileContent`, `getCompareDiff`, `resolveThread`). A future phase that adds a new
+// `getCompareDiff` consumer must extend the carve-out and document why here.
 
 const PROJECT_ROOT = join(__dirname, '..');
 
@@ -58,6 +67,17 @@ const SOURCE_SCAN_ALLOWLIST = new Set<string>([
   'src/server/core/github.ts',
   'src/server/core/bitbucket.ts',
   'src/server/services/github.ts',
+]);
+
+// Phase 18 carve-out: identifiers `getUnresolvedBotThreads` is permitted ONLY in
+// `src/server/core/review.ts` (the documented RND-01 / RND-04 round-detection + suppression
+// consumer). The other three Phase 17 primitives (`getFileContent`, `getCompareDiff`,
+// `resolveThread`) stay flagged everywhere because Phase 18 does NOT yet consume them -- any
+// future wiring must extend this carve-out explicitly. Stored as `{ file -> Set<identifier> }`
+// so the scan can verify the precise identifier allowed in each file rather than a blanket
+// file-level pass.
+const SC4_ALLOWLISTED_REVIEW_CALL_SITES = new Map<string, ReadonlySet<string>>([
+  ['src/server/core/review.ts', new Set(['getUnresolvedBotThreads'])],
 ]);
 
 function collectProductionFiles(dir: string): string[] {
@@ -105,7 +125,12 @@ describe('SC4 / NREG-01: no new call sites for Phase-17 primitives', () => {
       // Read every discovered file (the protected ones are scanned too — they MUST be
       // clean of the four identifiers, which is the load-bearing NREG-01 invariant).
       const content = readFileSync(join(PROJECT_ROOT, file), 'utf8');
+      const fileCarveOut = SC4_ALLOWLISTED_REVIEW_CALL_SITES.get(file);
       for (const identifier of PHASE_17_METHOD_IDENTIFIERS) {
+        // Phase 18 carve-out: if this (file, identifier) pair is in the explicit
+        // SC4_ALLOWLISTED_REVIEW_CALL_SITES map, the scan skips it. Every other
+        // combination must stay clean.
+        if (fileCarveOut?.has(identifier)) continue;
         // Word-boundary match so an unrelated identifier like `getCompareDiffStrict` does
         // not trip the scan. The seam methods are camelCase verbs followed by a `(`,
         // property, assignment, or end of token; `\b` covers all of those.
@@ -126,6 +151,21 @@ describe('SC4 / NREG-01: no new call sites for Phase-17 primitives', () => {
     expect(allowlist.length).toBeGreaterThan(0);
     for (const file of allowlist) {
       expect(allProductionFiles).toContain(file);
+    }
+  });
+
+  it('Phase 18 carve-out: SC4_ALLOWLISTED_REVIEW_CALL_SITES points at a real file and only permits the documented identifier(s)', () => {
+    // The carve-out grants a specific (file, identifier) pair a pass. Validate every
+    // entry references a real production file AND that the carve-out identifiers are a
+    // subset of PHASE_17_METHOD_IDENTIFIERS (no typo'd phantom primitive). A future
+    // addition (e.g. a future phase widening getCompareDiff use) must update this map
+    // AND extend the comment above -- an entry added without documentation fails this test.
+    expect(SC4_ALLOWLISTED_REVIEW_CALL_SITES.size).toBeGreaterThan(0);
+    for (const [file, identifiers] of SC4_ALLOWLISTED_REVIEW_CALL_SITES.entries()) {
+      expect(allProductionFiles).toContain(file);
+      for (const id of identifiers) {
+        expect((PHASE_17_METHOD_IDENTIFIERS as readonly string[])).toContain(id);
+      }
     }
   });
 });

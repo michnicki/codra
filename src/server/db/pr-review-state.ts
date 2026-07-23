@@ -212,7 +212,7 @@ export async function setLastReviewedSha(
         last_review_round = EXCLUDED.last_review_round,
         last_reviewed_at = EXCLUDED.last_reviewed_at
       WHERE pr_review_state.last_reviewed_sha IS NULL
-         OR pr_review_state.last_reviewed_round IS NULL
+         OR pr_review_state.last_review_round IS NULL
          OR pr_review_state.last_review_round < EXCLUDED.last_review_round
       RETURNING *
     `,

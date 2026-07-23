@@ -21,6 +21,7 @@ import {
   resetJobContinuationCount,
   releaseJobLease,
   setJobPullRequestMeta,
+  setJobReviewRoundAndMode,
   setJobWorkflowInstance,
   supersedeOlderJobs,
   updateJobCheckRun,
@@ -28,13 +29,26 @@ import {
   updateJobStatusCheckRef,
   updateJobStep,
 } from '@server/db/jobs';
+import { getPrReviewState, type PrReviewStateKey } from '@server/db/pr-review-state';
 import { filterReviewableFiles, parseUnifiedDiff, partitionReviewableFiles, selectReviewableFiles, type FileDiff, type FileSelectionResult } from './diff';
 import { insertSkippedFiles, listSkippedFilesForHead, type SkippedFilesHeadKey } from '@server/db/skipped-files';
 import { dedupeComposite, dedupeFindings } from './dedup';
 import { applyNoiseFilter, type NoiseFilterOptions } from './noise-filter';
 import { parseCriticPruneResponse, parseSummaryResponse, parseWalkthroughDiagram } from './model-output';
 import { buildWalkthroughData, editWalkthroughComment, postWalkthroughPlaceholder } from './walkthrough';
-import { buildFileSkipEvents, buildFinalizeDropEvents, recordFileSkips, recordFinalizeDrops, recordUnitAudit } from './audit';
+import {
+  buildFileSkipEvents,
+  buildFinalizeDropEvents,
+  recordFileSkips,
+  recordFinalizeDrops,
+  recordRoundAudit,
+  recordUnitAudit,
+} from './audit';
+import {
+  buildRoundInputsFromConfig,
+  buildRoundsDetectedEvent,
+  resolveRoundContext,
+} from './rounds';
 
 import { VcsService } from '../services/vcs';
 import type { VcsProvider, VcsPullRequest, VcsUpdateStatusCheckInput } from '../vcs/types';
@@ -816,6 +830,97 @@ async function runPreparePhase(
     } else {
       await updateJobStatusCheckRef(env, job.id, checkRun.ref);
     }
+  }
+
+  // Phase 18 (RND-01 / D-01..D-06): always-on round detection at prepare-time, INDEPENDENT of the
+  // `rounds.incremental` toggle. The resolved round / mode are persisted on the job and emitted as
+  // a `rounds.detected` audit event so the signal is observable at defaults. Consumer paths
+  // (compare-diff selection, floor escalation, thread suppression) wire in Plans 02/03/04 and are
+  // separately gated on `rounds.incremental` -- THIS plan persists the durable snapshot but does
+  // not activate any consumer path. The review-rest short-circuit (D-03) is the only branch that
+  // skips state + thread calls entirely.
+  const roundsIncremental = Boolean(config.review.rounds?.incremental ?? false);
+  if (job.reviewScope !== 'rest') {
+    // Non-rest path: query pr_review_state for the prior anchor AND (gated on the durable
+    // `rounds.incremental` snapshot) call the unresolved-thread listing. `getPrReviewState` is a
+    // cheap equality lookup and is ALWAYS called so a never-paused PR resolves to a clean
+    // null-state without a separate sentinel column. `getUnresolvedBotThreads` is gated on the
+    // capability flag AND on `rounds.incremental` (D-02: detection runs at defaults, but the
+    // thread-listing seam is a CONSUMER call that must stay inert at defaults).
+    let unresolvedThreads: import('@server/vcs/types').VcsReviewThread[] = [];
+    if (roundsIncremental && vcs.capabilities.supportsThreadListing) {
+      try {
+        unresolvedThreads = await vcs.getUnresolvedBotThreads(job.owner, job.repo, job.prNumber);
+      } catch (error) {
+        // Capability-flagged degradation (Phase 17 D-02): a thrown listing call degrades to [] so
+        // the resolver still resolves. The audit event below records the unavailable capability
+        // degradation explicitly.
+        logger.warn(
+          `Failed to list unresolved bot threads for job ${job.id}; treating as no threads (capability degradation)`,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      }
+    }
+
+    // Build the pr_review_state lookup key from the durable job identity (matches the
+    // pause-state setter key shape: vcs_provider + workspace + repo_slug + pr_number).
+    const prReviewStateKey: PrReviewStateKey = {
+      vcsProvider: (job.repositoryVcsProvider ?? 'github') as 'github' | 'bitbucket',
+      workspace: job.repositoryWorkspace ?? job.owner,
+      repoSlug: job.repo,
+      prNumber: job.prNumber,
+    };
+    const priorState = await getPrReviewState(env, prReviewStateKey);
+
+    // Pure resolver call (RND-01 / D-01..D-06): returns the resolved round + mode + boolean flags.
+    // Independent of the incremental toggle per D-02.
+    const roundContext = resolveRoundContext({
+      reviewScope: job.reviewScope ?? null,
+      priorState,
+      unresolvedThreads,
+      roundsIncremental,
+    });
+
+    // Persist the resolved round/mode onto the job (durable snapshot) so later phases / fresh
+    // instances / the dashboard read the same value. Best-effort: a failed write is logged and
+    // swallowed so the prepare phase can continue (the round is also captured in the audit
+    // trail, so an operational-state drift between jobs row and audit trail is recoverable).
+    try {
+      await setJobReviewRoundAndMode(env, job.id, {
+        reviewRound: roundContext.round,
+        reviewMode: roundContext.mode,
+      });
+    } catch (error) {
+      logger.warn(
+        `Failed to persist round/mode for job ${job.id}; round will be re-resolved on next prepare`,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+
+    // Emit the detected-event audit record. Best-effort recorder never throws into the caller.
+    await recordRoundAudit(env, job.id, [buildRoundsDetectedEvent(roundContext)]);
+  } else {
+    // D-03 review-rest short-circuit: NO state/thread calls, NO resolver. Persist round 1 / mode
+    // 'rest' directly so the dashboard reads the same round/mode pair this job will execute with,
+    // and emit a `rounds.detected` audit event with the explicit `rest` mode so the audit trail
+    // explains why this run did not participate in round detection.
+    try {
+      await setJobReviewRoundAndMode(env, job.id, { reviewRound: 1, reviewMode: 'rest' });
+    } catch (error) {
+      logger.warn(
+        `Failed to persist review-rest round for job ${job.id}`,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+    await recordRoundAudit(env, job.id, [
+      buildRoundsDetectedEvent({
+        round: 1,
+        mode: 'rest',
+        roundsIncremental,
+        anchorSha: null,
+        hasUnresolvedThreads: false,
+      }),
+    ]);
   }
 
   // Single-parse selection for the NON-rest path (Antigravity/Codex 15-05 MEDIUM): derive BOTH

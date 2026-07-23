@@ -1320,6 +1320,33 @@ export async function updateJobCriticResult(
 }
 
 /**
+ * Phase 18 (RND-01 / D-02 / D-16 widened): write the resolved round + selected review mode onto
+ * the job row. Plan 02's runPreparePhase calls this once per job with the pure resolveRoundContext
+ * result so the durable round/mode snapshot survives fresh-instance handoff + lease recovery
+ * (audit is intentionally excluded from mapJob). Both values are NULL-able, so a pre-Phase-18
+ * insert reads them back as null without throwing (NREG-01). The CHECK constraints installed by
+ * migration 011 (review_round >= 1, review_mode in 'full'|'incremental'|'fallback'|'no_changes'|
+ * 'rest') reject out-of-vocabulary mode strings at the DB layer; this setter trusts the schema
+ * surface and does not revalidate. Single parameterized UPDATE, no string interpolation.
+ */
+export async function setJobReviewRoundAndMode(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  state: { reviewRound: number; reviewMode: 'full' | 'incremental' | 'fallback' | 'no_changes' | 'rest' },
+): Promise<void> {
+  await queryRows(
+    env,
+    `
+      UPDATE jobs
+      SET review_round = $2,
+          review_mode = $3
+      WHERE id = $1
+    `,
+    [jobId, state.reviewRound, state.reviewMode],
+  );
+}
+
+/**
  * D-04: return the most recent job for a given (vcs_provider, workspace, owner, repo, prNumber)
  * tuple. Used by the Bitbucket webhook route's `pullrequest:updated` commit-hash dedup -- when a
  * push to the same PR head brings a new commit, the route looks up the prior job and skips
