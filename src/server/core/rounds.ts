@@ -350,7 +350,9 @@ export function buildRoundsEscalatedEvent(
     to: input.to,
     effective: input.effective,
     round: input.round,
-    droppedAtEffectiveFloor: input.droppedAtEffectiveFloor ?? 0,
+    ...(input.droppedAtEffectiveFloor === undefined
+      ? {}
+      : { droppedAtEffectiveFloor: input.droppedAtEffectiveFloor }),
     timestamp,
   };
 }
