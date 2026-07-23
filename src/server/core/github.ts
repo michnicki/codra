@@ -644,10 +644,24 @@ export class GitHubClient {
       }
 
       for (const node of nodes) collected.push(node);
-      if (!pageInfo?.hasNextPage || !pageInfo.endCursor) {
+      // R-9: a clean `hasNextPage === false` is the legitimate end-of-pages and returns the
+      // collected set. A `hasNextPage === true` with an absent/empty `endCursor` is an
+      // INCONSISTENT traversal signal (the provider claims more pages exist but offers no
+      // cursor to fetch them) and MUST fail closed - the adapter's `catch {}` converts the
+      // throw to `[]` so a partial set never leaks to the consumer.
+      if (pageInfo?.hasNextPage === false) {
         return collected;
       }
-      cursor = pageInfo.endCursor;
+      const endCursor = pageInfo?.endCursor;
+      if (typeof endCursor !== 'string' || endCursor.length === 0) {
+        throw new GitHubError(
+          503,
+          `GitHub thread pagination returned incomplete page metadata (hasNextPage=true but endCursor is ${endCursor === undefined ? 'undefined' : endCursor === null ? 'null' : 'empty'}) on page ${page + 1}/${maxPages}`,
+          '/graphql',
+          `GitHub thread list halted: incomplete page metadata on page ${page + 1}`,
+        );
+      }
+      cursor = endCursor;
     }
     // Cap reached with `hasNextPage: true` still outstanding. FAIL-CLOSED (R-9): the adapter
     // converts this throw to [] rather than returning a partial thread set.

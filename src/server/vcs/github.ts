@@ -34,15 +34,21 @@ export class GithubAdapter implements VcsProvider {
     supportsThreadResolution: true,
   };
   private gh: GitHubService;
+  // PROV-02 (R-9): retain the construction-time tracker so we can forward it into the
+  // thread-listing call path. Mirrors BitbucketAdapter's `TrackerLike` shape widened to
+  // include `hasRemainingSafeBudget`; the incrementSubrequests half is required by the existing
+  // `GitHubService` constructor (transitively forwarded into the client).
+  private readonly tracker?: { incrementSubrequests(count?: number): void; hasRemainingSafeBudget?(needed?: number): boolean };
 
   constructor(
     private env: AppBindings,
     installationId: string,
-    tracker?: { incrementSubrequests(count?: number): void },
+    tracker?: { incrementSubrequests(count?: number): void; hasRemainingSafeBudget?(needed?: number): boolean },
   ) {
     // tracker MUST be forwarded -- it's an optional param on GitHubService's constructor, so
     // dropping it is silent: the subrequest budget regresses with no compile error (Pitfall 1).
     this.gh = new GitHubService(env, installationId, tracker);
+    this.tracker = tracker;
   }
 
   async getPullRequest(owner: string, repo: string, prNumber: number): Promise<VcsPullRequest> {
@@ -85,9 +91,12 @@ export class GithubAdapter implements VcsProvider {
     try {
       const botIdentity = await this.gh.resolveBotUserIdentity();
       const botAccountId = botIdentity.accountId;
-      // `tracker` is intentionally not forwarded here in Phase 17 -- this primitive is inert
-      // (NREG-01) and the consumer (Phase 19) will plug in a tracked invocation once wired.
-      const rawThreads = await this.gh.getReviewThreads(owner, repo, prNumber);
+      // PROV-02 (R-9): forward the construction-time tracker so the client's per-page
+      // `hasRemainingSafeBudget` consult gates pagination at the boundary. The tracker shape
+      // accepted by the client is `hasRemainingSafeBudget?(needed?: number): boolean`; the
+      // adapter's `tracker` is wider (includes `incrementSubrequests` for the underlying
+      // REST path) so the structural narrow is intentional.
+      const rawThreads = await this.gh.getReviewThreads(owner, repo, prNumber, this.tracker);
       const out: VcsReviewThread[] = [];
       for (const rawThread of rawThreads) {
         const thread = rawThread as {

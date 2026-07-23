@@ -572,6 +572,122 @@ describe('PROV-02: GitHub thread listing and resolution', () => {
     }
   });
 
+  // PROV-02 (R-9): tracker reports no remaining safe budget -> pagination aborts at page boundary.
+  // The adapter consults the construction-time tracker via gh.getReviewThreads BEFORE issuing the
+  // GraphQL request, so a tracker that returns false at page 1 causes the seam to return [].
+  it('tracker reports no remaining safe budget - pagination aborts at page boundary', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const mock = installGitHubFetchMock({
+      ...buildGitHubFixtures(),
+      threadListResponses: [
+        {
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  nodes: [makeBotThread({ id: 'PRRT_budget1' })],
+                  pageInfo: { hasNextPage: true, endCursor: 'CURSOR_BUDGET' },
+                },
+              },
+            },
+          },
+        },
+      ],
+    });
+
+    const tracker = {
+      incrementSubrequests: vi.fn(),
+      hasRemainingSafeBudget: vi.fn().mockReturnValue(false),
+    };
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID, tracker);
+      await expect(adapter.getUnresolvedBotThreads(OWNER, REPO, PR_NUMBER)).resolves.toEqual([]);
+      // The tracker consult happens BEFORE the fetch, so the abort is at the boundary
+      // (not after a wasted request): exactly one consult call, zero GraphQL fetches.
+      expect(tracker.hasRemainingSafeBudget).toHaveBeenCalled();
+      const graphqlCalls = mock.calls.filter(
+        (call) => call.method === 'POST' && call.path === '/graphql',
+      );
+      expect(graphqlCalls).toHaveLength(0);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  // PROV-02 (R-9): inconsistent page metadata (hasNextPage=true with no endCursor) is a
+  // partial-traversal signal. The seam fails closed to [] rather than exposing the partial set.
+  it('inconsistent page metadata (hasNextPage=true with no endCursor) fails closed to []', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const mock = installGitHubFetchMock({
+      ...buildGitHubFixtures(),
+      threadListResponses: [
+        {
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  nodes: [makeBotThread({ id: 'PRRT_inconsistent' })],
+                  pageInfo: { hasNextPage: true, endCursor: null },
+                },
+              },
+            },
+          },
+        },
+      ],
+    });
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      await expect(adapter.getUnresolvedBotThreads(OWNER, REPO, PR_NUMBER)).resolves.toEqual([]);
+      // Exactly ONE GraphQL call: the adapter does not loop on incomplete metadata.
+      const graphqlCalls = mock.calls.filter(
+        (call) => call.method === 'POST' && call.path === '/graphql',
+      );
+      expect(graphqlCalls).toHaveLength(1);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  // PROV-02 (R-9): 10-page cap exhaustion with a final hasNextPage=true page outstanding MUST
+  // fail closed to [] (NOT silently return the collected nodes). The cap is the documented
+  // MAX_THREAD_LIST_PAGES = 10 - a 11th page is unrequested and the seam returns [].
+  it('10-page cap exhaustion with one final hasNextPage=true page fails closed to []', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const pages = Array.from({ length: 10 }, (_, i) => ({
+      data: {
+        repository: {
+          pullRequest: {
+            reviewThreads: {
+              nodes: [makeBotThread({ id: `PRRT_cap_${i + 1}` })],
+              pageInfo: { hasNextPage: true, endCursor: `CURSOR_${i + 1}` },
+            },
+          },
+        },
+      },
+    }));
+    const mock = installGitHubFetchMock({
+      ...buildGitHubFixtures(),
+      threadListResponses: pages,
+    });
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      await expect(adapter.getUnresolvedBotThreads(OWNER, REPO, PR_NUMBER)).resolves.toEqual([]);
+      // Exactly 10 GraphQL calls - the cap is enforced; the 11th page is never fetched.
+      const graphqlCalls = mock.calls.filter(
+        (call) => call.method === 'POST' && call.path === '/graphql',
+      );
+      expect(graphqlCalls).toHaveLength(10);
+    } finally {
+      mock.restore();
+    }
+  });
+
   it('maps the R-3 current/original fallback for outdated threads and skips malformed ranges', async () => {
     const env = createTestEnv();
     await seedInstallationToken(env, INSTALLATION_ID);
