@@ -39,6 +39,25 @@ export type BitbucketFetchMockOptions = {
    * `status: 200, body: ''` to exercise the empty-success path.
    */
   compareDiffResponses?: BitbucketMockResponse;
+  /**
+   * PROV-02: scripted list of raw pull-request comment pages for `listRawPullRequestComments`.
+   * Each entry becomes one `values[]` page; the LAST entry's missing `next` signals end-of-pages.
+   * Earlier entries that supply `next` cause the client to follow the link (validated against
+   * the SSRF guard, so use absolute HTTPS api.bitbucket.org URLs only). Empty default falls back
+   * to the single default fixture.
+   */
+  rawCommentPageResponses?: BitbucketMockResponse[];
+  /**
+   * PROV-02 (D-04): scripted status sequence for successive POST /resolve calls. Default is a
+   * single 200 (success). 403/404/501 flips `supportsThreadResolution` to false on the adapter;
+   * 500/other returns false WITHOUT flipping the capability.
+   */
+  resolveCommentStatuses?: Array<{ status: number }>;
+  /**
+   * PROV-02 (D-07): when true, `/user` (resolveBotUserIdentity) returns 403 to simulate a
+   * Repository Access Token. Use to verify the configured bot id SHORT-CIRCUITS that call.
+   */
+  blockResolveBotUserIdentity?: boolean;
 };
 
 // Concrete author fixtures for the comment-primitive specs (review F6). Three DISTINCT string
@@ -92,6 +111,8 @@ export function installBitbucketFetchMock(options: BitbucketFetchMockOptions = {
   const responseSequence = [...(options.responseSequence ?? [])];
   const getPullRequestResponses = [...(options.getPullRequestResponses ?? [])];
   const postPullRequestCommentResponses = [...(options.postPullRequestCommentResponses ?? [])];
+  const rawCommentPageResponses = [...(options.rawCommentPageResponses ?? [])];
+  const resolveCommentStatuses = [...(options.resolveCommentStatuses ?? [{ status: 200 }])];
 
   async function handler(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const rawUrl = typeof input === 'string' ? input : input instanceof Request ? input.url : String(input);
@@ -156,6 +177,14 @@ export function installBitbucketFetchMock(options: BitbucketFetchMockOptions = {
       };
       return toResponse(fixture);
     }
+    // PROV-02 (R-4): raw multi-page listRawPullRequestComments. MUST be checked BEFORE the existing
+    // `listPullRequestComments` route below because the raw consumer wants control over the page
+    // shape and follows the `next` URL itself; the legacy consumer wants the single-page mapped fixture.
+    // When no raw fixture is supplied, fall through to the legacy handler so existing tests keep
+    // their expected behavior.
+    if (method === 'GET' && /\/pullrequests\/\d+\/comments/.test(url.pathname) && rawCommentPageResponses.length > 0) {
+      return toResponse(rawCommentPageResponses.shift()!);
+    }
     if (method === 'GET' && /\/pullrequests\/\d+\/comments$/.test(url.pathname)) {
       return toResponse(options.listPullRequestCommentsResponse ?? {
         // Additive `user` object so the comment-primitive specs can assert author.id comes from
@@ -178,6 +207,32 @@ export function installBitbucketFetchMock(options: BitbucketFetchMockOptions = {
     }
     if (method === 'POST' && /\/pullrequests\/\d+\/comments$/.test(url.pathname)) {
       return toResponse(postPullRequestCommentResponses.shift() ?? { status: 201, body: { id: 8 } });
+    }
+    // PROV-02: POST /pullrequests/{n}/comments/{id}/resolve (D-04). Scripted status sequence lets
+    // a spec drive the success/403/404/500/501 matrix; 200/204 -> success, 403/404/501 -> adapter
+    // flips `supportsThreadResolution` to false, others -> false without flipping.
+    if (method === 'POST' && /\/pullrequests\/\d+\/comments\/\d+\/resolve$/.test(url.pathname)) {
+      const next = resolveCommentStatuses.shift();
+      const status = next?.status ?? 200;
+      return toResponse({
+        status,
+        body: status === 200 || status === 204 ? {} : { error: { message: `Resolve failed with ${status}` } },
+      });
+    }
+    // PROV-02 (D-07): GET /2.0/user — return 403 by default only if the fixture opts in. Default
+    // returns the configured immutable bot account id so the resolver short-circuits.
+    if (method === 'GET' && url.pathname === '/2.0/user') {
+      if (options.blockResolveBotUserIdentity) {
+        return toResponse({ status: 403, body: { error: { message: 'Repository access tokens cannot query /user' } } });
+      }
+      return toResponse({
+        status: 200,
+        body: {
+          account_id: BITBUCKET_FIXTURE_ACCOUNT_ID,
+          nickname: BITBUCKET_FIXTURE_NICKNAME,
+          display_name: BITBUCKET_FIXTURE_DISPLAY_NAME,
+        },
+      });
     }
     // Comment-edit PUT (net-new client method in Task 2). Default echoes the edited comment id;
     // a spec scripts 404/410 (gone -> null) or a non-gone 403/422 (must throw) via responseSequence.

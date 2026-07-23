@@ -118,7 +118,19 @@ type BitbucketCommentRecord = {
     path: string;
     to?: number;
     from?: number;
+    // PROV-02 (R-4): start_to and start_from are explicit new-side/old-side range starts. Absent
+    // fields are treated as undefined -- we never FABRICATE a value (D-05). Optional here so the
+    // existing `inline` mapping stays byte-compatible with submitReview's dedup step (NREG-01).
+    start_to?: number;
+    start_from?: number;
   };
+  // PROV-02 (R-4): `parent` distinguishes a root comment (parent == null) from a reply. `deleted`
+  // indicates a soft-deleted comment that must be filtered out. `resolution` is the OpenAPI's
+  // resolve-state object whose absence/null means unresolved. All three are OPTIONAL -- absent
+  // fields are treated as undefined (NREG-01 byte-compat).
+  parent?: { id?: number } | null;
+  deleted?: boolean;
+  resolution?: { user?: { account_id?: string }; created_on?: string } | null;
   // Additive author block (Phase 8). `account_id` is the IMMUTABLE provider id used as the author
   // self-filter key (NREG-02); `nickname` is the renameable @mention handle. Bitbucket comment
   // authors have NO `username` field (removed from the API in 2019) — never read it (Pitfall 4).
@@ -226,6 +238,127 @@ export class BitbucketClient {
     const path = `${repositoryPath(workspace, repoSlug)}/diff/${spec}?context=3&topic=true`;
     const response = await this.request('GET', path, undefined, 'text/plain');
     return response.text();
+  }
+
+  /**
+   * PROV-02 (R-4): RAWS multi-page walk of the comments endpoint. Distinct from
+   * `listPullRequestComments` (which projects to the byte-compatible dedup/listing shape used by
+   * submitReview). The raw shape here PRESERVES the OpenAPI fields a thread filter needs
+   * (`deleted`, `parent`, `resolution`, and nested `inline.start_to`/`inline.start_from`) so the
+   * adapter can build its filter without losing information. Pages are followed ONLY when the
+   * server-supplied `next` URL passes the SSRF guard (T-17-02-03 / R-9). On bound exhaustion OR
+   * later-page failure the client THROWS (so the adapter can convert to `[]` rather than
+   * returning partial comments -- D-01/D-02).
+   *
+   * `MAX_THREAD_LIST_PAGES = 10` is a TUNED EMPIRICAL CAP, intentionally identical to the
+   * GitHub cap (R-9). 100 comments per page x 10 pages = 1000 comments, well above any realistic
+   * PR. Going higher risks the Workers 50/invocation cap; going lower risks silently dropping
+   * legitimate bot threads on the largest PRs.
+   */
+  static readonly MAX_THREAD_LIST_PAGES = 10;
+
+  async listRawPullRequestComments(
+    workspace: string,
+    repoSlug: string,
+    prNumber: number,
+    tracker?: { hasRemainingSafeBudget?(needed?: number): boolean },
+  ): Promise<BitbucketCommentRecord[]> {
+    const maxPages = BitbucketClient.MAX_THREAD_LIST_PAGES;
+    const collected: BitbucketCommentRecord[] = [];
+    const seenNextUrls = new Set<string>();
+    let nextUrl: string | null = `${BITBUCKET_API_BASE_URL}${repositoryPath(workspace, repoSlug)}/pullrequests/${prNumber}/comments?pagelen=100`;
+    for (let page = 0; page < maxPages; page += 1) {
+      // R-9: cap before issuing the next request using the live tracker (optional / 1 unit).
+      if (tracker?.hasRemainingSafeBudget && !tracker.hasRemainingSafeBudget(1)) {
+        throw new BitbucketError(
+          503,
+          `Bitbucket thread pagination exceeded safe subrequest budget on page ${page + 1}/${maxPages}`,
+          '/pullrequests/{n}/comments',
+          `Bitbucket thread list aborted: safe subrequest budget exhausted at page ${page + 1}`,
+        );
+      }
+      // SSRF guard (T-17-02-03 / R-9): the client strictly trusts the FIRST page's URL (built
+      // locally) and treats any `next` URL from the response payload as UNTRUSTED. Validate the
+      // origin is the Bitbucket API host AND the path stays under `/2.0/` before following.
+      if (!isValidBitbucketNextUrl(nextUrl, seenNextUrls)) {
+        throw new BitbucketError(
+          502,
+          `Bitbucket next-link did not pass origin/path validation`,
+          '/pullrequests/{n}/comments',
+          `Bitbucket pagination next URL failed SSRF validation`,
+        );
+      }
+      // Fetch directly with the absolute URL (NOT request(), which would re-prefix the base).
+      // Use the same auth + timeout patterns as `request()`.
+      const headers: Record<string, string> = {
+        Accept: 'application/json',
+        Authorization: `Bearer ${this.token}`,
+        'User-Agent': this.env.BOT_USERNAME ?? 'codra-bot',
+      };
+      this.tracker?.incrementSubrequests(1);
+      const response = await withTimeout(`Bitbucket GET ${new URL(nextUrl).pathname}`, BITBUCKET_TIMEOUT_MS, (signal) =>
+        globalThis.fetch(nextUrl as string, { method: 'GET', signal, headers }),
+      );
+      if (!response.ok) {
+        const errorBody = await response.text();
+        throw new BitbucketError(
+          response.status,
+          errorBody,
+          new URL(nextUrl).pathname,
+          `Bitbucket API GET ${new URL(nextUrl).pathname} failed with ${response.status}`,
+          retryAfterMs(response),
+        );
+      }
+      const body = (await response.json()) as { values?: BitbucketCommentRecord[]; next?: string | null };
+      for (const v of body.values ?? []) collected.push(v);
+      if (!body.next) return collected;
+      seenNextUrls.add(nextUrl);
+      nextUrl = body.next;
+    }
+    // Cap reached while `body.next` was still populated -- FAIL CLOSED (D-01/D-02).
+    throw new BitbucketError(
+      503,
+      `Bitbucket thread pagination exceeded MAX_THREAD_LIST_PAGES (${maxPages}); aborting partial traversal`,
+      '/pullrequests/{n}/comments',
+      `Bitbucket thread list exceeded MAX_THREAD_LIST_PAGES=${maxPages}`,
+    );
+  }
+
+  /**
+   * PROV-02 (D-04 / R-1): POST /comments/{comment_id}/resolve. The narrow path here INTENTIONALLY
+   * bypasses `withRetry` via `requestNoRetry` so a 500/501 produces exactly ONE request -- a retry
+   * loop would mask the resolution-downgrade signal the adapter needs (Pitfall 2). The caller
+   * sees the raw status and decides whether to downgrade `supportsThreadResolution`.
+   */
+  async resolvePullRequestCommentThread(
+    workspace: string,
+    repoSlug: string,
+    prNumber: number,
+    commentId: number,
+  ): Promise<number> {
+    return this.resolvePullRequestCommentThreadStatus(workspace, repoSlug, prNumber, commentId);
+  }
+
+  async resolvePullRequestCommentThreadStatus(
+    workspace: string,
+    repoSlug: string,
+    prNumber: number,
+    commentId: number,
+  ): Promise<number> {
+    const path = `${repositoryPath(workspace, repoSlug)}/pullrequests/${prNumber}/comments/${commentId}/resolve`;
+    this.tracker?.incrementSubrequests(1);
+    const response = await withTimeout(`Bitbucket POST ${path}`, BITBUCKET_TIMEOUT_MS, (signal) =>
+      globalThis.fetch(`${BITBUCKET_API_BASE_URL}${path}`, {
+        method: 'POST',
+        signal,
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${this.token}`,
+          'User-Agent': this.env.BOT_USERNAME ?? 'codra-bot',
+        },
+      }),
+    );
+    return response.status;
   }
 
   async listPullRequestComments(workspace: string, repoSlug: string, prNumber: number, pagelen = 100) {
@@ -461,4 +594,24 @@ export function createBitbucketBotIdentityResolver(
       return client.resolveBotUserIdentity();
     },
   };
+}
+
+/**
+ * PROV-02 SSRF guard (T-17-02-03 / R-9): a Bitbucket pagination `next` URL must point at the
+ * Bitbucket Cloud API origin over HTTPS AND live under `/2.0/`. Returns false when either the
+ * origin/path guard fails or the URL has already been seen (cycle defense).
+ */
+export function isValidBitbucketNextUrl(url: string | null, seen: Set<string>): boolean {
+  if (!url) return false;
+  if (seen.has(url)) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:') return false;
+  if (parsed.hostname !== 'api.bitbucket.org') return false;
+  if (!parsed.pathname.startsWith('/2.0/')) return false;
+  return true;
 }

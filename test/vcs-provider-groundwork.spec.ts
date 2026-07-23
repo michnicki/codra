@@ -656,3 +656,419 @@ describe('PROV-02: GitHub thread listing and resolution', () => {
     }
   });
 });
+
+// --- PROV-02: Bitbucket unresolved-bot-thread listing + resolution ---
+
+const BB_BOT_ACCOUNT_ID = 'bb-bot-account-id';
+
+function makeBitbucketBotComment(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 100,
+    content: { raw: 'Bot root finding body' },
+    inline: { path: 'src/foo.ts', to: 12, from: undefined },
+    parent: null,
+    deleted: false,
+    resolution: null,
+    user: {
+      account_id: BB_BOT_ACCOUNT_ID,
+      nickname: 'botnick',
+      display_name: 'Bot',
+    },
+    ...overrides,
+  };
+}
+
+describe('PROV-02: Bitbucket thread listing and resolution', () => {
+  it('uses the configured bot account id and does NOT call /user (D-07)', async () => {
+    const mock = installBitbucketFetchMock({
+      blockResolveBotUserIdentity: true, // proves configured id short-circuits the live call
+      rawCommentPageResponses: [
+        {
+          status: 200,
+          body: { values: [makeBitbucketBotComment()], next: undefined },
+        },
+      ],
+    });
+
+    try {
+      const env = createTestEnv();
+      const client = new BitbucketClient(env, 'test-token-bearer');
+      const job = {
+        ...buildBitbucketFixture(),
+        configSnapshot: {
+          review: {
+            interactive: {
+              commands: {
+                enabled: true,
+                bitbucket_allowed_account_ids: [],
+                bitbucket_bot_account_id: BB_BOT_ACCOUNT_ID,
+              },
+              qa: { enabled: false, rate_limit_per_hour: 10 },
+            },
+          },
+        } as never,
+      };
+      const adapter = new (BitbucketAdapter as unknown as new (
+        env: ReturnType<typeof createTestEnv>,
+        client: BitbucketClient,
+        jobArg: typeof job,
+      ) => BitbucketAdapter)(env, client, job);
+
+      const threads = await adapter.getUnresolvedBotThreads(WORKSPACE, BB_REPO, BB_PR_NUMBER);
+      // Bot id filter should match the configured value.
+      expect(threads).toHaveLength(1);
+      // No /user call was made — the configured id short-circuits the resolver.
+      const userCalls = mock.calls.filter((call) => call.url.endsWith('/2.0/user') && call.method === 'GET');
+      expect(userCalls).toHaveLength(0);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  it('traverses at least two comment pages and applies the D-05/D-06 filter', async () => {
+    const mock = installBitbucketFetchMock({
+      rawCommentPageResponses: [
+        {
+          status: 200,
+          body: {
+            values: [
+              makeBitbucketBotComment({ id: 11 }),
+              // Human (not bot) - filtered.
+              makeBitbucketBotComment({
+                id: 12,
+                user: { account_id: 'other-user', nickname: 'h', display_name: 'H' },
+              }),
+              // Reply - filtered.
+              makeBitbucketBotComment({ id: 13, parent: { id: 11 } }),
+              // Resolved - filtered.
+              makeBitbucketBotComment({ id: 14, resolution: { created_on: 'now', user: { account_id: BB_BOT_ACCOUNT_ID } } }),
+              // Deleted - filtered.
+              makeBitbucketBotComment({ id: 15, deleted: true }),
+            ],
+            next: `https://api.bitbucket.org/2.0/repositories/${WORKSPACE}/${BB_REPO}/pullrequests/${BB_PR_NUMBER}/comments?pagelen=100&page=2`,
+          },
+        },
+        {
+          status: 200,
+          body: {
+            values: [makeBitbucketBotComment({ id: 21, inline: { path: 'src/foo.ts', to: 30, from: undefined } })],
+          },
+        },
+      ],
+    });
+
+    try {
+      const env = createTestEnv();
+      const client = new BitbucketClient(env, 'test-token-bearer');
+      const job = {
+        ...buildBitbucketFixture(),
+        configSnapshot: {
+          review: {
+            interactive: {
+              commands: {
+                enabled: true,
+                bitbucket_allowed_account_ids: [],
+                bitbucket_bot_account_id: BB_BOT_ACCOUNT_ID,
+              },
+              qa: { enabled: false, rate_limit_per_hour: 10 },
+            },
+          },
+        } as never,
+      };
+      const adapter = new (BitbucketAdapter as unknown as new (
+        env: ReturnType<typeof createTestEnv>,
+        client: BitbucketClient,
+        jobArg: typeof job,
+      ) => BitbucketAdapter)(env, client, job);
+
+      const threads = await adapter.getUnresolvedBotThreads(WORKSPACE, BB_REPO, BB_PR_NUMBER);
+      expect(threads).toHaveLength(2);
+      // Opaque refs are self-encoding `${pr}:${id}`.
+      expect(threads[0].ref).toBe(`${BB_PR_NUMBER}:11`);
+      expect(threads[1].ref).toBe(`${BB_PR_NUMBER}:21`);
+      // Two raw-comment GET calls must have been issued.
+      const commentCalls = mock.calls.filter(
+        (call) => call.method === 'GET' && call.path.includes('/comments'),
+      );
+      expect(commentCalls.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  it('returns [] when a later page fails (fail-closed pagination)', async () => {
+    const mock = installBitbucketFetchMock({
+      rawCommentPageResponses: [
+        {
+          status: 200,
+          body: {
+            values: [makeBitbucketBotComment({ id: 11 })],
+            next: `https://api.bitbucket.org/2.0/repositories/${WORKSPACE}/${BB_REPO}/pullrequests/${BB_PR_NUMBER}/comments?pagelen=100&page=2`,
+          },
+        },
+        { status: 500, body: { error: { message: 'intermittent' } } },
+      ],
+    });
+
+    try {
+      const env = createTestEnv();
+      const client = new BitbucketClient(env, 'test-token-bearer');
+      const job = {
+        ...buildBitbucketFixture(),
+        configSnapshot: {
+          review: {
+            interactive: {
+              commands: {
+                enabled: true,
+                bitbucket_allowed_account_ids: [],
+                bitbucket_bot_account_id: BB_BOT_ACCOUNT_ID,
+              },
+              qa: { enabled: false, rate_limit_per_hour: 10 },
+            },
+          },
+        } as never,
+      };
+      const adapter = new (BitbucketAdapter as unknown as new (
+        env: ReturnType<typeof createTestEnv>,
+        client: BitbucketClient,
+        jobArg: typeof job,
+      ) => BitbucketAdapter)(env, client, job);
+
+      await expect(adapter.getUnresolvedBotThreads(WORKSPACE, BB_REPO, BB_PR_NUMBER)).resolves.toEqual([]);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  it('marks old-side-only comments outdated (R-4)', async () => {
+    const mock = installBitbucketFetchMock({
+      rawCommentPageResponses: [
+        {
+          status: 200,
+          body: {
+            values: [
+              makeBitbucketBotComment({
+                id: 50,
+                inline: { path: 'src/foo.ts', to: undefined, from: 7, start_from: 5 },
+              }),
+            ],
+          },
+        },
+      ],
+      // Diff with no actual content for src/foo.ts so the line isn't valid.
+      getPullRequestDiffResponse: {
+        status: 200,
+        body: 'diff --git a/other.ts b/other.ts\n@@ -1 +1 @@\n-old\n+new\n',
+        headers: { 'content-type': 'text/plain' },
+      },
+    });
+
+    try {
+      const env = createTestEnv();
+      const client = new BitbucketClient(env, 'test-token-bearer');
+      const job = {
+        ...buildBitbucketFixture(),
+        configSnapshot: {
+          review: {
+            interactive: {
+              commands: {
+                enabled: true,
+                bitbucket_allowed_account_ids: [],
+                bitbucket_bot_account_id: BB_BOT_ACCOUNT_ID,
+              },
+              qa: { enabled: false, rate_limit_per_hour: 10 },
+            },
+          },
+        } as never,
+      };
+      const adapter = new (BitbucketAdapter as unknown as new (
+        env: ReturnType<typeof createTestEnv>,
+        client: BitbucketClient,
+        jobArg: typeof job,
+      ) => BitbucketAdapter)(env, client, job);
+
+      const threads = await adapter.getUnresolvedBotThreads(WORKSPACE, BB_REPO, BB_PR_NUMBER);
+      // Old-side-only: lineStart populated from start_from, lineEnd from from, outdated=true.
+      expect(threads).toHaveLength(1);
+      expect(threads[0]).toEqual({
+        ref: `${BB_PR_NUMBER}:50`,
+        path: 'src/foo.ts',
+        lineStart: 5,
+        lineEnd: 7,
+        rootBody: 'Bot root finding body',
+        outdated: true,
+      });
+    } finally {
+      mock.restore();
+    }
+  });
+
+  it('skips malformed anchors and empty bodies', async () => {
+    const mock = installBitbucketFetchMock({
+      rawCommentPageResponses: [
+        {
+          status: 200,
+          body: {
+            values: [
+              // Empty body - skipped.
+              makeBitbucketBotComment({ id: 60, content: { raw: '' } }),
+              // Empty inline.path - skipped (no path kept).
+              makeBitbucketBotComment({ id: 61, inline: { path: '', to: 12, from: undefined } }),
+              // Malformed range - skipped.
+              makeBitbucketBotComment({ id: 62, inline: { path: 'src/foo.ts', to: 0, from: undefined } }),
+            ],
+          },
+        },
+      ],
+    });
+
+    try {
+      const env = createTestEnv();
+      const client = new BitbucketClient(env, 'test-token-bearer');
+      const job = {
+        ...buildBitbucketFixture(),
+        configSnapshot: {
+          review: {
+            interactive: {
+              commands: {
+                enabled: true,
+                bitbucket_allowed_account_ids: [],
+                bitbucket_bot_account_id: BB_BOT_ACCOUNT_ID,
+              },
+              qa: { enabled: false, rate_limit_per_hour: 10 },
+            },
+          },
+        } as never,
+      };
+      const adapter = new (BitbucketAdapter as unknown as new (
+        env: ReturnType<typeof createTestEnv>,
+        client: BitbucketClient,
+        jobArg: typeof job,
+      ) => BitbucketAdapter)(env, client, job);
+
+      await expect(adapter.getUnresolvedBotThreads(WORKSPACE, BB_REPO, BB_PR_NUMBER)).resolves.toEqual([]);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  it('rejects malformed refs and flips `supportsThreadResolution` on 403/404/501', async () => {
+    const mock = installBitbucketFetchMock({
+      resolveCommentStatuses: [{ status: 403 }],
+    });
+
+    try {
+      const env = createTestEnv();
+      const client = new BitbucketClient(env, 'test-token-bearer');
+      const adapter = new (BitbucketAdapter as unknown as new (
+        env: ReturnType<typeof createTestEnv>,
+        client: BitbucketClient,
+        jobArg: ReturnType<typeof buildBitbucketFixture>,
+      ) => BitbucketAdapter)(env, client, buildBitbucketFixture());
+
+      // Malformed ref -> throws at the seam.
+      await expect(adapter.resolveThread(WORKSPACE, BB_REPO, 'not-a-valid-ref')).rejects.toThrow();
+
+      // Now try with a valid ref -> 403 -> flips capability.
+      await expect(adapter.resolveThread(WORKSPACE, BB_REPO, `${BB_PR_NUMBER}:7`)).resolves.toBe(false);
+      expect(adapter.capabilities.supportsThreadResolution).toBe(false);
+
+      // Second call must short-circuit (no resolve request) thanks to the downgrade.
+      const callsBefore = mock.calls.length;
+      await expect(adapter.resolveThread(WORKSPACE, BB_REPO, `${BB_PR_NUMBER}:7`)).resolves.toBe(false);
+      const resolveAfter = mock.calls.filter((call) => call.method === 'POST' && /\/comments\/\d+\/resolve/.test(call.path));
+      expect(resolveAfter).toHaveLength(1);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  it('returns false on 500/501 WITHOUT flipping the capability and uses exactly one request', async () => {
+    const mock = installBitbucketFetchMock({
+      resolveCommentStatuses: [{ status: 500 }],
+    });
+
+    try {
+      const env = createTestEnv();
+      const client = new BitbucketClient(env, 'test-token-bearer');
+      const adapter = new (BitbucketAdapter as unknown as new (
+        env: ReturnType<typeof createTestEnv>,
+        client: BitbucketClient,
+        jobArg: ReturnType<typeof buildBitbucketFixture>,
+      ) => BitbucketAdapter)(env, client, buildBitbucketFixture());
+
+      await expect(adapter.resolveThread(WORKSPACE, BB_REPO, `${BB_PR_NUMBER}:7`)).resolves.toBe(false);
+      // Capability stays optimistic (D-04: 500 is NOT a downgrade trigger).
+      expect(adapter.capabilities.supportsThreadResolution).toBe(true);
+      // Exactly one POST /resolve issued for the 500 attempt — no retry.
+      const resolveCalls = mock.calls.filter((call) => call.method === 'POST' && /\/comments\/\d+\/resolve/.test(call.path));
+      expect(resolveCalls).toHaveLength(1);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  it('resolves successfully on 200', async () => {
+    const mock = installBitbucketFetchMock({
+      resolveCommentStatuses: [{ status: 200 }],
+    });
+
+    try {
+      const env = createTestEnv();
+      const client = new BitbucketClient(env, 'test-token-bearer');
+      const adapter = new (BitbucketAdapter as unknown as new (
+        env: ReturnType<typeof createTestEnv>,
+        client: BitbucketClient,
+        jobArg: ReturnType<typeof buildBitbucketFixture>,
+      ) => BitbucketAdapter)(env, client, buildBitbucketFixture());
+
+      await expect(adapter.resolveThread(WORKSPACE, BB_REPO, `${BB_PR_NUMBER}:7`)).resolves.toBe(true);
+      expect(adapter.capabilities.supportsThreadResolution).toBe(true);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  it('rejects a non-Bitbucket next URL (SSRF guard)', async () => {
+    const mock = installBitbucketFetchMock({
+      rawCommentPageResponses: [
+        {
+          status: 200,
+          body: {
+            values: [makeBitbucketBotComment({ id: 11 })],
+            next: 'https://evil.example.com/2.0/comments?page=2',
+          },
+        },
+      ],
+    });
+
+    try {
+      const env = createTestEnv();
+      const client = new BitbucketClient(env, 'test-token-bearer');
+      const job = {
+        ...buildBitbucketFixture(),
+        configSnapshot: {
+          review: {
+            interactive: {
+              commands: {
+                enabled: true,
+                bitbucket_allowed_account_ids: [],
+                bitbucket_bot_account_id: BB_BOT_ACCOUNT_ID,
+              },
+              qa: { enabled: false, rate_limit_per_hour: 10 },
+            },
+          },
+        } as never,
+      };
+      const adapter = new (BitbucketAdapter as unknown as new (
+        env: ReturnType<typeof createTestEnv>,
+        client: BitbucketClient,
+        jobArg: typeof job,
+      ) => BitbucketAdapter)(env, client, job);
+
+      await expect(adapter.getUnresolvedBotThreads(WORKSPACE, BB_REPO, BB_PR_NUMBER)).resolves.toEqual([]);
+    } finally {
+      mock.restore();
+    }
+  });
+});
