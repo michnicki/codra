@@ -22,6 +22,17 @@ export class GitHubService {
     return this.client.getPullRequestDiff(owner, repo, prNumber);
   }
 
+  // PROV-01 (D-08): ref-aware file content primitive. The seam accepts the optional ref so
+  // callers can pass branch / tag / commit SHA; omitting it preserves the legacy no-ref behavior.
+  async getRepoFileContent(owner: string, repo: string, path: string, ref: string) {
+    return this.client.getRepoFileOrNull(owner, repo, path, ref);
+  }
+
+  // PROV-01 (D-09): compare-diff primitive. BASE...HEAD with `application/vnd.github.diff`.
+  async getCompareDiff(owner: string, repo: string, base: string, head: string) {
+    return this.client.getCompareDiff(owner, repo, base, head);
+  }
+
   async createCheckRun(owner: string, repo: string, params: { headSha: string; title: string; summary: string }) {
     return this.client.createCheckRun(owner, repo, params);
   }

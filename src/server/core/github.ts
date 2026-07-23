@@ -423,9 +423,13 @@ export class GitHubClient {
     });
   }
 
-  async getRepoFileOrNull(owner: string, repo: string, path: string) {
-    return withRetry(`getRepoFileOrNull ${owner}/${repo}/${path}`, async () => {
-      const response = await this.request(`${repoApiPath(owner, repo)}/contents/${encodeGitHubContentPath(path)}`);
+  async getRepoFileOrNull(owner: string, repo: string, path: string, ref?: string) {
+    return withRetry(`getRepoFileOrNull ${owner}/${repo}/${path}${ref ? `@${ref}` : ''}`, async () => {
+      // PROV-01 (D-08): when `ref` is supplied, append `?ref=<encoded>` so the endpoint resolves
+      // against any git ref (branch / tag / commit SHA). The legacy no-arg path is preserved
+      // byte-compatibly for the existing call sites (NREG-01).
+      const query = ref ? `?ref=${encodeURIComponent(ref)}` : '';
+      const response = await this.request(`${repoApiPath(owner, repo)}/contents/${encodeGitHubContentPath(path)}${query}`);
       if (response.status === 404) {
         return null;
       }
@@ -445,6 +449,23 @@ export class GitHubClient {
       }
 
       return data.encoding === 'base64' ? atob(data.content.replace(/\n/g, '')) : data.content;
+    });
+  }
+
+  // PROV-01 (D-09): compare-diff primitive. The GitHub REST compare endpoint orders operands
+  // `BASE...HEAD` (NOT `HEAD..BASE` — the opposite of Bitbucket's diff); see R-5/R-6. The
+  // `application/vnd.github.diff` media type returns the raw unified diff as text. An empty
+  // response is a real, expected result (same SHA on both sides) and is passed through as `''`
+  // so a Phase 18 consumer can distinguish a genuinely-empty diff from an errored one.
+  async getCompareDiff(owner: string, repo: string, base: string, head: string) {
+    const spec = `${encodeURIComponent(base)}...${encodeURIComponent(head)}`;
+    return withRetry(`getCompareDiff ${owner}/${repo} ${base}...${head}`, async () => {
+      const response = await this.requestAndCheck(
+        `${repoApiPath(owner, repo)}/compare/${spec}`,
+        {},
+        'application/vnd.github.diff',
+      );
+      return response.text();
     });
   }
 

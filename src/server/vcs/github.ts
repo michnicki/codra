@@ -64,18 +64,17 @@ export class GithubAdapter implements VcsProvider {
     return this.gh.getPullRequestDiff(owner, repo, prNumber);
   }
 
-  // PROV-01 (D-08): content primitive. PLAN-02-IMPL — Task 2 replaces this stub with the
-  // GitHubService.getRepoFileContent delegate (`ref` aware via `?ref=`).
+  // PROV-01 (D-08): content primitive. Delegates to GitHubService which forwards to the
+  // ref-aware `getRepoFileOrNull` (Task 2). 404 -> null; non-2xx -> GitHubError.
   async getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null> {
-    void owner; void repo; void path; void ref;
-    return null;
+    return this.gh.getRepoFileContent(owner, repo, path, ref);
   }
 
-  // PROV-01 (D-09): compare-diff primitive. PLAN-02-IMPL — Task 2 replaces this stub with the
-  // GitHubService.getCompareDiff delegate (`BASE...HEAD` + `application/vnd.github.diff`).
+  // PROV-01 (D-09): compare-diff primitive. Delegates to GitHubService.getCompareDiff which
+  // sends `/compare/{base}...{head}` with `application/vnd.github.diff` (Task 2). Empty success
+  // passes through as `''`; non-2xx throws GitHubError.
   async getCompareDiff(owner: string, repo: string, base: string, head: string): Promise<string> {
-    void owner; void repo; void base; void head;
-    return '';
+    return this.gh.getCompareDiff(owner, repo, base, head);
   }
 
   // PROV-02 (D-05/D-06/D-07): unresolved-bot-thread listing. PLAN-02-IMPL — Plan 17-02 replaces

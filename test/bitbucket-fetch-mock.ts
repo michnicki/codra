@@ -27,6 +27,18 @@ export type BitbucketFetchMockOptions = {
   upsertCodeInsightsReportResponse?: BitbucketMockResponse;
   postCommitBuildStatusResponse?: BitbucketMockResponse;
   responseSequence?: Array<BitbucketMockResponse | Response | ResponseFactory>;
+  /**
+   * Response for GET /repositories/{workspace}/{repo}/src/{ref}/{path} (PROV-01, D-08).
+   * `status` defaults to 200; `body` is returned as raw text. Use `status: 404` to exercise
+   * the null path.
+   */
+  fileContentResponses?: BitbucketMockResponse;
+  /**
+   * Response for GET /repositories/{workspace}/{repo}/diff/{spec}?context=3&topic=true
+   * (PROV-01, D-09). `status` defaults to 200; `body` is returned as raw text. Use
+   * `status: 200, body: ''` to exercise the empty-success path.
+   */
+  compareDiffResponses?: BitbucketMockResponse;
 };
 
 // Concrete author fixtures for the comment-primitive specs (review F6). Three DISTINCT string
@@ -122,6 +134,27 @@ export function installBitbucketFetchMock(options: BitbucketFetchMockOptions = {
         body: 'diff --git a/src/foo.ts b/src/foo.ts\n',
         headers: { 'content-type': 'text/plain' },
       });
+    }
+    // PROV-01 (D-08): GET /src/{ref}/{path} — single-page raw-text response. 404 -> null path
+    // at the adapter; non-404 status errors throw at the adapter. The recorder preserves the
+    // full URL (pathname + search) so a spec can assert the ref segment is encoded as-is.
+    if (method === 'GET' && /\/src\/[^/]+\//.test(url.pathname)) {
+      const fixture = options.fileContentResponses ?? {
+        status: 200,
+        body: 'default file content',
+        headers: { 'content-type': 'text/plain' },
+      };
+      return toResponse(fixture);
+    }
+    // PROV-01 (D-09): GET /diff/{head}..{base}?context=3&topic=true — raw-text. The recorder
+    // preserves the full URL so the reversed operands + query params are observable.
+    if (method === 'GET' && /\/diff\//.test(url.pathname)) {
+      const fixture = options.compareDiffResponses ?? {
+        status: 200,
+        body: 'diff --git a/src/foo.ts b/src/foo.ts\n+const added = true;\n',
+        headers: { 'content-type': 'text/plain' },
+      };
+      return toResponse(fixture);
     }
     if (method === 'GET' && /\/pullrequests\/\d+\/comments$/.test(url.pathname)) {
       return toResponse(options.listPullRequestCommentsResponse ?? {

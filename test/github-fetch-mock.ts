@@ -3,11 +3,22 @@ import { vi } from 'vitest';
 export type RecordedGitHubCall = {
   method: string;
   path: string;
+  search: string;
   accept: string | null;
   body: any;
 };
 
 export type ReviewResponseScript = Array<{ status: number; id?: number }>;
+
+/**
+ * Body for any of the new mock fixtures (content/compare). `body` is whatever the adapter
+ * expects to decode — a JSON object for `/contents`, a raw string for `/compare`.
+ */
+export type BitbucketLikeMockResponse = {
+  status?: number;
+  body?: unknown;
+  headers?: Record<string, string>;
+};
 
 /**
  * Scripted status sequence for successive PATCH /issues/comments/{id} calls (the edit-comment
@@ -66,6 +77,18 @@ export type GitHubFetchMockFixtures = {
    * `user` object so a spec can prove the adapter re-verifies the immutable id (id-mismatch → null).
    */
   permissionResponse?: { status?: number; permission?: string; userId?: number; userLogin?: string };
+  /**
+   * Response for GET /repos/{owner}/{repo}/contents/{path}?ref={ref} (PROV-01, D-08). `status`
+   * defaults to 200; when `body` is provided as `{ content, encoding }` the route returns it
+   * verbatim so a spec can verify base64 decoding. Use `status: 404` to exercise the null path.
+   */
+  contentResponses?: BitbucketLikeMockResponse;
+  /**
+   * Response for GET /repos/{owner}/{repo}/compare/{base}...{head} with the
+   * `application/vnd.github.diff` media type (PROV-01, D-09). `status` defaults to 200; `body`
+   * is returned as raw text. Use `status: 200, body: ''` to exercise the empty-success path.
+   */
+  compareResponses?: BitbucketLikeMockResponse;
 };
 
 /**
@@ -114,14 +137,34 @@ export function installGitHubFetchMock(fixtures: GitHubFetchMockFixtures) {
       }
     }
 
-    calls.push({ method, path: url.pathname, accept, body });
+    // Record BOTH the path's pathname (so existing pathname-only matchers keep working) AND the
+    // search query (so PROV-01 specs can assert the `?ref=` query on `/contents`).
+    calls.push({ method, path: url.pathname, search: url.search, accept, body });
 
     const json = (data: unknown, status = 200) =>
       new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
 
+    const text = (data: string, status = 200, extraHeaders: Record<string, string> = {}) =>
+      new Response(data, { status, headers: { 'content-type': 'text/plain', ...extraHeaders } });
+
+    // --- PROV-01: GET /compare/{base}...{head} (D-09) ---
+    // Match the canonical path; the compare accept hdr is `application/vnd.github.diff`. Order
+    // matters: this route must be checked BEFORE the getPullRequest `pathname === pulls/N` branch
+    // since `/compare/...` shares the prefix but never matches the bare pull endpoint.
+    if (method === 'GET' && url.pathname.includes('/compare/')) {
+      const fixture = fixtures.compareResponses ?? { status: 200, body: fixtures.diff };
+      const status = fixture.status ?? 200;
+      const headers = new Headers(fixture.headers ?? {});
+      if (!headers.has('content-type')) headers.set('content-type', 'text/plain');
+      if (typeof fixture.body === 'string') {
+        return new Response(fixture.body, { status, headers });
+      }
+      return new Response(JSON.stringify(fixture.body), { status, headers });
+    }
+
     if (method === 'GET' && url.pathname === `${repoPrefix}/pulls/${fixtures.prNumber}`) {
       if (accept === 'application/vnd.github.v3.diff') {
-        return new Response(fixtures.diff, { status: 200 });
+        return text(fixtures.diff, 200);
       }
       return json(fixtures.pull);
     }
@@ -147,6 +190,24 @@ export function installGitHubFetchMock(fixtures: GitHubFetchMockFixtures) {
         return json({ message: 'Unprocessable Entity' }, script.status);
       }
       return json({ id: script.id ?? 5150 }, script.status);
+    }
+
+    // --- PROV-01: GET /contents/{path}?ref={ref} (D-08) ---
+    // Match the contents path (any sub-path, with optional ?ref=). Status 404 maps to a null
+    // text body; 200 returns the supplied fixture body so a spec can verify base64 decoding.
+    if (method === 'GET' && /^\/repos\/[^/]+\/[^/]+\/contents\//.test(url.pathname)) {
+      const fixture = fixtures.contentResponses ?? {
+        status: 200,
+        body: { content: Buffer.from('default content').toString('base64'), encoding: 'base64' },
+      };
+      const status = fixture.status ?? 200;
+      if (status === 404) {
+        return json({ message: 'Not Found' }, 404);
+      }
+      if (status >= 400) {
+        return json({ message: `Contents error ${status}` }, status);
+      }
+      return json(fixture.body, status);
     }
 
     // --- Issue-comment routes (net-new, additive; NREG-01) ---
