@@ -8,12 +8,17 @@ import { SEVERITY_RANK, type MergeRecord } from './dedup';
  * Chain order is FR-180 canonical and MUST run in exactly this sequence [D-10]:
  *   1. per-category effective confidence floor  -> dropped.confidenceFloor
  *   2. severity floor (min_severity)            -> dropped.severityFloor
- *   3. sort severity desc, then confidence desc (stable — earlier input wins a full tie)
- *   4. dedup (INJECTED via opts.dedup so this module stays pure; the caller resolves the
+ *   3. optional pre-cap suppression             -> suppressed
+ *   4. sort severity desc, then confidence desc (stable — earlier input wins a full tie)
+ *   5. dedup (INJECTED via opts.dedup so this module stays pure; the caller resolves the
  *      composite-vs-legacy selection — D-04)  -> dropped.merges
- *   5. tiered cap: EXEMPT P0/P1/P2 (SEVERITY_RANK <= 2), cap ONLY P3/nit (rank >= 3) [D-13].
+ *   6. tiered cap: EXEMPT P0/P1/P2 (SEVERITY_RANK <= 2), cap ONLY P3/nit (rank >= 3) [D-13].
  *      So 8 P0 + 5 P2 + 10 nit with cap 3 posts 16 comments — the cap trims the already-sorted
  *      P3+nit sub-list (P3-before-nit, highest-confidence first) to effectiveMaxComments.
+ *
+ * The optional suppression seam runs after eligibility floors but before dedup/cap. This lets
+ * round-thread suppression backfill capped slots without reclassifying confidence/severity drops,
+ * while callers that omit it retain the original byte-identical filter behavior.
  *
  * Effective confidence floor = max(global min_confidence, category_confidence[category]) — a category
  * floor only TIGHTENS and never loosens the global (FILT-02, locked). null/absent confidence is
@@ -39,17 +44,25 @@ export type DropRecord = {
   effectiveFloor?: number;
 };
 
+export type PreCapSuppressionResult = {
+  survivors: ParsedReviewComment[];
+  suppressed: ParsedReviewComment[];
+};
+
 export type NoiseFilterOptions = {
   minConfidence: number;
   categoryConfidence: Partial<Record<ReviewCategory, number>>;
   minSeverity: ReviewSeverity;
   effectiveMaxComments: number;
+  // Optional round-thread seam. It receives only floor-eligible findings and must remain pure.
+  preCapSuppress?: (comments: ParsedReviewComment[]) => PreCapSuppressionResult;
   // Injected so the filter stays pure and I/O-free; a no-op dedup returns { survivors: input, merges: [] }.
   dedup: (comments: ParsedReviewComment[]) => { survivors: ParsedReviewComment[]; merges: MergeRecord[] };
 };
 
 export type NoiseFilterResult = {
   kept: ParsedReviewComment[];
+  suppressed: ParsedReviewComment[];
   dropped: {
     confidenceFloor: DropRecord[];
     severityFloor: DropRecord[];
@@ -104,18 +117,27 @@ export function applyNoiseFilter(comments: ParsedReviewComment[], opts: NoiseFil
     }
   }
 
-  // Step 3 — sort severity desc then confidence desc. Array.prototype.sort is stable (ES2019+), so a
+  // Step 3 — optional suppression after eligibility but before dedup/cap. The default preserves the
+  // pre-RND-04 chain exactly. Suppressed findings are returned separately from the existing drop
+  // categories so finalize can emit its posting-only rounds.suppressed audit without treating them
+  // as confidence, severity, dedup, or cap drops.
+  const suppression = opts.preCapSuppress?.(afterSeverity) ?? {
+    survivors: afterSeverity,
+    suppressed: [],
+  };
+
+  // Step 4 — sort severity desc then confidence desc. Array.prototype.sort is stable (ES2019+), so a
   // full severity+confidence tie preserves earlier-input order -> deterministic cap trimming [D-12].
-  const sorted = [...afterSeverity].sort((a, b) => {
+  const sorted = [...suppression.survivors].sort((a, b) => {
     const rankDiff = rankOf(a.severity) - rankOf(b.severity);
     if (rankDiff !== 0) return rankDiff;
     return (b.confidence ?? -1) - (a.confidence ?? -1);
   });
 
-  // Step 4 — dedup (injected). A no-op dedup returns its input unchanged with no merges.
+  // Step 5 — dedup (injected). A no-op dedup returns its input unchanged with no merges.
   const { survivors, merges } = opts.dedup(sorted);
 
-  // Step 5 — tiered cap: exempt P0/P1/P2 (rank <= 2), cap only P3/nit (rank >= 3) [D-13]. The exempt
+  // Step 6 — tiered cap: exempt P0/P1/P2 (rank <= 2), cap only P3/nit (rank >= 3) [D-13]. The exempt
   // set precedes the kept-capped set, and every exempt rank sorts before every capped rank, so `kept`
   // stays globally sorted severity desc.
   const exempt: ParsedReviewComment[] = [];
@@ -131,6 +153,7 @@ export function applyNoiseFilter(comments: ParsedReviewComment[], opts: NoiseFil
 
   return {
     kept: [...exempt, ...keptCapped],
+    suppressed: suppression.suppressed,
     dropped: { confidenceFloor, severityFloor, cap, merges },
   };
 }
