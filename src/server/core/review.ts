@@ -843,6 +843,13 @@ async function runPreparePhase(
   // separately gated on `rounds.incremental` -- THIS plan persists the durable snapshot but does
   // not activate any consumer path. The review-rest short-circuit (D-03) is the only branch that
   // skips state + thread calls entirely.
+  //
+  // Phase 18 Plan 02 (RND-02): the SELECTED mode (the OUTPUT of selectDiffForRound) is what gets
+  // persisted as `review_mode` -- NOT the resolver's mode. The resolver's mode is the constraint
+  // (full / incremental / fallback), the selector's output is the actual review behavior
+  // (which may downgrade to 'no_changes' on a successful empty compare). The two writes
+  // (setJobReviewRoundAndMode + setJobDiffSelection) happen AFTER the compare/fetch so the
+  // job row's review_mode can transition from 'incremental' to 'no_changes' inline.
   const roundsIncremental = Boolean(config.review.rounds?.incremental ?? false);
   if (job.reviewScope !== 'rest') {
     // Non-rest path: query pr_review_state for the prior anchor AND (gated on the durable
@@ -885,24 +892,15 @@ async function runPreparePhase(
       roundsIncremental,
     });
 
-    // Persist the resolved round/mode onto the job (durable snapshot) so later phases / fresh
-    // instances / the dashboard read the same value. Best-effort: a failed write is logged and
-    // swallowed so the prepare phase can continue (the round is also captured in the audit
-    // trail, so an operational-state drift between jobs row and audit trail is recoverable).
-    try {
-      await setJobReviewRoundAndMode(env, job.id, {
-        reviewRound: roundContext.round,
-        reviewMode: roundContext.mode,
-      });
-    } catch (error) {
-      logger.warn(
-        `Failed to persist round/mode for job ${job.id}; round will be re-resolved on next prepare`,
-        error instanceof Error ? error : new Error(String(error)),
-      );
-    }
-
-    // Emit the detected-event audit record. Best-effort recorder never throws into the caller.
+    // Emit the detected-event audit record NOW (before the diff fetch) so the round signal is
+    // observable at the prepare step regardless of whether the compare fetch succeeds. The
+    // best-effort recorder never throws into the caller.
     await recordRoundAudit(env, job.id, [buildRoundsDetectedEvent(roundContext)]);
+
+    // The selected mode (selector's output) is staged for the write below. The selected mode
+    // may differ from the resolver's mode (e.g., resolver says 'incremental' but selector says
+    // 'no_changes' for an empty compare). The job's review_mode is the SELECTED mode.
+    void roundContext;
   } else {
     // D-03 review-rest short-circuit: NO state/thread calls, NO resolver. Persist round 1 / mode
     // 'rest' directly so the dashboard reads the same round/mode pair this job will execute with,
@@ -993,6 +991,23 @@ async function runPreparePhase(
       fullFiles,
       toSha: pr.headSha,
     });
+
+    // Persist the SELECTED mode (not the resolver's mode) so the job row's review_mode
+    // reflects the ACTUAL review behavior. A selector that downgrades 'incremental' to
+    // 'no_changes' on an empty compare writes 'no_changes' here -- the placeholder finalize
+    // path sees the no_changes descriptor and short-circuits cleanly. Best-effort: a failed
+    // write is logged + swallowed so the prepare phase can continue.
+    try {
+      await setJobReviewRoundAndMode(env, job.id, {
+        reviewRound: roundContextForSelection.round,
+        reviewMode: selectionDescriptor.mode,
+      });
+    } catch (error) {
+      logger.warn(
+        `Failed to persist selected round/mode for job ${job.id}; round will be re-resolved on next prepare`,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
 
     // Persist the descriptor on the job row. Best-effort: a failed write is logged + swallowed
     // so the prepare phase can continue (the descriptor is also captured in the audit trail,
