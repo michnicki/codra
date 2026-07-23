@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { runReviewJob } from '@server/core/review';
-import { getJobDetail, getJobForProcessing, insertJob, mapJob, updateJobStep } from '@server/db/jobs';
+import { getJobDetail, getJobForProcessing, insertJob, mapJob, setJobDiffSelection, setJobReviewRoundAndMode, updateJobFileCount, updateJobStep } from '@server/db/jobs';
 import { setLastReviewedSha, type PrReviewStateKey } from '@server/db/pr-review-state';
 import { upsertFileReview } from '@server/db/file-reviews';
 import { runWithDb } from '@server/db/client';
@@ -42,6 +42,19 @@ function defaultRoundsConfig(incremental: boolean): RepoConfig {
     },
   };
 }
+
+const noiseFilterOptionCalls = vi.hoisted(() => [] as unknown[]);
+
+vi.mock('@server/core/noise-filter', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@server/core/noise-filter')>();
+  return {
+    ...actual,
+    applyNoiseFilter: (...args: Parameters<typeof actual.applyNoiseFilter>) => {
+      noiseFilterOptionCalls.push(args[1]);
+      return actual.applyNoiseFilter(...args);
+    },
+  };
+});
 
 vi.mock('@server/db/jobs', async (importOriginal) => {
   const mod = await importOriginal<typeof import('@server/db/jobs')>();
@@ -149,6 +162,7 @@ dbDescribe('Phase 18 Plan 02 — durable selection + no_changes placeholder inte
     // tests' spies (e.g., a prior test's `getCompareDiff` mock would otherwise hijack a
     // latter test's null-anchor path).
     vi.restoreAllMocks();
+    noiseFilterOptionCalls.length = 0;
   });
 
   afterEach(() => {
@@ -452,6 +466,103 @@ dbDescribe('Phase 18 Plan 02 — durable selection + no_changes placeholder inte
     const files = await getJobDiffFiles(env, finalJob, new GitHubService(env, '123'), config);
     expect(compareSpy).toHaveBeenCalled();
     expect(files.map((f) => f.path)).toContain('src/durable.ts');
+  }, 30000);
+
+  it('round 2 finalize shares composed options across both consumers and records one effective-floor event', async () => {
+    const env = createTestEnv();
+    const config: RepoConfig = {
+      ...defaultRoundsConfig(true),
+      review: {
+        ...defaultRoundsConfig(true).review,
+        min_confidence: 0.7,
+        min_severity: 'nit',
+        category_confidence: { security: 0.9 },
+      },
+    };
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo: `repo-floors-${Date.now()}`,
+      prNumber: 7,
+      prTitle: 'Round Floors PR',
+      prAuthor: 'author',
+      commitSha: sha('t'),
+      baseSha: sha('0'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: config,
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+    await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+    await setJobReviewRoundAndMode(env, job.id, { reviewRound: 2, reviewMode: 'incremental' });
+    await setJobDiffSelection(env, job.id, {
+      mode: 'incremental',
+      fromSha: sha('a'),
+      toSha: sha('t'),
+    });
+    await upsertFileReview(env, job.id, {
+      filePath: 'src/x.ts',
+      pass: 'main',
+      fileStatus: 'done',
+      modelUsed: 'test-model',
+      modelProvider: 'test-provider',
+      diffLineCount: 1,
+      diffInput: 'diff',
+      rawAiOutput: '{}',
+      parsedComments: [{
+        path: 'src/x.ts',
+        line: 1,
+        position: 1,
+        severity: 'P2',
+        category: 'quality',
+        title: 'Round finding',
+        body: 'Round finding body',
+        confidence: 0.75,
+      }],
+      inputTokens: 1,
+      outputTokens: 1,
+      durationMs: 1,
+      verdict: 'comment',
+      fileSummary: 'summary',
+      overallCorrectness: 'issues found',
+      confidenceScore: 0.9,
+      errorMessage: null,
+    });
+
+    const { GitHubService } = await import('@server/services/github');
+    vi.spyOn(GitHubService.prototype, 'getCompareDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/x.ts', content: 'x' }]),
+    );
+    vi.spyOn(GitHubService.prototype, 'updateCheckRun').mockResolvedValue(undefined);
+
+    await runWithDb(env, async () => {
+      const result = await runReviewJob(env, {
+        jobId: job.id,
+        deliveryId: `delivery-floors-${Date.now()}`,
+        phase: 'finalize',
+      });
+      expect(result).toEqual({ action: 'ack' });
+    });
+
+    expect(noiseFilterOptionCalls).toHaveLength(2);
+    expect(noiseFilterOptionCalls[0]).toEqual(noiseFilterOptionCalls[1]);
+    expect(noiseFilterOptionCalls[0]).toMatchObject({
+      minConfidence: 0.8,
+      minSeverity: 'P2',
+      categoryConfidence: { security: 0.9 },
+    });
+
+    const detail = await getJobDetail(env, job.id);
+    const escalationEvents = detail!.audit.filter((event) => event.stage === 'rounds.escalated');
+    expect(escalationEvents).toHaveLength(1);
+    expect(escalationEvents[0]).toMatchObject({
+      round: 2,
+      effective: { minConfidence: 0.8, minSeverity: 'P2' },
+      droppedAtEffectiveFloor: 1,
+    });
   }, 30000);
 
   it('default-disabled byte identity: rounds.incremental:false never calls getCompareDiff', async () => {
