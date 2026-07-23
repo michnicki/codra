@@ -17,6 +17,7 @@ import { upsertFileReview } from '@server/db/file-reviews';
 import { queryRows, runWithDb } from '@server/db/client';
 import {
   defaultRepoConfig,
+  reviewSeverities,
   type ParsedReviewComment,
   type RepoConfig,
 } from '@shared/schema';
@@ -175,6 +176,15 @@ function mainComment(severity: ParsedReviewComment['severity'], title: string, b
   };
 }
 
+function inlineSeverityCounts(comments: Array<{ body: string }>) {
+  return Object.fromEntries(
+    reviewSeverities.map((severity) => [
+      severity,
+      comments.filter((comment) => comment.body.includes(severity)).length,
+    ]),
+  );
+}
+
 dbDescribe('NREG-01 default-path regression: Phase 18 rounds.incremental:false is byte-identical to Phase 17', () => {
   const env = createTestEnv();
   const fixture = loadFixture();
@@ -218,6 +228,9 @@ dbDescribe('NREG-01 default-path regression: Phase 18 rounds.incremental:false i
         return { id: 700 };
       },
     );
+
+    const jobsMod = await import('@server/db/jobs');
+    const completeSpy = vi.spyOn(jobsMod, 'completeJob');
 
     await runWithDb(env, async () => {
       const res = await runReviewJob(env, {
@@ -270,6 +283,10 @@ dbDescribe('NREG-01 default-path regression: Phase 18 rounds.incremental:false i
     expect(capturedReviewInput.comments.map((c: any) => c.path)).toEqual(
       fixture.round1.expectedSubmitReview.commentsPaths,
     );
+    expect(capturedReviewInput.comments.map((comment: any) =>
+      reviewSeverities.find((severity) => comment.body.includes(severity)),
+    )).toEqual(fixture.round1.expectedSubmitReview.commentsSeverityOrder);
+    expect(inlineSeverityCounts(capturedReviewInput.comments)).toEqual(fixture.round1.expectedSeverityCounts);
     // GitHub's submitReview input uses `body` (not `summaryBody`). Both providers accept the
     // opaque VcsSubmitReviewInput -- this test pins the GitHub side because the mocks are.
     expect(capturedReviewInput.body).toBeDefined();
@@ -302,15 +319,26 @@ dbDescribe('NREG-01 default-path regression: Phase 18 rounds.incremental:false i
 
     // Audit trail carries the rounds.detected event (observable at defaults).
     const detail = await getJobDetail(env, job.id);
+    expect(detail!.files.map((file) => file.filePath)).toEqual(fixture.round1.expectedFileSelection);
+    expect(detail!.summaryMarkdown).toBe(capturedReviewInput.body);
     const stages = detail!.audit.map((e) => e.stage);
     for (const expected of fixture.round1.expectedAuditEvents) {
       expect(stages).toContain(expected);
     }
+    expect(stages).not.toContain('rounds.escalated');
+    expect(stages).not.toContain('rounds.suppressed');
+    expect(createReviewSpy.mock.invocationCallOrder[0]).toBeLessThan(
+      updateIssueSpy.mock.invocationCallOrder[0],
+    );
+    expect(updateIssueSpy.mock.invocationCallOrder[0]).toBeLessThan(
+      completeSpy.mock.invocationCallOrder[0],
+    );
 
     createReviewSpy.mockRestore();
     updateIssueSpy.mockRestore();
     compareDiffSpy.mockRestore();
     unresolvedThreadsSpy.mockRestore();
+    completeSpy.mockRestore();
   }, 30000);
 
   it('round 2 (prior anchor, rounds.incremental:false): externally-visible payload matches round 1', async () => {
@@ -364,6 +392,9 @@ dbDescribe('NREG-01 default-path regression: Phase 18 rounds.incremental:false i
       },
     );
 
+    const jobsMod = await import('@server/db/jobs');
+    const completeSpy = vi.spyOn(jobsMod, 'completeJob');
+
     await runWithDb(env, async () => {
       const res = await runReviewJob(env, {
         jobId: job.id,
@@ -412,6 +443,10 @@ dbDescribe('NREG-01 default-path regression: Phase 18 rounds.incremental:false i
     expect(capturedReviewInput.comments.map((c: any) => c.path)).toEqual(
       fixture.round2.expectedSubmitReview.commentsPaths,
     );
+    expect(capturedReviewInput.comments.map((comment: any) =>
+      reviewSeverities.find((severity) => comment.body.includes(severity)),
+    )).toEqual(fixture.round2.expectedSubmitReview.commentsSeverityOrder);
+    expect(inlineSeverityCounts(capturedReviewInput.comments)).toEqual(fixture.round2.expectedSeverityCounts);
     expect(capturedReviewInput.body).toBeDefined();
     for (const substring of fixture.round2.expectedSubmitReview.summaryContains) {
       expect(capturedReviewInput.body).toContain(substring);
@@ -434,6 +469,24 @@ dbDescribe('NREG-01 default-path regression: Phase 18 rounds.incremental:false i
     const finalJob = mapJob(finalRow!);
     expect(finalJob!.reviewRound).toBe(fixture.round2.expectedJobRound);
     expect(finalJob!.reviewMode).toBe(fixture.round2.expectedJobMode);
+    expect(finalJob!.fileCount).toBe(fixture.round2.expectedFileCount);
+    expect(finalJob!.commentCount).toBe(fixture.round2.expectedCommentCount);
+    expect(finalJob!.totalInputTokens ?? 0).toBeGreaterThan(0);
+    expect(finalJob!.totalOutputTokens ?? 0).toBeGreaterThan(0);
+
+    const detail = await getJobDetail(env, job.id);
+    expect(detail!.files.map((file) => file.filePath)).toEqual(fixture.round2.expectedFileSelection);
+    expect(detail!.summaryMarkdown).toBe(capturedReviewInput.body);
+    const stages = detail!.audit.map((event) => event.stage);
+    expect(stages).toEqual(expect.arrayContaining(fixture.round2.expectedAuditEvents));
+    expect(stages).not.toContain('rounds.escalated');
+    expect(stages).not.toContain('rounds.suppressed');
+    expect(createReviewSpy.mock.invocationCallOrder[0]).toBeLessThan(
+      updateIssueSpy.mock.invocationCallOrder[0],
+    );
+    expect(updateIssueSpy.mock.invocationCallOrder[0]).toBeLessThan(
+      completeSpy.mock.invocationCallOrder[0],
+    );
 
     // The pause state is preserved across the anchor write (Phase 18 Plan 02 D-13).
     const prReviewStateRow = await queryRows<{ paused_by: string | null }>(
@@ -448,5 +501,6 @@ dbDescribe('NREG-01 default-path regression: Phase 18 rounds.incremental:false i
     updateIssueSpy.mockRestore();
     compareDiffSpy.mockRestore();
     unresolvedThreadsSpy.mockRestore();
+    completeSpy.mockRestore();
   }, 30000);
 });
