@@ -197,6 +197,37 @@ export class BitbucketClient {
     return response.text();
   }
 
+  // PROV-01 (D-08): raw file content via /src/{ref}/{path}. The ref is preserved case (Bitbucket
+  // branch / tag names are case-sensitive), and the path is encoded segment-by-segment so slash
+  // delimiters survive (`encodeURIComponent` on the whole path would lose them). 404 -> null
+  // (D-08 delete-at-head); any other non-2xx throws BitbucketError.
+  async getFileContent(workspace: string, repoSlug: string, ref: string, path: string): Promise<string | null> {
+    const encodedPath = path.split('/').map((segment) => encodeURIComponent(segment)).join('/');
+    const apiPath = `${repositoryPath(workspace, repoSlug)}/src/${encodeURIComponent(ref)}/${encodedPath}`;
+    try {
+      const response = await this.request('GET', apiPath, undefined, 'text/plain');
+      return response.text();
+    } catch (error) {
+      if (error instanceof BitbucketError && error.status === 404) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  // PROV-01 (D-09): compare-diff primitive. Bitbucket's diff spec is REVERSED relative to the
+  // seam's `(base, head)` convention: the first spec operand is the SOURCE commit (changes to
+  // preview) and the second is the DESTINATION (the state to compare against). The seam's
+  // `base` parameter is the destination, `head` is the source of new changes -- so the spec
+  // becomes `HEAD..BASE` (R-5). `context=3` matches the existing PR-diff call; `topic=true`
+  // is sent explicitly so a future default change cannot silently alter the response shape.
+  async getCompareDiff(workspace: string, repoSlug: string, base: string, head: string): Promise<string> {
+    const spec = `${encodeURIComponent(head)}..${encodeURIComponent(base)}`;
+    const path = `${repositoryPath(workspace, repoSlug)}/diff/${spec}?context=3&topic=true`;
+    const response = await this.request('GET', path, undefined, 'text/plain');
+    return response.text();
+  }
+
   async listPullRequestComments(workspace: string, repoSlug: string, prNumber: number, pagelen = 100) {
     // SINGLE page, pagelen=100, OLDEST-first (Bitbucket's default order). A consumer needing the
     // most-recent comments must sort newest-first or paginate — the primitive does not (cap +

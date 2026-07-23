@@ -182,18 +182,18 @@ export class BitbucketAdapter implements VcsProvider {
     return this.client.getPullRequestDiff(owner, repo, prNumber);
   }
 
-  // PROV-01 (D-08): content primitive. PLAN-02-IMPL — Task 3 replaces this stub with the
-  // BitbucketClient.getFileContent delegate (`/src/{ref}/{path}`).
+  // PROV-01 (D-08): content primitive. Delegates to BitbucketClient.getFileContent
+  // (`/src/{ref}/{path}`); 404 -> null at the client; non-2xx throws BitbucketError. Bitbucket's
+  // `owner` parameter is the workspace (canonical per repo), so we pass it through.
   async getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null> {
-    void owner; void repo; void path; void ref;
-    return null;
+    return this.client.getFileContent(owner, repo, ref, path);
   }
 
-  // PROV-01 (D-09): compare-diff primitive. PLAN-02-IMPL — Task 3 replaces this stub with the
-  // BitbucketClient.getCompareDiff delegate (`HEAD..BASE` + `context=3&topic=true`).
+  // PROV-01 (D-09): compare-diff primitive. Delegates to BitbucketClient.getCompareDiff which
+  // builds the REVERSED spec `HEAD..BASE` so the seam's `(base, head)` semantics survive
+  // (R-5). Empty success passes through as `''`; non-2xx throws BitbucketError.
   async getCompareDiff(owner: string, repo: string, base: string, head: string): Promise<string> {
-    void owner; void repo; void base; void head;
-    return '';
+    return this.client.getCompareDiff(owner, repo, base, head);
   }
 
   // PROV-02 (D-05/D-06/D-07): unresolved-bot-thread listing. PLAN-02-IMPL — Plan 17-02 replaces
