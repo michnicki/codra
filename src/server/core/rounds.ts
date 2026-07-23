@@ -374,7 +374,7 @@ export function buildRoundsSuppressedEvent(
     stage: 'rounds.suppressed',
     path: input.finding.path,
     line: input.finding.line ?? null,
-    title: input.finding.title,
+    title: input.finding.title.slice(0, 100),
     threadPath: input.threadPath,
     timestamp,
   };

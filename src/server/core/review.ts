@@ -50,14 +50,17 @@ import {
   buildRoundsDetectedEvent,
   buildRoundsEscalatedEvent,
   buildRoundsNoChangesEvent,
+  buildRoundsSuppressedEvent,
   composeRoundFloors,
   resolveRoundContext,
   selectDiffForRound,
+  suppressByOpenThreads,
   type DiffSelectionDescriptor,
+  type ResolvedRoundContext,
 } from './rounds';
 
 import { VcsService } from '../services/vcs';
-import type { VcsProvider, VcsPullRequest, VcsUpdateStatusCheckInput } from '../vcs/types';
+import type { VcsProvider, VcsPullRequest, VcsReviewThread, VcsUpdateStatusCheckInput } from '../vcs/types';
 import { isRetryableModelError, ModelService } from '../services/model';
 import { FormatterService } from '../services/formatter';
 import { TokenTracker } from './token-tracker';
@@ -841,10 +844,10 @@ async function runPreparePhase(
   // Phase 18 (RND-01 / D-01..D-06): always-on round detection at prepare-time, INDEPENDENT of the
   // `rounds.incremental` toggle. The resolved round / mode are persisted on the job and emitted as
   // a `rounds.detected` audit event so the signal is observable at defaults. Consumer paths
-  // (compare-diff selection, floor escalation, thread suppression) wire in Plans 02/03/04 and are
-  // separately gated on `rounds.incremental` -- THIS plan persists the durable snapshot but does
-  // not activate any consumer path. The review-rest short-circuit (D-03) is the only branch that
-  // skips state + thread calls entirely.
+  // (compare-diff selection, floor escalation, thread suppression) are separately gated on the
+  // durable `rounds.incremental` snapshot. Thread listing here is detection input only: it runs at
+  // most once and only when no prior anchor exists, because an anchor already resolves round 2+.
+  // The review-rest short-circuit (D-03) skips state + thread calls entirely.
   //
   // Phase 18 Plan 02 (RND-02): the SELECTED mode (the OUTPUT of selectDiffForRound) is what gets
   // persisted as `review_mode` -- NOT the resolver's mode. The resolver's mode is the constraint
@@ -853,56 +856,18 @@ async function runPreparePhase(
   // (setJobReviewRoundAndMode + setJobDiffSelection) happen AFTER the compare/fetch so the
   // job row's review_mode can transition from 'incremental' to 'no_changes' inline.
   const roundsIncremental = Boolean(config.review.rounds?.incremental ?? false);
+  let preparedRoundContext: ResolvedRoundContext | null = null;
   if (job.reviewScope !== 'rest') {
-    // Non-rest path: query pr_review_state for the prior anchor AND (gated on the durable
-    // `rounds.incremental` snapshot) call the unresolved-thread listing. `getPrReviewState` is a
-    // cheap equality lookup and is ALWAYS called so a never-paused PR resolves to a clean
-    // null-state without a separate sentinel column. `getUnresolvedBotThreads` is gated on the
-    // capability flag AND on `rounds.incremental` (D-02: detection runs at defaults, but the
-    // thread-listing seam is a CONSUMER call that must stay inert at defaults).
-    let unresolvedThreads: import('@server/vcs/types').VcsReviewThread[] = [];
-    if (roundsIncremental && vcs.capabilities.supportsThreadListing) {
-      try {
-        unresolvedThreads = await vcs.getUnresolvedBotThreads(job.owner, job.repo, job.prNumber);
-      } catch (error) {
-        // Capability-flagged degradation (Phase 17 D-02): a thrown listing call degrades to [] so
-        // the resolver still resolves. The audit event below records the unavailable capability
-        // degradation explicitly.
-        logger.warn(
-          `Failed to list unresolved bot threads for job ${job.id}; treating as no threads (capability degradation)`,
-          error instanceof Error ? error : new Error(String(error)),
-        );
-      }
-    }
-
-    // Build the pr_review_state lookup key from the durable job identity (matches the
-    // pause-state setter key shape: vcs_provider + workspace + repo_slug + pr_number).
-    const prReviewStateKey: PrReviewStateKey = {
-      vcsProvider: (job.repositoryVcsProvider ?? 'github') as 'github' | 'bitbucket',
-      workspace: job.repositoryWorkspace ?? job.owner,
-      repoSlug: job.repo,
-      prNumber: job.prNumber,
-    };
-    const priorState = await getPrReviewState(env, prReviewStateKey);
-
-    // Pure resolver call (RND-01 / D-01..D-06): returns the resolved round + mode + boolean flags.
-    // Independent of the incremental toggle per D-02.
-    const roundContext = resolveRoundContext({
-      reviewScope: job.reviewScope ?? null,
-      priorState,
-      unresolvedThreads,
-      roundsIncremental,
-    });
+    // Resolve exactly once. The helper reads the prior anchor first and lists threads only when no
+    // anchor exists, because only the thread-only round-detection branch needs that provider call.
+    // Detection stays independent of the incremental consumer toggle (D-02); compare/floors/
+    // suppression remain gated separately on the persisted toggle.
+    preparedRoundContext = await resolveRoundContextForJob(env, job, vcs, config);
 
     // Emit the detected-event audit record NOW (before the diff fetch) so the round signal is
     // observable at the prepare step regardless of whether the compare fetch succeeds. The
     // best-effort recorder never throws into the caller.
-    await recordRoundAudit(env, job.id, [buildRoundsDetectedEvent(roundContext)]);
-
-    // The selected mode (selector's output) is staged for the write below. The selected mode
-    // may differ from the resolver's mode (e.g., resolver says 'incremental' but selector says
-    // 'no_changes' for an empty compare). The job's review_mode is the SELECTED mode.
-    void roundContext;
+    await recordRoundAudit(env, job.id, [buildRoundsDetectedEvent(preparedRoundContext)]);
   } else {
     // D-03 review-rest short-circuit: NO state/thread calls, NO resolver. Persist round 1 / mode
     // 'rest' directly so the dashboard reads the same round/mode pair this job will execute with,
@@ -948,7 +913,8 @@ async function runPreparePhase(
     // Build the descriptor against the prepare-time round context. The full diff is fetched on
     // 'full' (the default round 1 path) AND on the thrown-compare fallback path for 'incremental'.
     // 'fallback' mode (thread-only D-04 path) uses the full diff as the source directly.
-    const roundContextForSelection = await resolveRoundContextForJob(env, job, vcs, config);
+    const roundContextForSelection = preparedRoundContext
+      ?? await resolveRoundContextForJob(env, job, vcs, config);
     let compareDiff = '';
     let compareFiles: FileDiff[] = [];
     let compareThrew = false;
@@ -1901,16 +1867,71 @@ async function runFinalizePhase(
       minSeverity: config.review.min_severity,
     },
   });
+
+  // RND-04 durable consumer gate: suppression runs only for an enabled round-2+ incremental/fallback
+  // job. `roundsIncremental` is the prepare-time persisted snapshot, so a live config change cannot
+  // activate or deactivate suppression halfway through a durable workflow. no_changes returned above;
+  // full/rest modes and round 1 remain inert.
+  const suppressionEligible =
+    (job.reviewRound ?? 1) >= 2
+    && (job.roundsIncremental ?? false)
+    && (job.reviewMode === 'incremental' || job.reviewMode === 'fallback');
+  let unresolvedThreads: VcsReviewThread[] = [];
+  let suppressionUnavailableReason: 'capability_unavailable' | 'listing_failed' | null = null;
+  if (suppressionEligible) {
+    if (!vcs.capabilities.supportsThreadListing) {
+      suppressionUnavailableReason = 'capability_unavailable';
+      logger.info(`Open-thread suppression unavailable for job ${job.id}`, {
+        reason: suppressionUnavailableReason,
+        provider: vcs.name,
+      });
+    } else {
+      try {
+        // One fresh finalize-time listing. Prepare's thread-only detection result is intentionally not
+        // reused because threads may have been resolved, deleted, or become outdated during review.
+        unresolvedThreads = await vcs.getUnresolvedBotThreads(job.owner, job.repo, job.prNumber);
+      } catch (error) {
+        suppressionUnavailableReason = 'listing_failed';
+        logger.warn(
+          `Open-thread suppression degraded for job ${job.id}`,
+          {
+            reason: suppressionUnavailableReason,
+            provider: vcs.name,
+            error: error instanceof Error ? error : new Error(String(error)),
+          },
+        );
+      }
+    }
+  }
+
+  // Legitimate empty thread data still installs the seam (and suppresses nothing); unavailable data
+  // leaves it undefined and therefore fails open. The same callback instance feeds posting and main
+  // candidates, keeping their pre-cap behavior identical without another provider call.
+  const preCapSuppress: NoiseFilterOptions['preCapSuppress'] =
+    suppressionEligible && suppressionUnavailableReason === null
+      ? (comments) => {
+          const result = suppressByOpenThreads(comments, unresolvedThreads);
+          return {
+            survivors: result.survivors,
+            suppressed: result.suppressed.map(({ finding }) => finding),
+          };
+        }
+      : undefined;
+
   const noiseFilterOptions: NoiseFilterOptions = {
     minConfidence: composedFloors.minConfidence,
     categoryConfidence: composedFloors.categoryConfidence,
     minSeverity: composedFloors.minSeverity,
     effectiveMaxComments,
+    preCapSuppress,
     dedup: chosenDedup,
   };
   const postingResult = applyNoiseFilter(reviewedComments, noiseFilterOptions);
   const finalComments = postingResult.kept;
   const omittedCount = postingResult.dropped.cap.length;
+  const suppressionAuditEvents = postingResult.suppressed.map((finding) =>
+    buildRoundsSuppressedEvent({ finding, threadPath: finding.path }),
+  );
 
   // Pitfall 3 (corrected): buildWalkthroughData ALREADY filters its `reviews` arg to pass==='main'
   // internally (walkthrough.ts), but it derives per-file counts and global severity counts from its
@@ -2085,6 +2106,13 @@ async function runFinalizePhase(
       body: formatter.formatInlineComment(comment, { provider: vcs.name }),
     })),
   });
+
+  // Emit rounds.suppressed only after a successful posting boundary and at most once. A finalize
+  // retry that already entered Completing reuses the posted review and skips this append, matching
+  // the existing drop-audit retry posture. The main/walkthrough path never emits suppression audit.
+  if (!finalizeRetriedPastPost && suppressionAuditEvents.length > 0) {
+    await recordRoundAudit(env, job.id, suppressionAuditEvents);
+  }
 
   const fileInputTokens = reviews.reduce((sum, review) => sum + (review.input_tokens ?? 0), 0) + summaryInputTokens;
   const fileOutputTokens = reviews.reduce((sum, review) => sum + (review.output_tokens ?? 0), 0) + summaryOutputTokens;
@@ -2528,18 +2556,6 @@ async function resolveRoundContextForJob(
     };
   }
 
-  let unresolvedThreads: import('@server/vcs/types').VcsReviewThread[] = [];
-  if (roundsIncremental && vcs.capabilities.supportsThreadListing) {
-    try {
-      unresolvedThreads = await vcs.getUnresolvedBotThreads(job.owner, job.repo, job.prNumber);
-    } catch (error) {
-      logger.warn(
-        `Failed to list unresolved bot threads for job ${job.id}; treating as no threads (capability degradation)`,
-        error instanceof Error ? error : new Error(String(error)),
-      );
-    }
-  }
-
   const prReviewStateKey: PrReviewStateKey = {
     vcsProvider: (job.repositoryVcsProvider ?? 'github') as 'github' | 'bitbucket',
     workspace: job.repositoryWorkspace ?? job.owner,
@@ -2547,6 +2563,22 @@ async function resolveRoundContextForJob(
     prNumber: job.prNumber,
   };
   const priorState = await getPrReviewState(env, prReviewStateKey);
+
+  // Thread listing is needed only for the thread-only round-detection branch. Read the durable anchor
+  // first; when it exists, it already proves round 2+ and a listing would add provider cost without
+  // changing the decision. When the anchor is absent, detection lists independently of the incremental
+  // consumer toggle so unresolved bot threads can still make the observable round counter advance.
+  let unresolvedThreads: import('@server/vcs/types').VcsReviewThread[] = [];
+  if (!priorState?.last_reviewed_sha && vcs.capabilities.supportsThreadListing) {
+    try {
+      unresolvedThreads = await vcs.getUnresolvedBotThreads(job.owner, job.repo, job.prNumber);
+    } catch (error) {
+      logger.warn(
+        `Failed to list unresolved bot threads for job ${job.id}; round detection is degrading to no thread signal`,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+  }
 
   return resolveRoundContext({
     reviewScope: job.reviewScope ?? null,

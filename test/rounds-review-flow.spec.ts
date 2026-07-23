@@ -4,7 +4,8 @@ import { getJobDetail, getJobForProcessing, insertJob, mapJob, setJobDiffSelecti
 import { setLastReviewedSha, type PrReviewStateKey } from '@server/db/pr-review-state';
 import { upsertFileReview } from '@server/db/file-reviews';
 import { runWithDb } from '@server/db/client';
-import { defaultRepoConfig, type RepoConfig } from '@shared/schema';
+import { VcsService } from '@server/services/vcs';
+import { defaultRepoConfig, type ParsedReviewComment, type RepoConfig } from '@shared/schema';
 import { createTestEnv, generateMockDiff, hasConfiguredTestDatabaseUrl } from './helpers';
 
 // Phase 18 Plan 02 / Task 2 (RND-02 / D-04..D-07) + Task 3 (wave-2 regression gate). The
@@ -43,7 +44,69 @@ function defaultRoundsConfig(incremental: boolean): RepoConfig {
   };
 }
 
+async function seedRoundFinalizeJob(
+  env: ReturnType<typeof createTestEnv>,
+  input: {
+    repo: string;
+    config?: RepoConfig;
+    comments: ParsedReviewComment[];
+    reviewMode?: 'incremental' | 'fallback';
+  },
+) {
+  const config = input.config ?? defaultRoundsConfig(true);
+  const job = await insertJob(env, {
+    installationId: '123',
+    owner: 'test-owner',
+    repo: input.repo,
+    prNumber: 18,
+    prTitle: 'Suppression PR',
+    prAuthor: 'author',
+    commitSha: sha('t'),
+    baseSha: sha('0'),
+    trigger: 'auto',
+    headRef: 'feature',
+    baseRef: 'main',
+    configSnapshot: config,
+  });
+  await updateJobFileCount(env, job.id, 1);
+  await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+  await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+  await setJobReviewRoundAndMode(env, job.id, {
+    reviewRound: 2,
+    reviewMode: input.reviewMode ?? 'incremental',
+  });
+  await setJobDiffSelection(env, job.id, {
+    mode: input.reviewMode ?? 'incremental',
+    fromSha: sha('a'),
+    toSha: sha('t'),
+  });
+  await upsertFileReview(env, job.id, {
+    filePath: 'src/x.ts',
+    pass: 'main',
+    fileStatus: 'done',
+    modelUsed: 'test-model',
+    modelProvider: 'test-provider',
+    diffLineCount: 3,
+    diffInput: 'diff',
+    rawAiOutput: '{}',
+    parsedComments: input.comments,
+    inputTokens: 1,
+    outputTokens: 1,
+    durationMs: 1,
+    verdict: 'comment',
+    fileSummary: 'summary',
+    overallCorrectness: 'issues found',
+    confidenceScore: 0.9,
+    errorMessage: null,
+  });
+  return job;
+}
+
 const noiseFilterOptionCalls = vi.hoisted(() => [] as unknown[]);
+const noiseFilterResults = vi.hoisted(() => [] as Array<{
+  kept: ParsedReviewComment[];
+  suppressed: ParsedReviewComment[];
+}>);
 
 vi.mock('@server/core/noise-filter', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@server/core/noise-filter')>();
@@ -51,7 +114,9 @@ vi.mock('@server/core/noise-filter', async (importOriginal) => {
     ...actual,
     applyNoiseFilter: (...args: Parameters<typeof actual.applyNoiseFilter>) => {
       noiseFilterOptionCalls.push(args[1]);
-      return actual.applyNoiseFilter(...args);
+      const result = actual.applyNoiseFilter(...args);
+      noiseFilterResults.push({ kept: result.kept, suppressed: result.suppressed });
+      return result;
     },
   };
 });
@@ -163,6 +228,7 @@ dbDescribe('Phase 18 Plan 02 — durable selection + no_changes placeholder inte
     // latter test's null-anchor path).
     vi.restoreAllMocks();
     noiseFilterOptionCalls.length = 0;
+    noiseFilterResults.length = 0;
   });
 
   afterEach(() => {
@@ -466,6 +532,128 @@ dbDescribe('Phase 18 Plan 02 — durable selection + no_changes placeholder inte
     const files = await getJobDiffFiles(env, finalJob, new GitHubService(env, '123'), config);
     expect(compareSpy).toHaveBeenCalled();
     expect(files.map((f) => f.path)).toContain('src/durable.ts');
+  }, 30000);
+
+  it('enabled round finalize lists threads once, suppresses both consumers, and audits only after posting', async () => {
+    const env = createTestEnv();
+    const overlap: ParsedReviewComment = {
+      path: 'src/x.ts',
+      line: 1,
+      position: 1,
+      severity: 'P2',
+      category: 'quality',
+      title: 'already open',
+      body: 'already tracked',
+      confidence: 0.9,
+    };
+    const fresh: ParsedReviewComment = {
+      ...overlap,
+      line: 30,
+      title: 'new finding',
+      body: 'new body',
+    };
+    const job = await seedRoundFinalizeJob(env, {
+      repo: `repo-suppression-${Date.now()}`,
+      comments: [overlap, fresh],
+    });
+
+    const { GitHubService } = await import('@server/services/github');
+    const listThreadsSpy = vi.spyOn(GitHubService.prototype, 'getReviewThreads').mockResolvedValue([
+      {
+        id: 'thread-1',
+        path: 'src/x.ts',
+        line: 1,
+        startLine: null,
+        originalLine: 1,
+        originalStartLine: null,
+        isResolved: false,
+        isOutdated: false,
+        comments: {
+          nodes: [{ body: 'PRIVATE THREAD BODY', replyTo: null, author: { databaseId: 'bot-1' } }],
+        },
+      },
+    ] as any);
+    vi.spyOn(GitHubService.prototype, 'updateCheckRun').mockResolvedValue(undefined);
+    const createReviewSpy = vi.spyOn(GitHubService.prototype, 'createReview');
+    createReviewSpy.mockImplementation(async (...args: any[]) => {
+      const detailAtPost = await getJobDetail(env, job.id);
+      expect(detailAtPost?.audit.filter((event) => event.stage === 'rounds.suppressed')).toHaveLength(0);
+      expect(args[3].comments).toHaveLength(1);
+      expect(args[3].comments[0].body).not.toContain('PRIVATE THREAD BODY');
+      return { id: 999 };
+    });
+
+    await runWithDb(env, async () => {
+      const result = await runReviewJob(env, {
+        jobId: job.id,
+        deliveryId: `delivery-suppression-${Date.now()}`,
+        phase: 'finalize',
+      });
+      expect(result).toEqual({ action: 'ack' });
+    });
+
+    expect(listThreadsSpy).toHaveBeenCalledTimes(1);
+    expect(noiseFilterResults).toHaveLength(2);
+    expect(noiseFilterResults[0].kept).toHaveLength(1);
+    expect(noiseFilterResults[1].kept).toHaveLength(1);
+    expect(noiseFilterResults[0].kept[0]).toMatchObject(fresh);
+    expect(noiseFilterResults[1].kept[0]).toMatchObject(fresh);
+    expect(noiseFilterResults[0].suppressed).toHaveLength(1);
+    expect(noiseFilterResults[1].suppressed).toHaveLength(1);
+    expect(noiseFilterResults[0].suppressed[0]).toMatchObject(overlap);
+    expect(noiseFilterResults[1].suppressed[0]).toMatchObject(overlap);
+
+    const detail = await getJobDetail(env, job.id);
+    const suppressionEvents = detail!.audit.filter((event) => event.stage === 'rounds.suppressed');
+    expect(suppressionEvents).toHaveLength(1);
+    expect(suppressionEvents[0]).toMatchObject({
+      path: 'src/x.ts',
+      line: 1,
+      title: 'already open',
+      threadPath: 'src/x.ts',
+    });
+    expect(JSON.stringify(suppressionEvents[0])).not.toContain('PRIVATE THREAD BODY');
+  }, 30000);
+
+  it('capability-disabled finalize does not list threads or suppress findings', async () => {
+    const env = createTestEnv();
+    const candidate: ParsedReviewComment = {
+      path: 'src/x.ts',
+      line: 1,
+      position: 1,
+      severity: 'P2',
+      category: 'quality',
+      title: 'capability fallback',
+      body: 'must remain visible',
+      confidence: 0.9,
+    };
+    const job = await seedRoundFinalizeJob(env, {
+      repo: `repo-suppression-capability-${Date.now()}`,
+      comments: [candidate],
+    });
+
+    const { GitHubService } = await import('@server/services/github');
+    const listThreadsSpy = vi.spyOn(GitHubService.prototype, 'getReviewThreads');
+    vi.spyOn(GitHubService.prototype, 'updateCheckRun').mockResolvedValue(undefined);
+    const provider = await VcsService.forRepo(env, { installationId: '123', repositoryVcsProvider: 'github' });
+    (provider.capabilities as { supportsThreadListing: boolean }).supportsThreadListing = false;
+    vi.spyOn(VcsService, 'forRepo').mockResolvedValue(provider);
+
+    await runWithDb(env, async () => {
+      const result = await runReviewJob(env, {
+        jobId: job.id,
+        deliveryId: `delivery-suppression-capability-${Date.now()}`,
+        phase: 'finalize',
+      });
+      expect(result).toEqual({ action: 'ack' });
+    });
+
+    expect(listThreadsSpy).not.toHaveBeenCalled();
+    expect(noiseFilterResults[0].kept).toHaveLength(1);
+    expect(noiseFilterResults[0].kept[0]).toMatchObject(candidate);
+    expect(noiseFilterResults[0].suppressed).toEqual([]);
+    const detail = await getJobDetail(env, job.id);
+    expect(detail!.audit.some((event) => event.stage === 'rounds.suppressed')).toBe(false);
   }, 30000);
 
   it('round 2 finalize shares composed options across both consumers and records one effective-floor event', async () => {
