@@ -339,6 +339,8 @@ export function buildRoundsEscalatedEvent(
     to: { minConfidence: number; minSeverity: ReviewSeverity };
     effective: { minConfidence: number; minSeverity: ReviewSeverity };
     round: number;
+    /** Absolute drops under the composed floor; not a claimed baseline-vs-round delta. */
+    droppedAtEffectiveFloor?: number;
   },
   timestamp: string = new Date().toISOString(),
 ): JobAuditEvent {
@@ -348,6 +350,7 @@ export function buildRoundsEscalatedEvent(
     to: input.to,
     effective: input.effective,
     round: input.round,
+    droppedAtEffectiveFloor: input.droppedAtEffectiveFloor ?? 0,
     timestamp,
   };
 }

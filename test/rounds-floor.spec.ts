@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { composeRoundFloors } from '@server/core/rounds';
+import { buildRoundsEscalatedEvent, composeRoundFloors } from '@server/core/rounds';
 import type { ReviewMode } from '@shared/schema';
 
 const categoryConfidence = { security: 0.9 } as const;
@@ -100,6 +100,19 @@ describe('composeRoundFloors', () => {
       minConfidence: 0.8,
       minSeverity: 'P1',
       effectiveChanged: true,
+    });
+  });
+
+  it('names the absolute effective-floor audit metric without claiming a baseline delta', () => {
+    expect(buildRoundsEscalatedEvent({
+      from: { minConfidence: 0.7, minSeverity: 'nit' },
+      to: { minConfidence: 0.8, minSeverity: 'P2' },
+      effective: { minConfidence: 0.8, minSeverity: 'P2' },
+      round: 2,
+      droppedAtEffectiveFloor: 3,
+    }, '2026-07-23T00:00:00.000Z')).toMatchObject({
+      stage: 'rounds.escalated',
+      droppedAtEffectiveFloor: 3,
     });
   });
 });

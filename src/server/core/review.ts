@@ -48,7 +48,9 @@ import {
 import {
   buildRoundInputsFromConfig,
   buildRoundsDetectedEvent,
+  buildRoundsEscalatedEvent,
   buildRoundsNoChangesEvent,
+  composeRoundFloors,
   resolveRoundContext,
   selectDiffForRound,
   type DiffSelectionDescriptor,
@@ -1888,10 +1890,21 @@ async function runFinalizePhase(
   // tiered-cap trim count ONLY (dropped.cap.length) — the "N comments trimmed to {max}" footer counts
   // P3/nit cap trims exclusively, NOT confidence/severity/dedup drops nor the exempt P0/P1/P2
   // (Pitfall 2 / A4 / review finding #3).
+  const composedFloors = composeRoundFloors({
+    reviewRound: job.reviewRound ?? 1,
+    reviewMode: job.reviewMode ?? 'full',
+    roundsIncremental: job.roundsIncremental ?? false,
+    escalateFloors: config.review.rounds?.escalate_floors ?? true,
+    base: {
+      minConfidence: config.review.min_confidence,
+      categoryConfidence: config.review.category_confidence,
+      minSeverity: config.review.min_severity,
+    },
+  });
   const noiseFilterOptions: NoiseFilterOptions = {
-    minConfidence: config.review.min_confidence,
-    categoryConfidence: config.review.category_confidence,
-    minSeverity: config.review.min_severity,
+    minConfidence: composedFloors.minConfidence,
+    categoryConfidence: composedFloors.categoryConfidence,
+    minSeverity: composedFloors.minSeverity,
     effectiveMaxComments,
     dedup: chosenDedup,
   };
@@ -2034,10 +2047,28 @@ async function runFinalizePhase(
       env,
       job.id,
       buildFinalizeDropEvents(postingResult.dropped, {
-        severityFloor: config.review.min_severity,
+        severityFloor: composedFloors.minSeverity,
         cap: effectiveMaxComments,
       }),
     );
+    if (composedFloors.effectiveChanged) {
+      await recordRoundAudit(env, job.id, [
+        buildRoundsEscalatedEvent({
+          from: {
+            minConfidence: config.review.min_confidence,
+            minSeverity: config.review.min_severity,
+          },
+          to: composedFloors.roundFloor,
+          effective: {
+            minConfidence: composedFloors.minConfidence,
+            minSeverity: composedFloors.minSeverity,
+          },
+          round: job.reviewRound ?? 1,
+          droppedAtEffectiveFloor:
+            postingResult.dropped.confidenceFloor.length + postingResult.dropped.severityFloor.length,
+        }),
+      ]);
+    }
   }
   // The interface omits botLogin (Pitfall 5) -- the adapter injects env.BOT_USERNAME internally.
   const existingReview = finalizeRetriedPastPost
