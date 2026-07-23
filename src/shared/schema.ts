@@ -317,6 +317,16 @@ export const repoConfigSchema = z.object({
     }),
 });
 
+// Phase 18 (RND-01 / RND-02 / RND-03 / RND-05): the locked review-mode value-set for jobs.review_mode
+// (mirrors the migration-011 review_mode CHECK constraint in db/migrations/011_*.sql). Kept in sync
+// with the producer surface (Plan 01's recordRoundAudit + the future Plan 02 selectDiffForRound
+// consumer) so an out-of-vocabulary mode string fails at parse rather than silently bypassing the
+// contract. Matches fileReviewPassSchema's enum-of-literals shape; future modes require a coordinated
+// schema + DB CHECK + producer edit.
+export const reviewModes = ['full', 'incremental', 'fallback', 'no_changes', 'rest'] as const;
+export type ReviewMode = typeof reviewModes[number];
+export const reviewModeSchema = z.enum(reviewModes);
+
 export const reviewJobMessageSchema = z.object({
   jobId: z.uuid().optional(),
   deliveryId: z.string().min(1),
@@ -511,6 +521,17 @@ export const jobSummarySchema = z.object({
   // (NREG-01). `.nullable().optional()` so pre-widening fixtures still parse.
   reviewScope: z.enum(['all', 'rest', 'head']).nullable().optional(),
   scopeSourceJobId: z.uuid().nullable().optional(),
+  // Phase 18 (RND-01 / D-16): durable round/mode snapshot persisted by the prepare-time round
+  // detection (Phase 18 Plan 02). review_round is the resolved round (>= 1); review_mode is the
+  // selected diff source ('full' | 'incremental' | 'fallback' | 'no_changes' | 'rest'). Both are
+  // NULL on a freshly-inserted job (Plan 01 has no writer wired — Plan 02 populates them). `.nullable()
+  // .optional()` so pre-Phase-18 fixtures (and every existing insert until Plan 02's prepare change
+  // lands) still parse without throwing. rounds_incremental is the durable snapshot of
+  // config.review.rounds.incremental at insert time — NOT NULL DEFAULT false in the DB, surfaced as
+  // boolean with `.optional()` so a pre-Phase-18 fixture (which never had the column) still parses.
+  reviewRound: z.number().int().min(1).nullable().optional(),
+  reviewMode: reviewModeSchema.nullable().optional(),
+  roundsIncremental: z.boolean().optional(),
 });
 
 export const jobsQuerySchema = z.object({
@@ -685,6 +706,91 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
       path: z.string(),
       line: z.number().nullable().optional(),
       title: z.string(),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // Phase 18 round/anchor audit events (RND-01 / RND-02 / RND-03 / RND-05). All five variants share
+  // the `rounds.` stage prefix; the client-side AuditDisplayStage normalization (see audit-grouping.ts)
+  // collapses them to the single `rounds` display group while preserving the original event stage
+  // and insertion order. Every variant ends with `.passthrough()` (Phase 13 D-08 pattern) so a future
+  // phase can add fields non-breakingly. Privacy bounded: NEVER body / diff / existingCode /
+  // thread bodies — the producer (`core/rounds.ts::recordRoundAudit`) is the only writer.
+  //
+  // - `rounds.detected` (RND-01 / D-02): the resolution that set this job's review_round + review_mode.
+  //   `mode` is one of the locked reviewModes; `round` is the resolved integer; `incremental` records
+  //   the durable config snapshot of `rounds.incremental` at prepare time. Optional `anchorSha` and
+  //   `hasUnresolvedThreads` capture the two resolution signals (prior anchor / unresolved threads).
+  z
+    .object({
+      stage: z.literal('rounds.detected'),
+      mode: reviewModeSchema,
+      round: z.number().int().min(1),
+      incremental: z.boolean(),
+      anchorSha: z.string().nullable().optional(),
+      hasUnresolvedThreads: z.boolean().optional(),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // - `rounds.no_changes` (RND-02 / D-08): finalize produced a silent `no_changes` placeholder
+  //   (genuinely empty incremental diff with no full-diff fallback content). The D-08 exact producer
+  //   fields: { from, to, round, incremental: true }. `from`/`to` are the SHA anchors the compare
+  //   ran between (from = last_reviewed_sha; to = current pr.headSha).
+  z
+    .object({
+      stage: z.literal('rounds.no_changes'),
+      from: z.string(),
+      to: z.string(),
+      round: z.number().int().min(1),
+      incremental: z.literal(true),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // - `rounds.anchor_skipped` (D-15): finalize completed but the anchor write was skipped because
+  //   the head SHA was empty / zero-length. `reason` carries the skip rationale (today: 'empty_head');
+  //   kept as a free-form string so a future failure mode can extend it without a breaking edit.
+  z
+    .object({
+      stage: z.literal('rounds.anchor_skipped'),
+      reason: z.string(),
+      round: z.number().int().min(1).nullable().optional(),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // - `rounds.escalated` (RND-03): the prepare-time round raised the effective confidence floor
+  //   and/or severity floor. `from`/`to` are the locked value-set of round 2 (0.8/P2) and round 3+
+  //   (0.85/P2). `effective` records the COMPOSED minConfidence / minSeverity the finalize actually
+  //   used (max(round, global, category_confidence)) so the audit trail explains the user-visible
+  //   escalation rather than only the round's own floor.
+  z
+    .object({
+      stage: z.literal('rounds.escalated'),
+      from: z.object({
+        minConfidence: z.number(),
+        minSeverity: z.enum(reviewSeverities),
+      }),
+      to: z.object({
+        minConfidence: z.number(),
+        minSeverity: z.enum(reviewSeverities),
+      }),
+      effective: z.object({
+        minConfidence: z.number(),
+        minSeverity: z.enum(reviewSeverities),
+      }),
+      round: z.number().int().min(1),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // - `rounds.suppressed` (RND-04): a per-finding event emitted on the POSTING path only when an
+  //   open-thread overlap suppressed a finding. `path` / `line` / `title` mirror the privacy-bounded
+  //   identifier shape used by the other variants (T-13-03-03); the thread's content / ref are
+  //   NEVER persisted (the audit trail is decision telemetry, not raw thread data).
+  z
+    .object({
+      stage: z.literal('rounds.suppressed'),
+      path: z.string(),
+      line: z.number().nullable().optional(),
+      title: z.string(),
+      threadPath: z.string(),
       timestamp: dateStringSchema,
     })
     .passthrough(),

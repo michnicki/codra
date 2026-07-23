@@ -270,3 +270,31 @@ export async function recordFileSkips(
     logger.warn(`Failed to record file-skip audit events for job ${jobId}`, error);
   }
 }
+
+/**
+ * Phase 18 (RND-01..05): bounded best-effort recorder for the `rounds.*` audit variants.
+ * `core/rounds.ts` builds typed events via the locked builder helpers (buildRoundsDetectedEvent
+ * etc.) and the caller batches them into ONE `appendJobAuditEvents` call here. Mirrors
+ * `recordFinalizeDrops` / `recordFileSkips` EXACTLY: try/catch, defensive timestamp stamping,
+ * logs and NEVER rethrows. A broken round audit write must never fail the caller's review
+ * (T-15-05-02 / D-13-03-04 carry-over posture).
+ *
+ * Producer discipline (D-08): rounds.* events carry the exact producer fields declared in
+ * src/shared/schema.ts:jobAuditEventSchema — NEVER body / diff / existingCode / thread bodies
+ * (T-13-03-03). The .passthrough() on each variant is additive-only and does not strip secrets;
+ * producer construction is the privacy boundary, not the schema parser.
+ */
+export async function recordRoundAudit(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  events: JobAuditEvent[],
+): Promise<void> {
+  try {
+    const stamped = events.map((event) =>
+      event.timestamp ? event : { ...event, timestamp: new Date().toISOString() },
+    );
+    await appendJobAuditEvents(env, jobId, stamped);
+  } catch (error) {
+    logger.warn(`Failed to record round audit events for job ${jobId}`, error);
+  }
+}

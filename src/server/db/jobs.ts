@@ -79,6 +79,15 @@ export type JobRow = {
   // eviction flag set by appendJobAuditEvents when the 500-event cap trims the oldest entries.
   audit: unknown;
   audit_truncated: boolean | null;
+  // Phase 18 (migration 011, RND-01 / D-02 / D-16 widened): durable round/mode snapshot persisted
+  // by the prepare-time round detection (Phase 18 Plan 02). review_round is the resolved round
+  // (>= 1); review_mode is the selected diff source ('full' | 'incremental' | 'fallback' |
+  // 'no_changes' | 'rest'). Both NULLABLE because Plan 01 has no writer wired and Phase 18 Plan 02
+  // populates them on the prepare-phase path. rounds_incremental is the durable snapshot of
+  // config.review.rounds.incremental at insert time — NOT NULL DEFAULT false in the DB.
+  review_round: number | null;
+  review_mode: string | null;
+  rounds_incremental: boolean;
 };
 
 type JobStep = {
@@ -220,6 +229,14 @@ export function mapJob(row: JobRow) {
     // insert (no writer supplies them) -- additive, behaviorally inert (NREG-01).
     reviewScope: row.review_scope,
     scopeSourceJobId: row.scope_source_job_id,
+    // Phase 18 (RND-01 / D-02 / D-16 widened): surface the durable round/mode snapshot. reviewRound
+    // and reviewMode are NULL until Phase 18 Plan 02 wires the prepare-time writer; roundsIncremental
+    // is the durable config snapshot at insert time (NOT NULL DEFAULT false in the DB, so this
+    // resolves to false for every pre-Phase-18 insert and every future insert where the config is
+    // inert at the schema-default).
+    reviewRound: row.review_round,
+    reviewMode: row.review_mode,
+    roundsIncremental: row.rounds_incremental,
   });
 }
 
@@ -376,9 +393,10 @@ export async function insertJob(
           base_ref,
           retry_of_job_id,
           review_scope,
-          scope_source_job_id
+          scope_source_job_id,
+          rounds_incremental
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8::jsonb, $9, $10, $11::uuid, $12, $13::uuid)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8::jsonb, $9, $10, $11::uuid, $12, $13::uuid, $14)
         RETURNING *
       )
       SELECT i.*, r.owner, r.repo, r.installation_id, r.vcs_provider AS "repositoryVcsProvider", r.workspace AS "repositoryWorkspace", i.status_check_ref
@@ -399,6 +417,13 @@ export async function insertJob(
       input.retryOfJobId ?? null,
       input.reviewScope ?? null,
       input.scopeSourceJobId ?? null,
+      // Phase 18 (D-02 / D-16): capture the durable rounds_incremental snapshot from the config at
+      // insert time so every subsequent read (mapJob's hot path, the lease-claim path, the
+      // audit-trail read) sees the same value the webhook route saw. Default-false on the
+      // schema-resolved config (review.rounds.incremental defaults false) means a pre-Phase-18
+      // configSnapshot without rounds.* is inert -- false here, false in the DB, no behavior change.
+      // Using a triple-null coalesce so the bitwise comparison stays a non-null boolean column.
+      Boolean(input.configSnapshot?.review?.rounds?.incremental ?? false),
     ],
   );
 

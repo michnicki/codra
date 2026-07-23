@@ -7,13 +7,17 @@ interface AuditTrailViewerProps {
 }
 
 // D-09: human-readable labels for each pipeline stage (STAGE_ORDER lives in audit-grouping).
-const STAGE_LABELS: Record<JobAuditEvent['stage'], string> = {
+// The display-stage `rounds` covers every `rounds.*` sub-variant (D-08 / Phase 18); original
+// sub-stage is preserved on each event (rounds.detected, rounds.no_changes, etc.) and surfaced
+// as a sub-label inside the DecisionEvent renderer below.
+const STAGE_LABELS: Record<AuditStageGroup['stage'], string> = {
   file_skipped: 'Files skipped',
   drafted: 'Drafted',
   severity_adjusted: 'Severity adjusted',
   filtered: 'Filtered',
   deduped: 'Deduped',
   evidence_missing: 'Evidence missing',
+  rounds: 'Rounds',
 };
 
 // A count pill mirroring the job-findings-list / critic-panel count-badge idiom.
@@ -151,6 +155,61 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
       return (
         <li className="rounded-md border border-border/40 bg-card/40 p-3">
           <MetricLine label="reason" value={event.reason} />
+          <SampleIdentifier path={event.path} line={event.line} title={event.title} />
+        </li>
+      );
+    // Phase 18 RND-01..05: every `rounds.*` sub-variant lands inside the normalized `Rounds`
+    // DecisionGroup via the audit-grouping normalizer. The original event.stage distinguishes
+    // each sub-variant for the per-row renderer below; .passthrough() keeps every known field
+    // (anchorSha, hasUnresolvedThreads, effective, etc.) accessible without further normalization.
+    case 'rounds.detected':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="stage" value="rounds.detected" />
+          <MetricLine label="round" value={String(event.round)} />
+          <MetricLine label="mode" value={event.mode} />
+          <MetricLine label="incremental" value={event.incremental ? 'true' : 'false'} />
+          {event.anchorSha ? <MetricLine label="anchor" value={event.anchorSha.slice(0, 12)} /> : null}
+          {event.hasUnresolvedThreads ? <MetricLine label="threads" value="unresolved" /> : null}
+        </li>
+      );
+    case 'rounds.no_changes':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="stage" value="rounds.no_changes" />
+          <MetricLine label="round" value={String(event.round)} />
+          <MetricLine label="from" value={event.from.slice(0, 12)} />
+          <MetricLine label="to" value={event.to.slice(0, 12)} />
+        </li>
+      );
+    case 'rounds.anchor_skipped':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="stage" value="rounds.anchor_skipped" />
+          <MetricLine label="reason" value={event.reason} />
+          {event.round != null ? <MetricLine label="round" value={String(event.round)} /> : null}
+        </li>
+      );
+    case 'rounds.escalated':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="stage" value="rounds.escalated" />
+          <MetricLine label="round" value={String(event.round)} />
+          <MetricLine
+            label="confidence"
+            value={`${event.from.minConfidence.toFixed(2)} → ${event.to.minConfidence.toFixed(2)} (effective ${event.effective.minConfidence.toFixed(2)})`}
+          />
+          <MetricLine
+            label="severity"
+            value={`${event.from.minSeverity} → ${event.to.minSeverity} (effective ${event.effective.minSeverity})`}
+          />
+        </li>
+      );
+    case 'rounds.suppressed':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="stage" value="rounds.suppressed" />
+          <MetricLine label="thread path" value={event.threadPath} />
           <SampleIdentifier path={event.path} line={event.line} title={event.title} />
         </li>
       );
