@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { applyNoiseFilter } from '@server/core/noise-filter';
 import {
@@ -229,6 +230,12 @@ describe('NREG-02 round lifecycle parity through the VcsProvider seam', () => {
         hasUnresolvedThreads: false,
       });
     }
+  });
+
+  it('keeps shared round consumers free of provider-name branches', () => {
+    const source = readFileSync(new URL('../src/server/core/rounds.ts', import.meta.url), 'utf8');
+    expect(source).not.toMatch(/vcs\.name\s*(?:===|!==)/);
+    expect(source).not.toMatch(/['"](?:github|bitbucket)['"]/);
   });
 
   it('completes an identical neutral status outcome through both provider seams', async () => {
