@@ -122,9 +122,9 @@ describe('Phase 19 canonical degraded and partial outcomes', () => {
       { id: 2, verdict: 'unsupported', reason: 'evidence_missing' },
     ], { status: 'completed' });
     expect(completed.map((decision) => [decision.verdict, decision.outcome, decision.reason])).toEqual([
-      ['proven', 'kept', 'evidence_proven'],
-      ['plausible', 'kept', 'threshold_met'],
-      ['unsupported', 'dropped', 'evidence_missing'],
+      ['proven', 'kept', 'evidence-supported'],
+      ['plausible', 'kept', 'keeps-evidence'],
+      ['unsupported', 'dropped', 'evidence-unsupported'],
       [null, 'dropped', 'no-verdict'],
     ]);
     expect(reconcileCriticDecisions(candidates, [], { status: 'fail_open', reason: 'parse-failure' })
