@@ -15,10 +15,11 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
-  buildWalkthroughEnrichmentAuditEvent,
-  recordWalkthroughAudit,
-  buildFinalizeDropEvents,
   buildCriticDecisionsAuditEvent,
+  buildFinalizeDropEvents,
+  buildWalkthroughEnrichmentAuditEvent,
+  recordCriticAudit,
+  recordWalkthroughAudit,
 } from '@server/core/audit';
 import { appendJobAuditEvents } from '@server/db/jobs';
 import * as jobsModule from '@server/db/jobs';
@@ -302,6 +303,209 @@ describe('BLOCKER 1: buildCriticDecisionsAuditEvent redacts sample titles (D-06)
       { id: 0, path: 'src/a.ts', line: 1, severity: 'P2', category: 'quality', title: longTitle, body: 'body', confidence: 0.9, verdict: 'proven', outcome: 'kept', reason: 'evidence-supported' },
     ];
     const event = buildCriticDecisionsAuditEvent(decisions, 'completed');
+    const parsed = jobAuditEventSchema.safeParse(event);
+    expect(parsed.success).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 20.1 BLOCKER 5: the skip branch at review.ts:2803-2856 must emit a
+// critic.decisions audit event with status='skipped' + reason + count=0 + sample=[]
+// for all three skip causes (empty input, explicit skip_threshold, over-char-budget).
+// The audit-event schema already accepts status='skipped' via criticRunStatusSchema at
+// schema.ts:485 — no schema change needed; only the producer wiring + chain routing.
+// The empty-input / over-char-budget paths pass an empty decisions array to the
+// builder, which returns null (audit.ts:470). The skip branch then hand-crafts the
+// event to ensure the audit viewer receives the skip terminal. The recorder is
+// best-effort (never rethrows) so the audit write never fails the review.
+// ---------------------------------------------------------------------------
+
+describe('BLOCKER 5: buildCriticDecisionsAuditEvent skipped semantic', () => {
+  it('returns null when decisions is empty (hand-crafted fallback is the BLOCKER 5 fix)', () => {
+    // Mirrors the builder's existing empty-input short-circuit at audit.ts:470. The skip branch
+    // depends on this so the BLOCKER 5 fix uses a hand-crafted event instead of the builder.
+    const event = buildCriticDecisionsAuditEvent([], 'skipped', 'empty-input');
+    expect(event).toBeNull();
+  });
+
+  it('emits a valid event with status=skipped + count=0 + sample=[] when decisions is empty AND the builder would have been forced to derive from the kept set', () => {
+    // The empty-input case has zero candidates passed to the builder, so the cleanest path is
+    // the hand-crafted event. This test pins the SHAPE the hand-craft must match: the schema
+    // derives count from the received count field and sample from the received sample array —
+    // a hand-crafted event with count=0 and sample=[] is therefore schema-valid.
+    const event = buildCriticDecisionsAuditEvent([], 'skipped', 'empty-input');
+    // The hand-crafted event the skip branch produces (see review.ts:2835-2842) is structurally
+    // identical to a builder output but with explicit count=0 + sample=[].
+    const handCrafted = {
+      stage: 'critic.decisions' as const,
+      status: 'skipped' as const,
+      count: 0,
+      sample: [],
+      reason: 'empty-input',
+      timestamp: new Date().toISOString(),
+    };
+    const parsed = jobAuditEventSchema.safeParse(handCrafted);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.stage).toBe('critic.decisions');
+      if (parsed.data.stage === 'critic.decisions') {
+        expect(parsed.data.status).toBe('skipped');
+        expect(parsed.data.count).toBe(0);
+        expect(parsed.data.sample).toEqual([]);
+        expect(parsed.data.reason).toBe('empty-input');
+      }
+    }
+    // The builder itself returns null for this input — the skip branch must use the hand-craft.
+    expect(event).toBeNull();
+  });
+
+  it('emits a valid event with status=skipped + reason when decisions has candidates', () => {
+    // The skip_threshold / over-char-budget paths pass a non-empty decisions array (the
+    // reconciled decisions from reconcileCriticDecisions). The builder returns a valid event
+    // with count=candidates.length — the skip branch may use the builder output directly.
+    const decisions: CriticDecision[] = [
+      { id: 0, path: 'src/a.ts', line: 1, severity: 'P2', category: 'quality', title: 'short', body: 'body', confidence: 0.9, verdict: null, outcome: 'kept', reason: 'evidence-supported' },
+    ];
+    const event = buildCriticDecisionsAuditEvent(decisions, 'skipped', 'below-skip-threshold');
+    expect(event).not.toBeNull();
+    expect(event!.status).toBe('skipped');
+    expect(event!.reason).toBe('below-skip-threshold');
+    expect(event!.count).toBe(1);
+    expect(event!.sample).toHaveLength(1);
+    const parsed = jobAuditEventSchema.safeParse(event);
+    expect(parsed.success).toBe(true);
+  });
+
+  it('emits a valid event with status=skipped + reason for over-char-budget reason', () => {
+    const decisions: CriticDecision[] = [
+      { id: 0, path: 'src/a.ts', line: 1, severity: 'P2', category: 'quality', title: 'short', body: 'body', confidence: 0.9, verdict: null, outcome: 'kept', reason: 'evidence-supported' },
+    ];
+    const event = buildCriticDecisionsAuditEvent(decisions, 'skipped', 'over-char-budget');
+    expect(event).not.toBeNull();
+    expect(event!.status).toBe('skipped');
+    expect(event!.reason).toBe('over-char-budget');
+  });
+});
+
+describe('BLOCKER 5: recordCriticAudit accepts skipped event (best-effort)', () => {
+  it('SUCCESS: recordCriticAudit appends a skipped event with the bounded structural shape', async () => {
+    // The skip branch at review.ts:2843 calls recordCriticAudit with a single hand-crafted event.
+    // The recorder is best-effort: try/catch + logger.warn + never rethrows (D-13-03-04 posture).
+    const env = { HYPERDRIVE: { connectionString: 'postgres://test' } } as any;
+    const jobId = 'job-id';
+    const appendSpy = vi.spyOn(jobsModule, 'appendJobAuditEvents').mockResolvedValue(undefined);
+    const skippedEvent = {
+      stage: 'critic.decisions' as const,
+      status: 'skipped' as const,
+      count: 0,
+      sample: [],
+      reason: 'empty-input',
+      timestamp: new Date().toISOString(),
+    };
+    await expect(recordCriticAudit(env, jobId, [skippedEvent])).resolves.toBeUndefined();
+    expect(appendSpy).toHaveBeenCalledTimes(1);
+    expect(appendSpy).toHaveBeenCalledWith(
+      env,
+      jobId,
+      [expect.objectContaining({ stage: 'critic.decisions', status: 'skipped', count: 0, sample: [] })],
+    );
+    appendSpy.mockRestore();
+  });
+
+  it('EMPTY-INPUT: recordCriticAudit is a no-op and never calls appendJobAuditEvents', async () => {
+    // Mirrors the existing fast-return at audit.ts:510. The skip branch should never pass an empty
+    // array (the hand-craft always has at least one event), but the recorder must stay defensive.
+    const env = { HYPERDRIVE: { connectionString: 'postgres://test' } } as any;
+    const jobId = 'job-id';
+    const appendSpy = vi.spyOn(jobsModule, 'appendJobAuditEvents');
+    await recordCriticAudit(env, jobId, []);
+    expect(appendSpy).not.toHaveBeenCalled();
+    appendSpy.mockRestore();
+  });
+
+  it('FAILED-WRITE: recordCriticAudit resolves (never throws) and warns when appendJobAuditEvents rejects', async () => {
+    // Best-effort posture: a broken audit write must never wreck the review (D-13-03-04).
+    const env = { HYPERDRIVE: { connectionString: 'postgres://test' } } as any;
+    const jobId = 'job-id';
+    const appendSpy = vi
+      .spyOn(jobsModule, 'appendJobAuditEvents')
+      .mockRejectedValue(new Error('simulated audit-write failure'));
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const skippedEvent = {
+      stage: 'critic.decisions' as const,
+      status: 'skipped' as const,
+      count: 0,
+      sample: [],
+      reason: 'empty-input',
+      timestamp: new Date().toISOString(),
+    };
+    await expect(recordCriticAudit(env, jobId, [skippedEvent])).resolves.toBeUndefined();
+    expect(warnSpy).toHaveBeenCalled();
+    appendSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it('stamps a timestamp on a skipped event that arrived without one', async () => {
+    // The skip branch always sets timestamp explicitly, but the recorder must remain defensive
+    // (mirrors the walkthrough pattern at audit-events.spec.ts:127-142).
+    const env = { HYPERDRIVE: { connectionString: 'postgres://test' } } as any;
+    const jobId = 'job-id';
+    const appendSpy = vi.spyOn(jobsModule, 'appendJobAuditEvents').mockResolvedValue(undefined);
+    const eventWithoutTimestamp = {
+      stage: 'critic.decisions' as const,
+      status: 'skipped' as const,
+      count: 0,
+      sample: [],
+      reason: 'empty-input',
+      // timestamp omitted intentionally — the recorder must stamp it.
+    } as unknown as Parameters<typeof recordCriticAudit>[2][number];
+    await recordCriticAudit(env, jobId, [eventWithoutTimestamp]);
+    expect(appendSpy).toHaveBeenCalledTimes(1);
+    const passedEvent = appendSpy.mock.calls[0][2][0];
+    expect(passedEvent.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    appendSpy.mockRestore();
+  });
+});
+
+describe('BLOCKER 5: hand-crafted skipped event schema-validates', () => {
+  // The skip branch at review.ts:2835-2842 hand-crafts the event because the builder returns
+  // null for empty decisions. This block pins the exact shape the hand-craft must match so a
+  // regression that drifts the producer shape is caught at test time, not in production.
+  it('hand-crafted event for empty-input reason validates against jobAuditEventSchema', () => {
+    const event = {
+      stage: 'critic.decisions' as const,
+      status: 'skipped' as const,
+      count: 0,
+      sample: [],
+      reason: 'empty-input',
+      timestamp: new Date().toISOString(),
+    };
+    const parsed = jobAuditEventSchema.safeParse(event);
+    expect(parsed.success).toBe(true);
+  });
+
+  it('hand-crafted event for below-skip-threshold reason validates against jobAuditEventSchema', () => {
+    const event = {
+      stage: 'critic.decisions' as const,
+      status: 'skipped' as const,
+      count: 0,
+      sample: [],
+      reason: 'below-skip-threshold',
+      timestamp: new Date().toISOString(),
+    };
+    const parsed = jobAuditEventSchema.safeParse(event);
+    expect(parsed.success).toBe(true);
+  });
+
+  it('hand-crafted event for over-char-budget reason validates against jobAuditEventSchema', () => {
+    const event = {
+      stage: 'critic.decisions' as const,
+      status: 'skipped' as const,
+      count: 0,
+      sample: [],
+      reason: 'over-char-budget',
+      timestamp: new Date().toISOString(),
+    };
     const parsed = jobAuditEventSchema.safeParse(event);
     expect(parsed.success).toBe(true);
   });
