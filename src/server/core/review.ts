@@ -85,6 +85,8 @@ import { isRetryableModelError, ModelService } from '../services/model';
 import { FormatterService } from '../services/formatter';
 import { TokenTracker } from './token-tracker';
 import { loadRepoConfig } from './config';
+import { NextPhaseError } from './next-phase-error';
+import { runWalkthroughEnrichmentPhase } from './walkthrough-enrichment';
 import { getWebhookDelivery } from '@server/db/webhook-deliveries';
 import { getReviewSettings } from '@server/db/app-settings';
 import { REVIEW_CONCURRENCY_LIMITS } from '@shared/schema';
@@ -108,7 +110,7 @@ export type ReviewJobRunResult =
   // hand off exactly like every other phase. The verify_fixes phase runs as its OWN fresh-budget
   // step between critic and finalize (or review and finalize when critic is off) — see
   // nextPhaseAfterCritic / nextPhaseAfterVerifyFixes below.
-  | { action: 'next_phase'; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes'; delaySeconds: number; jobId?: string; freshInstance?: boolean };
+  | { action: 'next_phase'; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment'; delaySeconds: number; jobId?: string; freshInstance?: boolean };
 
 const REVIEW_CHUNK_WALL_CLOCK_MS = 12 * 60 * 1000;
 const JOB_LEASE_SECONDS = 15 * 60;
@@ -509,6 +511,17 @@ export async function runReviewJob(env: AppBindings, message: ReviewJobMessage):
       // off to finalize on its own fresh-budget step (so a long-lived instance never accidentally
       // shares the review/critic phase's near-empty budget).
       await runVerifyFixesPhase(env, job, leaseOwner, vcs, model, tracker);
+    } else if (phase === 'walkthrough_enrichment') {
+      // Phase 19 Plan 19-08 (PASS-03): the durable walkthrough enrichment phase. Always hands off
+      // to finalize on its own fresh-budget step. Finalize performs ZERO enrichment model work —
+      // it reads the persisted blob via buildWalkthroughData and feeds it through formatWalkthrough.
+      const configForEnrichment = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
+      await runWalkthroughEnrichmentPhase({
+        env,
+        job,
+        config: configForEnrichment,
+        model,
+      });
     } else {
       await runReviewPhase(env, job, leaseOwner, vcs, model, tracker);
     }
@@ -525,14 +538,16 @@ export async function runReviewJob(env: AppBindings, message: ReviewJobMessage):
 
     if (error instanceof NextPhaseError) {
       await releaseJobLease(env, job.id, leaseOwner);
-      // Finalize AND critic AND verify_fixes each need a fresh instance for a clean subrequest
-      // budget: finalize posts the review (~20 subrequests at once), critic makes its single
-      // whole-set model call on its OWN budget (D-07 — the critic must never share finalize's
-      // budget), and verify_fixes runs an unbounded number of file-content fetches + model calls
-      // + resolution calls on its OWN budget (D-01/D-02 — never share the prior phase's spent
-      // budget). Other phase transitions (e.g. the per-chunk review yield) stay in this instance
-      // and rely on the normal step.sleep hibernation to reset the budget.
-      const freshInstance = error.phase === 'finalize' || error.phase === 'critic' || error.phase === 'verify_fixes';
+      // Finalize AND critic AND verify_fixes AND walkthrough_enrichment each need a fresh instance
+      // for a clean subrequest budget: finalize posts the review (~20 subrequests at once), critic
+      // makes its single whole-set model call on its OWN budget (D-07 — the critic must never share
+      // finalize's budget), verify_fixes runs an unbounded number of file-content fetches + model
+      // calls + resolution calls on its OWN budget (D-01/D-02 — never share the prior phase's
+      // spent budget), and walkthrough_enrichment makes its single whole-set enrichment call on
+      // its OWN budget (D-13 — never share the prior phase's spent budget). Other phase transitions
+      // (e.g. the per-chunk review yield) stay in this instance and rely on the normal step.sleep
+      // hibernation to reset the budget.
+      const freshInstance = error.phase === 'finalize' || error.phase === 'critic' || error.phase === 'verify_fixes' || error.phase === 'walkthrough_enrichment';
       return { action: 'next_phase', phase: error.phase, delaySeconds: error.delaySeconds, jobId: job.id, freshInstance };
     }
 
@@ -584,7 +599,7 @@ async function continueOrFailWedgedJob(
   job: PersistedReviewJob,
   vcs: VcsProvider,
   leaseOwner: string,
-  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes',
+  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment',
   delaySeconds: number,
   reason: string,
 ): Promise<ReviewJobRunResult> {
@@ -596,7 +611,7 @@ async function continueOrFailWedgedJob(
   // review keeps the generous ceiling because it makes real per-file progress. (Critic and
   // verify_fixes never terminal-fail on exceed — they fail OPEN to finalize in the branches
   // below — but they still use the low ceiling to bound their fresh-instance retries.)
-  const ceiling = phase === 'finalize' || phase === 'critic' || phase === 'verify_fixes'
+  const ceiling = phase === 'finalize' || phase === 'critic' || phase === 'verify_fixes' || phase === 'walkthrough_enrichment'
     ? MAX_FINALIZE_CONTINUATIONS
     : MAX_JOB_CONTINUATIONS;
 
@@ -692,7 +707,7 @@ async function continueOrFailWedgedJob(
 async function resolveQueuedJob(
   env: AppBindings,
   message: ReviewJobMessage,
-): Promise<{ job: PersistedReviewJob; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' } | null> {
+): Promise<{ job: PersistedReviewJob; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' } | null> {
   // The WIRE contract (reviewJobMessageSchema.phase) includes 'critic' (D-07). Phase 10 DISPATCHES it
   // — but ONLY for a jobId-bearing message. A critic phase is only ever reached AFTER a job exists
   // (review→critic hands off keyed on the resolved jobId), so a phase:'critic' message WITHOUT a jobId
@@ -705,16 +720,20 @@ async function resolveQueuedJob(
   // their workers land in later plans. Reject an early/spoofed delivery instead of letting the
   // dispatch fallback misclassify it as a normal review phase. Each owning plan removes its value
   // from this gate when it installs the corresponding explicit dispatch branch.
-  if (requestedPhase === 'walkthrough_enrichment') {
-    logger.warn(`Queue message ignored: phase "${requestedPhase}" is not active yet.`);
-    return null;
-  }
   if (requestedPhase === 'critic' && !message.jobId) {
     logger.warn('Queue message ignored: phase "critic" requires a jobId (a jobId-less critic message is treated as a spoof).');
     return null;
   }
   if (requestedPhase === 'verify_fixes' && !message.jobId) {
     logger.warn('Queue message ignored: phase "verify_fixes" requires a jobId (a jobId-less verify_fixes message is treated as a spoof).');
+    return null;
+  }
+  if (requestedPhase === 'walkthrough_enrichment' && !message.jobId) {
+    // Phase 19 Plan 19-08 (PASS-03): walkthrough_enrichment is a jobId-only phase, same posture as
+    // critic / verify_fixes. A phase:'walkthrough_enrichment' message WITHOUT a jobId is a
+    // spoof / premature delivery — REJECT it here so a stray queue message can never resolve a
+    // job by webhook payload and run against it.
+    logger.warn('Queue message ignored: phase "walkthrough_enrichment" requires a jobId (a jobId-less enrichment message is treated as a spoof).');
     return null;
   }
 
@@ -2545,10 +2564,26 @@ async function runFinalizePhase(
         }
       }
       // (c) deterministic aggregation over the main-pass reviews + the floored/capped finalComments.
+      // Phase 19 Plan 19-08 (PASS-03, D-13): finalize does ZERO enrichment model work — it reads
+      // the persisted walkthrough_enrichment blob and feeds it through buildWalkthroughData's
+      // projection. A blob with status='completed' or 'partial' yields the grouped renderer
+      // branch; a 'failed' blob yields the historical flat branch (NREG-01). Absent blob
+      // (NREG-01 / walkthrough disabled) yields the historical flat branch as well.
+      const enrichment = job.walkthroughEnrichment && (
+        job.walkthroughEnrichment.status === 'completed' ||
+        job.walkthroughEnrichment.status === 'partial'
+      )
+        ? {
+            groups: job.walkthroughEnrichment.groups ?? [],
+            confidence: job.walkthroughEnrichment.confidence ?? null,
+            effort: job.walkthroughEnrichment.effort ?? null,
+          }
+        : null;
       const data = buildWalkthroughData({
         reviews: mainReviews,
         finalComments: mainFinalComments,
         threadVerification: job.threadVerification,
+        enrichment,
       });
       // (d) single in-place edit (delete-recovery + bounded transient retry live in the helper). The
       // mermaid fence is added GitHub-only by formatWalkthrough (Plan 01), filling the Plan 02 seam.
@@ -2683,7 +2718,10 @@ async function runCriticPhase(
     await enqueueJobPhase(
       env,
       job.id,
-      config.review.threads?.verify_fixes ? 'verify_fixes' : 'finalize',
+      // Post-critic routing: verify_fixes (when enabled) → walkthrough_enrichment (when enabled) →
+      // finalize. The walkthrough enrichment runs on its own fresh budget regardless of the
+      // preceding verify_fixes presence so the durable chain stays correct in either toggle config.
+      config.review.threads?.verify_fixes ? 'verify_fixes' : nextPhaseAfterCritic(config),
       FRESH_INVOCATION_YIELD_SECONDS,
     );
     return;
@@ -2698,7 +2736,11 @@ async function runCriticPhase(
     await enqueueJobPhase(
       env,
       job.id,
-      config.review.threads?.verify_fixes ? 'verify_fixes' : 'finalize',
+      // Same routing as the idempotency branch above — verify_fixes (when enabled) →
+      // walkthrough_enrichment (when enabled) → finalize. The walkthrough enrichment runs on its
+      // own fresh budget regardless of the preceding verify_fixes presence so the durable chain
+      // stays correct in either toggle config.
+      config.review.threads?.verify_fixes ? 'verify_fixes' : nextPhaseAfterCritic(config),
       FRESH_INVOCATION_YIELD_SECONDS,
     );
     return;
@@ -2897,7 +2939,10 @@ async function runCriticPhase(
   await enqueueJobPhase(
     env,
     job.id,
-    config.review.threads?.verify_fixes ? 'verify_fixes' : 'finalize',
+    // Post-critic hand-off: verify_fixes (when enabled) → walkthrough_enrichment (when enabled) →
+    // finalize. The walkthrough enrichment runs on its own fresh budget regardless of the
+    // preceding verify_fixes presence so the durable chain stays correct in either toggle config.
+    config.review.threads?.verify_fixes ? 'verify_fixes' : nextPhaseAfterCritic(config),
     FRESH_INVOCATION_YIELD_SECONDS,
   );
 }
@@ -2910,11 +2955,7 @@ async function heartbeatAndCheckSuperseded(env: AppBindings, jobId: string, leas
   }
 }
 
-export class NextPhaseError extends Error {
-  constructor(public phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes', public delaySeconds: number) {
-    super(`NextPhase: ${phase}`);
-  }
-}
+export { NextPhaseError } from './next-phase-error';
 
 /**
  * Single source of truth for where the review phase hands off (D-07 / MP-03). When the critic pass is
@@ -2948,10 +2989,29 @@ function nextPhaseAfterVerifyFixes(config: RepoConfig): 'critic' | 'finalize' {
   return config.review.passes?.critic?.enabled ? 'critic' : 'finalize';
 }
 
+/**
+ * Phase 19 Plan 19-08 (PASS-03, D-13): the durable walkthrough enrichment sits between the
+ * last LLM phase (critic or verify_fixes) and finalize. Walkthrough enrichment runs ONLY when
+ * `review.walkthrough.enabled` is on — otherwise the chain skips it and goes straight to finalize
+ * (NREG-01). This selector is shared by both `nextPhaseAfterCritic` and `nextPhaseAfterVerifyFixes`
+ * so the durable chain always inserts the enrichment phase exactly once.
+ */
+function maybeRouteToWalkthroughEnrichment(config: RepoConfig): 'walkthrough_enrichment' | 'finalize' {
+  return config.review.walkthrough?.enabled ? 'walkthrough_enrichment' : 'finalize';
+}
+
+/**
+ * Phase 19 Plan 19-08 (PASS-03): post-critic hand-off. Routes through the walkthrough enrichment
+ * phase when the walkthrough is enabled, otherwise straight to finalize.
+ */
+function nextPhaseAfterCritic(config: RepoConfig): 'walkthrough_enrichment' | 'finalize' {
+  return maybeRouteToWalkthroughEnrichment(config);
+}
+
 async function enqueueJobPhase(
   env: AppBindings,
   jobId: string,
-  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes',
+  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment',
   delaySeconds = 0,
 ) {
   await markJobContinuationQueued(env, jobId, delaySeconds);

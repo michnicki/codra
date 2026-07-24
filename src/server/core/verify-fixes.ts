@@ -350,7 +350,7 @@ import {
   setJobThreadVerifications,
   appendJobAuditEvents,
 } from '../db/jobs';
-import { NextPhaseError } from './review';
+import { NextPhaseError } from './next-phase-error';
 import { logger } from './logger';
 
 // Subrequest cost model for verify-fixes. Conservative on purpose: the worst case is roughly
@@ -706,12 +706,13 @@ export async function runVerifyFixesPhase(
 
   await emitCompletionAudit(env, job.id, finalTotals, allProcessed);
 
-  // Phase 19 (D-03 / D-04): verify_fixes always hands off to finalize on its own fresh-budget
-  // step. Throw NextPhaseError so runReviewJob's catch translates it into a {action:'next_phase'}
-  // result. When the critic is enabled, finalize runs after the critic; when verify_fixes is
-  // routed BEFORE the critic, finalize runs after verify_fixes; either way finalize is the
-  // terminal step. (See nextPhaseAfterVerifyFixes in core/review.ts.)
-  throw new NextPhaseError('finalize', VERIFY_FIXES_FRESH_INVOCATION_YIELD_SECONDS);
+  // Phase 19 (D-03 / D-04): verify_fixes always hands off to its successor on its own fresh-budget
+  // step. The successor is the walkthrough enrichment phase (when the walkthrough is enabled) so
+  // the durable chain can do PASS-03 work BEFORE finalize, otherwise finalize directly. Throw
+  // NextPhaseError so runReviewJob's catch translates it into a {action:'next_phase'} result.
+  // (See nextPhaseAfterVerifyFixes in core/review.ts.)
+  const handOff = config.review.walkthrough?.enabled ? 'walkthrough_enrichment' : 'finalize';
+  throw new NextPhaseError(handOff, VERIFY_FIXES_FRESH_INVOCATION_YIELD_SECONDS);
 }
 
 /**

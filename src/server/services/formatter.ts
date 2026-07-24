@@ -296,6 +296,32 @@ OpenCodra can also answer questions or update the PR. Try commenting "@${botUser
           }
         | { status: 'degraded' };
       mermaid?: string | null;
+      // Phase 19 Plan 19-08 (PASS-03, D-14/D-15): optional grouped sections + bottom assessment.
+      // When `groups` is supplied, the renderer emits grouped sections instead of the flat
+      // coverage table (D-14). The `assessment` block renders below the grouped coverage (D-15)
+      // and stays independent of the row counter so the bottom block always lands (the body cap
+      // only truncates the coverage rows, never the assessment or D-04 totals). The historical
+      // flat path stays byte-identical when both are absent (NREG-01).
+      groups?: Array<{
+        label: string;
+        files: Array<{
+          path: string;
+          summary: string;
+          counts: Record<ParsedReviewComment['severity'], number>;
+        }>;
+      }>;
+      assessment?: {
+        confidence: {
+          score: number;
+          label: string;
+          reason: string;
+        } | null;
+        effort: {
+          level: number;
+          label: string;
+          minutes: number;
+        } | null;
+      };
     },
     options?: FormatterOptions,
   ): string {
@@ -332,6 +358,44 @@ OpenCodra can also answer questions or update the PR. Try commenting "@${botUser
 
     const tableHeader = '| File | Summary | Findings |\n| --- | --- | --- |';
 
+    // Phase 19 Plan 19-08 (D-14): when groups are supplied, the coverage is rendered as one
+    // compact section per group. The renderer walks ONE global row counter across the sections so
+    // a body-cap truncation can monotonically drop rows from any tail section (threat T-19-08-03).
+    // The flat `files` field is ignored when groups are present — it is retained so a caller can
+    // build the WalkthroughData projection once and feed it back through either rendering branch.
+    const groupedSections = input.groups && input.groups.length > 0 ? input.groups : null;
+
+    const renderAssessment = (): string[] => {
+      if (!input.assessment) return [];
+      const { confidence, effort } = input.assessment;
+      const lines: string[] = [];
+      if (confidence) {
+        lines.push(`**Confidence ${confidence.score}/5 — ${confidence.label}** · ${confidence.reason}`);
+      } else {
+        lines.push('**Confidence:** Unavailable');
+      }
+      if (effort) {
+        lines.push(`**Effort ${effort.level}/5 — ${effort.label} · ~${effort.minutes} minutes**`);
+      } else {
+        lines.push('**Effort:** Unavailable');
+      }
+      return lines;
+    };
+
+    // Flatten the rendering inputs into a single ordered row list so the body-cap loop has ONE
+    // counter it can monotonically decrement. Group headers are interleaved with the file rows
+    // so the table-header is emitted ONCE at the first file row. An empty trailing section's
+    // header is dropped to avoid misleading rows.
+    type FlatRow =
+      | { kind: 'group-header'; label: string }
+      | { kind: 'file'; file: { path: string; summary: string; counts: Record<ParsedReviewComment['severity'], number> } };
+    const renderableStream: FlatRow[] = groupedSections
+      ? groupedSections.flatMap((section) => [
+          { kind: 'group-header' as const, label: section.label },
+          ...section.files.map((file) => ({ kind: 'file' as const, file })),
+        ])
+      : files.map((file) => ({ kind: 'file' as const, file }));
+
     const buildBody = (rowCount: number, truncated: boolean): string => {
       const sections: string[] = ['### OpenCodra Walkthrough'];
       if (countsLine) sections.push(countsLine);
@@ -345,10 +409,42 @@ OpenCodra can also answer questions or update the PR. Try commenting "@${botUser
         sections.push('**Thread verification:** Unavailable (degraded)');
       }
 
-      const renderedRows = files.slice(0, rowCount).map(renderRow);
-      sections.push([tableHeader, ...renderedRows].join('\n'));
+      // Walk the renderable stream until `rowCount` file rows have been emitted. Group headers
+      // are emitted for free (they are NOT counted against the row budget — the cap is per file,
+      // matching the historical contract). The header for a group with no remaining files is also
+      // suppressed (an empty section is a misleading row).
+      let remaining = rowCount;
+      const renderedRows: string[] = [];
+      let pendingHeader: string | null = null;
+      let headerEmitted = false;
+      for (const item of renderableStream) {
+        if (item.kind === 'group-header') {
+          // Hold the header pending until the next file row is actually rendered. If the row
+          // budget is exhausted before a file row lands, the header is dropped.
+          if (remaining > 0) {
+            pendingHeader = `**${item.label}**`;
+          }
+          continue;
+        }
+        if (remaining <= 0) break;
+        if (!headerEmitted) {
+          renderedRows.push(tableHeader);
+          headerEmitted = true;
+        }
+        if (pendingHeader !== null) {
+          renderedRows.push(pendingHeader);
+          pendingHeader = null;
+        }
+        renderedRows.push(renderRow(item.file));
+        remaining -= 1;
+      }
 
-      const overflow = files.length - rowCount;
+      if (renderedRows.length > 0) {
+        sections.push(renderedRows.join('\n'));
+      }
+
+      const totalFilesRenderable = renderableStream.filter((item) => item.kind === 'file').length;
+      const overflow = totalFilesRenderable - rowCount;
       if (overflow > 0) {
         sections.push(`_+${overflow} more files reviewed_`);
       } else if (truncated) {
@@ -357,6 +453,10 @@ OpenCodra can also answer questions or update the PR. Try commenting "@${botUser
 
       sections.push(`_${fileWord}_`);
 
+      // Bottom assessment block (D-15) — independent of the row counter so the bottom line always
+      // lands. Empty assessment means nothing is appended.
+      sections.push(...renderAssessment());
+
       if (!isBitbucket && typeof input.mermaid === 'string' && input.mermaid.trim().length > 0) {
         sections.push('```mermaid\n' + input.mermaid.trim() + '\n```');
       }
@@ -364,13 +464,20 @@ OpenCodra can also answer questions or update the PR. Try commenting "@${botUser
       return sections.join('\n\n');
     };
 
+    const totalFileCount = groupedSections
+      ? groupedSections.reduce((sum, section) => sum + section.files.length, 0)
+      : files.length;
+
     // Row cap (D-04): render at most WALKTHROUGH_FILE_CAP rows (caller supplies them pre-sorted);
-    // the remainder collapses to a "+N more files reviewed" line.
-    let rowCount = Math.min(files.length, WALKTHROUGH_FILE_CAP);
+    // the remainder collapses to a "+N more files reviewed" line. The cap applies to the
+    // renderable file count, not the section count, so a multi-section enrichment stays bounded
+    // the same way the flat table does.
+    let rowCount = Math.min(totalFileCount, WALKTHROUGH_FILE_CAP);
     let body = buildBody(rowCount, false);
 
-    // Total-body ceiling backstop (threat T-09-03): drop trailing rows until the body is provably
-    // under WALKTHROUGH_BODY_MAX regardless of per-cell content.
+    // Total-body ceiling backstop (threat T-19-08-03): drop trailing rows until the body is provably
+    // under WALKTHROUGH_BODY_MAX regardless of per-cell content. The row counter shrinks
+    // MONOTONICALLY across iterations so truncation never re-emits a row it previously dropped.
     let truncated = false;
     while (body.length > WALKTHROUGH_BODY_MAX && rowCount > 0) {
       rowCount -= 1;
