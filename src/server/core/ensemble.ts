@@ -1,11 +1,13 @@
 import type { ParsedReviewComment } from '@shared/schema';
 import { matchCompositeRule, pickSurvivor, SEVERITY_RANK } from './dedup';
+import type { TokenTracker } from './token-tracker';
 
 /**
- * Phase 19 (PASS-02) — deterministic ensemble voting.
+ * Phase 19 (PASS-02) — deterministic ensemble voting + actual-attempt budget admission.
  *
  * Pure, zero-I/O helpers that turn N ensemble runs (each a parsed main-pass result) into a
- * single consensus finding list. LOCKED semantics from D-10..D-12:
+ * single consensus finding list, AND admit a unit against the actual per-attempt subrequest
+ * budget before any provider call is made. LOCKED semantics from D-10..D-13:
  *
  *   D-10: Failed ensemble calls are removed from the denominator. A finding wins when its vote
  *         count is strictly greater than half of successful runs. One survivor degrades to that
@@ -15,6 +17,8 @@ import { matchCompositeRule, pickSurvivor, SEVERITY_RANK } from './dedup';
  *   D-12: A winning cluster uses the primary run's finding when the primary belongs to that
  *         cluster. If the winner exists only in extra runs, select its representative using the
  *         established severity → confidence → stable-first survivor ranking (`pickSurvivor`).
+ *   D-13: Ensemble applies to the main pass only. The security pass remains one separate
+ *         `(file, 'security')` budget-visible unit. Admission MUST NOT multiply security.
  *
  * This module is deliberately orchestration-free: budget scheduling, model fan-out, and the
  * `(file, 'security')` unit live in review.ts. The whole module is PURE — every export returns
@@ -233,3 +237,85 @@ function buildClusterId(clusterIndex: number, runIndex: number, finding: ParsedR
 // Re-export so downstream call sites can `import { SEVERITY_RANK } from '@server/core/ensemble'`
 // if they only consume the ensemble helpers (D-11/D-12 reference this constant in comments).
 export { SEVERITY_RANK };
+
+// ---------------------------------------------------------------------------
+// D-13 actual-attempt budget admission. Static per-(file,pass) cost governs CONCURRENCY; an
+// ensemble-enabled unit's real per-attempt cost is the product of [samples × chunks × per-call
+// max attempts] plus a fixed DB/audit headroom the tracker does not observe directly. Admission
+// must consult this product before starting the unit so a fresh-instance handoff can take over
+// instead of crashing mid-unit on the per-invocation subrequest cap.
+//
+// The helpers are PURE: `admitEnsembleUnit` consults the provided TokenTracker but never mutates
+// it. The caller (review.ts::runFileWithEnsemble) is the one that increments the tracker on each
+// actual attempt — keeping admission and accounting independent so the test layer can pin the
+// exact admission signal without the model dispatch side-effects.
+// ---------------------------------------------------------------------------
+
+/**
+ * Headroom reserved for DB/audit/KV writes the TokenTracker does not see (Hyperdrive
+ * round-trips for resolveModel/upsertFileReview/getFileReviewsForJobs, the recordUnitAudit
+ * append, etc.). Sized to match the `ESTIMATED_SUBREQUESTS_PER_FILE` per-unit ceiling so a
+ * worst-case full-cost unit still has the room it needs for the bookkeeping that surrounds
+ * every model call. Additive to `actualAttempts`, never multiplied, so the headroom is a fixed
+ * per-unit cost.
+ */
+export const ENSEMBLE_ADMISSION_HEADROOM = 5;
+
+export type EnsembleAdmissionShape = {
+  runs: number;
+  chunkCount: number;
+  fallbackCount: number;
+  googleMaxRetries: number;
+};
+
+export type EnsembleAdmissionEstimate = {
+  actualAttempts: number;
+  headroom: number;
+  totalCost: number;
+};
+
+/**
+ * PURE actual-attempt estimator. Returns the worst-case subrequest cost of one (file, pass) unit
+ * given its fan-out shape. The cost is `samples × chunks × (1 primary + fallbacks + Google retries)`
+ * because every sample walks the full fallback chain and Google retries are internal to one
+ * primary call (each counted as a subrequest before its fetch). D-13: callers are responsible
+ * for clamping the security pass to `runs: 1` so this estimator returns 1 attempt for a security
+ * unit.
+ */
+export function estimateEnsembleActualAttempts(shape: EnsembleAdmissionShape): EnsembleAdmissionEstimate {
+  const perCall = 1 + Math.max(0, shape.fallbackCount) + Math.max(0, shape.googleMaxRetries);
+  const actualAttempts = Math.max(0, shape.runs) * Math.max(0, shape.chunkCount) * perCall;
+  return {
+    actualAttempts,
+    headroom: ENSEMBLE_ADMISSION_HEADROOM,
+    totalCost: actualAttempts + ENSEMBLE_ADMISSION_HEADROOM,
+  };
+}
+
+export type EnsembleAdmissionResult =
+  | { admitted: true; estimate: EnsembleAdmissionEstimate; reason: null }
+  | { admitted: false; estimate: EnsembleAdmissionEstimate; reason: string };
+
+/**
+ * PURE budget admission. Returns `{ admitted: true }` iff the worst-case actual-attempt cost
+ * fits within the tracker's remaining safe budget. Returns `{ admitted: false, reason }`
+ * otherwise — the caller should yield to a fresh instance rather than start an over-budget unit.
+ * Does NOT mutate the tracker; the model dispatch increments subrequests for each actual attempt
+ * (Google's pre-fetch `tracker.incrementSubrequests(1)` already does this, and the per-chunk
+ * call-resolve path is the right place for future sub-claim incrementing).
+ */
+export function admitEnsembleUnit(
+  tracker: Pick<TokenTracker, 'remainingSafeBudget'>,
+  shape: EnsembleAdmissionShape,
+): EnsembleAdmissionResult {
+  const estimate = estimateEnsembleActualAttempts(shape);
+  const remaining = tracker.remainingSafeBudget();
+  if (estimate.totalCost <= remaining) {
+    return { admitted: true, estimate, reason: null };
+  }
+  return {
+    admitted: false,
+    estimate,
+    reason: `ensemble unit would exceed safe subrequest budget (cost=${estimate.totalCost}, remaining=${remaining})`,
+  };
+}
