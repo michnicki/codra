@@ -2,10 +2,14 @@ import { budgetAwareFileLimit, runReviewJob } from '@server/core/review';
 import { TokenTracker } from '@server/core/token-tracker';
 import { createTestEnv, generateMockDiff, hasConfiguredTestDatabaseUrl } from './helpers';
 import { vi } from 'vitest';
-import { findExistingJobForHead, getJobDetail, getJobForProcessing, insertJob, mapJob, updateJobCriticResult, updateJobFileCount, updateJobStep, updateJobWalkthroughCommentRef } from '@server/db/jobs';
+import { findExistingJobForHead, getJobDetail, getJobForProcessing, insertJob, mapJob, markJobContinuationQueued, setJobThreadVerifications, updateJobCriticResult, updateJobFileCount, updateJobStep, updateJobWalkthroughCommentRef } from '@server/db/jobs';
+// Alias the module namespace under a stable name so vi.spyOn can wrap markJobContinuationQueued
+// on the SAME module instance the production code imports (vitest's vi.mock + dynamic
+// import('@server/db/jobs') would otherwise create a separate instance the spy can't see).
+import * as jobsModule from '@server/db/jobs';
 import { BitbucketAdapter } from '@server/vcs/bitbucket';
 import { getFileReviewsForJobs, upsertFileReview } from '@server/db/file-reviews';
-import { defaultRepoConfig, REVIEW_CONCURRENCY_LIMITS, type ParsedReviewComment, type RepoConfig } from '@shared/schema';
+import { defaultRepoConfig, REVIEW_CONCURRENCY_LIMITS, type ParsedReviewComment, type RepoConfig, type ThreadVerifications } from '@shared/schema';
 import { runWithDb, queryRows } from '@server/db/client';
 import { buildWalkthroughData, editWalkthroughComment, postWalkthroughPlaceholder, type WalkthroughReviewRow } from '@server/core/walkthrough';
 import { FormatterService } from '@server/services/formatter';
@@ -1390,6 +1394,372 @@ dbDescribe('Review Flow Lifecycle', () => {
       critiqueSpy.mockRestore();
       reviewSpy.mockRestore();
       getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    // Phase 20.1 (BLOCKER 4): the verify-fixes idempotency guard + review-rest guard used to
+    // `return` without scheduling a successor. A crash between the terminal write and the throw
+    // left the job non-terminal indefinitely -- the queue message was acked with no next-phase
+    // message and finalize never ran. The fix: both guards now schedule a successor via
+    // markJobContinuationQueued + NextPhaseError(nextPhaseAfterVerifyFixes(config)). These three
+    // integration tests pin the end-to-end behavior at the runReviewJob level.
+    //
+    //   Test 11: a verify_fixes job whose durable state is 'completed' (simulating the post-
+    //            terminal-write crash) recovers: the idempotency guard fires, schedules the
+    //            successor, and the chain reaches finalize.
+    //   Test 12: a review-rest job with verify_fixes enabled sees the review-rest guard fire and
+    //            schedules the successor (no-op on the verify-fixes work, but the chain continues).
+    //   Test 13: a double-enqueue (two consecutive runVerifyFixesPhase calls both scheduling the
+    //            same successor) is absorbed by the runFinalizePhase idempotency: the finalize
+    //            phase runs exactly once.
+    it('BLOCKER 4: a verify_fixes job with terminal durable state schedules successor + chain reaches finalize', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const repo = `test-repo-${Date.now()}-blocker4-crash`;
+
+      // v1.2 toggles: verify_fixes + critic on, walkthrough off. The chain is
+      // review → verify_fixes (idempotency guard) → critic → finalize. With verify_fixes
+      // terminal state pre-loaded, the idempotency guard fires and schedules critic.
+      const config: RepoConfig = {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          threads: { verify_fixes: true, auto_resolve: false },
+          passes: {
+            ...defaultRepoConfig.review.passes,
+            critic: { enabled: true, skip_threshold: 1 },
+          },
+        },
+      };
+
+      // Insert a job that already has review files counted + prepare done so verify_fixes is the
+      // next phase. Pre-load thread_verifications = completed to simulate the post-terminal-write
+      // crash state: the verify-fixes phase will see status='completed' and the BLOCKER 4 fix
+      // will fire on the idempotency guard.
+      const job = await insertJob(env, {
+        installationId: '123',
+        owner: 'test-owner',
+        repo,
+        prNumber: 8,
+        prTitle: 'BLOCKER 4 crash recovery test',
+        prAuthor: 'author',
+        commitSha: sha('h'),
+        baseSha: sha('0'),
+        trigger: 'auto',
+        headRef: 'feature',
+        baseRef: 'main',
+        configSnapshot: config,
+      });
+      await updateJobFileCount(env, job.id, 1);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+      await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+      // Insert a 'done' file_review so the finalize phase does not fail-closed on the
+      // 'all files failed' gate (review.ts:2182). The BLOCKER 4 chain assertion only needs the
+      // chain to reach finalize, not to assert the review quality.
+      await upsertFileReview(env, job.id, {
+        filePath: 'src/app.ts',
+        fileStatus: 'done',
+        modelUsed: 'test-model',
+        modelProvider: 'test-provider',
+        diffLineCount: 1,
+        diffInput: 'diff',
+        rawAiOutput: '{}',
+        parsedComments: [],
+        inputTokens: 1,
+        outputTokens: 1,
+        durationMs: 1,
+        verdict: 'approve',
+        fileSummary: 'ok',
+        errorMessage: null,
+      });
+
+      const terminalState: ThreadVerifications = {
+        version: 1,
+        status: 'completed',
+        entries: [],
+        totals: { fixed: 0, unfixed: 0, unverifiable: 0, resolved: 0 },
+      };
+      await setJobThreadVerifications(env, job.id, terminalState);
+
+      // Spy on markJobContinuationQueued so we can verify it was called by the BLOCKER 4 guard.
+      // Use the static-imported module reference (line 5) so the spy wraps the SAME instance the
+      // production code uses; dynamic `await import('@server/db/jobs')` would create a separate
+      // module instance under vitest's vi.mock and the spy would never see the production calls.
+      const continuationSpy = vi.spyOn(
+        jobsModule,
+        'markJobContinuationQueued',
+      );
+
+      // Drain the chain starting from verify_fixes. The BLOCKER 4 fix schedules the successor
+      // (critic), then the chain continues critic → finalize.
+      const phasesObserved: string[] = [];
+      await runWithDb(env, async () => {
+        let currentMessage: any = { jobId: job.id, deliveryId: 'delivery-blocker4-crash', phase: 'verify_fixes' };
+        let retries = 0;
+        while (currentMessage) {
+          const result = await runReviewJob(env, currentMessage);
+          if (result.action === 'next_phase') {
+            phasesObserved.push(result.phase);
+            currentMessage = { ...currentMessage, phase: result.phase };
+            retries = 0;
+            await queryRows(env, `UPDATE jobs SET last_queue_message_at = now() - interval '5 seconds' WHERE id = $1`, [job.id]);
+          } else if (result.action === 'retry') {
+            if (++retries > 5) throw new Error('Max retries exceeded');
+            break;
+          } else {
+            currentMessage = null;
+          }
+        }
+      });
+
+      // The idempotency guard fired and scheduled critic. The chain reached finalize.
+      expect(phasesObserved[0]).toBe('critic');
+      expect(phasesObserved).toContain('finalize');
+
+      // markJobContinuationQueued was called by the BLOCKER 4 fix (the success path also calls
+      // it, so we just confirm it was called at least once during the verify_fixes phase).
+      expect(continuationSpy).toHaveBeenCalled();
+
+      // The job reached 'done' — the chain completed after the simulated crash recovery.
+      const finalJob = await findExistingJobForHead(env, { owner: 'test-owner', repo, prNumber: 8, commitSha: sha('h'), trigger: 'auto' });
+      expect(finalJob?.status).toBe('done');
+
+      continuationSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('BLOCKER 4: a review-rest job with verify_fixes enabled schedules successor via review-rest guard', async () => {
+      // A review-rest job with verify_fixes enabled hits the review-rest guard (verify-fixes.ts:449).
+      // The BLOCKER 4 fix schedules the successor so the chain reaches finalize. The verify_fixes
+      // work itself is skipped (D-03), but the chain MUST continue.
+      const repo = `test-repo-${Date.now()}-blocker4-rest`;
+
+      const config: RepoConfig = {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          threads: { verify_fixes: true, auto_resolve: false },
+        },
+      };
+
+      const job = await insertJob(env, {
+        installationId: '123',
+        owner: 'test-owner',
+        repo,
+        prNumber: 8,
+        prTitle: 'BLOCKER 4 review-rest test',
+        prAuthor: 'author',
+        commitSha: sha('r'),
+        baseSha: sha('0'),
+        trigger: 'auto',
+        headRef: 'feature',
+        baseRef: 'main',
+        configSnapshot: config,
+        reviewScope: 'rest',
+        scopeSourceJobId: null,
+      });
+      await updateJobFileCount(env, job.id, 1);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+      await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+      // Insert a 'done' file_review so the finalize phase does not fail-closed on the
+      // 'all files failed' gate (review.ts:2182).
+      await upsertFileReview(env, job.id, {
+        filePath: 'src/app.ts',
+        fileStatus: 'done',
+        modelUsed: 'test-model',
+        modelProvider: 'test-provider',
+        diffLineCount: 1,
+        diffInput: 'diff',
+        rawAiOutput: '{}',
+        parsedComments: [],
+        inputTokens: 1,
+        outputTokens: 1,
+        durationMs: 1,
+        verdict: 'approve',
+        fileSummary: 'ok',
+        errorMessage: null,
+      });
+
+      // Spy on markJobContinuationQueued to confirm the BLOCKER 4 review-rest guard calls it.
+      const continuationSpy = vi.spyOn(
+        jobsModule,
+        'markJobContinuationQueued',
+      );
+
+      const phasesObserved: string[] = [];
+      await runWithDb(env, async () => {
+        let currentMessage: any = { jobId: job.id, deliveryId: 'delivery-blocker4-rest', phase: 'verify_fixes' };
+        let retries = 0;
+        while (currentMessage) {
+          const result = await runReviewJob(env, currentMessage);
+          if (result.action === 'next_phase') {
+            phasesObserved.push(result.phase);
+            currentMessage = { ...currentMessage, phase: result.phase };
+            retries = 0;
+            await queryRows(env, `UPDATE jobs SET last_queue_message_at = now() - interval '5 seconds' WHERE id = $1`, [job.id]);
+          } else if (result.action === 'retry') {
+            if (++retries > 5) throw new Error('Max retries exceeded');
+            break;
+          } else {
+            currentMessage = null;
+          }
+        }
+      });
+
+      // The review-rest guard fired and scheduled finalize (no critic, no walkthrough).
+      // The chain reaches finalize.
+      expect(phasesObserved).toContain('finalize');
+      expect(continuationSpy).toHaveBeenCalled();
+
+      // The job reached 'done'.
+      const finalJob = await getJobForProcessing(env, job.id);
+      expect(finalJob?.status).toBe('done');
+
+      continuationSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('BLOCKER 4: a double-enqueue (two consecutive guard fires) is absorbed by runFinalizePhase idempotency', async () => {
+      // The D-17 idempotent counter is markJobContinuationQueued. The next-phase guards in
+      // runCriticPhase / runWalkthroughEnrichmentPhase / runFinalizePhase absorb any double-enqueue.
+      // This test simulates the worst case: TWO consecutive verify_fixes invocations both hit the
+      // idempotency guard and both schedule 'finalize'. The first one drives the chain; the
+      // second is absorbed (runFinalizePhase is idempotent on the already-done job).
+      const repo = `test-repo-${Date.now()}-blocker4-double`;
+
+      const config: RepoConfig = {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          threads: { verify_fixes: true, auto_resolve: false },
+        },
+      };
+
+      const job = await insertJob(env, {
+        installationId: '123',
+        owner: 'test-owner',
+        repo,
+        prNumber: 8,
+        prTitle: 'BLOCKER 4 double-enqueue test',
+        prAuthor: 'author',
+        commitSha: sha('d'),
+        baseSha: sha('0'),
+        trigger: 'auto',
+        headRef: 'feature',
+        baseRef: 'main',
+        configSnapshot: config,
+      });
+      await updateJobFileCount(env, job.id, 1);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+      await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+      // Insert a 'done' file_review so the finalize phase does not fail-closed on the
+      // 'all files failed' gate (review.ts:2182).
+      await upsertFileReview(env, job.id, {
+        filePath: 'src/app.ts',
+        fileStatus: 'done',
+        modelUsed: 'test-model',
+        modelProvider: 'test-provider',
+        diffLineCount: 1,
+        diffInput: 'diff',
+        rawAiOutput: '{}',
+        parsedComments: [],
+        inputTokens: 1,
+        outputTokens: 1,
+        durationMs: 1,
+        verdict: 'approve',
+        fileSummary: 'ok',
+        errorMessage: null,
+      });
+
+      const terminalState: ThreadVerifications = {
+        version: 1,
+        status: 'completed',
+        entries: [],
+        totals: { fixed: 0, unfixed: 0, unverifiable: 0, resolved: 0 },
+      };
+      await setJobThreadVerifications(env, job.id, terminalState);
+
+      const continuationSpy = vi.spyOn(
+        jobsModule,
+        'markJobContinuationQueued',
+      );
+
+      // First verify_fixes invocation: BLOCKER 4 guard fires → schedules finalize.
+      // The runReviewJob result must be { action: 'next_phase', phase: 'finalize' }.
+      const firstResult = await runWithDb(env, async () =>
+        runReviewJob(env, {
+          jobId: job.id,
+          deliveryId: 'delivery-blocker4-double-1',
+          phase: 'verify_fixes',
+        }),
+      );
+      expect(firstResult.action).toBe('next_phase');
+      if (firstResult.action === 'next_phase') {
+        expect(firstResult.phase).toBe('finalize');
+      }
+
+      // markJobContinuationQueued stamps last_queue_message_at = now() + 60s, which would cause
+      // the next claim to report 'busy' and return 'retry'. Backdate it so the second invocation
+      // can actually claim the job (mirrors the drain-loop backdate in the existing tests).
+      await runWithDb(env, async () => {
+        await queryRows(env, `UPDATE jobs SET last_queue_message_at = now() - interval '5 seconds' WHERE id = $1`, [job.id]);
+      });
+
+      // The job is now in a state where finalize is queued. Before finalize runs, a SECOND
+      // verify_fixes message arrives (simulating the queue replaying the message). The guard
+      // fires again and schedules finalize again. The markJobContinuationQueued counter is
+      // incremented a second time (D-17 idempotent).
+      const secondResult = await runWithDb(env, async () =>
+        runReviewJob(env, {
+          jobId: job.id,
+          deliveryId: 'delivery-blocker4-double-2',
+          phase: 'verify_fixes',
+        }),
+      );
+      expect(secondResult.action).toBe('next_phase');
+      if (secondResult.action === 'next_phase') {
+        expect(secondResult.phase).toBe('finalize');
+      }
+
+      // markJobContinuationQueued was called at least twice (once per guard fire).
+      expect(continuationSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+
+      // Backdate last_queue_message_at so the finalize claim doesn't see a fresh lease.
+      await runWithDb(env, async () => {
+        await queryRows(env, `UPDATE jobs SET last_queue_message_at = now() - interval '5 seconds' WHERE id = $1`, [job.id]);
+      });
+
+      // The runFinalizePhase idempotency absorbs the double-enqueue (it checks job.checkRunId +
+      // the bot review idempotency, so a second finalize on a done job is a no-op). Calling
+      // finalize with the real implementation: the first call acks after the work is done; a
+      // second call also acks because the job is already 'done' / has a check_run_id.
+      const firstFinalize = await runWithDb(env, async () =>
+        runReviewJob(env, {
+          jobId: job.id,
+          deliveryId: 'delivery-blocker4-double-finalize-1',
+          phase: 'finalize',
+        }),
+      );
+      expect(firstFinalize.action).toBe('ack');
+
+      // Backdate again for the second finalize.
+      await runWithDb(env, async () => {
+        await queryRows(env, `UPDATE jobs SET last_queue_message_at = now() - interval '5 seconds' WHERE id = $1`, [job.id]);
+      });
+
+      const secondFinalize = await runWithDb(env, async () =>
+        runReviewJob(env, {
+          jobId: job.id,
+          deliveryId: 'delivery-blocker4-double-finalize-2',
+          phase: 'finalize',
+        }),
+      );
+      // Second finalize is absorbed: the job is already 'done', so the runReviewJob claim
+      // returns no job and the runReviewJob top-level returns { action: 'ack' } via the
+      // "job already terminal" path.
+      expect(secondFinalize.action).toBe('ack');
+
+      // The job stays 'done' after both finalize calls.
+      const finalJob = await getJobForProcessing(env, job.id);
+      expect(finalJob?.status).toBe('done');
+
+      continuationSpy.mockRestore();
     }, REVIEW_FLOW_TIMEOUT_MS);
   });
 
