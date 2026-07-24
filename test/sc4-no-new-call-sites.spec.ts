@@ -27,14 +27,16 @@ import { describe, expect, it } from 'vitest';
 // for thread-aware round detection. That call site is the documented Phase 18 consumer of the
 // Phase 17 seam primitive, scoped to one method call gated by config + capability. The scan
 // excludes it via SC4_ALLOWLISTED_REVIEW_CALL_SITES so the broader NREG-01 invariant stays tight
-// for every other primitive, including the two that Phase 18 does NOT yet consume
-// (`getFileContent`, `resolveThread`). Phase 18 Plan 02 (RND-02) ALSO wires `getCompareDiff`
-// in `src/server/core/review.ts` (the prepare-time selection block, gated on
+// for every other primitive. Phase 18 Plan 02 (RND-02) ALSO wires `getCompareDiff` in
+// `src/server/core/review.ts` (the prepare-time selection block, gated on
 // `rounds.incremental && hasAnchor`) and the typed `selectDiffForRound` signature in
-// `src/server/core/rounds.ts` references the seam primitive's name in JSDoc. The
-// `getCompareDiff` carve-out is build-time-only: the call site is gated so the consumer is
-// inert at defaults (NREG-01). A future phase that adds a new consumer must extend the
-// carve-out and document why here.
+// `src/server/core/rounds.ts` references the seam primitive's name in JSDoc.
+//
+// Phase 19 carve-out (THR-01 / THR-02): `src/server/core/verify-fixes.ts` is the intentional,
+// default-off consumer of thread listing, head file content, and resolution. It remains provider-
+// neutral and capability-gated; test/verify-fixes-provider-parity.spec.ts proves equivalent logical
+// outcomes on GitHub and Bitbucket. The explicit per-file identifier set below keeps any other new
+// consumer fail-closed.
 
 const PROJECT_ROOT = join(__dirname, '..');
 
@@ -74,18 +76,18 @@ const SOURCE_SCAN_ALLOWLIST = new Set<string>([
   'src/server/services/github.ts',
 ]);
 
-// Phase 18 carve-out: identifiers `getUnresolvedBotThreads` is permitted ONLY in
-// `src/server/core/review.ts` (the documented RND-01 / RND-04 round-detection + suppression
-// consumer). Phase 18 Plan 02 (RND-02) ALSO wires `getCompareDiff` in `src/server/core/review.ts`
-// (the prepare-time selection block, gated on `rounds.incremental && hasAnchor`) and the typed
-// `selectDiffForRound` signature in `src/server/core/rounds.ts` references the seam primitive's
-// name in JSDoc. The other two Phase 17 primitives (`getFileContent`, `resolveThread`) stay
-// flagged everywhere because Phase 18 does NOT yet consume them -- any future wiring must extend
-// this carve-out explicitly. Stored as `{ file -> Set<identifier> }` so the scan can verify
-// the precise identifier allowed in each file rather than a blanket file-level pass.
+// Explicit consumer carve-outs. Phase 18 permits round detection/compare selection in review.ts
+// and the rounds helper's typed reference. Phase 19 permits verify-fixes.ts to consume thread
+// listing, file content, and resolution behind its default-off config and provider capabilities.
+// Stored as `{ file -> Set<identifier> }` so the scan grants only the documented primitive to each
+// file rather than a blanket file-level pass.
 const SC4_ALLOWLISTED_REVIEW_CALL_SITES = new Map<string, ReadonlySet<string>>([
   ['src/server/core/review.ts', new Set(['getUnresolvedBotThreads', 'getCompareDiff'])],
   ['src/server/core/rounds.ts', new Set(['getCompareDiff'])],
+  [
+    'src/server/core/verify-fixes.ts',
+    new Set(['getFileContent', 'getUnresolvedBotThreads', 'resolveThread']),
+  ],
 ]);
 
 function collectProductionFiles(dir: string): string[] {
@@ -162,12 +164,9 @@ describe('SC4 / NREG-01: no new call sites for Phase-17 primitives', () => {
     }
   });
 
-  it('Phase 18 carve-out: SC4_ALLOWLISTED_REVIEW_CALL_SITES points at a real file and only permits the documented identifier(s)', () => {
-    // The carve-out grants a specific (file, identifier) pair a pass. Validate every
-    // entry references a real production file AND that the carve-out identifiers are a
-    // subset of PHASE_17_METHOD_IDENTIFIERS (no typo'd phantom primitive). A future
-    // addition (e.g. a future phase widening getCompareDiff use) must update this map
-    // AND extend the comment above -- an entry added without documentation fails this test.
+  it('consumer carve-outs point at real files and permit only Phase-17 method identifiers', () => {
+    // Each carve-out grants specific (file, identifier) pairs. Validate every entry references a
+    // real production file and every identifier belongs to the closed primitive vocabulary.
     expect(SC4_ALLOWLISTED_REVIEW_CALL_SITES.size).toBeGreaterThan(0);
     for (const [file, identifiers] of SC4_ALLOWLISTED_REVIEW_CALL_SITES.entries()) {
       expect(allProductionFiles).toContain(file);
