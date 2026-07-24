@@ -1094,9 +1094,11 @@ dbDescribe('Review Flow Lifecycle', () => {
         ]),
       );
       const reviewSpy = vi.spyOn(ModelService.prototype as any, 'reviewFile').mockImplementation(findingReview);
-      // Prune the finding at index 0; the reconciliation keeps the rest.
+      // Phase 19 (PASS-01 / D-09): the critic v2 model output is `{ verdicts: [{id, verdict, reason}] }`.
+      // Mark id 0 as unsupported so the reconciler drops it; id 1 is omitted and falls through to the
+      // v2 no-verdict drop path.
       const critiqueSpy = vi.spyOn(ModelService.prototype as any, 'critiqueFindings').mockResolvedValue({
-        rawText: '{"prune":[{"id":0,"reason":"duplicate of another finding"}]}',
+        rawText: '{"verdicts":[{"id":0,"verdict":"unsupported","reason":"duplicate of another finding"},{"id":1,"verdict":"proven","reason":"evidence-supported"}]}',
         modelUsed: 'critic-model',
         inputTokens: 5,
         outputTokens: 2,
@@ -1117,8 +1119,12 @@ dbDescribe('Review Flow Lifecycle', () => {
       expect(criticResult).not.toBeNull();
       expect(criticResult?.skipped).toBe(false);
       expect(criticResult?.dedupedCount).toBe(2);
-      expect(criticResult?.pruned).toHaveLength(1);
-      expect(criticResult?.kept).toHaveLength(1);
+      // v2 ledger: exactly 2 decisions, one per candidate.
+      expect(criticResult?.decisions).toHaveLength(2);
+      expect(criticResult?.decisions?.[0].outcome).toBe('dropped');
+      expect(criticResult?.decisions?.[1].outcome).toBe('kept');
+      expect(criticResult?.status).toBe('completed');
+      expect(criticResult?.version).toBe(2);
       // kept + pruned accounts for the whole deduped candidate set (nothing invented, nothing lost).
       expect((criticResult?.kept.length ?? 0) + (criticResult?.pruned.length ?? 0)).toBe(2);
 
@@ -1130,7 +1136,7 @@ dbDescribe('Review Flow Lifecycle', () => {
       getDiffSpy.mockRestore();
     }, REVIEW_FLOW_TIMEOUT_MS);
 
-    it('skips the model call and keeps all findings when the deduped set is at/below the skip threshold', async () => {
+    it('honors an explicit skip_threshold and keeps all findings when the candidate set is at/below it', async () => {
       const { GitHubService } = await import('@server/services/github');
       const { ModelService } = await import('@server/services/model');
       const repo = `test-repo-${Date.now()}-critic-skip`;
@@ -1140,8 +1146,9 @@ dbDescribe('Review Flow Lifecycle', () => {
       const reviewSpy = vi.spyOn(ModelService.prototype as any, 'reviewFile').mockImplementation(findingReview);
       const critiqueSpy = vi.spyOn(ModelService.prototype as any, 'critiqueFindings');
 
-      // Default skip_threshold (CRITIC_SKIP_THRESHOLD = 3); a single-finding set is below it.
-      const job = await insertCriticJob(repo, criticConfig(), 'b');
+      // D-06 (v2): the implicit small-set skip is gone. The critic still runs on a single-finding
+      // set by default; only an explicit skip_threshold keeps it as a no-op keep-all skip.
+      const job = await insertCriticJob(repo, criticConfig({ skip_threshold: 1 }), 'b');
       await updateJobFileCount(env, job.id, 1);
       await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
 
@@ -1155,6 +1162,11 @@ dbDescribe('Review Flow Lifecycle', () => {
       expect(criticResult?.skipped).toBe(true);
       expect(criticResult?.pruned).toHaveLength(0);
       expect(criticResult?.kept).toHaveLength(1);
+      expect(criticResult?.status).toBe('skipped');
+      expect(criticResult?.reason).toBe('below-skip-threshold');
+      expect(criticResult?.decisions).toHaveLength(1);
+      expect(criticResult?.decisions?.[0].outcome).toBe('kept');
+      expect(criticResult?.decisions?.[0].verdict).toBeNull();
 
       critiqueSpy.mockRestore();
       reviewSpy.mockRestore();

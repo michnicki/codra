@@ -6,8 +6,9 @@ import type { JobAuditEvent } from '@shared/schema';
 
 // D-09: the fixed display order for stage groups. Matches the pipeline's logical stage progression
 // (file selection -> drafting -> severity adjustment -> noise filter -> dedup -> evidence gate ->
-// rounds -> thread verification). Phase 18 adds `rounds`; Phase 19 adds one normalized `threads`
-// group for every `threads.*` verdict/resolution event.
+// rounds -> thread verification -> critic). Phase 18 adds `rounds`; Phase 19 adds one normalized
+// `threads` group for every `threads.*` verdict/resolution event and a `critic` group for the
+// canonical critic-decisions audit event.
 export const STAGE_ORDER = [
   'file_skipped',
   'drafted',
@@ -17,6 +18,7 @@ export const STAGE_ORDER = [
   'evidence_missing',
   'rounds',
   'threads',
+  'critic',
 ] as const;
 
 /**
@@ -39,10 +41,16 @@ export type AuditDisplayStage = typeof STAGE_ORDER[number];
  * the real stages). This normalizer collapses EVERY `rounds.*` sub-variant to the single
  * `rounds` display stage while leaving non-round stages unchanged. The audit-trail viewer
  * (Phase 16-06) renders ALL rounds events under one `Rounds` group.
+ *
+ * Phase 19 (PASS-01 / D-05): the synthetic `critic` display group covers the single
+ * `critic.decisions` aggregate event. The canonical decisions array lives on jobs.critic_result;
+ * the audit receives only a bounded sample so the viewer can show the same outcome/reason
+ * pattern for the audited rows.
  */
 export function normalizeAuditDisplayStage(stage: JobAuditEvent['stage']): AuditDisplayStage {
   if (stage.startsWith('rounds.')) return 'rounds';
   if (stage.startsWith('threads.')) return 'threads';
+  if (stage === 'critic.decisions') return 'critic';
   return stage as AuditDisplayStage;
 }
 

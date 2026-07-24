@@ -19,6 +19,7 @@ const STAGE_LABELS: Record<AuditStageGroup['stage'], string> = {
   evidence_missing: 'Evidence missing',
   rounds: 'Rounds',
   threads: 'Threads',
+  critic: 'Critic',
 };
 
 // A count pill mirroring the job-findings-list / critic-panel count-badge idiom.
@@ -233,6 +234,27 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
           <MetricLine label="reason" value={event.reason} />
           <MetricLine label="thread" value={shortOpaqueRef(event.threadRef)} />
           <SampleIdentifier path={event.path} line={event.line} />
+        </li>
+      );
+    case 'critic.decisions':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="stage" value="critic.decisions" />
+          <MetricLine label="status" value={event.status} />
+          <MetricLine label="count" value={String(event.count)} />
+          {event.reason ? <MetricLine label="reason" value={event.reason} /> : null}
+          {event.sample.length > 0 && (
+            <ul className="mt-2 flex flex-col gap-1.5 border-t border-border/30 pt-2">
+              {event.sample.map((s) => (
+                <li key={`${s.id}:${s.path}:${s.line ?? ''}`}>
+                  <SampleIdentifier path={s.path} line={s.line} title={s.title} />
+                  <div className="text-[10px] text-muted-foreground/70 font-mono">
+                    {[(s.verdict ?? 'no-verdict'), s.outcome, s.reason].filter(Boolean).join(' · ')}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
         </li>
       );
     default:

@@ -613,3 +613,172 @@ describe('JobDetailPage thread verification surfaces', () => {
     expect(document.body.textContent).not.toContain(`fixed-${'r'.repeat(80)}`);
   });
 });
+
+// Phase 19 Plan 19-04 / D-05 / D-07 / D-08: every canonical critic outcome renders exactly once
+// in the UI, and legacy prune-only rows are labeled as such without fabricated verdicts.
+describe('JobDetailPage critic v2 canonical outcomes', () => {
+  const okResponse = <T,>(data: T) => ({
+    status: 200 as const,
+    etag: null,
+    lastModified: null,
+    notModified: false as const,
+    data,
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const completedDecisions = [
+    { id: 0, path: 'src/a.ts', line: 10, severity: 'P1' as const, category: 'bugs' as const, title: 'proven title', body: 'b', confidence: 0.95, verdict: 'proven' as const, outcome: 'kept' as const, reason: 'evidence-supported' },
+    { id: 1, path: 'src/b.ts', line: 20, severity: 'P1' as const, category: 'quality' as const, title: 'unsupported title', body: 'b', confidence: 0.5, verdict: 'unsupported' as const, outcome: 'dropped' as const, reason: 'evidence-unsupported' },
+    { id: 2, path: 'src/c.ts', line: 30, severity: 'P0' as const, category: 'security' as const, title: 'plausible title', body: 'b', confidence: 0.9, verdict: 'plausible' as const, outcome: 'kept' as const, reason: 'keeps-evidence' },
+    { id: 3, path: 'src/d.ts', line: 40, severity: 'P2' as const, category: 'correctness' as const, title: 'plausible threshold dropped', body: 'b', confidence: 0.7, verdict: 'plausible' as const, outcome: 'dropped' as const, reason: 'plausible-below-threshold' },
+    { id: 4, path: 'src/e.ts', line: 50, severity: 'P1' as const, category: 'bugs' as const, title: 'no-verdict dropped', body: 'b', confidence: 0.9, verdict: null, outcome: 'dropped' as const, reason: 'no-verdict' },
+  ];
+
+  function makeBoundedCriticJob(overrides: any): JobDetail {
+    return {
+      ...JOB,
+      criticResult: {
+        kept: [],
+        pruned: [],
+        ...overrides,
+      },
+    } as JobDetail;
+  }
+
+  it('renders every canonical outcome exactly once for a completed run', async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.getJob).mockResolvedValue(
+      okResponse({
+        job: makeBoundedCriticJob({
+          version: 2,
+          status: 'completed',
+          decisions: completedDecisions,
+        }),
+      }),
+    );
+
+    renderJobDetail();
+
+    const heading = await screen.findByText('Critic');
+    const panel = heading.closest('.surface') as HTMLElement;
+
+    // Each outcome total reflects the canonical decisions array.
+    expect(within(panel).getByText('Kept').parentElement?.textContent).toBe('Kept2');
+    expect(within(panel).getByText('Dropped').parentElement?.textContent).toBe('Dropped3');
+    expect(within(panel).getByText('Proven').parentElement?.textContent).toBe('Proven1');
+    expect(within(panel).getByText('Plausible').parentElement?.textContent).toBe('Plausible1');
+    expect(within(panel).getByText('Unsupported').parentElement?.textContent).toBe('Unsupported1');
+    expect(within(panel).getByText('No verdict').parentElement?.textContent).toBe('No verdict1');
+
+    // Expand the decisions list and assert each canonical row renders once.
+    await user.click(within(panel).getByRole('button', { name: /Decisions \(5\)/ }));
+    for (const d of completedDecisions) {
+      expect(within(panel).getByText(d.title)).toBeVisible();
+    }
+  });
+
+  it('renders the skipped banner (kept all) for skipped runs', async () => {
+    vi.mocked(api.getJob).mockResolvedValue(
+      okResponse({
+        job: makeBoundedCriticJob({
+          version: 2,
+          status: 'skipped',
+          reason: 'below-skip-threshold',
+          decisions: completedDecisions.map((d) => ({ ...d, verdict: null, outcome: 'kept', reason: 'below-skip-threshold' })),
+        }),
+      }),
+    );
+
+    renderJobDetail();
+
+    expect(await screen.findByText('Critic skipped (kept all)')).toBeInTheDocument();
+  });
+
+  it('renders the fail-open banner (kept all) for fail_open runs', async () => {
+    vi.mocked(api.getJob).mockResolvedValue(
+      okResponse({
+        job: makeBoundedCriticJob({
+          version: 2,
+          status: 'fail_open',
+          reason: 'malformed',
+          decisions: completedDecisions.map((d) => ({ ...d, verdict: null, outcome: 'kept', reason: 'malformed' })),
+        }),
+      }),
+    );
+
+    renderJobDetail();
+
+    expect(await screen.findByText('Critic unavailable (kept all / fail-open)')).toBeInTheDocument();
+  });
+
+  it('renders legacy prune-only rows as Legacy prune-only (no fabricated verdicts)', async () => {
+    vi.mocked(api.getJob).mockResolvedValue(
+      okResponse({
+        job: {
+          ...JOB,
+          criticResult: {
+            kept: [
+              { path: 'src/a.ts', severity: 'P1', category: 'bugs', title: 'kept finding', body: 'still relevant' },
+            ],
+            pruned: [
+              {
+                finding: { path: 'src/b.ts', severity: 'nit', category: 'quality', title: 'pruned finding', body: 'dropped' },
+                reason: 'duplicate of a higher-severity finding',
+              },
+            ],
+          },
+        } as JobDetail,
+      }),
+    );
+
+    renderJobDetail();
+
+    const heading = await screen.findByText('Critic');
+    const panel = heading.closest('.surface') as HTMLElement;
+    expect(within(panel).getByText('Legacy prune-only')).toBeInTheDocument();
+    expect(within(panel).getByText('Kept').parentElement?.textContent).toBe('Kept1');
+    expect(within(panel).getByText('Pruned').parentElement?.textContent).toBe('Pruned1');
+    // Legacy rows must never display a verdict tile.
+    expect(within(panel).queryByText('Proven')).not.toBeInTheDocument();
+    expect(within(panel).queryByText('Plausible')).not.toBeInTheDocument();
+    expect(within(panel).queryByText('Unsupported')).not.toBeInTheDocument();
+  });
+
+  it('renders the critic-decisions audit event in the audit trail', async () => {
+    const user = userEvent.setup();
+    const audit: JobDetail['audit'] = [
+      {
+        stage: 'critic.decisions',
+        status: 'completed',
+        count: 5,
+        reason: undefined,
+        sample: completedDecisions.slice(0, 3).map((d) => ({
+          id: d.id,
+          path: d.path,
+          line: d.line,
+          title: d.title,
+          verdict: d.verdict,
+          outcome: d.outcome,
+          reason: d.reason,
+        })),
+        timestamp: new Date().toISOString(),
+      },
+    ];
+    vi.mocked(api.getJob).mockResolvedValue(
+      okResponse({
+        job: { ...JOB, audit } as JobDetail,
+      }),
+    );
+
+    renderJobDetail();
+    const auditHeading = await screen.findByText('Audit trail');
+    await user.click(auditHeading);
+
+    expect(screen.getByText('Critic')).toBeVisible();
+    expect(screen.getByText('status')).toBeVisible();
+    expect(screen.getByText('count')).toBeVisible();
+  });
+});

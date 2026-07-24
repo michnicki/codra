@@ -14,7 +14,7 @@ const ev = (stage: JobAuditEvent['stage'], timestamp = '2026-01-01T00:00:00Z') =
   ({ stage, timestamp } as unknown as JobAuditEvent);
 
 describe('STAGE_ORDER', () => {
-  it('is the fixed eight-stage order including rounds and thread verification', () => {
+  it('is the fixed nine-stage order including rounds, threads, and critic', () => {
     expect(STAGE_ORDER).toEqual([
       'file_skipped',
       'drafted',
@@ -24,6 +24,7 @@ describe('STAGE_ORDER', () => {
       'evidence_missing',
       'rounds',
       'threads',
+      'critic',
     ]);
   });
 });
