@@ -351,6 +351,10 @@ import {
   appendJobAuditEvents,
 } from '../db/jobs';
 import { NextPhaseError } from './next-phase-error';
+// Phase 20.1 (BLOCKER 3): import the post-verify_fixes selector from the shared module so the
+// combined verify_fixes + critic config chains verify_fixes INTO the critic instead of bypassing
+// it. The selector lives in `phase-routing.ts` to avoid the review.ts ↔ verify-fixes.ts cycle.
+import { nextPhaseAfterVerifyFixes } from './phase-routing';
 import { logger } from './logger';
 
 // Subrequest cost model for verify-fixes. Conservative on purpose: the worst case is roughly
@@ -706,12 +710,11 @@ export async function runVerifyFixesPhase(
 
   await emitCompletionAudit(env, job.id, finalTotals, allProcessed);
 
-  // Phase 19 (D-03 / D-04): verify_fixes always hands off to its successor on its own fresh-budget
-  // step. The successor is the walkthrough enrichment phase (when the walkthrough is enabled) so
-  // the durable chain can do PASS-03 work BEFORE finalize, otherwise finalize directly. Throw
-  // NextPhaseError so runReviewJob's catch translates it into a {action:'next_phase'} result.
-  // (See nextPhaseAfterVerifyFixes in core/review.ts.)
-  const handOff = config.review.walkthrough?.enabled ? 'walkthrough_enrichment' : 'finalize';
+  // Phase 20.1 (BLOCKER 3): verify_fixes hands off through the shared selector so the combined
+  // verify_fixes + critic config chains verify_fixes INTO the critic instead of bypassing it.
+  // The selector routes to critic (when enabled) → walkthrough_enrichment (when enabled) → finalize
+  // (NREG-01 default).
+  const handOff = nextPhaseAfterVerifyFixes(config);
   throw new NextPhaseError(handOff, VERIFY_FIXES_FRESH_INVOCATION_YIELD_SECONDS);
 }
 
