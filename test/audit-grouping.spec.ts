@@ -6,15 +6,15 @@ import {
 } from '@client/lib/audit-grouping';
 import type { JobAuditEvent } from '@shared/schema';
 
-// AUD-02 stable group-by-stage (Plan 16-02, Task 2) extended by Phase 18 (RND-01..05) — every
-// `rounds.*` sub-variant collapses to the single `rounds` display group. Fixtures are minimal
+// AUD-02 stable group-by-stage (Plan 16-02, Task 2) extended by Phases 18-19 — every
+// `rounds.*` and `threads.*` sub-variant collapses to its normalized display group. Fixtures are minimal
 // { stage, timestamp } objects cast through JobAuditEvent[] to keep them terse — the grouper only
 // reads `.stage`.
 const ev = (stage: JobAuditEvent['stage'], timestamp = '2026-01-01T00:00:00Z') =>
   ({ stage, timestamp } as unknown as JobAuditEvent);
 
 describe('STAGE_ORDER', () => {
-  it('is the fixed seven-stage order including the Phase 18 rounds display group', () => {
+  it('is the fixed eight-stage order including rounds and thread verification', () => {
     expect(STAGE_ORDER).toEqual([
       'file_skipped',
       'drafted',
@@ -23,6 +23,7 @@ describe('STAGE_ORDER', () => {
       'deduped',
       'evidence_missing',
       'rounds',
+      'threads',
     ]);
   });
 });
@@ -65,7 +66,15 @@ describe('normalizeAuditDisplayStage — Phase 18 RND-01..05', () => {
     expect(normalizeAuditDisplayStage('rounds.suppressed')).toBe('rounds');
   });
 
-  it('passes non-round stages through unchanged', () => {
+  it('maps every threads.* sub-variant to the single `threads` display stage', () => {
+    expect(normalizeAuditDisplayStage('threads.verified_fixed')).toBe('threads');
+    expect(normalizeAuditDisplayStage('threads.unfixed')).toBe('threads');
+    expect(normalizeAuditDisplayStage('threads.unverifiable')).toBe('threads');
+    expect(normalizeAuditDisplayStage('threads.resolved')).toBe('threads');
+    expect(normalizeAuditDisplayStage('threads.resolve_failed')).toBe('threads');
+  });
+
+  it('passes non-prefixed stages through unchanged', () => {
     expect(normalizeAuditDisplayStage('file_skipped')).toBe('file_skipped');
     expect(normalizeAuditDisplayStage('drafted')).toBe('drafted');
     expect(normalizeAuditDisplayStage('severity_adjusted')).toBe('severity_adjusted');

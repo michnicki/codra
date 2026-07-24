@@ -210,7 +210,11 @@ describe('NREG-02 verify-fixes lifecycle parity through VcsProvider', () => {
       outcomes.push(await runLogicalLifecycle(provider, scenario));
       expect(listThreads).toHaveBeenCalledWith('owner', 'repo', 19);
       expect(getFileContent).toHaveBeenCalledWith('owner', 'repo', 'src/example.ts', 'head-sha');
-      if (!scenario.autoResolve || scenario.file !== 'present' || scenario.supportsResolution === false) {
+      if (
+        !scenario.autoResolve ||
+        scenario.file !== 'present' ||
+        ('supportsResolution' in scenario && scenario.supportsResolution === false)
+      ) {
         expect(resolveThread).not.toHaveBeenCalled();
       }
     }

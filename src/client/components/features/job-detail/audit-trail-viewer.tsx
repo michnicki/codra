@@ -18,6 +18,7 @@ const STAGE_LABELS: Record<AuditStageGroup['stage'], string> = {
   deduped: 'Deduped',
   evidence_missing: 'Evidence missing',
   rounds: 'Rounds',
+  threads: 'Threads',
 };
 
 // A count pill mirroring the job-findings-list / critic-panel count-badge idiom.
@@ -60,6 +61,11 @@ function MetricLine({ label, value }: { label: string; value: string }) {
       <span className="font-mono break-all text-foreground/80">{value}</span>
     </div>
   );
+}
+
+function shortOpaqueRef(value: string): string {
+  if (value.length <= 20) return value;
+  return `${value.slice(0, 12)}…${value.slice(-4)}`;
 }
 
 // Render one decision event's reason + sample identifiers + decision metrics. Reads ONLY the known
@@ -214,6 +220,19 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
           <MetricLine label="stage" value="rounds.suppressed" />
           <MetricLine label="thread path" value={event.threadPath} />
           <SampleIdentifier path={event.path} line={event.line} title={event.title} />
+        </li>
+      );
+    case 'threads.verified_fixed':
+    case 'threads.unfixed':
+    case 'threads.unverifiable':
+    case 'threads.resolved':
+    case 'threads.resolve_failed':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="stage" value={event.stage} />
+          <MetricLine label="reason" value={event.reason} />
+          <MetricLine label="thread" value={shortOpaqueRef(event.threadRef)} />
+          <SampleIdentifier path={event.path} line={event.line} />
         </li>
       );
     default:

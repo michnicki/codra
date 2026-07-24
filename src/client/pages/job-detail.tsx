@@ -6,6 +6,7 @@ import { JobMetaCards } from '@client/components/features/job-detail/job-meta-ca
 import { JobReviewOverview } from '@client/components/features/job-detail/job-review-overview';
 import { JobSeveritySummary } from '@client/components/features/job-detail/job-severity-summary';
 import { CriticPanel } from '@client/components/features/job-detail/critic-panel';
+import { ThreadVerificationPanel } from '@client/components/features/job-detail/thread-verification-panel';
 import { JobFindingsList } from '@client/components/features/job-detail/job-findings-list';
 import { AuditTrailViewer } from '@client/components/features/job-detail/audit-trail-viewer';
 import { JobDetailSkeleton } from '@client/components/features/job-detail/job-skeleton';
@@ -55,6 +56,8 @@ export function JobDetailPage() {
 
       {/* D-06: renders nothing when job.criticResult is absent */}
       <CriticPanel job={job} />
+
+      <ThreadVerificationPanel job={job} />
 
       <JobFindingsList job={job} />
 

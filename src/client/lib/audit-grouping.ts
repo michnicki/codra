@@ -6,9 +6,8 @@ import type { JobAuditEvent } from '@shared/schema';
 
 // D-09: the fixed display order for stage groups. Matches the pipeline's logical stage progression
 // (file selection -> drafting -> severity adjustment -> noise filter -> dedup -> evidence gate ->
-// rounds). Phase 18 adds `rounds` as the final displayed pipeline group before completion. The
-// viewer renders a single `Rounds` group for ALL `rounds.*` sub-variants — see `AuditDisplayStage`
-// below — so a producer variant like `rounds.detected` lands here without a per-variant list.
+// rounds -> thread verification). Phase 18 adds `rounds`; Phase 19 adds one normalized `threads`
+// group for every `threads.*` verdict/resolution event.
 export const STAGE_ORDER = [
   'file_skipped',
   'drafted',
@@ -17,6 +16,7 @@ export const STAGE_ORDER = [
   'deduped',
   'evidence_missing',
   'rounds',
+  'threads',
 ] as const;
 
 /**
@@ -42,6 +42,7 @@ export type AuditDisplayStage = typeof STAGE_ORDER[number];
  */
 export function normalizeAuditDisplayStage(stage: JobAuditEvent['stage']): AuditDisplayStage {
   if (stage.startsWith('rounds.')) return 'rounds';
+  if (stage.startsWith('threads.')) return 'threads';
   return stage as AuditDisplayStage;
 }
 
