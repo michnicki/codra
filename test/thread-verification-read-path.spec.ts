@@ -133,7 +133,7 @@ dbDescribe('thread-verification persistence read path', () => {
 
     // The durable result is independent metadata. The original config_snapshot remains the sole
     // authoritative source for whether verification/auto-resolution were enabled for this job.
-    expect(detail!.configSnapshot.review.threads).toEqual({
+    expect(detail!.configSnapshot?.review.threads).toEqual({
       verify_fixes: false,
       auto_resolve: false,
     });

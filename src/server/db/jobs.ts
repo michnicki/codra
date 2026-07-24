@@ -1,6 +1,18 @@
 import type { AppBindings } from '@server/env';
 import { parseJsonColumn, queryRows } from './client';
-import { criticResultSchema, defaultRepoConfig, jobAuditEventSchema, jobDetailSchema, jobSummarySchema, repoConfigSchema, type CriticResult, type JobAuditEvent, type RepoConfig } from '@shared/schema';
+import {
+  criticResultSchema,
+  defaultRepoConfig,
+  jobAuditEventSchema,
+  jobDetailSchema,
+  jobSummarySchema,
+  repoConfigSchema,
+  threadVerificationsSchema,
+  type CriticResult,
+  type JobAuditEvent,
+  type RepoConfig,
+  type ThreadVerifications,
+} from '@shared/schema';
 import { logger } from '@server/core/logger';
 import { getOrCreateRepository } from './repositories';
 
@@ -63,6 +75,10 @@ export type JobRow = {
   // criticResultSchema. In Phase 7 no writer is wired, so critic_result is always null.
   walkthrough_comment_ref: string | null;
   critic_result: CriticResult | string | null;
+  // Phase 19 (migration 013, THR-01/THR-02): durable verify-fixes cursor/result. The JSONB value is
+  // validated fail-soft in mapJob so malformed external/model-derived data degrades only the
+  // threadVerification field, never the job summary, lease claim, or detail response.
+  thread_verifications: ThreadVerifications | string | null;
   // Phase 11 (migration 009, REVIEW: Codex 11-05 HIGH): durable review-rest scope. Both NULLABLE and
   // NOT written by insertJob's explicit column list unless a caller supplies them, so every existing
   // insert reads them back as null (behaviorally inert, NREG-01). review_scope mirrors
@@ -184,6 +200,22 @@ export function mapJob(row: JobRow) {
     }
   }
 
+  // Phase 19 mirrors critic_result's fail-soft trust boundary. Stored JSONB may be malformed or may
+  // come from a future schema version; validate it out-of-band so only this optional field degrades
+  // to null while the job remains claimable and its detail page remains readable (T-19-01-01).
+  const rawThreadVerification = parseJsonColumn<unknown>(row.thread_verifications, null);
+  const threadParsed = rawThreadVerification === null
+    ? null
+    : threadVerificationsSchema.safeParse(rawThreadVerification);
+  let threadVerification: ThreadVerifications | null = null;
+  if (threadParsed !== null) {
+    if (threadParsed.success) {
+      threadVerification = threadParsed.data;
+    } else {
+      logger.warn(`Ignoring unparseable thread_verifications for job ${row.id}`);
+    }
+  }
+
   return jobSummarySchema.parse({
     id: row.id,
     owner: row.owner,
@@ -233,6 +265,9 @@ export function mapJob(row: JobRow) {
     // WR-01: pass the out-of-band-validated value (see above); a bad blob has already degraded to
     // null so the strict schema field never throws on the whole-row parse.
     criticResult,
+    // Phase 19: publish only the independently validated thread result. Malformed JSONB has already
+    // degraded to null above and cannot poison the strict jobSummarySchema parse.
+    threadVerification,
     // Phase 11: surface the migration-009 review-rest scope columns. Both are null on every existing
     // insert (no writer supplies them) -- additive, behaviorally inert (NREG-01).
     reviewScope: row.review_scope,
@@ -1331,6 +1366,24 @@ export async function updateJobCriticResult(
     env,
     `UPDATE jobs SET critic_result = $2::jsonb WHERE id = $1`,
     [jobId, criticResult === null ? null : JSON.stringify(criticResult)],
+  );
+}
+
+/**
+ * Phase 19 THR-01/THR-02: persist the resumable verify-fixes state/result as one JSONB value. The
+ * caller writes after each bounded batch so a fresh Workflow instance can resume from durable
+ * cursors; mapJob validates the value fail-soft on every processing/detail reload. Parameterized
+ * JSONB binding keeps external identifiers and model-derived reasons out of SQL text.
+ */
+export async function setJobThreadVerifications(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  threadVerifications: ThreadVerifications | null,
+): Promise<void> {
+  await queryRows(
+    env,
+    `UPDATE jobs SET thread_verifications = $2::jsonb WHERE id = $1`,
+    [jobId, threadVerifications === null ? null : JSON.stringify(threadVerifications)],
   );
 }
 
