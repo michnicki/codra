@@ -1761,6 +1761,343 @@ dbDescribe('Review Flow Lifecycle', () => {
 
       continuationSpy.mockRestore();
     }, REVIEW_FLOW_TIMEOUT_MS);
+
+    // Phase 20.1 (BLOCKER 5): the skip branch at review.ts:2803-2856 (empty input, explicit
+    // skip_threshold, over-char-budget) used to persist the skipped ledger and return directly
+    // to finalize, bypassing the audit emission and the walkthrough enrichment hop. The fix
+    // hand-crafts a critic.decisions audit event with status='skipped' + reason + count=0 +
+    // sample=[] and routes through verify_fixes (when enabled) then walkthrough_enrichment
+    // (when enabled) then finalize — matching the no-skip path's chain at line 2945.
+    //
+    // These four integration tests pin the end-to-end behavior at the runReviewJob level:
+    //   Test 11: empty candidates + walkthrough enabled → audit + walkthrough_enrichment
+    //   Test 12: explicit skip_threshold hit + verify_fixes enabled → audit + verify_fixes
+    //   Test 13: over-char-budget + all-off → audit + finalize
+    //   Test 14: skip_threshold + verify_fixes + walkthrough enabled → audit + verify_fixes
+    //            (chain order: verify_fixes first, walkthrough LAST before finalize)
+    it('BLOCKER 5: empty candidates + walkthrough enabled emits audit + routes to walkthrough_enrichment', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { ModelService } = await import('@server/services/model');
+      const repo = `test-repo-${Date.now()}-blocker5-empty`;
+
+      // No diff at all — zero files, zero candidates. The review phase finds no files to
+      // review and the critic's candidate set is empty.
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([]),
+      );
+      const reviewSpy = vi.spyOn(ModelService.prototype as any, 'reviewFile').mockImplementation(findingReview);
+      const critiqueSpy = vi.spyOn(ModelService.prototype as any, 'critiqueFindings');
+
+      // v1.2 toggles: critic ON, verify_fixes OFF, walkthrough ON. The skip path emits the
+      // audit event, then routes to walkthrough_enrichment (skip path mirrors no-skip path).
+      // skip_threshold is intentionally NOT set so the empty-candidates case fires reason
+      // 'empty-input' (not 'below-skip-threshold' — see review.ts:2804-2808).
+      const config: RepoConfig = {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          passes: {
+            ...defaultRepoConfig.review.passes,
+            critic: { enabled: true },
+          },
+          walkthrough: { enabled: true, sequence_diagram: { enabled: true } },
+        },
+      };
+
+      const job = await insertCriticJob(repo, config, 'a');
+      await updateJobFileCount(env, job.id, 0);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+
+      // Drain the chain, capturing every `next_phase` action so the chain order is asserted.
+      const phasesObserved: string[] = [];
+      await runWithDb(env, async () => {
+        let currentMessage: any = { jobId: job.id, deliveryId: 'delivery-blocker5-empty', phase: 'review' };
+        let retries = 0;
+        while (currentMessage) {
+          const result = await runReviewJob(env, currentMessage);
+          if (result.action === 'next_phase') {
+            phasesObserved.push(result.phase);
+            currentMessage = { ...currentMessage, phase: result.phase };
+            retries = 0;
+            await queryRows(env, `UPDATE jobs SET last_queue_message_at = now() - interval '5 seconds' WHERE id = $1`, [job.id]);
+          } else if (result.action === 'retry') {
+            if (++retries > 5) throw new Error('Max retries exceeded');
+            break;
+          } else {
+            currentMessage = null;
+          }
+        }
+      });
+
+      // The skip branch fired: the critic phase ran but never called the model (empty candidates).
+      expect(critiqueSpy).not.toHaveBeenCalled();
+
+      // The skip branch persisted the skipped ledger with status='skipped' + reason='empty-input'.
+      const criticResult = await readCriticResult(job.id);
+      expect(criticResult).not.toBeNull();
+      expect(criticResult?.skipped).toBe(true);
+      expect(criticResult?.status).toBe('skipped');
+      expect(criticResult?.reason).toBe('empty-input');
+
+      // The chain reached walkthrough_enrichment (skip path mirrors the no-skip path's chain at
+      // line 2945: verify_fixes OFF → walkthrough_enrichment when enabled).
+      expect(phasesObserved).toContain('walkthrough_enrichment');
+      expect(phasesObserved).toContain('finalize');
+      // Walkthrough_enrichment comes BEFORE finalize (it's the last hop before finalize).
+      expect(phasesObserved.indexOf('walkthrough_enrichment')).toBeLessThan(phasesObserved.indexOf('finalize'));
+
+      critiqueSpy.mockRestore();
+      reviewSpy.mockRestore();
+      getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('BLOCKER 5: explicit skip_threshold hit + verify_fixes enabled emits audit + routes to verify_fixes', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { ModelService } = await import('@server/services/model');
+      const repo = `test-repo-${Date.now()}-blocker5-skip-threshold`;
+
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/one.ts', content: 'console.log(1);' }]),
+      );
+      const reviewSpy = vi.spyOn(ModelService.prototype as any, 'reviewFile').mockImplementation(findingReview);
+      const critiqueSpy = vi.spyOn(ModelService.prototype as any, 'critiqueFindings');
+
+      // v1.2 toggles: critic ON with skip_threshold=1, verify_fixes ON, walkthrough OFF.
+      // The single-finding candidate set is BELOW the skip_threshold, so the skip branch fires
+      // with reason='below-skip-threshold'. The skip path then routes to verify_fixes (the first
+      // hop after review), which is the BLOCKER 5 chain correctness fix.
+      const config: RepoConfig = {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          threads: { verify_fixes: true, auto_resolve: false },
+          passes: {
+            ...defaultRepoConfig.review.passes,
+            critic: { enabled: true, skip_threshold: 1 },
+          },
+        },
+      };
+
+      const job = await insertCriticJob(repo, config, 'b');
+      await updateJobFileCount(env, job.id, 1);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+
+      // The skip path routes to verify_fixes first (chain correctness: verify_fixes is the FIRST
+      // hop after review, NOT a hop after critic). The verify_fixes phase will see no thread
+      // verifications (the MockGitHubService returns []) and route onward via NextPhaseError.
+      const phasesObserved: string[] = [];
+      await runWithDb(env, async () => {
+        let currentMessage: any = { jobId: job.id, deliveryId: 'delivery-blocker5-skip-threshold', phase: 'review' };
+        let retries = 0;
+        while (currentMessage) {
+          const result = await runReviewJob(env, currentMessage);
+          if (result.action === 'next_phase') {
+            phasesObserved.push(result.phase);
+            currentMessage = { ...currentMessage, phase: result.phase };
+            retries = 0;
+            await queryRows(env, `UPDATE jobs SET last_queue_message_at = now() - interval '5 seconds' WHERE id = $1`, [job.id]);
+          } else if (result.action === 'retry') {
+            if (++retries > 5) throw new Error('Max retries exceeded');
+            break;
+          } else {
+            currentMessage = null;
+          }
+        }
+      });
+
+      // The skip branch fired: the critic phase ran but never called the model.
+      expect(critiqueSpy).not.toHaveBeenCalled();
+
+      // The skip branch persisted the skipped ledger with reason='below-skip-threshold'.
+      const criticResult = await readCriticResult(job.id);
+      expect(criticResult).not.toBeNull();
+      expect(criticResult?.skipped).toBe(true);
+      expect(criticResult?.status).toBe('skipped');
+      expect(criticResult?.reason).toBe('below-skip-threshold');
+
+      // The chain reached verify_fixes (the skip path's first hop after the critic terminal).
+      expect(phasesObserved).toContain('verify_fixes');
+      // verify_fixes comes BEFORE finalize (the chain must continue, not stop at verify_fixes).
+      expect(phasesObserved.indexOf('verify_fixes')).toBeLessThan(phasesObserved.indexOf('finalize'));
+
+      critiqueSpy.mockRestore();
+      reviewSpy.mockRestore();
+      getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('BLOCKER 5: over-char-budget + all-off emits audit + routes to finalize', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { ModelService } = await import('@server/services/model');
+      const repo = `test-repo-${Date.now()}-blocker5-overbudget`;
+
+      // A single long finding whose serialized JSON exceeds the input_char_budget of 100 chars.
+      const longBody = 'x'.repeat(500);
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/one.ts', content: 'console.log(1);' }]),
+      );
+      const reviewSpy = vi.spyOn(ModelService.prototype as any, 'reviewFile').mockImplementation(
+        (params: any) => ({
+          parsed: {
+            comments: [{
+              path: params.file.path,
+              line: 1,
+              position: 1,
+              severity: 'P2',
+              category: 'quality',
+              title: 'Long finding',
+              body: longBody,
+            }],
+            verdict: 'comment' as const,
+            fileSummary: `Reviewed ${params.file.path}`,
+            overallCorrectness: 'issues found',
+            confidenceScore: 0.9,
+          },
+          modelUsed: 'test-model',
+          provider: 'test-provider',
+          inputTokens: 10,
+          outputTokens: 5,
+          rawText: '{}',
+          userPrompt: '',
+        }),
+      );
+      const critiqueSpy = vi.spyOn(ModelService.prototype as any, 'critiqueFindings');
+
+      // v1.2 toggles: critic ON with input_char_budget=100, verify_fixes OFF, walkthrough OFF.
+      // The single long finding's serialized JSON exceeds 100 chars, so the skip branch fires
+      // with reason='over-char-budget'. The skip path then routes to finalize (NREG-01 default).
+      const config: RepoConfig = {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          passes: {
+            ...defaultRepoConfig.review.passes,
+            critic: { enabled: true, input_char_budget: 100 },
+          },
+        },
+      };
+
+      const job = await insertCriticJob(repo, config, 'c');
+      await updateJobFileCount(env, job.id, 1);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+
+      const phasesObserved: string[] = [];
+      await runWithDb(env, async () => {
+        let currentMessage: any = { jobId: job.id, deliveryId: 'delivery-blocker5-overbudget', phase: 'review' };
+        let retries = 0;
+        while (currentMessage) {
+          const result = await runReviewJob(env, currentMessage);
+          if (result.action === 'next_phase') {
+            phasesObserved.push(result.phase);
+            currentMessage = { ...currentMessage, phase: result.phase };
+            retries = 0;
+            await queryRows(env, `UPDATE jobs SET last_queue_message_at = now() - interval '5 seconds' WHERE id = $1`, [job.id]);
+          } else if (result.action === 'retry') {
+            if (++retries > 5) throw new Error('Max retries exceeded');
+            break;
+          } else {
+            currentMessage = null;
+          }
+        }
+      });
+
+      // The skip branch fired: the critic phase ran but never called the model.
+      expect(critiqueSpy).not.toHaveBeenCalled();
+
+      // The skip branch persisted the skipped ledger with reason='over-char-budget'.
+      const criticResult = await readCriticResult(job.id);
+      expect(criticResult).not.toBeNull();
+      expect(criticResult?.skipped).toBe(true);
+      expect(criticResult?.status).toBe('skipped');
+      expect(criticResult?.reason).toBe('over-char-budget');
+
+      // The chain reached finalize (NREG-01: all-off → finalize).
+      expect(phasesObserved).toContain('finalize');
+      // The skip path does NOT route to verify_fixes or walkthrough_enrichment (both off).
+      expect(phasesObserved).not.toContain('verify_fixes');
+      expect(phasesObserved).not.toContain('walkthrough_enrichment');
+
+      critiqueSpy.mockRestore();
+      reviewSpy.mockRestore();
+      getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('BLOCKER 5: skip_threshold + verify_fixes + walkthrough enabled routes to verify_fixes first (chain correctness)', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { ModelService } = await import('@server/services/model');
+      const repo = `test-repo-${Date.now()}-blocker5-chain`;
+
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/one.ts', content: 'console.log(1);' }]),
+      );
+      const reviewSpy = vi.spyOn(ModelService.prototype as any, 'reviewFile').mockImplementation(findingReview);
+      const critiqueSpy = vi.spyOn(ModelService.prototype as any, 'critiqueFindings');
+
+      // All v1.2 toggles ON: critic + verify_fixes + walkthrough. The skip path mirrors the
+      // no-skip path's chain at line 2945: verify_fixes FIRST (not walkthrough_enrichment) so
+      // the chain correctly avoids the critic → verify_fixes loop BLOCKER 3 warned about.
+      // The walkthrough hop comes AFTER verify_fixes (it's the last hop before finalize).
+      const config: RepoConfig = {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          threads: { verify_fixes: true, auto_resolve: false },
+          passes: {
+            ...defaultRepoConfig.review.passes,
+            critic: { enabled: true, skip_threshold: 1 },
+          },
+          walkthrough: { enabled: true, sequence_diagram: { enabled: true } },
+        },
+      };
+
+      const job = await insertCriticJob(repo, config, 'd');
+      await updateJobFileCount(env, job.id, 1);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+
+      const phasesObserved: string[] = [];
+      await runWithDb(env, async () => {
+        let currentMessage: any = { jobId: job.id, deliveryId: 'delivery-blocker5-chain', phase: 'review' };
+        let retries = 0;
+        while (currentMessage) {
+          const result = await runReviewJob(env, currentMessage);
+          if (result.action === 'next_phase') {
+            phasesObserved.push(result.phase);
+            currentMessage = { ...currentMessage, phase: result.phase };
+            retries = 0;
+            await queryRows(env, `UPDATE jobs SET last_queue_message_at = now() - interval '5 seconds' WHERE id = $1`, [job.id]);
+          } else if (result.action === 'retry') {
+            if (++retries > 5) throw new Error('Max retries exceeded');
+            break;
+          } else {
+            currentMessage = null;
+          }
+        }
+      });
+
+      // The skip branch fired: the critic phase ran but never called the model.
+      expect(critiqueSpy).not.toHaveBeenCalled();
+
+      // The skip branch persisted the skipped ledger with reason='below-skip-threshold'.
+      const criticResult = await readCriticResult(job.id);
+      expect(criticResult).not.toBeNull();
+      expect(criticResult?.skipped).toBe(true);
+      expect(criticResult?.status).toBe('skipped');
+      expect(criticResult?.reason).toBe('below-skip-threshold');
+
+      // The chain order matches the no-skip path: verify_fixes first, then walkthrough_enrichment,
+      // then finalize. The skip path mirrors the no-skip path at line 2945 exactly.
+      const verifyIdx = phasesObserved.indexOf('verify_fixes');
+      const walkIdx = phasesObserved.indexOf('walkthrough_enrichment');
+      const finalizeIdx = phasesObserved.indexOf('finalize');
+      expect(verifyIdx).toBeGreaterThanOrEqual(0);
+      expect(walkIdx).toBeGreaterThanOrEqual(0);
+      expect(finalizeIdx).toBeGreaterThan(walkIdx);
+      // verify_fixes comes BEFORE walkthrough_enrichment (chain correctness).
+      expect(verifyIdx).toBeLessThan(walkIdx);
+
+      critiqueSpy.mockRestore();
+      reviewSpy.mockRestore();
+      getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
   });
 
   it('marks completed jobs with skipped files as partial reviews', async () => {
