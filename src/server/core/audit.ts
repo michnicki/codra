@@ -1,6 +1,6 @@
 import type { AppBindings } from '@server/env';
 import { appendJobAuditEvents } from '@server/db/jobs';
-import type { FileReviewPass, JobAuditEvent, ReviewSeverity } from '@shared/schema';
+import type { CriticDecision, FileReviewPass, JobAuditEvent, ReviewSeverity } from '@shared/schema';
 import type { FileSelectionResult } from './diff';
 import type { DropRecord, NoiseFilterResult } from './noise-filter';
 import type { EnsembleReconciliation } from './ensemble';
@@ -427,5 +427,79 @@ export async function recordEnsembleAudit(
     await appendJobAuditEvents(env, jobId, stamped);
   } catch (error) {
     logger.warn(`Failed to record ensemble audit events for job ${jobId}`, error);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 19 (PASS-01) — bounded critic-decisions audit builder + best-effort recorder.
+//
+// One aggregate `critic.decisions` event per persisted critic run. The canonical decisions array
+// lives on jobs.critic_result; the audit receives a privacy-bounded sample (max 20 rows) so a
+// huge candidate set cannot flood the 500-event ring buffer or duplicate full finding bodies.
+// ---------------------------------------------------------------------------
+
+const CRITIC_DECISION_SAMPLE_CAP = 20;
+
+export type CriticDecisionsAuditEvent = Extract<JobAuditEvent, { stage: 'critic.decisions' }>;
+
+/**
+ * PURE critic-decisions audit builder (PASS-01 / D-05). Derives ONE `critic.decisions` event
+ * from the canonical decisions array, refusing to duplicate body/evidence content. The sample
+ * is always sliced to the bounded cap (max 20) so a 200-candidate set still produces a single
+ * audit row whose sample merely names the bounded milestones.
+ *
+ * Returns null when the input decisions array is empty so the inert critic-off / empty-input
+ * paths emit ZERO Phase-19 critic audit events (NREG-01 — mirrors the ensemble / file_skipped
+ * builders).
+ */
+export function buildCriticDecisionsAuditEvent(
+  decisions: CriticDecision[],
+  status: 'completed' | 'skipped' | 'fail_open',
+  reason?: string,
+): CriticDecisionsAuditEvent | null {
+  if (decisions.length === 0) return null;
+  const sample = decisions.slice(0, CRITIC_DECISION_SAMPLE_CAP).map((d) => ({
+    id: d.id,
+    path: d.path,
+    line: d.line ?? null,
+    title: d.title,
+    verdict: d.verdict,
+    outcome: d.outcome,
+    reason: d.reason,
+  }));
+  return {
+    stage: 'critic.decisions',
+    status,
+    count: decisions.length,
+    reason,
+    sample,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+/**
+ * Phase 19 (PASS-01): bounded best-effort recorder for the `critic.decisions` audit variant.
+ * Mirrors `recordEnsembleAudit` EXACTLY: try/catch, defensive timestamp stamping, logs and
+ * NEVER rethrows. A broken critic audit write must never fail the caller's review (D-13-03-04
+ * carry-over posture).
+ *
+ * The builder is pure and short-circuits to null for empty decisions (D-06 inert), so the
+ * recorder's no-op path handles both the no-events case and the broken-DB case identically. The
+ * producer (review.ts::runCriticPhase) owns the privacy boundary — events only carry the
+ * { id, path, line, title, verdict, outcome, reason } sample shape, never raw finding bodies.
+ */
+export async function recordCriticAudit(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  events: JobAuditEvent[],
+): Promise<void> {
+  try {
+    if (events.length === 0) return; // nothing to append — never produce an inert event row.
+    const stamped = events.map((event) =>
+      event.timestamp ? event : { ...event, timestamp: new Date().toISOString() },
+    );
+    await appendJobAuditEvents(env, jobId, stamped);
+  } catch (error) {
+    logger.warn(`Failed to record critic audit events for job ${jobId}`, error);
   }
 }

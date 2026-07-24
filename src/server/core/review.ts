@@ -35,7 +35,17 @@ import { filterReviewableFiles, parseUnifiedDiff, partitionReviewableFiles, sele
 import { insertSkippedFiles, listSkippedFilesForHead, type SkippedFilesHeadKey } from '@server/db/skipped-files';
 import { dedupeComposite, dedupeFindings } from './dedup';
 import { applyNoiseFilter, type NoiseFilterOptions } from './noise-filter';
-import { parseCriticPruneResponse, parseSummaryResponse, parseWalkthroughDiagram } from './model-output';
+import { parseSummaryResponse, parseWalkthroughDiagram } from './model-output';
+import { buildCriticDecisionsAuditEvent, recordCriticAudit } from './audit';
+import {
+  CRITIC_REASON_BELOW_SKIP_THRESHOLD,
+  CRITIC_REASON_OVER_CHAR_BUDGET,
+  CRITIC_REASON_PARSE_FAILURE,
+  CRITIC_REASON_WHOLE_CALL_EXCEPTION,
+  CRITIC_V2_VERSION,
+  parseCriticV2Response,
+  reconcileCriticDecisions,
+} from './critic-v2';
 import { buildWalkthroughData, editWalkthroughComment, postWalkthroughPlaceholder } from './walkthrough';
 import {
   buildFileSkipEvents,
@@ -132,12 +142,11 @@ const MAX_JOB_CONTINUATIONS = 20;
 // a clean budget, more retries won't help -- so cap them low and fail fast (the check-run reconciler
 // and an inheriting re-run recover) instead of churning ~20 min against the shared ceiling.
 const MAX_FINALIZE_CONTINUATIONS = 3;
-// Critic skip threshold (D-06): a deduped candidate set this small isn't worth a model round-trip.
-// The critic's value is triaging a LARGE finding set (deduping main+security noise); re-judging a
-// handful of findings risks pruning a genuine issue for negligible noise reduction. At or below this
-// count runCriticPhase keeps ALL findings and records { skipped: true } instead of calling the model.
-// Overridable per-repo via passes.critic.skip_threshold; kept low so the critic still runs on any set
-// big enough to plausibly contain duplicates.
+// Critic skip threshold (D-06, v2 revision): The Phase 10 implicit `length <= 3` skip that
+// qppeared to "save a round-trip" is GONE in v2. The critic v2 grades every non-empty candidate set
+// by default (D-06), so an explicit per-repo `passes.critic.skip_threshold` is the only integer
+// that drives a keep-all skip. The constant is kept named for migration traceability with the old
+// schema but is no longer used as a default.
 const CRITIC_SKIP_THRESHOLD = 3;
 // Critic input char budget (D-06): an upper bound on the serialized candidate set handed to the
 // single whole-set critic call. Beyond this the prompt would risk the model's context window and this
@@ -2455,30 +2464,60 @@ async function runCriticPhase(
   // already-pruned kept set.
   const dedupedSet = securityEnabled ? dedupeFindings(candidateSet) : candidateSet;
 
-  // (5) SKIP conditions (D-06): a trivially small set isn't worth a round-trip, and an oversized set
-  // can't be chunked — both keep ALL findings and record skipped:true (nothing lost, audit-visible).
-  const skipThreshold = config.review.passes.critic.skip_threshold ?? CRITIC_SKIP_THRESHOLD;
+  // Build the v2 candidate input: stable numeric id + the locked finding snapshot. The id is the
+  // candidate's index in the deduped order, and the reconciler relies on it to map model verdicts
+  // back to findings. The review.ts contract is unchanged: every candidate is a parsedReviewComment
+  // produced by an earlier review; the v2 layer never rewrites or invents a candidate.
+  const candidates = dedupedSet.map((finding, index) => ({
+    id: index,
+    path: finding.path,
+    line: finding.line ?? null,
+    severity: finding.severity,
+    category: finding.category,
+    title: finding.title,
+    body: finding.body,
+    confidence: finding.confidence ?? null,
+  }));
+
+  // (5) SKIP conditions (D-06): an EXPLICIT `skip_threshold` config is an intentional cost override
+  // and continues to keep all findings. Empty input does not call the model. The prompt rendered
+  // against the input-char budget is bounded by the same metric used downstream so an over-budget
+  // set is classified as 'skipped' with machine reason 'over-char-budget' rather than being
+  // partially judged. The implicit small-set skip from Phase 10 is REMOVED (D-06 v2 rev).
+  const explicitSkipThreshold = config.review.passes.critic.skip_threshold;
   const charBudget = config.review.passes.critic.input_char_budget ?? CRITIC_INPUT_CHAR_BUDGET;
   const serializedChars = JSON.stringify(dedupedSet).length;
-  if (dedupedSet.length <= skipThreshold || serializedChars > charBudget) {
+  const explicitSkip = typeof explicitSkipThreshold === 'number' && candidates.length <= explicitSkipThreshold;
+  const overBudget = serializedChars > charBudget;
+  if (candidates.length === 0 || explicitSkip || overBudget) {
+    const reason = explicitSkip
+      ? CRITIC_REASON_BELOW_SKIP_THRESHOLD
+      : overBudget
+        ? CRITIC_REASON_OVER_CHAR_BUDGET
+        : 'empty-input';
+    const skippedDecisions = reconcileCriticDecisions(candidates, [], { status: 'skipped', reason });
     logger.info(`Critic skipping the model call for job ${job.id} (keep-all).`, {
       dedupedCount: dedupedSet.length,
-      skipThreshold,
+      skipThreshold: explicitSkipThreshold ?? null,
       serializedChars,
       charBudget,
-      reason: dedupedSet.length <= skipThreshold ? 'below-skip-threshold' : 'over-char-budget',
+      reason,
     });
     await updateJobCriticResult(env, job.id, {
       kept: dedupedSet,
       pruned: [],
       skipped: true,
       dedupedCount: dedupedSet.length,
+      version: CRITIC_V2_VERSION,
+      status: 'skipped',
+      reason,
+      decisions: skippedDecisions,
     });
     await enqueueJobPhase(env, job.id, 'finalize', FRESH_INVOCATION_YIELD_SECONDS);
     return;
   }
 
-  // (6) The single whole-set, ID-based, PRUNE-ONLY model call + in-code reconciliation. Wrapped in a
+  // (6) The single whole-set, verdict-only model call + in-code v2 reconciliation. Wrapped in a
   // fail-open try/catch (7): any error EXCEPT a subrequest-budget hit keeps all findings and continues.
   let criticResult: CriticResult;
   try {
@@ -2494,34 +2533,56 @@ async function runCriticPhase(
       config,
     });
 
-    // RECONCILE IN CODE (T-10-10): map each pruned INDEX id back to a finding. Ignore out-of-range and
-    // duplicate ids; a model keep-list is never trusted — kept = deduped MINUS pruned-by-index. This is
-    // what makes a hallucinated/injected finding structurally unable to enter the posted set.
-    const pruneList = parseCriticPruneResponse(response.rawText);
-    const prunedIndices = new Set<number>();
-    const pruned: CriticResult['pruned'] = [];
-    for (const { id, reason } of pruneList) {
-      if (!Number.isInteger(id) || id < 0 || id >= dedupedSet.length) continue; // out-of-range id ignored
-      if (prunedIndices.has(id)) continue; // duplicate id ignored
-      prunedIndices.add(id);
-      pruned.push({ finding: dedupedSet[id], reason });
-    }
-    const kept = dedupedSet.filter((_finding, index) => !prunedIndices.has(index));
+    // Parse the v2 envelope. A fail-open result (kind: 'fail_open') is one of whole-call exceptions
+    // (parse-failure / empty / malformed) and keeps every candidate with verdict/confidence null.
+    const parsed = parseCriticV2Response(response.rawText);
+    if (parsed.kind === 'fail_open') {
+      logger.warn(
+        `Critic v2 whole-call parse failed for job ${job.id}; failing open (no grading applied).`,
+        { reason: parsed.reason },
+      );
+      const failOpenDecisions = reconcileCriticDecisions(candidates, [], {
+        status: 'fail_open',
+        reason: parsed.reason,
+      });
+      criticResult = {
+        kept: dedupedSet,
+        pruned: [],
+        skipped: true,
+        dedupedCount: dedupedSet.length,
+        version: CRITIC_V2_VERSION,
+        status: 'fail_open',
+        reason: parsed.reason,
+        decisions: failOpenDecisions,
+      };
+    } else {
+      // RECONCILE IN CODE (D-05/D-09): map each verdict id back to a candidate. Ignore out-of-range
+      // and duplicate ids; a model keep-list is never trusted — kept = candidates whose decision
+      // outcome is 'kept'. The canonical decision array is the durable artifact (Phase 19).
+      const decisions = reconcileCriticDecisions(candidates, parsed.verdicts, { status: 'completed' });
+      const kept = decisions.filter((d) => d.outcome === 'kept').map((d) => dedupedSet[d.id]);
+      const pruned = decisions
+        .filter((d) => d.outcome === 'dropped')
+        .map((d) => ({ finding: dedupedSet[d.id], reason: d.reason }));
 
-    criticResult = {
-      kept,
-      pruned,
-      model: response.modelUsed,
-      inputTokens: response.inputTokens,
-      outputTokens: response.outputTokens,
-      dedupedCount: dedupedSet.length,
-      skipped: false,
-    };
-    logger.info(`Critic pruned ${pruned.length}/${dedupedSet.length} findings for job ${job.id}.`, {
-      kept: kept.length,
-      pruned: pruned.length,
-      model: response.modelUsed,
-    });
+      criticResult = {
+        kept,
+        pruned,
+        model: response.modelUsed,
+        inputTokens: response.inputTokens,
+        outputTokens: response.outputTokens,
+        dedupedCount: dedupedSet.length,
+        skipped: false,
+        version: CRITIC_V2_VERSION,
+        status: 'completed',
+        decisions,
+      };
+      logger.info(`Critic v2 graded ${decisions.length}/${dedupedSet.length} findings for job ${job.id}.`, {
+        kept: kept.length,
+        dropped: pruned.length,
+        model: response.modelUsed,
+      });
+    }
   } catch (error) {
     // (7) A subrequest-budget error is NOT a critic failure — it clears on a fresh invocation. Re-throw
     // so runReviewJob's catch routes it through continueOrFailWedgedJob (critic ceiling), which retries
@@ -2534,11 +2595,17 @@ async function runCriticPhase(
       `Critic model call failed for job ${job.id}; failing open (keeping all findings, no prune applied)`,
       error instanceof Error ? error : new Error(String(error)),
     );
+    const reason = CRITIC_REASON_WHOLE_CALL_EXCEPTION;
+    const failOpenDecisions = reconcileCriticDecisions(candidates, [], { status: 'fail_open', reason });
     criticResult = {
       kept: dedupedSet,
       pruned: [],
       skipped: true,
       dedupedCount: dedupedSet.length,
+      version: CRITIC_V2_VERSION,
+      status: 'fail_open',
+      reason,
+      decisions: failOpenDecisions,
     };
   }
 
@@ -2548,6 +2615,19 @@ async function runCriticPhase(
   // runs after the critic; when verify_fixes is disabled the hand-off is byte-identical to the
   // pre-Phase-19 finalize hand-off (NREG-01).
   await updateJobCriticResult(env, job.id, criticResult);
+
+  // Best-effort bounded audit (D-05/D-13). One aggregate `critic.decisions` event per run carries
+  // a max-20 sample from the canonical decisions array. The recorder never rethrows; a broken
+  // audit write must never wreck the review (D-13-03-04 posture).
+  const auditEvent = buildCriticDecisionsAuditEvent(
+    criticResult.decisions ?? [],
+    criticResult.status ?? 'completed',
+    criticResult.reason,
+  );
+  if (auditEvent) {
+    await recordCriticAudit(env, job.id, [auditEvent]);
+  }
+
   await enqueueJobPhase(
     env,
     job.id,
