@@ -421,3 +421,195 @@ describe('JobDetailPage audit trail viewer', () => {
     ).not.toBeInTheDocument();
   });
 });
+
+// Phase 19 D-04: durable thread-verification results render independently of the audit trail and
+// survive the same job-detail reload path on both providers.
+describe('JobDetailPage thread verification surfaces', () => {
+  const okResponse = <T,>(data: T) => ({
+    status: 200 as const,
+    etag: null,
+    lastModified: null,
+    notModified: false as const,
+    data,
+  });
+
+  const threadVerification: NonNullable<JobDetail['threadVerification']> = {
+    version: 1,
+    status: 'completed',
+    entries: [
+      {
+        threadRef: `opaque-fixed-${'x'.repeat(80)}`,
+        path: 'src/fixed.ts',
+        lineStart: 10,
+        lineEnd: 10,
+        verdict: 'fixed',
+        reason: 'model_confirmed_fix',
+        resolved: true,
+      },
+      {
+        threadRef: 'opaque-fixed-open',
+        path: 'src/fixed.ts',
+        lineStart: 20,
+        lineEnd: 21,
+        verdict: 'fixed',
+        reason: 'model_confirmed_via_window',
+        resolved: false,
+      },
+      {
+        threadRef: 'opaque-unfixed',
+        path: 'src/open.ts',
+        lineStart: 30,
+        lineEnd: 32,
+        verdict: 'unfixed',
+        reason: 'issue_still_present',
+        resolved: false,
+      },
+      {
+        threadRef: 'opaque-deleted',
+        path: 'src/deleted.ts',
+        lineStart: null,
+        lineEnd: null,
+        verdict: 'unverifiable',
+        reason: 'file_deleted_at_head',
+        resolved: false,
+      },
+    ],
+    totals: { fixed: 2, unfixed: 1, unverifiable: 1, resolved: 1 },
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it.each(['github', 'bitbucket'] as const)(
+    'renders four truthful totals and every persisted verdict/reason after %s reload',
+    async (provider) => {
+      const user = userEvent.setup();
+      vi.mocked(api.getJob).mockResolvedValue(
+        okResponse({
+          job: {
+            ...JOB,
+            repositoryVcsProvider: provider,
+            repositoryWorkspace: provider === 'bitbucket' ? 'acme-workspace' : null,
+            threadVerification,
+          } as JobDetail,
+        }),
+      );
+
+      renderJobDetail();
+
+      const heading = await screen.findByText('Thread verification');
+      const panel = heading.closest('.surface') as HTMLElement;
+      expect(within(panel).getByText('Fixed').parentElement?.textContent).toBe('Fixed2');
+      expect(within(panel).getByText('Unfixed').parentElement?.textContent).toBe('Unfixed1');
+      expect(within(panel).getByText('Unverifiable').parentElement?.textContent).toBe('Unverifiable1');
+      expect(within(panel).getByText('Resolved').parentElement?.textContent).toBe('Resolved1');
+
+      await user.click(within(panel).getByText('Threads (4)'));
+      for (const reason of [
+        'model_confirmed_fix',
+        'model_confirmed_via_window',
+        'issue_still_present',
+        'file_deleted_at_head',
+      ]) {
+        expect(within(panel).getByText(reason)).toBeVisible();
+      }
+      expect(within(panel).getAllByText('fixed')).toHaveLength(2);
+      expect(within(panel).getByText('unfixed')).toBeVisible();
+      expect(within(panel).getByText('unverifiable')).toBeVisible();
+      expect(panel.textContent).not.toContain(`opaque-fixed-${'x'.repeat(80)}`);
+    },
+  );
+
+  it('hides absent/default results and renders fail-open as visibly degraded', async () => {
+    vi.mocked(api.getJob).mockResolvedValue(okResponse({ job: { ...JOB, threadVerification: null } }));
+    const first = renderJobDetail();
+    await screen.findByText('Add retry handling');
+    expect(screen.queryByText('Thread verification')).not.toBeInTheDocument();
+    first.unmount();
+
+    vi.mocked(api.getJob).mockResolvedValue(
+      okResponse({
+        job: {
+          ...JOB,
+          threadVerification: {
+            version: 1,
+            status: 'fail_open',
+            reason: 'provider_unavailable',
+            entries: [],
+            totals: { fixed: 0, unfixed: 0, unverifiable: 0, resolved: 0 },
+          },
+        } as JobDetail,
+      }),
+    );
+    renderJobDetail();
+
+    expect(await screen.findByText('Verification unavailable (degraded)')).toBeVisible();
+    expect(screen.getByText('provider_unavailable')).toBeVisible();
+    expect(screen.queryByText('Fixed')).not.toBeInTheDocument();
+  });
+
+  it('normalizes every thread audit event and keeps the verified-fixed reason visible', async () => {
+    const user = userEvent.setup();
+    const timestamp = new Date().toISOString();
+    const threadAudit: JobDetail['audit'] = [
+      {
+        stage: 'threads.verified_fixed',
+        threadRef: `fixed-${'r'.repeat(80)}`,
+        path: 'src/fixed.ts',
+        line: 10,
+        reason: 'model_confirmed_fix',
+        timestamp,
+      },
+      {
+        stage: 'threads.unfixed',
+        threadRef: 'unfixed-ref',
+        path: 'src/open.ts',
+        line: 20,
+        reason: 'issue_still_present',
+        timestamp,
+      },
+      {
+        stage: 'threads.unverifiable',
+        threadRef: 'deleted-ref',
+        path: 'src/deleted.ts',
+        line: null,
+        reason: 'file_deleted_at_head',
+        timestamp,
+      },
+      {
+        stage: 'threads.resolved',
+        threadRef: 'resolved-ref',
+        path: 'src/fixed.ts',
+        line: 10,
+        reason: 'verify_fixes_auto_resolve',
+        timestamp,
+      },
+      {
+        stage: 'threads.resolve_failed',
+        threadRef: 'failed-ref',
+        path: 'src/open.ts',
+        line: 20,
+        reason: 'provider_returned_false',
+        timestamp,
+      },
+    ];
+    vi.mocked(api.getJob).mockResolvedValue(okResponse({ job: { ...JOB, audit: threadAudit } }));
+
+    renderJobDetail();
+    const auditHeading = await screen.findByText('Audit trail');
+    await user.click(auditHeading);
+
+    expect(screen.getByText('Threads')).toBeVisible();
+    for (const reason of [
+      'model_confirmed_fix',
+      'issue_still_present',
+      'file_deleted_at_head',
+      'verify_fixes_auto_resolve',
+      'provider_returned_false',
+    ]) {
+      expect(screen.getByText(reason)).toBeVisible();
+    }
+    expect(document.body.textContent).not.toContain(`fixed-${'r'.repeat(80)}`);
+  });
+});
