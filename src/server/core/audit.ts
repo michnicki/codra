@@ -3,6 +3,7 @@ import { appendJobAuditEvents } from '@server/db/jobs';
 import type { FileReviewPass, JobAuditEvent, ReviewSeverity } from '@shared/schema';
 import type { FileSelectionResult } from './diff';
 import type { DropRecord, NoiseFilterResult } from './noise-filter';
+import type { EnsembleReconciliation } from './ensemble';
 import { logger } from './logger';
 
 /**
@@ -328,5 +329,103 @@ export async function recordVerifyFixesAudit(
     await appendJobAuditEvents(env, jobId, stamped);
   } catch (error) {
     logger.warn(`Failed to record verify-fixes audit events for job ${jobId}`, error);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 19 (PASS-02) — bounded ensemble vote audit builder + best-effort recorder.
+// ---------------------------------------------------------------------------
+
+// Audit sample bounds — match the `ensemble.voted` schema's `.max(20)` limits and the
+// `failedRunReasons` `.max(4)` cap (max four extra ensemble runs in any configuration).
+const ENSEMBLE_WINNING_SAMPLE_CAP = 20;
+const ENSEMBLE_DROPPED_SAMPLE_CAP = 20;
+const ENSEMBLE_FAILED_RUN_REASONS_CAP = 4;
+
+export type EnsembleVoteAuditEvent = Extract<JobAuditEvent, { stage: 'ensemble.voted' }>;
+
+/**
+ * PURE ensemble vote audit builder (PASS-02 / D-12). Derives one `ensemble.voted` event from a
+ * single reconciliation result. Returns null when total runs <= 1 so the inert D-13 (runs:1)
+ * path emits ZERO Phase-19 ensemble audit events (NREG-01 — this mirrors the existing
+ * `deduped`/`file_skipped` builders which also guard against empty input).
+ *
+ * Bounded samples (T-19-05-01): winningSample and droppedSample are independently sliced to
+ * <=20 so a single file with a large cluster set cannot flood the 500-event ring buffer.
+ * failedRunReasons are machine strings only (never raw provider response bodies) and are
+ * capped at 4 (the configured max number of extra runs).
+ */
+export function buildEnsembleVoteAuditEvent(
+  file: string,
+  reconciliation: EnsembleReconciliation,
+  failedRunReasons: readonly string[] = [],
+): EnsembleVoteAuditEvent | null {
+  const totalRuns = reconciliation.successfulRuns + reconciliation.failedRuns;
+  if (totalRuns <= 1) return null;
+
+  const winningSample = reconciliation.winners
+    .slice(0, ENSEMBLE_WINNING_SAMPLE_CAP)
+    .map(({ cluster, finding }) => ({
+      clusterId: cluster.id,
+      votes: cluster.voters.length,
+      path: finding.path,
+      line: finding.line ?? null,
+      title: finding.title.slice(0, 200),
+    }));
+
+  const droppedSample = reconciliation.droppedClusters
+    .slice(0, ENSEMBLE_DROPPED_SAMPLE_CAP)
+    .map((cluster) => {
+      // Deterministic first member's path/line/title for the sample (privacy-bounded identifier).
+      const sample = cluster.members[0]?.finding;
+      return {
+        clusterId: cluster.id,
+        votes: cluster.voters.length,
+        path: sample?.path ?? '',
+        line: sample?.line ?? null,
+        title: (sample?.title ?? '').slice(0, 200),
+      };
+    });
+
+  return {
+    stage: 'ensemble.voted',
+    file,
+    requestedRuns: totalRuns,
+    successfulRuns: reconciliation.successfulRuns,
+    failedRuns: reconciliation.failedRuns,
+    winnerCount: reconciliation.winners.length,
+    droppedClusterCount: reconciliation.droppedClusters.length,
+    winningSample,
+    droppedSample,
+    failedRunReasons: failedRunReasons.slice(0, ENSEMBLE_FAILED_RUN_REASONS_CAP),
+    timestamp: new Date().toISOString(),
+  };
+}
+
+/**
+ * Phase 19 (PASS-02): bounded best-effort recorder for the `ensemble.voted` audit variant.
+ * Mirrors `recordRoundAudit` / `recordVerifyFixesAudit` EXACTLY: try/catch, defensive timestamp
+ * stamping, logs and NEVER rethrows. A broken ensemble audit write must never fail the caller's
+ * review (T-19-05-01 / D-13-03-04 carry-over posture).
+ *
+ * The builder is pure and short-circuits to null for runs <= 1 (D-13 inert), so the recorder's
+ * no-op path handles both the no-events case and the broken-DB case identically. The producer
+ * (core/ensemble.ts via review.ts) owns the privacy boundary — events only carry the
+ * { clusterId, votes, path, line, title } sample shape plus failed-run machine reasons; never
+ * raw provider/model payloads.
+ */
+export async function recordEnsembleAudit(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  events: JobAuditEvent[],
+): Promise<void> {
+  try {
+    if (events.length === 0) return; // nothing to append — never produce an inert event row.
+    const stamped = events.map((event) =>
+      event.timestamp ? event : { ...event, timestamp: new Date().toISOString() },
+    );
+    await appendJobAuditEvents(env, jobId, stamped);
+  } catch (error) {
+    logger.warn(`Failed to record ensemble audit events for job ${jobId}`, error);
   }
 }

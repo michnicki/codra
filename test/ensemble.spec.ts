@@ -1,13 +1,21 @@
-import { describe, expect, it } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import type { ParsedReviewComment } from '@shared/schema';
+import { insertJob, getJobDetail } from '@server/db/jobs';
+import * as jobsModule from '@server/db/jobs';
+import { logger } from '@server/core/logger';
 import {
   buildEnsembleVoteAuditEvent,
+  recordEnsembleAudit,
+} from '@server/core/audit';
+import {
   clusterEnsembleRuns,
   pickClusterRepresentative,
   reconcileEnsembleRuns,
   type EnsembleRun,
 } from '@server/core/ensemble';
 import { matchCompositeRule, type CompositeMatch } from '@server/core/dedup';
+import { createTestEnv, hasConfiguredTestDatabaseUrl } from './helpers';
+import { defaultRepoConfig } from '@shared/schema';
 
 // Pure, no-DB unit spec (mirrors test/dedup.spec.ts): ensemble voting is a deterministic
 // function over run outputs, so every D-10/D-11/D-12 edge the cross-AI review flagged is pinned
@@ -316,5 +324,93 @@ describe('buildEnsembleVoteAuditEvent', () => {
     expect(event!.failedRunReasons).toBeDefined();
     expect(event!.failedRunReasons!.length).toBe(1);
     expect(event!.failedRunReasons![0]).toBe('timeout');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// recordEnsembleAudit best-effort recorder (T-19-05-01 / D-12). Mirrors the
+// recordRoundAudit / recordVerifyFixesAudit / recordUnitAudit shape:
+//   - appends every event in ONE call (no per-event recapture)
+//   - never throws — a broken append resolves undefined and logs warn
+//   - empty input is a no-op (zero Phase-19 events for the inert runs:1 path)
+// ---------------------------------------------------------------------------
+
+const dbDescribe = hasConfiguredTestDatabaseUrl() ? describe : describe.skip;
+
+const recorderJob = {
+  installationId: '123',
+  owner: 'test-owner',
+  prTitle: 'Ensemble audit',
+  prAuthor: 'author',
+  trigger: 'auto' as const,
+  headRef: 'feature',
+  baseRef: 'main',
+  configSnapshot: defaultRepoConfig,
+};
+
+let prCounter = 0;
+async function freshRecorderJob(env: ReturnType<typeof createTestEnv>, label: string) {
+  prCounter += 1;
+  return insertJob(env, {
+    ...recorderJob,
+    repo: `test-repo-${Date.now()}-ensemble-${label}-${prCounter}`,
+    prNumber: prCounter,
+    commitSha: 'a'.repeat(40),
+    baseSha: '0'.repeat(40),
+  });
+}
+
+dbDescribe('recordEnsembleAudit best-effort recorder (T-19-05-01)', () => {
+  const env = createTestEnv();
+
+  it('FAILED-WRITE: recordEnsembleAudit resolves (never throws) and warns when appendJobAuditEvents rejects', async () => {
+    const job = await freshRecorderJob(env, 'failed-write');
+    const appendSpy = vi
+      .spyOn(jobsModule, 'appendJobAuditEvents')
+      .mockRejectedValue(new Error('simulated audit-write failure'));
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    await expect(recordEnsembleAudit(env, job.id, [
+      {
+        stage: 'ensemble.voted',
+        file: 'src/a.ts',
+        requestedRuns: 3,
+        successfulRuns: 3,
+        failedRuns: 0,
+        winnerCount: 0,
+        droppedClusterCount: 0,
+        winningSample: [],
+        droppedSample: [],
+        timestamp: new Date().toISOString(),
+      },
+    ])).resolves.toBeUndefined();
+    expect(warnSpy).toHaveBeenCalled();
+    appendSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it('EMPTY-INPUT: recordEnsembleAudit is a no-op and never calls appendJobAuditEvents', async () => {
+    const job = await freshRecorderJob(env, 'empty');
+    const appendSpy = vi.spyOn(jobsModule, 'appendJobAuditEvents');
+    await recordEnsembleAudit(env, job.id, []);
+    expect(appendSpy).not.toHaveBeenCalled();
+    appendSpy.mockRestore();
+  });
+
+  it('SUCCESS: one ensemble event is appended with the privacy-bounded sample shape', async () => {
+    const job = await freshRecorderJob(env, 'success');
+    const r0 = run(0, [finding({ line: 5, title: 'null check on user id' })]);
+    const r1 = run(1, [finding({ line: 5, title: 'null check on user id' })]);
+    const r2 = run(2, [finding({ line: 5, category: 'bugs', title: 'unrelated concern alpha beta' })]);
+    const reconciliation = reconcileEnsembleRuns([r0, r1, r2]);
+    const event = buildEnsembleVoteAuditEvent('src/a.ts', reconciliation, ['timeout']);
+    expect(event).not.toBeNull();
+    await recordEnsembleAudit(env, job.id, [event!]);
+    const detail = await getJobDetail(env, job.id);
+    expect(detail).not.toBeNull();
+    expect(detail!.audit).toHaveLength(1);
+    expect(detail!.audit[0].stage).toBe('ensemble.voted');
+    const audited = detail!.audit[0] as Extract<NonNullable<typeof detail>['audit'][0], { stage: 'ensemble.voted' }>;
+    expect(audited.winnerCount).toBe(1);
+    expect(audited.winningSample).toHaveLength(1);
   });
 });

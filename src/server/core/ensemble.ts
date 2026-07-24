@@ -1,4 +1,4 @@
-import type { JobAuditEvent, ParsedReviewComment } from '@shared/schema';
+import type { ParsedReviewComment } from '@shared/schema';
 import { matchCompositeRule, pickSurvivor, SEVERITY_RANK } from './dedup';
 
 /**
@@ -71,10 +71,10 @@ export type EnsembleReconciliation = {
 };
 
 // ---------------------------------------------------------------------------
-// Audit projection input/output.
+// Audit projection — the builder lives in audit.ts (matches the `buildFinalizeDropEvents` /
+// `buildFileSkipEvents` convention). The reconciliation output type is exported so callers can
+// thread it through without re-importing the audit builder.
 // ---------------------------------------------------------------------------
-
-export type EnsembleVoteAuditEvent = Extract<JobAuditEvent, { stage: 'ensemble.voted' }>;
 
 // ---------------------------------------------------------------------------
 // D-11: cluster each run's findings using the Phase-14 composite matcher.
@@ -213,68 +213,6 @@ export function reconcileEnsembleRuns(runs: EnsembleRun[]): EnsembleReconciliati
   }
 
   return { successfulRuns, failedRuns, clusters, winners, droppedClusters };
-}
-
-// ---------------------------------------------------------------------------
-// Audit projection — bounded (T-19-05-01) and never emitted for runs=1 (D-13).
-// ---------------------------------------------------------------------------
-
-const WINNING_SAMPLE_CAP = 20;
-const DROPPED_SAMPLE_CAP = 20;
-const FAILED_RUN_REASONS_CAP = 4;
-
-/**
- * Pure audit builder. Returns null when `reconciliation.successfulRuns + failedRuns <= 1` so
- * the inert runs:1 path emits zero Phase-19 ensemble audit events (D-13 / NREG-01). Each sample
- * entry is bounded to ≤20 so a 500-event ring buffer cannot be flooded by a single large file's
- * cluster explosion (T-19-05-01 / D-12 audit-bounded invariant). Failed-run reasons are passed
- * through verbatim (machine strings, never raw provider bodies).
- */
-export function buildEnsembleVoteAuditEvent(
-  file: string,
-  reconciliation: EnsembleReconciliation,
-  failedRunReasons: string[] = [],
-): EnsembleVoteAuditEvent | null {
-  const totalRuns = reconciliation.successfulRuns + reconciliation.failedRuns;
-  if (totalRuns <= 1) return null;
-
-  const winningSample = reconciliation.winners
-    .slice(0, WINNING_SAMPLE_CAP)
-    .map(({ cluster, finding }) => ({
-      clusterId: cluster.id,
-      votes: cluster.voters.length,
-      path: finding.path,
-      line: finding.line ?? null,
-      title: finding.title.slice(0, 200),
-    }));
-
-  const droppedSample = reconciliation.droppedClusters
-    .slice(0, DROPPED_SAMPLE_CAP)
-    .map((cluster) => {
-      // Pick any finding from the cluster for the path/line/title (deterministic first member).
-      const sample = cluster.members[0]?.finding;
-      return {
-        clusterId: cluster.id,
-        votes: cluster.voters.length,
-        path: sample?.path ?? '',
-        line: sample?.line ?? null,
-        title: (sample?.title ?? '').slice(0, 200),
-      };
-    });
-
-  return {
-    stage: 'ensemble.voted',
-    file,
-    requestedRuns: totalRuns,
-    successfulRuns: reconciliation.successfulRuns,
-    failedRuns: reconciliation.failedRuns,
-    winnerCount: reconciliation.winners.length,
-    droppedClusterCount: reconciliation.droppedClusters.length,
-    winningSample,
-    droppedSample,
-    failedRunReasons: failedRunReasons.slice(0, FAILED_RUN_REASONS_CAP),
-    timestamp: new Date().toISOString(),
-  };
 }
 
 // ---------------------------------------------------------------------------
