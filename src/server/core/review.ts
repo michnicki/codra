@@ -2824,7 +2824,33 @@ async function runCriticPhase(
       reason,
       decisions: skippedDecisions,
     });
-    await enqueueJobPhase(env, job.id, 'finalize', FRESH_INVOCATION_YIELD_SECONDS);
+
+    // Phase 20.1 (BLOCKER 5): skipped-ledger cases still emit the critic.decisions audit event so
+    // the audit viewer sees the skip terminal. The audit-event schema already accepts
+    // status='skipped' via criticRunStatusSchema at schema.ts:485; the builder at audit.ts:454-491
+    // returns null for an empty decisions array, so this branch hand-crafts the event (the
+    // sample really is empty — there are no candidates — and the D-05 audit ought to reflect
+    // that truthfully). The recorder is best-effort (never rethrows) so a broken audit write
+    // never wrecks the review (D-13-03-04 posture).
+    const skippedAuditEvent = {
+      stage: 'critic.decisions' as const,
+      status: 'skipped' as const,
+      count: 0,
+      sample: [],
+      reason,
+      timestamp: new Date().toISOString(),
+    };
+    await recordCriticAudit(env, job.id, [skippedAuditEvent]);
+
+    // Phase 20.1 (BLOCKER 5 chain correctness): the skip path MUST use the same hand-off as
+    // the no-skip path at line 2951 (`nextPhaseAfterCritic(config)`) — UNCONDITIONALLY. The
+    // verify_fixes hop has ALREADY happened before this phase (it is the FIRST hop after review,
+    // not a hop after critic). Re-entering verify_fixes from the critic terminal would recreate
+    // the critic → verify_fixes → critic → verify_fixes loop that Plan 20.1-02 / commit caf2eef
+    // explicitly fixed. The skip path is therefore byte-equivalent to the no-skip path's hand-off
+    // selector: walkthrough_enrichment (when enabled) → finalize. No verify_fixes branch.
+    const handOff = nextPhaseAfterCritic(config);
+    await enqueueJobPhase(env, job.id, handOff, FRESH_INVOCATION_YIELD_SECONDS);
     return;
   }
 
