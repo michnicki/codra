@@ -298,3 +298,35 @@ export async function recordRoundAudit(
     logger.warn(`Failed to record round audit events for job ${jobId}`, error);
   }
 }
+
+/**
+ * Phase 19 (THR-01/THR-02, D-04): bounded best-effort recorder for the per-thread verify-fixes
+ * audit variants (`threads.verified_fixed`, `threads.unfixed`, `threads.unverifiable`,
+ * `threads.resolved`, `threads.resolve_failed`). Mirrors `recordRoundAudit` EXACTLY: try/catch,
+ * defensive timestamp stamping, logs and NEVER rethrows. A broken verify-fixes audit write
+ * must never fail the caller's review (T-19-01-02 carry-over posture).
+ *
+ * Each event carries ONLY the privacy-bounded identifier { threadRef, path, line, reason } +
+ * verdict. NEVER the thread body, file content, prompt, or raw provider/model payload. The
+ * `.passthrough()` on each `threads.*` schema variant is additive-only; producer construction
+ * here is the privacy boundary.
+ *
+ * The caller (core/verify-fixes.ts runVerifyFixesPhase) batches up to 20 events per call so a
+ * single batch's emission never approaches the 500-event ring buffer cap (T-19-01-02). The
+ * `appendJobAuditEvents` helper itself applies the 500-event trim with `audit_truncated` flag,
+ * so this recorder needs no additional cap.
+ */
+export async function recordVerifyFixesAudit(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  events: JobAuditEvent[],
+): Promise<void> {
+  try {
+    const stamped = events.map((event) =>
+      event.timestamp ? event : { ...event, timestamp: new Date().toISOString() },
+    );
+    await appendJobAuditEvents(env, jobId, stamped);
+  } catch (error) {
+    logger.warn(`Failed to record verify-fixes audit events for job ${jobId}`, error);
+  }
+}

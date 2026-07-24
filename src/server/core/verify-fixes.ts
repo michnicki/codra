@@ -350,6 +350,7 @@ import {
   setJobThreadVerifications,
   appendJobAuditEvents,
 } from '../db/jobs';
+import { NextPhaseError } from './review';
 import { logger } from './logger';
 
 // Subrequest cost model for verify-fixes. Conservative on purpose: the worst case is roughly
@@ -363,6 +364,11 @@ const COST_FETCH_FILE = 2;
 const COST_MODEL_CALL = 1;
 const COST_RESOLVE_THREAD = 1;
 const SAFE_BUDGET_MIN_HEADROOM = 3;
+// Long-enough sleep to force the Workflow to hibernate into a NEW Worker invocation with a fresh
+// 50-subrequest budget. Cloudflare only hibernates on a long-enough step.sleep; a short sleep keeps
+// the instance warm and accumulates subrequests across chunks. Mirrors core/review.ts's
+// FRESH_INVOCATION_YIELD_SECONDS so verify_fixes' budget-pressure yields behave identically.
+const VERIFY_FIXES_FRESH_INVOCATION_YIELD_SECONDS = 60;
 
 // The maximum number of thread entries that fit in one model call's user prompt. Larger batches
 // must be split so the prompt stays under a reasonable token budget (D-04: the model sees a
@@ -699,6 +705,13 @@ export async function runVerifyFixesPhase(
   await persistState(env, job.id, finalState);
 
   await emitCompletionAudit(env, job.id, finalTotals, allProcessed);
+
+  // Phase 19 (D-03 / D-04): verify_fixes always hands off to finalize on its own fresh-budget
+  // step. Throw NextPhaseError so runReviewJob's catch translates it into a {action:'next_phase'}
+  // result. When the critic is enabled, finalize runs after the critic; when verify_fixes is
+  // routed BEFORE the critic, finalize runs after verify_fixes; either way finalize is the
+  // terminal step. (See nextPhaseAfterVerifyFixes in core/review.ts.)
+  throw new NextPhaseError('finalize', VERIFY_FIXES_FRESH_INVOCATION_YIELD_SECONDS);
 }
 
 /**
@@ -982,17 +995,12 @@ async function emitCompletionAudit(
 }
 
 function throwYield(state: ThreadVerifications, _reason: string): never {
-  // The high-level runVerifyFixesPhase uses NextPhaseError('finalize', ...) for the actual
-  // hand-off (so the workflow routes to finalize on a fresh instance). Tests that exercise
-  // processVerifyFixesBatch receive a yielded result instead.
-  throw new YieldSignal(state);
-}
-
-class YieldSignal extends Error {
-  constructor(public state: ThreadVerifications) {
-    super(`verify-fixes yielded: ${state.status}`);
-    this.name = 'YieldSignal';
-  }
+  // Budget-pressure yield: persist the cursor (already done by the caller), then throw
+  // NextPhaseError('verify_fixes') so the runReviewJob catch routes it back into verify_fixes in
+  // a fresh instance. The fresh instance reads the persisted cursor and resumes exactly where
+  // this invocation stopped.
+  void state;
+  throw new NextPhaseError('verify_fixes', VERIFY_FIXES_FRESH_INVOCATION_YIELD_SECONDS);
 }
 
 // ============================================================================
@@ -1002,6 +1010,8 @@ class YieldSignal extends Error {
 /**
  * Pure (deps-free) classifier used by orchestration tests. Decides whether a batch can be admitted
  * against the remaining safe subrequest budget given the conservative per-operation costs.
+ *
+ * An empty component set ({}) is always admitted (a no-op batch needs no subrequest budget).
  */
 export function canAdmitVerifyFixesBatch(
   tracker: TokenTracker,
@@ -1011,6 +1021,7 @@ export function canAdmitVerifyFixesBatch(
   if (components.fetch) cost += COST_FETCH_FILE;
   if (components.modelCall) cost += COST_MODEL_CALL;
   if (components.resolve) cost += COST_RESOLVE_THREAD;
+  if (cost === 0) return true;
   return tracker.remainingSafeBudget() >= cost + SAFE_BUDGET_MIN_HEADROOM;
 }
 

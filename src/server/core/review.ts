@@ -44,7 +44,9 @@ import {
   recordFinalizeDrops,
   recordRoundAudit,
   recordUnitAudit,
+  recordVerifyFixesAudit,
 } from './audit';
+import { runVerifyFixesPhase } from './verify-fixes';
 import {
   buildRoundInputsFromConfig,
   buildRoundsAnchorSkippedEvent,
@@ -85,7 +87,12 @@ export type ReviewJobRunResult =
   // subrequest budget anymore: either a subrequest-limit deferral (a long-lived instance has stopped
   // hibernating, so its budget never resets) or the transition into finalize (which needs ~20
   // subrequests at once to post the review). A fresh instance's first step always gets a clean budget.
-  | { action: 'next_phase'; phase: 'prepare' | 'review' | 'finalize' | 'critic'; delaySeconds: number; jobId?: string; freshInstance?: boolean };
+  //
+  // Phase 19 widens the phase union with 'verify_fixes' so the durable cursor-batched phase can
+  // hand off exactly like every other phase. The verify_fixes phase runs as its OWN fresh-budget
+  // step between critic and finalize (or review and finalize when critic is off) — see
+  // nextPhaseAfterCritic / nextPhaseAfterVerifyFixes below.
+  | { action: 'next_phase'; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes'; delaySeconds: number; jobId?: string; freshInstance?: boolean };
 
 const REVIEW_CHUNK_WALL_CLOCK_MS = 12 * 60 * 1000;
 const JOB_LEASE_SECONDS = 15 * 60;
@@ -482,6 +489,11 @@ export async function runReviewJob(env: AppBindings, message: ReviewJobMessage):
       await runFinalizePhase(env, job, leaseOwner, vcs, formatter);
     } else if (phase === 'critic') {
       await runCriticPhase(env, job, leaseOwner, model);
+    } else if (phase === 'verify_fixes') {
+      // Phase 19 (THR-01/THR-02): the durable cursor-batched verify_fixes phase. Always hands
+      // off to finalize on its own fresh-budget step (so a long-lived instance never accidentally
+      // shares the review/critic phase's near-empty budget).
+      await runVerifyFixesPhase(env, job, leaseOwner, vcs, model, tracker);
     } else {
       await runReviewPhase(env, job, leaseOwner, vcs, model, tracker);
     }
@@ -498,12 +510,15 @@ export async function runReviewJob(env: AppBindings, message: ReviewJobMessage):
 
     if (error instanceof NextPhaseError) {
       await releaseJobLease(env, job.id, leaseOwner);
-      // Finalize AND critic each need a fresh instance for a clean subrequest budget: finalize posts
-      // the review (~20 subrequests at once) and critic makes its single whole-set model call on its
-      // OWN budget (D-07 — the critic must never share finalize's budget). Other phase transitions
-      // (e.g. the per-chunk review yield) stay in this instance and rely on the normal step.sleep
-      // hibernation to reset the budget.
-      return { action: 'next_phase', phase: error.phase, delaySeconds: error.delaySeconds, jobId: job.id, freshInstance: error.phase === 'finalize' || error.phase === 'critic' };
+      // Finalize AND critic AND verify_fixes each need a fresh instance for a clean subrequest
+      // budget: finalize posts the review (~20 subrequests at once), critic makes its single
+      // whole-set model call on its OWN budget (D-07 — the critic must never share finalize's
+      // budget), and verify_fixes runs an unbounded number of file-content fetches + model calls
+      // + resolution calls on its OWN budget (D-01/D-02 — never share the prior phase's spent
+      // budget). Other phase transitions (e.g. the per-chunk review yield) stay in this instance
+      // and rely on the normal step.sleep hibernation to reset the budget.
+      const freshInstance = error.phase === 'finalize' || error.phase === 'critic' || error.phase === 'verify_fixes';
+      return { action: 'next_phase', phase: error.phase, delaySeconds: error.delaySeconds, jobId: job.id, freshInstance };
     }
 
     if (isRetryableModelError(error)) {
@@ -554,18 +569,21 @@ async function continueOrFailWedgedJob(
   job: PersistedReviewJob,
   vcs: VcsProvider,
   leaseOwner: string,
-  phase: 'prepare' | 'review' | 'finalize' | 'critic',
+  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes',
   delaySeconds: number,
   reason: string,
 ): Promise<ReviewJobRunResult> {
   const continuationCount = await markJobContinuationQueued(env, job.id, delaySeconds);
 
-  // Finalize AND critic burn their low ceiling fast so a saturated instance that can't post the
-  // review / can't run the critic on a clean budget fails over within a few minutes instead of
-  // looping ~20 min against the review-sized ceiling; review keeps the generous ceiling because it
-  // makes real per-file progress. (Critic never terminal-fails on exceed — it fails OPEN to finalize
-  // in the branch below — but it still uses the low ceiling to bound its fresh-instance retries.)
-  const ceiling = phase === 'finalize' || phase === 'critic' ? MAX_FINALIZE_CONTINUATIONS : MAX_JOB_CONTINUATIONS;
+  // Finalize AND critic AND verify_fixes burn their low ceiling fast so a saturated instance that
+  // can't post the review / can't run the critic / can't finish verification on a clean budget
+  // fails over within a few minutes instead of looping ~20 min against the review-sized ceiling;
+  // review keeps the generous ceiling because it makes real per-file progress. (Critic and
+  // verify_fixes never terminal-fail on exceed — they fail OPEN to finalize in the branches
+  // below — but they still use the low ceiling to bound their fresh-instance retries.)
+  const ceiling = phase === 'finalize' || phase === 'critic' || phase === 'verify_fixes'
+    ? MAX_FINALIZE_CONTINUATIONS
+    : MAX_JOB_CONTINUATIONS;
 
   if (continuationCount > ceiling) {
     if (phase === 'review') {
@@ -621,6 +639,20 @@ async function continueOrFailWedgedJob(
       await resetJobContinuationCount(env, job.id);
       await releaseJobLease(env, job.id, leaseOwner);
       return { action: 'next_phase', phase: 'finalize', delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
+    } else if (phase === 'verify_fixes') {
+      // FAIL-OPEN ceiling (D-03): a wedged verify_fixes (repeated subrequest-budget exhaustion on its
+      // fresh-instance retries) must NEVER terminal-fail the job. Reset the continuation counter and
+      // hand finalize its own fresh instance/budget; finalize reads the persisted
+      // thread_verifications JSONB idempotently so a fail-open verify_fixes still surfaces whatever
+      // entries the cursor had persisted before exhaustion.
+      logger.error(`verify_fixes phase exceeded the continuation ceiling; failing OPEN to finalize (verification halted at cursor): ${job.owner}/${job.repo} PR #${job.prNumber}`, {
+        phase,
+        continuationCount,
+        reason,
+      });
+      await resetJobContinuationCount(env, job.id);
+      await releaseJobLease(env, job.id, leaseOwner);
+      return { action: 'next_phase', phase: 'finalize', delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
     } else {
       const message = `Review could not make progress after ${continuationCount} continuation attempts (${reason}). Failing the job to avoid an endless retry loop; re-run it once the underlying provider issue clears.`;
       logger.error(`Review job exceeded the continuation ceiling; failing terminally: ${job.owner}/${job.repo} PR #${job.prNumber}`, {
@@ -645,7 +677,7 @@ async function continueOrFailWedgedJob(
 async function resolveQueuedJob(
   env: AppBindings,
   message: ReviewJobMessage,
-): Promise<{ job: PersistedReviewJob; phase: 'prepare' | 'review' | 'finalize' | 'critic' } | null> {
+): Promise<{ job: PersistedReviewJob; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' } | null> {
   // The WIRE contract (reviewJobMessageSchema.phase) includes 'critic' (D-07). Phase 10 DISPATCHES it
   // — but ONLY for a jobId-bearing message. A critic phase is only ever reached AFTER a job exists
   // (review→critic hands off keyed on the resolved jobId), so a phase:'critic' message WITHOUT a jobId
@@ -658,12 +690,16 @@ async function resolveQueuedJob(
   // their workers land in later plans. Reject an early/spoofed delivery instead of letting the
   // dispatch fallback misclassify it as a normal review phase. Each owning plan removes its value
   // from this gate when it installs the corresponding explicit dispatch branch.
-  if (requestedPhase === 'verify_fixes' || requestedPhase === 'walkthrough_enrichment') {
+  if (requestedPhase === 'walkthrough_enrichment') {
     logger.warn(`Queue message ignored: phase "${requestedPhase}" is not active yet.`);
     return null;
   }
   if (requestedPhase === 'critic' && !message.jobId) {
     logger.warn('Queue message ignored: phase "critic" requires a jobId (a jobId-less critic message is treated as a spoof).');
+    return null;
+  }
+  if (requestedPhase === 'verify_fixes' && !message.jobId) {
+    logger.warn('Queue message ignored: phase "verify_fixes" requires a jobId (a jobId-less verify_fixes message is treated as a spoof).');
     return null;
   }
 
@@ -2361,19 +2397,31 @@ async function runCriticPhase(
   // (1) IDEMPOTENCY: a valid persisted result means the model call already ran (or was skipped) on a
   // prior invocation that then died before finalize picked up. mapJob has already safeParsed the blob
   // (a malformed one degrades to null), so a non-null criticResult is trustworthy. Skip straight to
-  // finalize with NO model call so a re-entry after hibernation never re-critiques (T-10-12 / cost).
+  // the next phase (verify_fixes if enabled, else finalize) with NO model call so a re-entry after
+  // hibernation never re-critiques (T-10-12 / cost).
   if (job.criticResult) {
-    logger.info(`Critic result already persisted for job ${job.id}; skipping the model call and transitioning to finalize.`);
-    await enqueueJobPhase(env, job.id, 'finalize', FRESH_INVOCATION_YIELD_SECONDS);
+    logger.info(`Critic result already persisted for job ${job.id}; skipping the model call and transitioning onward.`);
+    await enqueueJobPhase(
+      env,
+      job.id,
+      config.review.threads?.verify_fixes ? 'verify_fixes' : 'finalize',
+      FRESH_INVOCATION_YIELD_SECONDS,
+    );
     return;
   }
 
   // (2) TOGGLE-OFF fail-open: a critic phase reached with passes.critic off (config drift / a stale
-  // in-flight message after the toggle was turned off) must NOT run — fail open straight to finalize
-  // so behavior is byte-identical to the critic-off engine (NREG-01, Pitfall 5).
+  // in-flight message after the toggle was turned off) must NOT run — fail open to the next phase
+  // (verify_fixes if enabled, else finalize) so behavior is byte-identical to the critic-off engine
+  // (NREG-01, Pitfall 5).
   if (!config.review.passes?.critic?.enabled) {
-    logger.info(`Critic phase reached for job ${job.id} but passes.critic is off; failing open to finalize.`);
-    await enqueueJobPhase(env, job.id, 'finalize', FRESH_INVOCATION_YIELD_SECONDS);
+    logger.info(`Critic phase reached for job ${job.id} but passes.critic is off; failing open.`);
+    await enqueueJobPhase(
+      env,
+      job.id,
+      config.review.threads?.verify_fixes ? 'verify_fixes' : 'finalize',
+      FRESH_INVOCATION_YIELD_SECONDS,
+    );
     return;
   }
 
@@ -2490,10 +2538,18 @@ async function runCriticPhase(
     };
   }
 
-  // Persist BEFORE the (throwing) finalize hand-off so a persist-then-enqueue-failure re-enters this
-  // phase, hits the idempotency short-circuit (1), and never re-critiques.
+  // Persist BEFORE the (throwing) hand-off so a persist-then-enqueue-failure re-enters this phase,
+  // hits the idempotency short-circuit (1), and never re-critiques. When verify_fixes is enabled
+  // the hand-off routes through verify_fixes (THR-01/THR-02) so the durable cursor-batched phase
+  // runs after the critic; when verify_fixes is disabled the hand-off is byte-identical to the
+  // pre-Phase-19 finalize hand-off (NREG-01).
   await updateJobCriticResult(env, job.id, criticResult);
-  await enqueueJobPhase(env, job.id, 'finalize', FRESH_INVOCATION_YIELD_SECONDS);
+  await enqueueJobPhase(
+    env,
+    job.id,
+    config.review.threads?.verify_fixes ? 'verify_fixes' : 'finalize',
+    FRESH_INVOCATION_YIELD_SECONDS,
+  );
 }
 
 async function heartbeatAndCheckSuperseded(env: AppBindings, jobId: string, leaseOwner: string) {
@@ -2505,7 +2561,7 @@ async function heartbeatAndCheckSuperseded(env: AppBindings, jobId: string, leas
 }
 
 export class NextPhaseError extends Error {
-  constructor(public phase: 'prepare' | 'review' | 'finalize' | 'critic', public delaySeconds: number) {
+  constructor(public phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes', public delaySeconds: number) {
     super(`NextPhase: ${phase}`);
   }
 }
@@ -2518,15 +2574,34 @@ export class NextPhaseError extends Error {
  * — routes through this selector, so a degraded review can NEVER bypass the critic when it is enabled.
  * With passes.critic off this returns 'finalize' unconditionally, so routing is byte-identical to the
  * pre-critic engine (NREG-01).
+ *
+ * Phase 19 (THR-01/THR-02, D-03): when verify_fixes is enabled AND the job is not a review-rest
+ * job (reviewScope !== 'rest'), verify_fixes runs as its own fresh-budget phase BEFORE the critic.
+ * The verify_fixes phase is itself idempotent on re-entry (persisted thread_verifications
+ * cursor), so re-routing the same chain is safe and a failed-over verify_fixes still surfaces
+ * whatever entries the cursor had persisted.
  */
-function nextPhaseAfterReview(config: RepoConfig): 'critic' | 'finalize' {
+function nextPhaseAfterReview(config: RepoConfig): 'critic' | 'finalize' | 'verify_fixes' {
+  if (config.review.threads?.verify_fixes) {
+    return 'verify_fixes';
+  }
+  return config.review.passes?.critic?.enabled ? 'critic' : 'finalize';
+}
+
+/**
+ * Phase 19 (THR-01/THR-02): post-verify_fixes hand-off. Routes to the critic when enabled
+ * (so verify_fixes runs BEFORE the critic in the durable chain), otherwise straight to finalize.
+ * The verify_fixes phase ends with this selector so a hand-off never bypasses the critic
+ * when it is enabled.
+ */
+function nextPhaseAfterVerifyFixes(config: RepoConfig): 'critic' | 'finalize' {
   return config.review.passes?.critic?.enabled ? 'critic' : 'finalize';
 }
 
 async function enqueueJobPhase(
   env: AppBindings,
   jobId: string,
-  phase: 'prepare' | 'review' | 'finalize' | 'critic',
+  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes',
   delaySeconds = 0,
 ) {
   await markJobContinuationQueued(env, jobId, delaySeconds);
