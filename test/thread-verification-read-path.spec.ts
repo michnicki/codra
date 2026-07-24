@@ -181,4 +181,18 @@ dbDescribe('thread-verification persistence read path', () => {
     expect(detail!.files).toEqual([]);
     expect(detail!.threadVerification).toBeNull();
   });
+
+  it('degrades a JSONB scalar/string payload without poisoning the job read', async () => {
+    const job = await makeJob(env, 'scalar-malformed');
+
+    await getDb(env).query(
+      'UPDATE jobs SET thread_verifications = $2::jsonb WHERE id = $1',
+      [job.id, JSON.stringify('not-a-thread-verification-object')],
+    );
+
+    const processingRow = await jobsDb.getJobForProcessing(env, job.id);
+    expect(processingRow).not.toBeNull();
+    expect(() => jobsDb.mapJob(processingRow!)).not.toThrow();
+    expect(jobsDb.mapJob(processingRow!).threadVerification).toBeNull();
+  });
 });
