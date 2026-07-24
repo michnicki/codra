@@ -654,6 +654,14 @@ async function resolveQueuedJob(
   // payload and run against it. A jobId-bearing critic message falls through to the getJobForProcessing
   // branch below and is dispatched normally.
   const requestedPhase = message.phase;
+  // Contract-first safety gate: schema.ts already recognizes Phase 19's durable handoff values, but
+  // their workers land in later plans. Reject an early/spoofed delivery instead of letting the
+  // dispatch fallback misclassify it as a normal review phase. Each owning plan removes its value
+  // from this gate when it installs the corresponding explicit dispatch branch.
+  if (requestedPhase === 'verify_fixes' || requestedPhase === 'walkthrough_enrichment') {
+    logger.warn(`Queue message ignored: phase "${requestedPhase}" is not active yet.`);
+    return null;
+  }
   if (requestedPhase === 'critic' && !message.jobId) {
     logger.warn('Queue message ignored: phase "critic" requires a jobId (a jobId-less critic message is treated as a spoof).');
     return null;
