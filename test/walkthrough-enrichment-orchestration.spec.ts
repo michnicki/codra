@@ -24,12 +24,14 @@ import { NextPhaseError } from '@server/core/next-phase-error';
 import { parseWalkthroughEnrichmentResponse } from '@server/core/model-output';
 import {
   reviewSeverities,
+  walkthroughEnrichmentSchema,
   type ParsedReviewComment,
   type RepoConfig,
   type WalkthroughEnrichment,
 } from '@shared/schema';
 import { setJobWalkthroughEnrichment } from '@server/db/jobs';
 import { recordWalkthroughAudit } from '@server/core/audit';
+import { z } from 'zod';
 import type { ModelService } from '@server/services/model';
 
 function defaultRepoConfig(): RepoConfig {
@@ -374,12 +376,12 @@ describe('walkthrough-enrichment phase orchestration', () => {
     // Either fail_open path or partial path — never a raw re-throw of the parse error
   });
 
-  it('persists a failed blob and a single audit event when the assembled payload fails Zod validation', async () => {
-    // The schema-validation-failure branch is defensive and unreachable from the parser's
-    // happy-path (the parser only emits schema-valid fields). The branch is coverable only if
-    // a future regression lets a non-validated field into the envelope. The actual
-    // orchestration surface that matters is the safeParse(event) of the assembled enrichment;
-    // we exercise it explicitly here by intercepting the recordWalkthroughAudit call.
+  it('persists a failed blob and a single audit event when the parser returns fail_open on empty input', async () => {
+    // WR-02: empty input `{}` causes the parser to short-circuit to `fail_open` (all_fields_invalid),
+    // which exercises the parsed.kind === 'fail_open' branch (line 185-194) — NOT the defensive
+    // schema_validation_failed branch (line 222-234). The schema-validation-failed branch is
+    // unreachable from the parser's happy-path and is covered by the next test via an explicit
+    // walkthroughEnrichmentSchema.safeParse intercept.
     stubReviews = [
       { file_path: 'src/a.ts', file_summary: 'Adds endpoint.', file_status: 'done', error_msg: null, verdict: 'comment', pass: 'main' },
     ];
@@ -394,10 +396,68 @@ describe('walkthrough-enrichment phase orchestration', () => {
     })).rejects.toThrow(NextPhaseError);
 
     expect(setJobWalkthroughEnrichment).toHaveBeenCalledTimes(1);
-    // The persist + audit pair always lands the schema_validation_failed branch when the
-    // assembled payload fails safeParse. The parser's empty-input path actually short-circuits
-    // to fail_open, but the audit call still resolves (best-effort) and the run hands off.
+    expect(setJobWalkthroughEnrichment).toHaveBeenCalledWith(
+      expect.anything(),
+      'job-id',
+      expect.objectContaining({ status: 'failed', reason: 'all_fields_invalid' }),
+    );
     expect(recordWalkthroughAudit).toHaveBeenCalledTimes(1);
+    expect(recordWalkthroughAudit).toHaveBeenCalledWith(
+      expect.anything(),
+      'job-id',
+      [expect.objectContaining({ stage: 'walkthrough.enrichment', status: 'failed', reason: 'all_fields_invalid' })],
+    );
+  });
+
+  it('persists a failed blob and a single audit event when the assembled payload fails Zod validation', async () => {
+    // WR-02: direct coverage of the defensive schema_validation_failed branch. The branch is
+    // unreachable from the parser's happy-path (the parser only emits schema-valid fields), so we
+    // intercept walkthroughEnrichmentSchema.safeParse to force a failure. This pins the branch
+    // against future regressions that might let a non-validated field into the envelope.
+    stubReviews = [
+      { file_path: 'src/a.ts', file_summary: 'Adds endpoint.', file_status: 'done', error_msg: null, verdict: 'comment', pass: 'main' },
+    ];
+    const config = defaultRepoConfig();
+    // Emit a payload that the parser accepts as 'parsed' (groups non-empty + valid confidence +
+    // effort) so the code reaches the walkthroughEnrichmentSchema.safeParse defensive branch.
+    const model = makeModel({
+      rawText: JSON.stringify({
+        groups: [{ label: 'API', paths: ['src/a.ts'] }],
+        confidence: { score: 4, label: 'OK', reason: 'r' },
+        effort: { level: 2, label: 'Small', minutes: 30 },
+      }),
+    });
+
+    // Force the assembled payload to fail schema validation so the defensive branch is exercised.
+    const safeParseSpy = vi.spyOn(walkthroughEnrichmentSchema, 'safeParse').mockReturnValue({
+      success: false,
+      error: new z.ZodError([{ code: 'custom', path: [], message: 'forced schema failure' }]),
+    } as unknown as ReturnType<typeof walkthroughEnrichmentSchema.safeParse>);
+
+    try {
+      await expect(runWalkthroughEnrichmentPhase({
+        env: makeEnv(),
+        job: makeJob(),
+        config,
+        model,
+      })).rejects.toThrow(NextPhaseError);
+
+      expect(safeParseSpy).toHaveBeenCalled();
+      expect(setJobWalkthroughEnrichment).toHaveBeenCalledTimes(1);
+      expect(setJobWalkthroughEnrichment).toHaveBeenCalledWith(
+        expect.anything(),
+        'job-id',
+        expect.objectContaining({ status: 'failed', reason: 'schema_validation_failed' }),
+      );
+      expect(recordWalkthroughAudit).toHaveBeenCalledTimes(1);
+      expect(recordWalkthroughAudit).toHaveBeenCalledWith(
+        expect.anything(),
+        'job-id',
+        [expect.objectContaining({ stage: 'walkthrough.enrichment', status: 'failed', reason: 'schema_validation_failed' })],
+      );
+    } finally {
+      safeParseSpy.mockRestore();
+    }
   });
 });
 
