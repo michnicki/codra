@@ -14,7 +14,7 @@ const ev = (stage: JobAuditEvent['stage'], timestamp = '2026-01-01T00:00:00Z') =
   ({ stage, timestamp } as unknown as JobAuditEvent);
 
 describe('STAGE_ORDER', () => {
-  it('is the fixed nine-stage order including rounds, threads, and critic', () => {
+  it('is the fixed eleven-stage order including rounds, threads, critic, ensemble, and walkthrough', () => {
     expect(STAGE_ORDER).toEqual([
       'file_skipped',
       'drafted',
@@ -25,6 +25,8 @@ describe('STAGE_ORDER', () => {
       'rounds',
       'threads',
       'critic',
+      'ensemble',
+      'walkthrough',
     ]);
   });
 });
@@ -82,6 +84,46 @@ describe('normalizeAuditDisplayStage — Phase 18 RND-01..05', () => {
     expect(normalizeAuditDisplayStage('filtered')).toBe('filtered');
     expect(normalizeAuditDisplayStage('deduped')).toBe('deduped');
     expect(normalizeAuditDisplayStage('evidence_missing')).toBe('evidence_missing');
+  });
+});
+
+describe('normalizeAuditDisplayStage — Phase 20 D-01 / D-06 amended', () => {
+  it('maps ensemble.voted to the synthetic `ensemble` display stage', () => {
+    expect(normalizeAuditDisplayStage('ensemble.voted')).toBe('ensemble');
+  });
+
+  it('maps the schema-authoritative literal walkthrough.enrichment to the synthetic `walkthrough` display stage', () => {
+    expect(normalizeAuditDisplayStage('walkthrough.enrichment')).toBe('walkthrough');
+  });
+});
+
+describe('groupAuditByStage — Phase 20 D-01 / D-06 amended', () => {
+  it('produces an ensemble group for an ensemble.voted event and preserves its original stage', () => {
+    const event = ev('ensemble.voted', '2026-01-01T00:00:01Z');
+    const groups = groupAuditByStage([event]);
+    const ensembleGroup = groups.find((g) => g.stage === 'ensemble');
+    expect(ensembleGroup).toBeDefined();
+    expect(ensembleGroup!.count).toBe(1);
+    expect(ensembleGroup!.events.map((e) => e.stage)).toEqual(['ensemble.voted']);
+  });
+
+  it('produces a walkthrough group for a walkthrough.enrichment event and preserves its original stage', () => {
+    const event = ev('walkthrough.enrichment', '2026-01-01T00:00:01Z');
+    const groups = groupAuditByStage([event]);
+    const walkthroughGroup = groups.find((g) => g.stage === 'walkthrough');
+    expect(walkthroughGroup).toBeDefined();
+    expect(walkthroughGroup!.count).toBe(1);
+    expect(walkthroughGroup!.events.map((e) => e.stage)).toEqual(['walkthrough.enrichment']);
+  });
+
+  it('emits ensemble and walkthrough groups in order after critic when the input is mixed', () => {
+    const critic = ev('critic.decisions', '2026-01-01T00:00:01Z');
+    const ensemble = ev('ensemble.voted', '2026-01-01T00:00:02Z');
+    const walkthrough = ev('walkthrough.enrichment', '2026-01-01T00:00:03Z');
+
+    const groups = groupAuditByStage([critic, ensemble, walkthrough]);
+
+    expect(groups.map((g) => g.stage)).toEqual(['critic', 'ensemble', 'walkthrough']);
   });
 });
 

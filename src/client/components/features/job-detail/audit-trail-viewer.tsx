@@ -9,7 +9,9 @@ interface AuditTrailViewerProps {
 // D-09: human-readable labels for each pipeline stage (STAGE_ORDER lives in audit-grouping).
 // The display-stage `rounds` covers every `rounds.*` sub-variant (D-08 / Phase 18); original
 // sub-stage is preserved on each event (rounds.detected, rounds.no_changes, etc.) and surfaced
-// as a sub-label inside the DecisionEvent renderer below.
+// as a sub-label inside the DecisionEvent renderer below. Phase 20 (D-01 / D-06 amended) adds
+// `ensemble` (one per `ensemble.voted` event) and `walkthrough` (one per `walkthrough.enrichment`
+// event) — both are synthetic display stages that wrap a single bounded aggregate.
 const STAGE_LABELS: Record<AuditStageGroup['stage'], string> = {
   file_skipped: 'Files skipped',
   drafted: 'Drafted',
@@ -20,6 +22,8 @@ const STAGE_LABELS: Record<AuditStageGroup['stage'], string> = {
   rounds: 'Rounds',
   threads: 'Threads',
   critic: 'Critic',
+  ensemble: 'Ensemble',
+  walkthrough: 'Walkthrough enrichment',
 };
 
 // A count pill mirroring the job-findings-list / critic-panel count-badge idiom.
@@ -255,6 +259,67 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
               ))}
             </ul>
           )}
+        </li>
+      );
+    // Phase 20 D-01 / D-02: the ensemble.voted aggregate is one bounded row per file. The file
+    // identifier is always rendered (even when both samples are empty — D-02 LOW) so an all-failed
+    // ensemble event still names the file it ran for. Aggregate winner / dropped counts surface
+    // above the bounded sample lists so the operator can see the totals without scanning the
+    // samples.
+    case 'ensemble.voted':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="stage" value="ensemble.voted" />
+          <MetricLine label="file" value={event.file} />
+          <MetricLine label="runs" value={`${event.successfulRuns}/${event.requestedRuns} ok · ${event.failedRuns} failed`} />
+          <MetricLine label="winners" value={String(event.winnerCount)} />
+          <MetricLine label="dropped" value={String(event.droppedClusterCount)} />
+          {event.failedRunReasons && event.failedRunReasons.length > 0 && (
+            <MetricLine label="failed reasons" value={event.failedRunReasons.join(', ')} />
+          )}
+          {event.winningSample.length > 0 && (
+            <div className="mt-2 flex flex-col gap-1.5 border-t border-border/30 pt-2">
+              <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/70">Winning sample</div>
+              <ul className="flex flex-col gap-1.5">
+                {event.winningSample.map((s) => (
+                  <li key={`w:${s.clusterId}`}>
+                    <SampleIdentifier path={s.path} line={s.line} title={s.title} />
+                    <div className="text-[10px] text-muted-foreground/70 font-mono">
+                      {`${s.votes} votes · cluster ${s.clusterId}`}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {event.droppedSample.length > 0 && (
+            <div className="mt-2 flex flex-col gap-1.5 border-t border-border/30 pt-2">
+              <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/70">Dropped sample</div>
+              <ul className="flex flex-col gap-1.5">
+                {event.droppedSample.map((s) => (
+                  <li key={`d:${s.clusterId}`}>
+                    <SampleIdentifier path={s.path} line={s.line} title={s.title} />
+                    <div className="text-[10px] text-muted-foreground/70 font-mono">
+                      {`${s.votes} votes · cluster ${s.clusterId}`}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </li>
+      );
+    // Phase 20 D-06 amended: the walkthrough.enrichment aggregate is one bounded row per run.
+    // status is required (completed / partial / failed); reason is optional and names the
+    // machine-readable failure code; groupCount names the count of valid groups the model emitted
+    // on completed / partial runs (absent on failed runs).
+    case 'walkthrough.enrichment':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="stage" value="walkthrough.enrichment" />
+          <MetricLine label="status" value={event.status} />
+          {event.reason ? <MetricLine label="reason" value={event.reason} /> : null}
+          {event.groupCount != null ? <MetricLine label="groups" value={String(event.groupCount)} /> : null}
         </li>
       );
     default:

@@ -6,9 +6,11 @@ import type { JobAuditEvent } from '@shared/schema';
 
 // D-09: the fixed display order for stage groups. Matches the pipeline's logical stage progression
 // (file selection -> drafting -> severity adjustment -> noise filter -> dedup -> evidence gate ->
-// rounds -> thread verification -> critic). Phase 18 adds `rounds`; Phase 19 adds one normalized
-// `threads` group for every `threads.*` verdict/resolution event and a `critic` group for the
-// canonical critic-decisions audit event.
+// rounds -> thread verification -> critic -> ensemble -> walkthrough). Phase 18 adds `rounds`;
+// Phase 19 adds one normalized `threads` group for every `threads.*` verdict/resolution event and a
+// `critic` group for the canonical critic-decisions audit event. Phase 20 (D-01 / D-06 amended)
+// adds `ensemble` (one per `ensemble.voted` event) and `walkthrough` (one per `walkthrough.enrichment`
+// event).
 export const STAGE_ORDER = [
   'file_skipped',
   'drafted',
@@ -19,6 +21,8 @@ export const STAGE_ORDER = [
   'rounds',
   'threads',
   'critic',
+  'ensemble',
+  'walkthrough',
 ] as const;
 
 /**
@@ -46,11 +50,20 @@ export type AuditDisplayStage = typeof STAGE_ORDER[number];
  * `critic.decisions` aggregate event. The canonical decisions array lives on jobs.critic_result;
  * the audit receives only a bounded sample so the viewer can show the same outcome/reason
  * pattern for the audited rows.
+ *
+ * Phase 20 (D-01 / D-06 amended): the synthetic `ensemble` display group covers the single
+ * `ensemble.voted` aggregate event, and the synthetic `walkthrough` display group covers the
+ * single `walkthrough.enrichment` aggregate event. Both literals are the schema-authoritative
+ * phase-19 event names — they are mapped to a synthetic display stage so the `groupAuditByStage`
+ * filter (which iterates over STAGE_ORDER) and the `DecisionEvent` renderer (which switches on the
+ * event's stage) can route them through the same machinery as the existing synthetic groups.
  */
 export function normalizeAuditDisplayStage(stage: JobAuditEvent['stage']): AuditDisplayStage {
   if (stage.startsWith('rounds.')) return 'rounds';
   if (stage.startsWith('threads.')) return 'threads';
   if (stage === 'critic.decisions') return 'critic';
+  if (stage === 'ensemble.voted') return 'ensemble';
+  if (stage === 'walkthrough.enrichment') return 'walkthrough';
   return stage as AuditDisplayStage;
 }
 

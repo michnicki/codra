@@ -782,3 +782,149 @@ describe('JobDetailPage critic v2 canonical outcomes', () => {
     expect(screen.getByText('count')).toBeVisible();
   });
 });
+
+// Phase 20 D-01 / D-02: the ensemble.voted and walkthrough.enrichment audit events BOTH reach the
+// audit-trail viewer (GAP-INT-01 + GAP-INT-02 closure). The viewer's DecisionEvent switch covers
+// each new variant, and the synthetic `ensemble` / `walkthrough` display groups are reachable
+// from groupAuditByStage.
+describe('JobDetailPage audit-trail viewer — Phase 20 ensemble + walkthrough', () => {
+  const okResponse = <T,>(data: T) => ({
+    status: 200 as const,
+    etag: null,
+    lastModified: null,
+    notModified: false as const,
+    data,
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('renders a populated ensemble.voted event with file, runs, and aggregate counts', async () => {
+    const user = userEvent.setup();
+    const audit: JobDetail['audit'] = [
+      {
+        stage: 'ensemble.voted',
+        file: 'src/ensemble.ts',
+        requestedRuns: 3,
+        successfulRuns: 2,
+        failedRuns: 1,
+        winnerCount: 1,
+        droppedClusterCount: 1,
+        winningSample: [
+          {
+            clusterId: 'c1',
+            votes: 2,
+            path: 'src/ensemble.ts',
+            line: 10,
+            title: 'kept null-check finding',
+          },
+        ],
+        droppedSample: [
+          {
+            clusterId: 'c2',
+            votes: 1,
+            path: 'src/ensemble.ts',
+            line: 20,
+            title: 'dropped duplicate finding',
+          },
+        ],
+        failedRunReasons: ['timeout'],
+        timestamp: new Date().toISOString(),
+      },
+    ];
+    vi.mocked(api.getJob).mockResolvedValue(okResponse({ job: { ...JOB, audit } }));
+
+    renderJobDetail();
+    const auditHeading = await screen.findByText('Audit trail');
+    await user.click(auditHeading);
+
+    // The aggregator group + the per-row file / runs / winner / dropped metrics are visible.
+    expect(screen.getByText('Ensemble')).toBeVisible();
+    expect(screen.getByText('src/ensemble.ts')).toBeVisible();
+    expect(screen.getByText('2/3 ok · 1 failed')).toBeVisible();
+    expect(screen.getByText('failed reasons')).toBeVisible();
+    expect(screen.getByText('timeout')).toBeVisible();
+    // Bound samples visible
+    expect(screen.getByText(/kept null-check finding/)).toBeVisible();
+    expect(screen.getByText(/dropped duplicate finding/)).toBeVisible();
+  });
+
+  it('renders an all-failed ensemble.voted event with the file identifier and aggregate counts but no samples', async () => {
+    const user = userEvent.setup();
+    const audit: JobDetail['audit'] = [
+      {
+        stage: 'ensemble.voted',
+        file: 'src/all-failed.ts',
+        requestedRuns: 3,
+        successfulRuns: 0,
+        failedRuns: 3,
+        winnerCount: 0,
+        droppedClusterCount: 0,
+        winningSample: [],
+        droppedSample: [],
+        failedRunReasons: ['timeout', 'timeout', 'timeout'],
+        timestamp: new Date().toISOString(),
+      },
+    ];
+    vi.mocked(api.getJob).mockResolvedValue(okResponse({ job: { ...JOB, audit } }));
+
+    renderJobDetail();
+    const auditHeading = await screen.findByText('Audit trail');
+    await user.click(auditHeading);
+
+    // The group header + the file identifier + the aggregate counts are present even when both
+    // samples are empty (D-02 LOW — the file identifier must be visible to distinguish file events).
+    expect(screen.getByText('Ensemble')).toBeVisible();
+    expect(screen.getByText('src/all-failed.ts')).toBeVisible();
+    expect(screen.getByText('0/3 ok · 3 failed')).toBeVisible();
+    // No sample sub-headings rendered when both samples are empty.
+    expect(screen.queryByText('Winning sample')).not.toBeInTheDocument();
+    expect(screen.queryByText('Dropped sample')).not.toBeInTheDocument();
+  });
+
+  it('renders a walkthrough.enrichment event with status, reason, and group count', async () => {
+    const user = userEvent.setup();
+    const audit: JobDetail['audit'] = [
+      {
+        stage: 'walkthrough.enrichment',
+        status: 'completed',
+        reason: undefined,
+        groupCount: 3,
+        timestamp: new Date().toISOString(),
+      },
+    ];
+    vi.mocked(api.getJob).mockResolvedValue(okResponse({ job: { ...JOB, audit } }));
+
+    renderJobDetail();
+    const auditHeading = await screen.findByText('Audit trail');
+    await user.click(auditHeading);
+
+    expect(screen.getByText('Walkthrough enrichment')).toBeVisible();
+    expect(screen.getByText('completed')).toBeVisible();
+    expect(screen.getByText('3')).toBeVisible();
+  });
+
+  it('renders a walkthrough.enrichment failed event with reason and no group count', async () => {
+    const user = userEvent.setup();
+    const audit: JobDetail['audit'] = [
+      {
+        stage: 'walkthrough.enrichment',
+        status: 'failed',
+        reason: 'model_call_failed',
+        timestamp: new Date().toISOString(),
+      },
+    ];
+    vi.mocked(api.getJob).mockResolvedValue(okResponse({ job: { ...JOB, audit } }));
+
+    renderJobDetail();
+    const auditHeading = await screen.findByText('Audit trail');
+    await user.click(auditHeading);
+
+    expect(screen.getByText('Walkthrough enrichment')).toBeVisible();
+    expect(screen.getByText('failed')).toBeVisible();
+    expect(screen.getByText('model_call_failed')).toBeVisible();
+    // No group count surface when the run failed (status !== completed / partial).
+    expect(screen.queryByText('groups')).not.toBeInTheDocument();
+  });
+});
