@@ -289,6 +289,12 @@ OpenCodra can also answer questions or update the PR. Try commenting "@${botUser
       }>;
       severityCounts: Record<ParsedReviewComment['severity'], number>;
       filesReviewed: number;
+      threadVerification?:
+        | {
+            status: 'completed';
+            totals: { fixed: number; unfixed: number; unverifiable: number; resolved: number };
+          }
+        | { status: 'degraded' };
       mermaid?: string | null;
     },
     options?: FormatterOptions,
@@ -329,6 +335,15 @@ OpenCodra can also answer questions or update the PR. Try commenting "@${botUser
     const buildBody = (rowCount: number, truncated: boolean): string => {
       const sections: string[] = ['### OpenCodra Walkthrough'];
       if (countsLine) sections.push(countsLine);
+
+      if (input.threadVerification?.status === 'completed') {
+        const { fixed, unfixed, unverifiable, resolved } = input.threadVerification.totals;
+        sections.push(
+          `**Thread verification:** Fixed ${fixed} · Unfixed ${unfixed} · Unverifiable ${unverifiable} · Resolved ${resolved}`,
+        );
+      } else if (input.threadVerification?.status === 'degraded') {
+        sections.push('**Thread verification:** Unavailable (degraded)');
+      }
 
       const renderedRows = files.slice(0, rowCount).map(renderRow);
       sections.push([tableHeader, ...renderedRows].join('\n'));

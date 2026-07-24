@@ -2270,7 +2270,11 @@ async function runFinalizePhase(
         }
       }
       // (c) deterministic aggregation over the main-pass reviews + the floored/capped finalComments.
-      const data = buildWalkthroughData({ reviews: mainReviews, finalComments: mainFinalComments });
+      const data = buildWalkthroughData({
+        reviews: mainReviews,
+        finalComments: mainFinalComments,
+        threadVerification: job.threadVerification,
+      });
       // (d) single in-place edit (delete-recovery + bounded transient retry live in the helper). The
       // mermaid fence is added GitHub-only by formatWalkthrough (Plan 01), filling the Plan 02 seam.
       await editWalkthroughComment({ env, job, config, vcs, formatter, data, mermaid });

@@ -20,7 +20,13 @@
 import { logger } from './logger';
 import type { AppBindings } from '@server/env';
 import { updateJobWalkthroughCommentRef } from '@server/db/jobs';
-import { reviewSeverities, type ParsedReviewComment, type RepoConfig } from '@shared/schema';
+import {
+  reviewSeverities,
+  type ParsedReviewComment,
+  type RepoConfig,
+  type ThreadVerificationTotals,
+  type ThreadVerifications,
+} from '@shared/schema';
 import type { VcsProvider } from '../vcs/types';
 import type { FormatterService } from '../services/formatter';
 
@@ -53,11 +59,17 @@ export type WalkthroughReviewRow = {
   pass: 'main' | 'security';
 };
 
+/** Durable thread-verification data projected into the PR walkthrough. */
+export type WalkthroughThreadVerificationSummary =
+  | { status: 'completed'; totals: ThreadVerificationTotals }
+  | { status: 'degraded' };
+
 /** Deterministic, provider-agnostic payload consumed by FormatterService.formatWalkthrough. */
 export type WalkthroughData = {
   files: Array<{ path: string; summary: string; counts: Record<Severity, number> }>;
   severityCounts: Record<Severity, number>;
   filesReviewed: number;
+  threadVerification?: WalkthroughThreadVerificationSummary;
 };
 
 /** The subset of a PersistedReviewJob these helpers read. */
@@ -131,6 +143,29 @@ export async function postWalkthroughPlaceholder(params: {
   await updateJobWalkthroughCommentRef(env, job.id, ref);
 }
 
+function projectThreadVerification(
+  result: ThreadVerifications | null | undefined,
+): WalkthroughThreadVerificationSummary | undefined {
+  if (!result) return undefined;
+
+  // Only a completed durable result may claim successful counts. A fail-open/in-flight result, or a
+  // logically impossible resolved count, is rendered as degraded rather than fabricating zeros or
+  // silently clamping persisted data (D-02/D-04, T-19-03-02).
+  if (result.status !== 'completed' || result.totals.resolved > result.totals.fixed) {
+    return { status: 'degraded' };
+  }
+
+  return {
+    status: 'completed',
+    totals: {
+      fixed: result.totals.fixed,
+      unfixed: result.totals.unfixed,
+      unverifiable: result.totals.unverifiable,
+      resolved: result.totals.resolved,
+    },
+  };
+}
+
 /**
  * WT-02/WT-04: deterministic, pure aggregation. FIRST filters `pass === 'main'` (getFileReviewsForJobs
  * returns all passes; uniqueness is (job_id, file_path, pass), so filtering main keeps exactly one row
@@ -147,8 +182,9 @@ export async function postWalkthroughPlaceholder(params: {
 export function buildWalkthroughData(params: {
   reviews: WalkthroughReviewRow[];
   finalComments: ParsedReviewComment[];
+  threadVerification?: ThreadVerifications | null;
 }): WalkthroughData {
-  const { reviews, finalComments } = params;
+  const { reviews, finalComments, threadVerification } = params;
 
   // Filter to the main pass BEFORE aggregating (cross-AI MEDIUM, WT-04 adjacency).
   const mainReviews = reviews.filter((review) => review.pass === 'main');
@@ -197,10 +233,13 @@ export function buildWalkthroughData(params: {
     return b._diffLineCount - a._diffLineCount;
   });
 
+  const threadVerificationSummary = projectThreadVerification(threadVerification);
+
   return {
     files: files.map(({ path, summary, counts }) => ({ path, summary, counts })),
     severityCounts,
     filesReviewed: mainReviews.length,
+    ...(threadVerificationSummary ? { threadVerification: threadVerificationSummary } : {}),
   };
 }
 
