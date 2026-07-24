@@ -21,6 +21,7 @@ import { getResolvedModelConfig, type ResolvedModelConfig } from '@server/db/mod
 import { decryptLlmApiKey } from '@server/core/llm-crypto';
 import { ModelCallGate, adaptiveModelTimeoutMs, MODEL_FALLBACK_CHAIN_BUDGET_MS } from '../models/limits';
 import { admitEnsembleUnit, type EnsembleRun, type EnsembleAdmissionShape } from '../core/ensemble';
+import { redactErrorMessage } from '../core/audit-redact';
 
 const PROVIDER_UNAVAILABLE_TTL_SECONDS = 24 * 60 * 60;
 const COMPACT_REVIEW_PROMPT_LINE_CAP = 400;
@@ -522,7 +523,13 @@ export class ModelService {
         };
       }
       // Failed run — record a machine-readable reason so the audit can explain the gap.
-      const reason = result.reason instanceof Error ? result.reason.message : String(result.reason ?? 'unknown');
+      // Phase 20.1 BLOCKER 1 (D-07): the prior `result.reason instanceof Error ? .message : String(...)`
+      // chain persisted up to 200 chars of arbitrary Error.message text — provider response bodies,
+      // stack frames, host context. The redactor maps the value to one of the 5 MACHINE_ERROR_REASONS
+      // codes (model_timeout / model_transient / provider_5xx / network_reset / unknown) so the
+      // persisted audit trail never carries raw provider payloads. The returned code is bounded by
+      // the enum so the `.slice(0, 200)` legacy cap is redundant but harmless.
+      const reason = redactErrorMessage(result.reason);
       return {
         runIndex,
         findings: [],
@@ -530,7 +537,7 @@ export class ModelService {
         inputTokens: 0,
         outputTokens: 0,
         failed: true,
-        reason: reason.slice(0, 200),
+        reason,
       };
     });
 

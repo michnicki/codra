@@ -41,7 +41,7 @@ const FINDING_TITLE_MAX_LENGTH = 100;
 // of 100 is therefore strict — the redactor must truncate BEFORE the marker wrapping. The
 // explicit clamp on the head slice keeps the conditional "<= 110" in the spec literal-shaped.
 const REDACTED_TITLE_HEAD_LENGTH = 100;
-const REDACTED_MARKER_HEAD_BUDGET = 74;
+const REDACTED_MARKER_HEAD_BUDGET = 72;
 
 // Defensive marker for null / undefined / empty input. A non-empty placeholder keeps the
 // downstream schema's `min(1)` truth value (the relaxed proposal still wants a non-empty cell

@@ -16,7 +16,7 @@ import {
 import { z } from 'zod';
 import { logger } from './logger';
 import { applySeverityRules } from './severity';
-import { clampAuditTitle } from './audit';
+import { redactFindingTitle } from './audit-redact';
 import { findClosestValidLine, findPositionForLine, getValidNewLines, getValidPositions } from './diff';
 import type { FileDiff } from './diff';
 import { jsonrepair } from 'jsonrepair';
@@ -520,12 +520,16 @@ export function parseFileReviewResponse(
       if (evidence == null || needle.length === 0) {
         // null / undefined / whitespace-only -> `absent`. A JSON `null` reaches here (never a parse
         // failure) because fileReviewModelOutputSchema.existing_code is nullable().optional() (15-01).
+        // Phase 20.1 BLOCKER 1 (D-06): the title is redacted via redactFindingTitle (max 100 chars
+        // with a length-bounded head-clamp marker for over-length input). The prior clampAuditTitle
+        // only truncated; the redactor is the producer-side enforcement of the audit-event privacy
+        // boundary (AUD-01 sign-off text).
         severityAuditEvents.push({
           stage: 'evidence_missing',
           reason: 'absent',
           path: file.path,
           line,
-          title: clampAuditTitle(title),
+          title: redactFindingTitle(title),
           timestamp: new Date().toISOString(),
         });
       } else if (!evidenceHaystack.includes(needle)) {
@@ -534,7 +538,7 @@ export function parseFileReviewResponse(
           reason: 'not_in_hunk',
           path: file.path,
           line,
-          title: clampAuditTitle(title),
+          title: redactFindingTitle(title),
           timestamp: new Date().toISOString(),
         });
       }

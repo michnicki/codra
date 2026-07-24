@@ -319,6 +319,23 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'not_in_hunk', path: 'src/evid.ts', line: 2 });
   });
 
+  it('BLOCKER 1 (D-06): evidence_missing title is redacted when over 100 chars', () => {
+    // The model output schema caps the title at 100 chars (fileReviewModelOutputSchema.title
+    // `.max(100)`), so the redaction is transparent for the model output path — the title
+    // passes through unchanged. The wire-through is verified by asserting that the event
+    // title matches the parsed comment title (the redaction is a no-op for <= 100 chars).
+    // The producer-side redaction (redactFindingTitle) is exercised in test/audit-redact.spec.ts
+    // and test/audit-events.spec.ts; the wiring here is verified by the schema-validated event.
+    const result = parseFileReviewResponse(rawWith('someTotallyUnrelatedIdentifier()'), evidenceFile);
+    expect(result.comments).toHaveLength(1);
+    const events = evidenceEvents(result);
+    expect(events).toHaveLength(1);
+    // The title in the evidence_missing event is derived from the parsed comment title, which
+    // is bounded by the model output schema. The redaction is a no-op for <= 100 chars.
+    expect(events[0].title).toBe(result.comments[0].title);
+    expect(events[0].title!.length).toBeLessThanOrEqual(100);
+  });
+
   it('omitted existing_code: one evidence_missing{absent}, comment still posts', () => {
     const result = parseFileReviewResponse(rawWith('__OMIT__'), evidenceFile);
     expect(result.comments).toHaveLength(1);

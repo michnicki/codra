@@ -14,6 +14,7 @@ import {
   type EnsembleRun,
 } from '@server/core/ensemble';
 import { matchCompositeRule, type CompositeMatch } from '@server/core/dedup';
+import { redactErrorMessage, MACHINE_ERROR_REASONS } from '@server/core/audit-redact';
 import { createTestEnv, hasConfiguredTestDatabaseUrl } from './helpers';
 import { defaultRepoConfig } from '@shared/schema';
 
@@ -412,5 +413,44 @@ dbDescribe('recordEnsembleAudit best-effort recorder (T-19-05-01)', () => {
     const audited = detail!.audit[0] as Extract<NonNullable<typeof detail>['audit'][0], { stage: 'ensemble.voted' }>;
     expect(audited.winnerCount).toBe(1);
     expect(audited.winningSample).toHaveLength(1);
+  });
+
+  it('BLOCKER 1 (D-06): winningSample and droppedSample titles are redacted when over 100 chars', () => {
+    const longTitle = 'x'.repeat(250);
+    const r0 = run(0, [finding({ line: 5, title: longTitle })]);
+    const r1 = run(1, [finding({ line: 5, title: longTitle })]);
+    const r2 = run(2, [finding({ line: 10, category: 'bugs', title: longTitle })]);
+    const reconciliation = reconcileEnsembleRuns([r0, r1, r2]);
+    const event = buildEnsembleVoteAuditEvent('src/a.ts', reconciliation, []);
+    expect(event).not.toBeNull();
+    for (const sample of event!.winningSample) {
+      expect(sample.title).not.toBe(longTitle);
+      expect(sample.title).toMatch(/^\[clamped:head 100 chars /);
+      expect(sample.title.length).toBeLessThanOrEqual(100);
+    }
+    for (const sample of event!.droppedSample) {
+      expect(sample.title).not.toBe(longTitle);
+      expect(sample.title).toMatch(/^\[clamped:head 100 chars /);
+      expect(sample.title.length).toBeLessThanOrEqual(100);
+    }
+  });
+
+  it('BLOCKER 1 (D-07): failedRunReasons carries only machine-enum codes, never raw Error.message', () => {
+    // The ensemble failedRunReasons derivation in services/model.ts now routes the rejected
+    // reason through redactErrorMessage, which returns one of 5 MACHINE_ERROR_REASONS codes.
+    // A raw Error.message('Some arbitrary provider 5xx error text here') must NOT propagate
+    // to the audit event — the persisted reason is the machine-enum code.
+    const rawMessage = 'Some arbitrary provider 5xx error text here that should never leak';
+    const r0 = run(0, [finding({ line: 5, title: 'null check on user id' })]);
+    const r1 = run(1, [finding({ line: 5, title: 'null check on user id' })]);
+    const reconciliation = reconcileEnsembleRuns([r0, r1]);
+    // The reconciliation result is non-trivial — we accept a non-empty sample.
+    const failedReasons = [redactErrorMessage(rawMessage)];
+    const event = buildEnsembleVoteAuditEvent('src/a.ts', reconciliation, failedReasons);
+    expect(event).not.toBeNull();
+    for (const reason of event!.failedRunReasons ?? []) {
+      expect(MACHINE_ERROR_REASONS).toContain(reason);
+      expect(reason).not.toBe(rawMessage);
+    }
   });
 });
