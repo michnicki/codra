@@ -777,12 +777,15 @@ export function parseAnswerResponse(raw: string): string {
  * no JSON object found, schema mismatch on ALL three fields) so the caller can persist a
  * `status: 'failed'` enrichment row without poisoning finalize (D-17 fail-soft contract).
  */
+export type WalkthroughEnrichmentField = 'groups' | 'confidence' | 'effort';
+
 export type ParsedWalkthroughEnrichment =
   | {
       kind: 'parsed';
       groups: WalkthroughChangeGroup[];
       confidence: WalkthroughConfidence | null;
       effort: WalkthroughEffort | null;
+      malformedFields: readonly WalkthroughEnrichmentField[];
     }
   | { kind: 'fail_open'; reason: string };
 
@@ -825,43 +828,78 @@ export function parseWalkthroughEnrichmentResponse(raw: string): ParsedWalkthrou
 
   const obj = parsedJson as Record<string, unknown>;
 
-  // Independent field parsing (D-17): each optional field is validated independently so a malformed
-  // value drops ONLY that field. We never throw; safeParse returns success=false on shape mismatch.
+  // Phase 20 (D-05 reachability): independent field parsing with malformed-field provenance.
+  // Each optional field is validated independently so a malformed value drops ONLY that field
+  // (D-17). A field is marked 'malformed' ONLY when the model supplied it but it failed validation
+  // (or supplied it as the wrong shape, e.g. a non-array for `groups`). An absent field is NOT
+  // malformed — the operator only cares about fields the model claimed to emit. The provenance
+  // list is the durable signal the caller uses to derive 'completed' vs 'partial' status.
+  const malformedFields: WalkthroughEnrichmentField[] = [];
+
+  // groups: must be supplied as an array of objects. If the model supplied a non-array, the
+  // whole field is malformed. If an array was supplied and at least one item survived, the
+  // field is not malformed (a partial group list is still useful to the projection).
   let groups: WalkthroughChangeGroup[] = [];
-  if (Array.isArray(obj.groups)) {
-    const seen = new Set<unknown>();
-    const collected: WalkthroughChangeGroup[] = [];
-    for (const item of obj.groups) {
-      if (item && typeof item === 'object' && !seen.has(item)) {
-        seen.add(item);
-        const parsed = walkthroughChangeGroupSchema.safeParse(item);
-        if (parsed.success) {
-          collected.push(parsed.data);
+  if ('groups' in obj) {
+    if (Array.isArray(obj.groups)) {
+      const seen = new Set<unknown>();
+      const collected: WalkthroughChangeGroup[] = [];
+      for (const item of obj.groups) {
+        if (item && typeof item === 'object' && !seen.has(item)) {
+          seen.add(item);
+          const parsed = walkthroughChangeGroupSchema.safeParse(item);
+          if (parsed.success) {
+            collected.push(parsed.data);
+          }
         }
       }
+      groups = collected;
+      if (groups.length === 0) {
+        malformedFields.push('groups');
+      }
+    } else {
+      malformedFields.push('groups');
     }
-    groups = collected;
   }
 
+  // confidence: must be supplied as an object (so a non-object is malformed). Absent is fine.
   let confidence: WalkthroughConfidence | null = null;
-  if (obj.confidence && typeof obj.confidence === 'object' && !Array.isArray(obj.confidence)) {
-    const parsed = walkthroughConfidenceSchema.safeParse(obj.confidence);
-    if (parsed.success) confidence = parsed.data;
+  if ('confidence' in obj) {
+    if (obj.confidence && typeof obj.confidence === 'object' && !Array.isArray(obj.confidence)) {
+      const parsed = walkthroughConfidenceSchema.safeParse(obj.confidence);
+      if (parsed.success) {
+        confidence = parsed.data;
+      } else {
+        malformedFields.push('confidence');
+      }
+    } else {
+      malformedFields.push('confidence');
+    }
   }
 
+  // effort: same shape contract as confidence — must be an object when supplied.
   let effort: WalkthroughEffort | null = null;
-  if (obj.effort && typeof obj.effort === 'object' && !Array.isArray(obj.effort)) {
-    const parsed = walkthroughEffortSchema.safeParse(obj.effort);
-    if (parsed.success) effort = parsed.data;
+  if ('effort' in obj) {
+    if (obj.effort && typeof obj.effort === 'object' && !Array.isArray(obj.effort)) {
+      const parsed = walkthroughEffortSchema.safeParse(obj.effort);
+      if (parsed.success) {
+        effort = parsed.data;
+      } else {
+        malformedFields.push('effort');
+      }
+    } else {
+      malformedFields.push('effort');
+    }
   }
 
   // Whole-call fail_open if NO field survived validation — distinguishes "model emitted garbage"
   // (fail_open, status='failed') from "model emitted a partial result we should still try to use"
-  // (status='partial', only valid fields kept).
+  // (status='partial', only valid fields kept). Callers use malformedFields to derive 'completed'
+  // vs 'partial' on the parsed path.
   if (groups.length === 0 && confidence === null && effort === null) {
     return { kind: 'fail_open', reason: 'all_fields_invalid' };
   }
 
-  return { kind: 'parsed', groups, confidence, effort };
+  return { kind: 'parsed', groups, confidence, effort, malformedFields };
 }
 

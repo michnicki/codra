@@ -37,6 +37,10 @@ import { getFileReviewsForJobs } from '@server/db/file-reviews';
 import { NextPhaseError } from './next-phase-error';
 import { parseWalkthroughEnrichmentResponse } from './model-output';
 import {
+  buildWalkthroughEnrichmentAuditEvent,
+  recordWalkthroughAudit,
+} from './audit';
+import {
   walkthroughEnrichmentSchema,
   type RepoConfig,
   type WalkthroughEnrichment,
@@ -62,6 +66,28 @@ type MainReviewRow = {
 // hand-off so the durable chain keeps a uniform rhythm; the enrichment call is small (one
 // primary-only inference) and consumes a small fraction of the new invocation's budget.
 const ENRICHMENT_FRESH_INVOCATION_YIELD_SECONDS = 60;
+
+// Phase 20 (D-05 reviewer LOW #6): a local helper that consolidates persist + audit emission so
+// every terminal branch writes the durable blob AND emits exactly one bounded audit event. The
+// helper owns the throwable surface — it never rethrows (recordWalkthroughAudit is best-effort) so
+// a broken audit write can never fail the caller. The next-phase hand-off is the caller's
+// responsibility, the helper only owns the (persist, audit) pair.
+async function persistAndAudit(
+  env: AppBindings,
+  jobId: string,
+  persistence: Parameters<typeof setJobWalkthroughEnrichment>[2],
+  auditStatus: 'completed' | 'partial' | 'failed',
+  auditReason?: string,
+  auditGroupCount?: number,
+): Promise<void> {
+  await setJobWalkthroughEnrichment(env, jobId, persistence);
+  const event = buildWalkthroughEnrichmentAuditEvent(
+    auditStatus,
+    auditReason,
+    auditGroupCount,
+  );
+  await recordWalkthroughAudit(env, jobId, [event]);
+}
 
 // Phase 19 Plan 19-08 (PASS-03): run the walkthrough enrichment phase. Idempotent on re-entry —
 // a persisted `walkthrough_enrichment` blob means a prior invocation reached either 'completed',
@@ -101,11 +127,11 @@ export async function runWalkthroughEnrichmentPhase(params: {
     // No reviewed files means there is nothing to enrich. Persist a `status: 'failed'` blob so the
     // job detail surface can render a truthful "no files to enrich" reason without ambiguity. The
     // buildWalkthroughData projection treats this as no-op (no groups / no assessment).
-    await setJobWalkthroughEnrichment(env, job.id, {
+    await persistAndAudit(env, job.id, {
       version: 1,
       status: 'failed',
       reason: 'no_files_to_enrich',
-    });
+    }, 'failed', 'no_files_to_enrich');
     throw new NextPhaseError('finalize', ENRICHMENT_FRESH_INVOCATION_YIELD_SECONDS);
   }
 
@@ -139,11 +165,11 @@ export async function runWalkthroughEnrichmentPhase(params: {
       `Walkthrough enrichment model call failed for job ${job.id}; failing open (no groups / no assessment)`,
       error instanceof Error ? error : new Error(String(error)),
     );
-    await setJobWalkthroughEnrichment(env, job.id, {
+    await persistAndAudit(env, job.id, {
       version: 1,
       status: 'failed',
       reason: 'model_call_failed',
-    });
+    }, 'failed', 'model_call_failed');
     throw new NextPhaseError('finalize', ENRICHMENT_FRESH_INVOCATION_YIELD_SECONDS);
   }
 
@@ -153,6 +179,9 @@ export async function runWalkthroughEnrichmentPhase(params: {
   const parsed = parseWalkthroughEnrichmentResponse(response.rawText);
 
   let enrichment: WalkthroughEnrichment;
+  let auditStatus: 'completed' | 'partial' | 'failed';
+  let auditReason: string | undefined;
+  let auditGroupCount: number | undefined;
   if (parsed.kind === 'fail_open') {
     enrichment = {
       version: 1,
@@ -162,12 +191,19 @@ export async function runWalkthroughEnrichmentPhase(params: {
       inputTokens: response.inputTokens,
       outputTokens: response.outputTokens,
     };
+    auditStatus = 'failed';
+    auditReason = parsed.reason;
   } else {
-    // A partial result is one or more valid fields but not all three; status='partial' tells the
-    // durable surface the model emitted something usable. When every field survived (or some
-    // were null/missing by design), status='completed'. Empty groups array is fine — the
-    // projection appends every unassigned path to "Other changes" (D-16).
-    const completed = parsed.groups.length > 0 || parsed.confidence !== null || parsed.effort !== null;
+    // Phase 20 (D-05 reachability): use the parser's malformed-field provenance to derive
+    // status. Completed means every supplied field survived validation; partial means at least
+    // one supplied field was malformed but some valid fields survived. Empty groups array is
+    // fine — the projection appends every unassigned path to "Other changes" (D-16). The
+    // auditGroupCount is the parser's surviving group count (NOT the validated blob's), so a
+    // fully-validated completed run reports the same number the finalize projection will use.
+    const completed = parsed.malformedFields.length === 0;
+    auditStatus = completed ? 'completed' : 'partial';
+    auditReason = completed ? undefined : `parse_partial: ${parsed.malformedFields.join(',')}`;
+    auditGroupCount = parsed.groups.length > 0 ? parsed.groups.length : undefined;
     enrichment = {
       version: 1,
       status: completed ? 'completed' : 'partial',
@@ -189,20 +225,22 @@ export async function runWalkthroughEnrichmentPhase(params: {
       `Walkthrough enrichment blob failed schema validation for job ${job.id}; failing open`,
       validated.error,
     );
-    await setJobWalkthroughEnrichment(env, job.id, {
+    await persistAndAudit(env, job.id, {
       version: 1,
       status: 'failed',
       reason: 'schema_validation_failed',
-    });
+    }, 'failed', 'schema_validation_failed');
     throw new NextPhaseError('finalize', ENRICHMENT_FRESH_INVOCATION_YIELD_SECONDS);
   }
 
-  await setJobWalkthroughEnrichment(env, job.id, validated.data);
+  await persistAndAudit(env, job.id, validated.data, auditStatus, auditReason, auditGroupCount);
   logger.info(`Walkthrough enrichment persisted for job ${job.id}; transitioning to finalize.`, {
     status: validated.data.status,
     groups: validated.data.groups?.length ?? 0,
     hasConfidence: validated.data.confidence !== null,
     hasEffort: validated.data.effort !== null,
+    auditStatus,
+    auditGroupCount,
   });
 
   // Always hand off to finalize. Finalize performs ZERO enrichment model work — it reads the

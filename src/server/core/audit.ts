@@ -503,3 +503,77 @@ export async function recordCriticAudit(
     logger.warn(`Failed to record critic audit events for job ${jobId}`, error);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 20 (PASS-03 closure, D-04 / D-05) — bounded walkthrough-enrichment audit builder +
+// best-effort recorder.
+//
+// One bounded `walkthrough.enrichment` event per enabled walkthrough run. The status is
+// determined by the parser's preserved malformed-field provenance (D-17 / D-05 reachability):
+// `completed` when every supplied field survived; `partial` when at least one supplied field
+// was malformed; `failed` when the whole call failed open. groupCount is set only on completed
+// and partial runs (the projection's group count is the most operator-useful field).
+// ---------------------------------------------------------------------------
+
+export type WalkthroughEnrichmentAuditEvent = Extract<JobAuditEvent, { stage: 'walkthrough.enrichment' }>;
+
+/**
+ * PURE walkthrough-enrichment audit builder (D-04 / D-05). Derives ONE `walkthrough.enrichment`
+ * event from the per-run inputs. The result validates against the schema-authoritative
+ * `walkthrough.enrichment` arm of `jobAuditEventSchema` (no widening, no schema-side change).
+ *
+ * Status semantics:
+ *   - `completed` — every supplied field survived validation (no malformedFields from the parser).
+ *   - `partial`  — at least one supplied field was malformed; some valid fields survived.
+ *   - `failed`   — the whole call failed open (no valid fields survived); the reason is the
+ *                  machine-readable code from the parser.
+ *
+ * `groupCount` is set only on completed / partial runs (named when the projection has at least
+ * one valid group). On failed runs groupCount is omitted — the projection never groups a
+ * non-surviving payload.
+ */
+export function buildWalkthroughEnrichmentAuditEvent(
+  status: 'completed' | 'partial' | 'failed',
+  reason?: string,
+  groupCount?: number,
+): WalkthroughEnrichmentAuditEvent {
+  const event: WalkthroughEnrichmentAuditEvent = {
+    stage: 'walkthrough.enrichment',
+    status,
+    timestamp: new Date().toISOString(),
+  };
+  if (reason != null) (event as { reason?: string }).reason = reason;
+  if (groupCount != null && (status === 'completed' || status === 'partial')) {
+    (event as { groupCount?: number }).groupCount = groupCount;
+  }
+  return event;
+}
+
+/**
+ * Phase 20 (D-04): bounded best-effort recorder for the `walkthrough.enrichment` audit variant.
+ * Mirrors `recordEnsembleAudit` / `recordCriticAudit` EXACTLY: try/catch, defensive timestamp
+ * stamping, logs and NEVER rethrows. A broken walkthrough audit write must never fail the
+ * caller's review (D-13-03-04 carry-over posture — same contract as the other Phase-19
+ * recorders).
+ *
+ * The builder is pure and never short-circuits, so the recorder's empty-input fast path handles
+ * only the broken-DB case (empty inputs are a no-op, never produce an inert event row). The
+ * producer (core/walkthrough-enrichment.ts::runWalkthroughEnrichmentPhase) owns the privacy
+ * boundary — events only carry { status, reason?, groupCount? } machine-readable metadata, never
+ * raw findings / model payloads / provider response bodies.
+ */
+export async function recordWalkthroughAudit(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  events: JobAuditEvent[],
+): Promise<void> {
+  try {
+    if (events.length === 0) return; // nothing to append — never produce an inert event row.
+    const stamped = events.map((event) =>
+      event.timestamp ? event : { ...event, timestamp: new Date().toISOString() },
+    );
+    await appendJobAuditEvents(env, jobId, stamped);
+  } catch (error) {
+    logger.warn(`Failed to record walkthrough audit events for job ${jobId}`, error);
+  }
+}

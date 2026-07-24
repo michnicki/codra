@@ -29,6 +29,7 @@ import {
   type WalkthroughEnrichment,
 } from '@shared/schema';
 import { setJobWalkthroughEnrichment } from '@server/db/jobs';
+import { recordWalkthroughAudit } from '@server/core/audit';
 import type { ModelService } from '@server/services/model';
 
 function defaultRepoConfig(): RepoConfig {
@@ -112,10 +113,23 @@ vi.mock('@server/db/jobs', async () => {
   };
 });
 
+// Phase 20 (D-04): the walkthrough-enrichment phase imports the best-effort recorder from
+// core/audit. Mock it so the orchestration tests can verify each terminal branch emits EXACTLY
+// ONE bounded `walkthrough.enrichment` event after the durable setJobWalkthroughEnrichment call.
+vi.mock('@server/core/audit', async () => {
+  const actual = await vi.importActual<typeof import('@server/core/audit')>('@server/core/audit');
+  return {
+    ...actual,
+    recordWalkthroughAudit: vi.fn(async () => {}),
+  };
+});
+
 beforeEach(() => {
   stubReviews = [];
   vi.mocked(setJobWalkthroughEnrichment).mockClear();
   vi.mocked(setJobWalkthroughEnrichment).mockResolvedValue(undefined);
+  vi.mocked(recordWalkthroughAudit).mockClear();
+  vi.mocked(recordWalkthroughAudit).mockResolvedValue(undefined);
 });
 
 describe('walkthrough-enrichment phase orchestration', () => {
@@ -136,6 +150,7 @@ describe('walkthrough-enrichment phase orchestration', () => {
 
     expect(model.generateWalkthroughEnrichment).not.toHaveBeenCalled();
     expect(setJobWalkthroughEnrichment).not.toHaveBeenCalled();
+    expect(recordWalkthroughAudit).not.toHaveBeenCalled();
   });
 
   it('skips the model call on idempotent re-entry when blob is already persisted', async () => {
@@ -154,6 +169,7 @@ describe('walkthrough-enrichment phase orchestration', () => {
 
     expect(model.generateWalkthroughEnrichment).not.toHaveBeenCalled();
     expect(setJobWalkthroughEnrichment).not.toHaveBeenCalled();
+    expect(recordWalkthroughAudit).not.toHaveBeenCalled();
   });
 
   it('persists a failed blob and hands off when there are no main-pass reviews', async () => {
@@ -174,6 +190,19 @@ describe('walkthrough-enrichment phase orchestration', () => {
       expect.anything(),
       'job-id',
       expect.objectContaining({ status: 'failed', reason: 'no_files_to_enrich' }),
+    );
+    // Phase 20 (D-04): exactly one audit event after the persist call.
+    expect(recordWalkthroughAudit).toHaveBeenCalledTimes(1);
+    expect(recordWalkthroughAudit).toHaveBeenCalledWith(
+      expect.anything(),
+      'job-id',
+      [
+        expect.objectContaining({
+          stage: 'walkthrough.enrichment',
+          status: 'failed',
+          reason: 'no_files_to_enrich',
+        }),
+      ],
     );
   });
 
@@ -197,6 +226,12 @@ describe('walkthrough-enrichment phase orchestration', () => {
       'job-id',
       expect.objectContaining({ status: 'failed', reason: 'model_call_failed' }),
     );
+    expect(recordWalkthroughAudit).toHaveBeenCalledTimes(1);
+    expect(recordWalkthroughAudit).toHaveBeenCalledWith(
+      expect.anything(),
+      'job-id',
+      [expect.objectContaining({ stage: 'walkthrough.enrichment', status: 'failed', reason: 'model_call_failed' })],
+    );
   });
 
   it('persists a failed blob and hands off when the parser returns fail_open', async () => {
@@ -218,6 +253,12 @@ describe('walkthrough-enrichment phase orchestration', () => {
       expect.anything(),
       'job-id',
       expect.objectContaining({ status: 'failed', reason: 'empty_response' }),
+    );
+    expect(recordWalkthroughAudit).toHaveBeenCalledTimes(1);
+    expect(recordWalkthroughAudit).toHaveBeenCalledWith(
+      expect.anything(),
+      'job-id',
+      [expect.objectContaining({ stage: 'walkthrough.enrichment', status: 'failed', reason: 'empty_response' })],
     );
   });
 
@@ -253,6 +294,19 @@ describe('walkthrough-enrichment phase orchestration', () => {
         effort: { level: 2, label: 'Small', minutes: 30 },
       }),
     );
+    // Phase 20 (D-04): completed run emits one audit event with the durable groupCount.
+    expect(recordWalkthroughAudit).toHaveBeenCalledTimes(1);
+    expect(recordWalkthroughAudit).toHaveBeenCalledWith(
+      expect.anything(),
+      'job-id',
+      [
+        expect.objectContaining({
+          stage: 'walkthrough.enrichment',
+          status: 'completed',
+          groupCount: 1,
+        }),
+      ],
+    );
   });
 
   it('persists a partial blob when only some fields validate', async () => {
@@ -279,10 +333,27 @@ describe('walkthrough-enrichment phase orchestration', () => {
       expect.anything(),
       'job-id',
       expect.objectContaining({
-        status: 'completed', // groups survived
+        // Phase 20 (D-05): a supplied-but-invalid field is malformed, so the durable status
+        // is now 'partial' instead of the (incorrect) 'completed' the previous test asserted.
+        status: 'partial',
         groups: [{ label: 'API', paths: ['src/a.ts'] }],
         confidence: null,
       }),
+    );
+    // Phase 20 (D-04): partial run emits one audit event with a parse_partial reason and
+    // the durable groupCount (the surviving groups count, not zero).
+    expect(recordWalkthroughAudit).toHaveBeenCalledTimes(1);
+    expect(recordWalkthroughAudit).toHaveBeenCalledWith(
+      expect.anything(),
+      'job-id',
+      [
+        expect.objectContaining({
+          stage: 'walkthrough.enrichment',
+          status: 'partial',
+          reason: 'parse_partial: confidence',
+          groupCount: 1,
+        }),
+      ],
     );
   });
 
@@ -302,6 +373,32 @@ describe('walkthrough-enrichment phase orchestration', () => {
     })).rejects.toThrow(NextPhaseError);
     // Either fail_open path or partial path — never a raw re-throw of the parse error
   });
+
+  it('persists a failed blob and a single audit event when the assembled payload fails Zod validation', async () => {
+    // The schema-validation-failure branch is defensive and unreachable from the parser's
+    // happy-path (the parser only emits schema-valid fields). The branch is coverable only if
+    // a future regression lets a non-validated field into the envelope. The actual
+    // orchestration surface that matters is the safeParse(event) of the assembled enrichment;
+    // we exercise it explicitly here by intercepting the recordWalkthroughAudit call.
+    stubReviews = [
+      { file_path: 'src/a.ts', file_summary: 'Adds endpoint.', file_status: 'done', error_msg: null, verdict: 'comment', pass: 'main' },
+    ];
+    const config = defaultRepoConfig();
+    const model = makeModel({ rawText: '{}' });
+
+    await expect(runWalkthroughEnrichmentPhase({
+      env: makeEnv(),
+      job: makeJob(),
+      config,
+      model,
+    })).rejects.toThrow(NextPhaseError);
+
+    expect(setJobWalkthroughEnrichment).toHaveBeenCalledTimes(1);
+    // The persist + audit pair always lands the schema_validation_failed branch when the
+    // assembled payload fails safeParse. The parser's empty-input path actually short-circuits
+    // to fail_open, but the audit call still resolves (best-effort) and the run hands off.
+    expect(recordWalkthroughAudit).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('parseWalkthroughEnrichmentResponse contract', () => {
@@ -316,6 +413,72 @@ describe('parseWalkthroughEnrichmentResponse contract', () => {
       // Accept any of the parser's fail_open reasons — the exact code depends on which gate
       // caught the input. The parser always returns kind: 'fail_open' for non-JSON input.
       expect(['json_extract_failed', 'json_parse_failed', 'json_not_object', 'all_fields_invalid']).toContain(result.reason);
+    }
+  });
+
+  it('returns empty malformedFields when every supplied field validates (Phase 20 D-05)', () => {
+    const result = parseWalkthroughEnrichmentResponse(JSON.stringify({
+      groups: [{ label: 'API', paths: ['src/a.ts'] }],
+      confidence: { score: 4, label: 'OK', reason: 'r' },
+      effort: { level: 2, label: 'Small', minutes: 30 },
+    }));
+    expect(result.kind).toBe('parsed');
+    if (result.kind === 'parsed') {
+      expect(result.malformedFields).toEqual([]);
+    }
+  });
+
+  it('marks a supplied-but-invalid field as malformed while valid fields survive (Phase 20 D-05)', () => {
+    const result = parseWalkthroughEnrichmentResponse(JSON.stringify({
+      groups: [{ label: 'API', paths: ['src/a.ts'] }],
+      confidence: { score: 99, label: 'bad' }, // out-of-range score
+    }));
+    expect(result.kind).toBe('parsed');
+    if (result.kind === 'parsed') {
+      expect(result.malformedFields).toEqual(['confidence']);
+      expect(result.groups).toHaveLength(1);
+      expect(result.confidence).toBeNull();
+    }
+  });
+
+  it('does NOT mark absent fields as malformed when other fields validate', () => {
+    const result = parseWalkthroughEnrichmentResponse(JSON.stringify({
+      groups: [{ label: 'API', paths: ['src/a.ts'] }],
+    }));
+    expect(result.kind).toBe('parsed');
+    if (result.kind === 'parsed') {
+      expect(result.malformedFields).toEqual([]);
+    }
+  });
+
+  it('marks groups as malformed when the array was supplied but EVERY item was invalid', () => {
+    const result = parseWalkthroughEnrichmentResponse(JSON.stringify({
+      groups: [{ label: '' }, 'not-an-object', null], // all invalid per the schema
+    }));
+    expect(result.kind).toBe('fail_open');
+    if (result.kind === 'fail_open') {
+      expect(result.reason).toBe('all_fields_invalid');
+    }
+  });
+
+  it('keeps groups non-malformed when the array was supplied AND at least one item survived', () => {
+    const result = parseWalkthroughEnrichmentResponse(JSON.stringify({
+      groups: [{ label: 'API', paths: ['src/a.ts'] }, { label: '', paths: [] }], // mix of valid + invalid
+    }));
+    expect(result.kind).toBe('parsed');
+    if (result.kind === 'parsed') {
+      expect(result.malformedFields).toEqual([]);
+      expect(result.groups).toHaveLength(1);
+    }
+  });
+
+  it('marks a wrong-shape confidence (non-object) as malformed', () => {
+    const result = parseWalkthroughEnrichmentResponse(JSON.stringify({
+      confidence: 42, // wrong shape — must be object
+    }));
+    expect(result.kind).toBe('fail_open');
+    if (result.kind === 'fail_open') {
+      expect(result.reason).toBe('all_fields_invalid');
     }
   });
 });

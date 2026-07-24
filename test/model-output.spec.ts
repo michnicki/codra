@@ -1,4 +1,4 @@
-import { normalizeForEvidence, parseCriticPruneResponse, parseFileReviewResponse, parseWalkthroughDiagram } from '@server/core/model-output';
+import { normalizeForEvidence, parseCriticPruneResponse, parseFileReviewResponse, parseWalkthroughDiagram, parseWalkthroughEnrichmentResponse } from '@server/core/model-output';
 import { truncateFileDiff, type FileDiff } from '@server/core/diff';
 
 describe('Model Output Parsing Deep Dive', () => {
@@ -640,5 +640,100 @@ describe('parseCriticPruneResponse (D-05 ID-based prune contract)', () => {
 
   it('tolerates a jsonrepair-fixable trailing comma', () => {
     expect(parseCriticPruneResponse('{"prune":[{"id":1,"reason":"x"},]}')).toEqual([{ id: 1, reason: 'x' }]);
+  });
+});
+
+// Phase 20 (D-05 reachability): the walkthrough enrichment parser carries malformed-field
+// provenance from each field-validation gate. The parser's `parsed` variant reports
+// `malformedFields` so the phase can distinguish 'completed' (every supplied field survived)
+// from 'partial' (at least one supplied field was malformed). These tests pin that contract —
+// the orchestrator's status derivation depends on it.
+describe('parseWalkthroughEnrichmentResponse — Phase 20 D-05 malformedFields provenance', () => {
+  it('returns empty malformedFields when every supplied field validates', () => {
+    const result = parseWalkthroughEnrichmentResponse(JSON.stringify({
+      groups: [{ label: 'API', paths: ['src/a.ts'] }],
+      confidence: { score: 4, label: 'Looks good', reason: 'r' },
+      effort: { level: 2, label: 'Small', minutes: 30 },
+    }));
+    expect(result.kind).toBe('parsed');
+    if (result.kind === 'parsed') {
+      expect(result.malformedFields).toEqual([]);
+    }
+  });
+
+  it('marks a supplied-but-invalid confidence as malformed', () => {
+    const result = parseWalkthroughEnrichmentResponse(JSON.stringify({
+      groups: [{ label: 'API', paths: ['src/a.ts'] }],
+      confidence: { score: 99, label: 'bad' }, // out-of-range score
+    }));
+    expect(result.kind).toBe('parsed');
+    if (result.kind === 'parsed') {
+      expect(result.malformedFields).toEqual(['confidence']);
+      expect(result.groups).toHaveLength(1);
+      expect(result.confidence).toBeNull();
+    }
+  });
+
+  it('marks a supplied-but-invalid effort as malformed', () => {
+    const result = parseWalkthroughEnrichmentResponse(JSON.stringify({
+      groups: [{ label: 'API', paths: ['src/a.ts'] }],
+      effort: { level: 2, label: 'Small' }, // missing minutes
+    }));
+    expect(result.kind).toBe('parsed');
+    if (result.kind === 'parsed') {
+      expect(result.malformedFields).toEqual(['effort']);
+      expect(result.effort).toBeNull();
+    }
+  });
+
+  it('does NOT mark absent fields as malformed when other fields validate', () => {
+    const result = parseWalkthroughEnrichmentResponse(JSON.stringify({
+      groups: [{ label: 'API', paths: ['src/a.ts'] }],
+    }));
+    expect(result.kind).toBe('parsed');
+    if (result.kind === 'parsed') {
+      expect(result.malformedFields).toEqual([]);
+    }
+  });
+
+  it('keeps groups non-malformed when the array was supplied AND at least one item survived', () => {
+    const result = parseWalkthroughEnrichmentResponse(JSON.stringify({
+      groups: [
+        { label: 'API', paths: ['src/a.ts'] },
+        { label: '', paths: [] }, // invalid per the schema
+      ],
+    }));
+    expect(result.kind).toBe('parsed');
+    if (result.kind === 'parsed') {
+      expect(result.malformedFields).toEqual([]);
+      expect(result.groups).toHaveLength(1);
+    }
+  });
+
+  it('marks groups as malformed when the array was supplied but EVERY item was invalid', () => {
+    const result = parseWalkthroughEnrichmentResponse(JSON.stringify({
+      groups: [{ label: '' }, 'not-an-object', null], // all invalid
+    }));
+    expect(result.kind).toBe('fail_open');
+    if (result.kind === 'fail_open') {
+      expect(result.reason).toBe('all_fields_invalid');
+    }
+  });
+
+  it('marks a wrong-shape groups (non-array) as malformed', () => {
+    const result = parseWalkthroughEnrichmentResponse(JSON.stringify({
+      groups: 'not-an-array',
+    }));
+    expect(result.kind).toBe('fail_open');
+    if (result.kind === 'fail_open') {
+      expect(result.reason).toBe('all_fields_invalid');
+    }
+  });
+
+  it('returns fail_open on non-object root', () => {
+    expect(parseWalkthroughEnrichmentResponse('[1, 2, 3]')).toEqual({
+      kind: 'fail_open',
+      reason: 'json_not_object',
+    });
   });
 });

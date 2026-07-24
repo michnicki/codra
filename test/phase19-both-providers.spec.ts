@@ -157,6 +157,8 @@ describe('Phase 19 canonical degraded and partial outcomes', () => {
       groups: [{ label: 'Runtime', paths: ['src/app.ts'] }],
       confidence: null,
       effort: null,
+      // Phase 20 (D-05): malformed-field provenance is part of the parsed contract.
+      malformedFields: ['confidence', 'effort'],
     });
   });
 });
