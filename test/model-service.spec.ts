@@ -1071,10 +1071,17 @@ describe('ModelService.runFileWithEnsemble (PASS-02 / D-13)', () => {
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    const primaryBody = JSON.parse(String(fetchMock.mock.calls[0][1]?.body));
-    const extraBody = JSON.parse(String(fetchMock.mock.calls[1][1]?.body));
-    expect(primaryBody.generationConfig).not.toHaveProperty('temperature');
-    expect(extraBody.generationConfig.temperature).toBe(0.55);
+    // Inspect each call's body. The order of mock.calls is the order of fetch invocations
+    // (which may not match i=0 / i=1 if Promise.allSettled schedules them out of order). Sort
+    // the calls by the presence of the ensemble temperature to identify primary vs extra.
+    const callBodies = fetchMock.mock.calls.map((c) =>
+      JSON.parse(String(c[1]?.body)) as { generationConfig?: { temperature?: number } },
+    );
+    const primaryCall = callBodies.find((b) => !('temperature' in (b.generationConfig ?? {})));
+    const extraCall = callBodies.find((b) => 'temperature' in (b.generationConfig ?? {}));
+    expect(primaryCall).toBeDefined();
+    expect(extraCall).toBeDefined();
+    expect(extraCall!.generationConfig!.temperature).toBe(0.55);
   });
 
   it('a failed sample is recorded as { failed: true, reason } so the denominator removes it', async () => {

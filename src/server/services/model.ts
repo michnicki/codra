@@ -431,6 +431,10 @@ export class ModelService {
     pass?: 'main' | 'security';
     runs: number;
     ensembleTemperature?: number;
+    // Internal: when an inner reviewFile call returns, this method may need to know the
+    // per-sample temperature. The primary call leaves it undefined; extras receive
+    // `ensembleTemperature`. The field is set internally by the fan-out loop.
+    temperature?: number;
   }): Promise<{ runs: EnsembleRun[] }> {
     // Defensive: when runs=1, fall through to the scalar/async path so the existing reviewFile
     // contract is byte-identically preserved. The caller (review.ts) is the source of truth for
@@ -490,19 +494,15 @@ export class ModelService {
     const settled = await Promise.allSettled(
       Array.from({ length: params.runs }, async (_, i) => {
         const isPrimary = i === 0;
-        // For the primary, delete the temperature from the spread so the inner reviewFile
-        // receives NO temperature field at all (rather than `temperature: undefined`). The
-        // reviewFile path then leaves it undefined and the providers omit it from the request
-        // body. Explicit-undefined on the spread is also fine but the explicit delete makes
-        // the contract obvious.
-        const { temperature: _ignored, ...paramsWithoutTemperature } = params;
-        void _ignored;
-        return this.reviewFile({
-          ...paramsWithoutTemperature,
-          // D-13: only extras receive the ensemble temperature; the primary call uses its normal
-          // review settings (undefined preserves the existing per-adapter default).
-          ...(isPrimary ? {} : { temperature: params.ensembleTemperature }),
-        });
+        // D-13: only extras receive the ensemble temperature; the primary call uses its normal
+        // review settings (undefined preserves the existing per-adapter default). The primary
+        // call is therefore made WITHOUT a `temperature` field on its params object, so the
+        // providers' `input.temperature === undefined ? {} : { temperature: ... }` guards
+        // omit the field from the request body.
+        const reviewParams: typeof params = isPrimary
+          ? params
+          : { ...params, temperature: params.ensembleTemperature };
+        return this.reviewFile(reviewParams);
       }),
     );
 

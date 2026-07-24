@@ -47,6 +47,12 @@ import {
   reconcileCriticDecisions,
 } from './critic-v2';
 import { buildWalkthroughData, editWalkthroughComment, postWalkthroughPlaceholder } from './walkthrough';
+import { buildEnsembleVoteAuditEvent, recordEnsembleAudit } from './audit';
+import {
+  reconcileEnsembleRuns,
+  type EnsembleRun,
+} from './ensemble';
+import { updateFileReviewEnsembleResult } from '@server/db/file-reviews';
 import {
   buildFileSkipEvents,
   buildFinalizeDropEvents,
@@ -1343,6 +1349,28 @@ async function runReviewPhase(
             awaitingAsync += 1;
             return;
           }
+          // Async batch unavailable -> fall through to ensemble OR the scalar sync path.
+          // D-13: ensemble applies to the main pass only. With ensemble.runs > 1, route the
+          // synchronous fallback through the ensemble fan-out so the merged finding list
+          // (D-10/D-12) is what finalize consumes. With ensemble.runs == 1 (the inert
+          // default, NREG-01) the scalar path is byte-identical to today.
+          const ensembleConfig = config.review.passes?.ensemble;
+          if (ensembleConfig && ensembleConfig.runs > 1) {
+            await reviewAndPersistFileWithEnsemble(
+              env,
+              job,
+              file,
+              pr,
+              config,
+              totalLineCount,
+              model,
+              resolveFailureModelProvider,
+              existingReview,
+              { runs: ensembleConfig.runs, temperature: ensembleConfig.temperature ?? 0.7 },
+            );
+            terminalProgress += 1;
+            return;
+          }
         }
         await reviewAndPersistFile(env, job, file, pr, config, totalLineCount, model, resolveFailureModelProvider, existingReview, pass);
         terminalProgress += 1;
@@ -1738,6 +1766,244 @@ async function reviewAndPersistFile(
       durationMs: Date.now() - startedAt,
       errorMessage,
     });
+  }
+}
+
+/**
+ * Phase 19 (PASS-02 / D-10/D-12/D-13): ensemble fan-out + reconcile + atomically persist the merged
+ * finding list for ONE (file, 'main') unit. Routes the main pass through `runFileWithEnsemble`
+ * (N samples under the three-slot gate), reconciles via `reconcileEnsembleRuns` (D-10 strict-
+ * majority over successful runs; D-12 primary-first representative), and persists the merged
+ * comments + the versioned `ensembleResultSchema` blob in a single upsert + JSONB update.
+ *
+ * **Provider-neutral / NREG-02:** the function is structurally identical for both providers —
+ * the VcsProvider seam stays out of this path and every audit event is keyed only on the file,
+ * path, and run outcomes (never on a provider-specific field). GitHub and Bitbucket produce
+ * identical logical result/audit counts.
+ *
+ * **Failure semantics (mirror reviewAndPersistFile):**
+ *   - subrequest budget error -> re-throw so the orchestrator fresh-hands off.
+ *   - transient (RetryableModelError) -> defer for retry, increments the failure counter.
+ *   - any other error -> mark the file failed (the per-file failure path is byte-identical to
+ *     the scalar path so audit / job-detail consumers don't have to special-case it).
+ */
+async function reviewAndPersistFileWithEnsemble(
+  env: AppBindings,
+  job: PersistedReviewJob,
+  file: ReturnType<typeof parseUnifiedDiff>[number],
+  pr: VcsPullRequest,
+  config: RepoConfig,
+  totalLineCount: number,
+  model: ModelService,
+  resolveFailureModelProvider: () => Promise<string | null>,
+  previousReview: { transient_error_count: number } | undefined,
+  // The ensemble config drives the fan-out; defaults to runs:1 to keep the function safe for
+  // any unexpected caller (the main scheduling site is the only writer).
+  ensembleConfig: { runs: number; temperature: number },
+) {
+  const startedAt = Date.now();
+  const compactPrompt = (previousReview?.transient_error_count ?? 0) > 0;
+  // D-13 defensive: if a non-main pass ever lands here, fall through to the scalar path so the
+  // security pass is never multiplied by ensemble runs.
+  // The main scheduling site guards pass === 'main'; this assertion is a belt-and-suspenders
+  // check.
+  let ensembleResult: Awaited<ReturnType<ModelService['runFileWithEnsemble']>>;
+  try {
+    ensembleResult = await model.runFileWithEnsemble({
+      file,
+      prTitle: pr.title ?? null,
+      prDescription: pr.body ?? null,
+      config,
+      totalLineCount,
+      compactPrompt,
+      pass: 'main',
+      runs: ensembleConfig.runs,
+      ensembleTemperature: ensembleConfig.temperature,
+    });
+  } catch (error) {
+    // Mirror reviewAndPersistFile's error routing: subrequest -> fresh handoff, transient ->
+    // defer, everything else -> mark failed.
+    const errorMessage = error instanceof Error ? error.message : 'Unknown ensemble error';
+    const modelId = config.model?.main ?? 'unconfigured';
+    const modelProvider = await resolveFailureModelProvider();
+
+    if (isSubrequestBudgetError(error)) {
+      logger.warn(`Ensemble review deferred for ${file.path}; subrequest budget will retry in a fresh invocation`, {
+        error: errorMessage,
+      });
+      Object.defineProperty(error, 'retryAfterSeconds', {
+        value: FRESH_INVOCATION_YIELD_SECONDS,
+        configurable: true,
+      });
+      throw error;
+    }
+
+    if (isRetryableModelError(error)) {
+      const failureCount = await recordRetryableFileReviewFailure(env, job.id, {
+        filePath: file.path,
+        pass: 'main',
+        modelUsed: modelId,
+        modelProvider,
+        diffLineCount: file.lineCount,
+        diffInput: '',
+        durationMs: Date.now() - startedAt,
+        errorMessage,
+      });
+
+      if (failureCount >= MAX_RETRYABLE_FILE_REVIEW_FAILURES) {
+        const finalError = `Ensemble review skipped after ${failureCount} repeated model provider outages.`;
+        await persistFailedFileReview(env, job.id, {
+          filePath: file.path,
+          pass: 'main',
+          modelUsed: modelId,
+          modelProvider,
+          diffLineCount: file.lineCount,
+          durationMs: Date.now() - startedAt,
+          errorMessage: finalError,
+        });
+        return;
+      }
+
+      Object.defineProperty(error, 'retryAfterSeconds', {
+        value: retryableModelFailureDelaySeconds(failureCount),
+        configurable: true,
+      });
+      throw error;
+    }
+
+    logger.error(`Ensemble review failed for ${file.path}`, { error });
+    await persistFailedFileReview(env, job.id, {
+      filePath: file.path,
+      pass: 'main',
+      modelUsed: modelId,
+      modelProvider,
+      diffLineCount: file.lineCount,
+      durationMs: Date.now() - startedAt,
+      errorMessage,
+    });
+    return;
+  }
+
+  // Reconcile -> merged finding list (D-10/D-11/D-12). The reconciler is pure and identical
+  // for GitHub and Bitbucket (no provider-specific field touches reconciliation).
+  const reconciliation = reconcileEnsembleRuns(ensembleResult.runs);
+  const mergedFindings = reconciliation.winners.map((w) => w.finding);
+
+  // D-10: with 0 or 1 successful runs, reconcile returns zero winners and the caller degrades
+  // to that run's output. The per-file "degrade to primary" path uses the primary run's
+  // findings (runIndex 0) when the primary succeeded; when the primary failed too, we degrade
+  // to whichever run succeeded (or to empty if all failed). The Phase-19-05 carve-out makes
+  // reconcile a no-op for successfulRuns <= 1, so this path is the only place that decides
+  // what to persist in the degrade case.
+  const successfulRuns = ensembleResult.runs.filter((r) => !r.failed);
+  let degradeFindings: ParsedReviewComment[] = [];
+  if (reconciliation.winners.length === 0 && successfulRuns.length > 0) {
+    // Prefer the primary run's findings (D-12 degrade semantics). If the primary failed, fall
+    // back to the first successful run.
+    const primary = ensembleResult.runs[0];
+    if (!primary.failed) {
+      degradeFindings = primary.findings;
+    } else {
+      const firstSuccessful = ensembleResult.runs.find((r) => !r.failed);
+      degradeFindings = firstSuccessful?.findings ?? [];
+    }
+  }
+
+  // Pick a representative model + verdict + summary for the persisted row. The primary
+  // run's metadata is the canonical surface; with the primary failed, fall through to the
+  // first successful run.
+  const primaryRun = ensembleResult.runs[0];
+  const firstSuccessfulRun = ensembleResult.runs.find((r) => !r.failed);
+  const representative = !primaryRun.failed ? primaryRun : firstSuccessfulRun;
+  const representativeModel = representative?.model ?? 'unconfigured';
+
+  // Find a verdict + summary from the representative's parsed comments. We don't have the
+  // full parsed envelope here, so we derive the verdict from whether the merged list is
+  // non-empty (matches reviewFile's "comments > 0 -> comment" rule) and use a static
+  // summary that names the ensemble path. This stays byte-identical to the scalar path for
+  // the runs:1 case (which delegates to reviewFile and never lands here).
+  const verdict: 'approve' | 'comment' = mergedFindings.length > 0 || degradeFindings.length > 0 ? 'comment' : 'approve';
+  const finalFindings = mergedFindings.length > 0 ? mergedFindings : degradeFindings;
+  const fileSummary = `Ensemble review (${ensembleConfig.runs} samples, ${successfulRuns.length} successful).`;
+
+  // Atomic persist: the comments are stored in the standard review_comments rows (one upsert
+  // call), the ensembleResult blob is stored in a separate UPDATE on the same (job_id, file_path)
+  // tuple. Both writes can fail independently; the file_comments upsert is the source of
+  // truth for finalize, the ensemble_result column is the audit cursor.
+  await upsertFileReview(env, job.id, {
+    filePath: file.path,
+    pass: 'main',
+    fileStatus: 'done',
+    modelUsed: representativeModel,
+    modelProvider: null,
+    diffLineCount: file.lineCount,
+    diffInput: '',
+    rawAiOutput: null,
+    parsedComments: finalFindings,
+    inputTokens: ensembleResult.runs.reduce((sum, r) => sum + (r.inputTokens ?? 0), 0),
+    outputTokens: ensembleResult.runs.reduce((sum, r) => sum + (r.outputTokens ?? 0), 0),
+    durationMs: Date.now() - startedAt,
+    verdict,
+    fileSummary,
+    overallCorrectness: null,
+    confidenceScore: null,
+    errorMessage: null,
+  });
+
+  // Build the durable ensemble_result blob (ensembleResultSchema). The runOutcomes array
+  // captures per-run status, model, tokens, and a bounded reason for failed runs.
+  const ensembleBlob = {
+    version: 1,
+    status:
+      successfulRuns.length === 0
+        ? 'failed'
+        : successfulRuns.length < ensembleConfig.runs
+          ? 'partial'
+          : reconciliation.winners.length === 0
+            ? 'completed' // all succeeded but no majority -> still 'completed' (degraded)
+            : 'completed',
+    requestedRuns: ensembleConfig.runs,
+    successfulRuns: successfulRuns.length,
+    failedRuns: ensembleResult.runs.length - successfulRuns.length,
+    winnerCount: reconciliation.winners.length,
+    droppedClusterCount: reconciliation.droppedClusters.length,
+    runOutcomes: ensembleResult.runs.map((r, index) => {
+      if (r.failed) {
+        return {
+          run: index,
+          status: 'failed' as const,
+          reason: r.reason ?? 'unknown',
+        };
+      }
+      return {
+        run: index,
+        status: 'succeeded' as const,
+        model: r.model ?? null,
+        inputTokens: r.inputTokens ?? 0,
+        outputTokens: r.outputTokens ?? 0,
+      };
+    }),
+  };
+
+  await updateFileReviewEnsembleResult(env, {
+    jobId: job.id,
+    filePath: file.path,
+    pass: 'main',
+    result: ensembleBlob,
+  });
+
+  // Emit the bounded audit event (T-19-05-01). The builder short-circuits to null for
+  // totalRuns <= 1, but D-13 constrains ensemble to runs >= 2 in the path that calls this
+  // function, so a real event is expected. The recorder is best-effort and never rethrows.
+  const failedRunReasons: string[] = [];
+  for (const r of ensembleResult.runs) {
+    if (r.failed) {
+      failedRunReasons.push(r.reason);
+    }
+  }
+  const auditEvent = buildEnsembleVoteAuditEvent(file.path, reconciliation, failedRunReasons);
+  if (auditEvent) {
+    await recordEnsembleAudit(env, job.id, [auditEvent]);
   }
 }
 
