@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -24,6 +24,7 @@ function getPhase19Schema(name: string): SchemaLike {
   return candidate as SchemaLike;
 }
 
+const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const migrationPath = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   '../db/migrations/013_phase19_durable_results.sql',
@@ -276,5 +277,26 @@ dbDescribe('migration 013_phase19_durable_results is idempotent', () => {
         data_type: 'jsonb',
       },
     ]);
+  });
+});
+
+describe('Phase-19 durable-result ownership and read-path closure', () => {
+  it('keeps migration 013 singular after all Phase-19 plans', () => {
+    const migrationsDir = path.resolve(rootDir, 'db/migrations');
+    const phase19Migrations = readdirSync(migrationsDir)
+      .filter((name) => /^013_.*\.sql$/.test(name));
+    expect(phase19Migrations).toEqual(['013_phase19_durable_results.sql']);
+  });
+
+  it('keeps all three nullable JSONB columns mapped through fail-soft read paths', () => {
+    const jobsSource = readFileSync(path.resolve(rootDir, 'src/server/db/jobs.ts'), 'utf8');
+    const fileReviewsSource = readFileSync(path.resolve(rootDir, 'src/server/db/file-reviews.ts'), 'utf8');
+
+    expect(jobsSource).toContain('thread_verifications');
+    expect(jobsSource).toContain('walkthrough_enrichment');
+    expect(jobsSource).toMatch(/threadVerificationsSchema\.safeParse/);
+    expect(jobsSource).toMatch(/walkthroughEnrichmentSchema\.safeParse/);
+    expect(fileReviewsSource).toContain('ensemble_result');
+    expect(fileReviewsSource).toMatch(/ensembleResultSchema\.safeParse/);
   });
 });

@@ -1,4 +1,4 @@
-import type { FileReviewPass, ParsedReviewComment } from '@shared/schema';
+import { ensembleResultSchema, type FileReviewPass, type ParsedReviewComment } from '@shared/schema';
 import type { AppBindings } from '@server/env';
 import { parseJsonColumn, queryRows, queryTransaction } from './client';
 
@@ -512,8 +512,17 @@ export async function getFileReviewsForJobs(env: Pick<AppBindings, 'HYPERDRIVE'>
     [jobIds],
   );
 
-  return rows.map((row) => ({
-    ...row,
-    parsed_comments: parseJsonColumn(row.parsed_comments, []),
-  }));
+  return rows.map((row) => {
+    const rawEnsembleResult = parseJsonColumn<unknown>(row.ensemble_result, null);
+    const ensembleParsed = rawEnsembleResult === null
+      ? null
+      : ensembleResultSchema.safeParse(rawEnsembleResult);
+    return {
+      ...row,
+      parsed_comments: parseJsonColumn(row.parsed_comments, []),
+      // A malformed durable ensemble cursor must not poison the file-review list; the reconciler
+      // can treat null as an absent cursor and recover from the persisted comments row.
+      ensemble_result: ensembleParsed?.success ? ensembleParsed.data : null,
+    };
+  });
 }
