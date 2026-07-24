@@ -555,6 +555,7 @@ export const walkthroughChangeGroupSchema = z
     paths: z.array(z.string().min(1).max(1_024)).max(150),
   })
   .passthrough();
+export type WalkthroughChangeGroup = z.infer<typeof walkthroughChangeGroupSchema>;
 
 export const walkthroughConfidenceSchema = z
   .object({
@@ -563,6 +564,7 @@ export const walkthroughConfidenceSchema = z
     reason: phase19MachineReasonSchema,
   })
   .passthrough();
+export type WalkthroughConfidence = z.infer<typeof walkthroughConfidenceSchema>;
 
 export const walkthroughEffortSchema = z
   .object({
@@ -571,6 +573,7 @@ export const walkthroughEffortSchema = z
     minutes: z.number().int().nonnegative().max(10_080),
   })
   .passthrough();
+export type WalkthroughEffort = z.infer<typeof walkthroughEffortSchema>;
 
 // Persist only validated enrichment metadata. Each optional field is independently nullable/absent
 // so a tolerant parser can preserve valid groups when confidence or effort is malformed (D-17).

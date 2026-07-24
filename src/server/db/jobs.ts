@@ -8,10 +8,12 @@ import {
   jobSummarySchema,
   repoConfigSchema,
   threadVerificationsSchema,
+  walkthroughEnrichmentSchema,
   type CriticResult,
   type JobAuditEvent,
   type RepoConfig,
   type ThreadVerifications,
+  type WalkthroughEnrichment,
 } from '@shared/schema';
 import { logger } from '@server/core/logger';
 import { getOrCreateRepository } from './repositories';
@@ -79,6 +81,11 @@ export type JobRow = {
   // validated fail-soft in mapJob so malformed external/model-derived data degrades only the
   // threadVerification field, never the job summary, lease claim, or detail response.
   thread_verifications: ThreadVerifications | string | null;
+  // Phase 19 (migration 013, PASS-03): durable walkthrough enrichment metadata. The JSONB value
+  // mirrors walkthroughEnrichmentSchema (status + optional groups/confidence/effort + reason +
+  // token accounting). Validated fail-soft in mapJob so a malformed JSONB blob degrades only the
+  // walkthroughEnrichment field — the durable completeJob write and post are unaffected.
+  walkthrough_enrichment: WalkthroughEnrichment | string | null;
   // Phase 11 (migration 009, REVIEW: Codex 11-05 HIGH): durable review-rest scope. Both NULLABLE and
   // NOT written by insertJob's explicit column list unless a caller supplies them, so every existing
   // insert reads them back as null (behaviorally inert, NREG-01). review_scope mirrors
@@ -216,6 +223,22 @@ export function mapJob(row: JobRow) {
     }
   }
 
+  // Phase 19 Plan 19-08 (PASS-03): independent fail-soft parse of walkthrough_enrichment. Mirrors
+  // the thread_verifications boundary above — malformed JSONB degrades only the
+  // walkthroughEnrichment field, never the job summary, lease claim, or detail response.
+  const rawWalkthroughEnrichment = parseJsonColumn<unknown>(row.walkthrough_enrichment, null);
+  const enrichmentParsed = rawWalkthroughEnrichment === null
+    ? null
+    : walkthroughEnrichmentSchema.safeParse(rawWalkthroughEnrichment);
+  let walkthroughEnrichment: WalkthroughEnrichment | null = null;
+  if (enrichmentParsed !== null) {
+    if (enrichmentParsed.success) {
+      walkthroughEnrichment = enrichmentParsed.data;
+    } else {
+      logger.warn(`Ignoring unparseable walkthrough_enrichment for job ${row.id}`);
+    }
+  }
+
   return jobSummarySchema.parse({
     id: row.id,
     owner: row.owner,
@@ -268,6 +291,9 @@ export function mapJob(row: JobRow) {
     // Phase 19: publish only the independently validated thread result. Malformed JSONB has already
     // degraded to null above and cannot poison the strict jobSummarySchema parse.
     threadVerification,
+    // Phase 19 Plan 19-08 (PASS-03): publish only the independently validated enrichment result.
+    // Malformed JSONB has already degraded to null above and cannot poison jobSummarySchema parse.
+    walkthroughEnrichment,
     // Phase 11: surface the migration-009 review-rest scope columns. Both are null on every existing
     // insert (no writer supplies them) -- additive, behaviorally inert (NREG-01).
     reviewScope: row.review_scope,
@@ -1384,6 +1410,27 @@ export async function setJobThreadVerifications(
     env,
     `UPDATE jobs SET thread_verifications = $2::jsonb WHERE id = $1`,
     [jobId, threadVerifications === null ? null : JSON.stringify(threadVerifications)],
+  );
+}
+
+/**
+ * Phase 19 Plan 19-08 (PASS-03): persist the walkthrough enrichment metadata as one JSONB value.
+ * The caller writes once per job when the enrichment phase completes (or fails) so finalize can
+ * merge the validated groups / confidence / effort onto WalkthroughData without re-calling the
+ * model. Mirrors setJobThreadVerifications' parameterized JSONB binding so external identifiers
+ * and model-derived labels never enter SQL text. Fail-soft trust boundary: mapJob re-validates the
+ * blob with walkthroughEnrichmentSchema.safeParse on every read so a malformed value degrades to
+ * null without poisoning the job summary.
+ */
+export async function setJobWalkthroughEnrichment(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  enrichment: WalkthroughEnrichment | null,
+): Promise<void> {
+  await queryRows(
+    env,
+    `UPDATE jobs SET walkthrough_enrichment = $2::jsonb WHERE id = $1`,
+    [jobId, enrichment === null ? null : JSON.stringify(enrichment)],
   );
 }
 

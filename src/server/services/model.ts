@@ -8,6 +8,7 @@ import { buildSecurityReviewPrompts } from '../prompts/security-review';
 import { buildCriticPrompts, type CriticCandidateFinding } from '../prompts/critic';
 import { buildSummaryPrompt, SUMMARY_SYSTEM_PROMPT } from '../prompts/summary';
 import { WALKTHROUGH_DIAGRAM_SYSTEM_PROMPT, buildWalkthroughDiagramPrompt } from '../prompts/walkthrough-diagram';
+import { WALKTHROUGH_ENRICHMENT_SYSTEM_PROMPT, buildWalkthroughEnrichmentPrompt, type EnrichmentFileEntry } from '../prompts/walkthrough-enrichment';
 import { parseFileReviewResponse, parseAnswerResponse } from '../core/model-output';
 import { truncateFileDiff, chunkFileDiff, type FileDiff } from '../core/diff';
 import type { RepoConfig } from '@shared/schema';
@@ -1203,6 +1204,47 @@ export class ModelService {
           prTitle: params.prTitle,
           files: params.files,
           fileSummaries: params.fileSummaries,
+        }),
+      },
+      adaptiveModelTimeoutMs(0),
+    );
+
+    if (this.tracker) {
+      this.tracker.record(response.modelUsed, response.inputTokens, response.outputTokens);
+    }
+
+    return response;
+  }
+
+  /**
+   * Phase 19 Plan 19-08 (PASS-03, D-14..D-18): the walkthrough enrichment model call. Generates a
+   * groups + confidence + effort assessment for the reviewed files. Mirrors generateWalkthroughDiagram
+   * in shape: it makes EXACTLY ONE outbound request (primary model only) so the enrichment phase
+   * stays inside the per-invocation subrequest budget (PASS-03 / D-13). The caller parses the raw
+   * text with parseWalkthroughEnrichmentResponse (tolerant, independent per-field validation)
+   * and persists the validated payload via setJobWalkthroughEnrichment. May throw on a transient
+   * provider failure; the runWalkthroughEnrichmentPhase caller wraps it in a best-effort try/catch
+   * and degrades to a `status: 'failed'` enrichment row (D-17 fail-open contract).
+   */
+  async generateWalkthroughEnrichment(params: {
+    prTitle: string | null;
+    files: EnrichmentFileEntry[];
+    config: RepoConfig;
+  }): Promise<ModelResponse> {
+    // Primary model ONLY — deliberately NOT `[primary, ...fallbacks]`. One outbound request. The
+    // enrichment runs AFTER critic on its own fresh invocation; widening to a fallback chain would
+    // multiply the subrequest cost (D-13). A transient failure degrades to a `status: 'failed'`
+    // row so finalize still posts the deterministic coverage walkthrough.
+    const { primary } = this.selectModel({ totalLineCount: 0, config: params.config });
+    const resolved = await this.resolveModel(primary);
+
+    const response = await this.callResolvedModel(
+      resolved,
+      {
+        systemPrompt: WALKTHROUGH_ENRICHMENT_SYSTEM_PROMPT,
+        userPrompt: buildWalkthroughEnrichmentPrompt({
+          prTitle: params.prTitle,
+          files: params.files,
         }),
       },
       adaptiveModelTimeoutMs(0),

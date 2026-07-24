@@ -1,4 +1,18 @@
-import { criticPruneOutputSchema, fileReviewModelOutputSchema, parsedReviewCommentSchema, summaryModelOutputSchema, type ParsedReviewComment, type JobAuditEvent, reviewSeverities } from '@shared/schema';
+import {
+  criticPruneOutputSchema,
+  fileReviewModelOutputSchema,
+  parsedReviewCommentSchema,
+  summaryModelOutputSchema,
+  walkthroughChangeGroupSchema,
+  walkthroughConfidenceSchema,
+  walkthroughEffortSchema,
+  type ParsedReviewComment,
+  type JobAuditEvent,
+  type WalkthroughChangeGroup,
+  type WalkthroughConfidence,
+  type WalkthroughEffort,
+  reviewSeverities,
+} from '@shared/schema';
 import { z } from 'zod';
 import { logger } from './logger';
 import { applySeverityRules } from './severity';
@@ -752,3 +766,102 @@ export function parseAnswerResponse(raw: string): string {
     return raw.trim() || 'I was unable to produce an answer for this question.';
   }
 }
+
+/**
+ * Phase 19 Plan 19-08 (PASS-03, D-17): tolerant parse of the walkthrough enrichment response.
+ * Returns the parsed groups / confidence / effort fields INDEPENDENTLY — a malformed group list
+ * drops only groups; a malformed confidence drops only confidence; a malformed effort drops only
+ * effort. The caller always receives a structured result and decides what to persist.
+ *
+ * Never throws. The {kind: 'fail_open'} variant signals a whole-call parse failure (empty input,
+ * no JSON object found, schema mismatch on ALL three fields) so the caller can persist a
+ * `status: 'failed'` enrichment row without poisoning finalize (D-17 fail-soft contract).
+ */
+export type ParsedWalkthroughEnrichment =
+  | {
+      kind: 'parsed';
+      groups: WalkthroughChangeGroup[];
+      confidence: WalkthroughConfidence | null;
+      effort: WalkthroughEffort | null;
+    }
+  | { kind: 'fail_open'; reason: string };
+
+export function parseWalkthroughEnrichmentResponse(raw: string): ParsedWalkthroughEnrichment {
+  if (typeof raw !== 'string' || raw.trim().length === 0) {
+    return { kind: 'fail_open', reason: 'empty_response' };
+  }
+
+  // Strip <think>...</think> reasoning (tolerant of a missing close tag) before extraction — mirrors
+  // parseWalkthroughDiagram / parseCriticPruneResponse. Reasoning text can contain JSON-looking
+  // fragments that would confuse the brace-scoring extractor.
+  const stripped = raw
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<think>[\s\S]*$/i, '');
+
+  let extracted: string;
+  try {
+    extracted = extractJson(stripped);
+  } catch {
+    return { kind: 'fail_open', reason: 'json_extract_failed' };
+  }
+
+  let repaired = extracted;
+  try {
+    repaired = jsonrepair(preprocessJson(extracted));
+  } catch {
+    // Fall back to the raw extracted text; the JSON.parse below is the final gate.
+  }
+
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(repaired);
+  } catch {
+    return { kind: 'fail_open', reason: 'json_parse_failed' };
+  }
+
+  if (!parsedJson || typeof parsedJson !== 'object' || Array.isArray(parsedJson)) {
+    return { kind: 'fail_open', reason: 'json_not_object' };
+  }
+
+  const obj = parsedJson as Record<string, unknown>;
+
+  // Independent field parsing (D-17): each optional field is validated independently so a malformed
+  // value drops ONLY that field. We never throw; safeParse returns success=false on shape mismatch.
+  let groups: WalkthroughChangeGroup[] = [];
+  if (Array.isArray(obj.groups)) {
+    const seen = new Set<unknown>();
+    const collected: WalkthroughChangeGroup[] = [];
+    for (const item of obj.groups) {
+      if (item && typeof item === 'object' && !seen.has(item)) {
+        seen.add(item);
+        const parsed = walkthroughChangeGroupSchema.safeParse(item);
+        if (parsed.success) {
+          collected.push(parsed.data);
+        }
+      }
+    }
+    groups = collected;
+  }
+
+  let confidence: WalkthroughConfidence | null = null;
+  if (obj.confidence && typeof obj.confidence === 'object' && !Array.isArray(obj.confidence)) {
+    const parsed = walkthroughConfidenceSchema.safeParse(obj.confidence);
+    if (parsed.success) confidence = parsed.data;
+  }
+
+  let effort: WalkthroughEffort | null = null;
+  if (obj.effort && typeof obj.effort === 'object' && !Array.isArray(obj.effort)) {
+    const parsed = walkthroughEffortSchema.safeParse(obj.effort);
+    if (parsed.success) effort = parsed.data;
+  }
+
+  // Whole-call fail_open if NO field survived validation — distinguishes "model emitted garbage"
+  // (fail_open, status='failed') from "model emitted a partial result we should still try to use"
+  // (status='partial', only valid fields kept).
+  if (groups.length === 0 && confidence === null && effort === null) {
+    return { kind: 'fail_open', reason: 'all_fields_invalid' };
+  }
+
+  return { kind: 'parsed', groups, confidence, effort };
+}
+
