@@ -542,9 +542,11 @@ export function buildWalkthroughEnrichmentAuditEvent(
     status,
     timestamp: new Date().toISOString(),
   };
-  if (reason != null) (event as { reason?: string }).reason = reason;
+  // The schema-derived `WalkthroughEnrichmentAuditEvent` type already declares `reason` and
+  // `groupCount` as optional fields, so direct assignment is type-safe — no cast needed (WR-03).
+  if (reason != null) event.reason = reason;
   if (groupCount != null && (status === 'completed' || status === 'partial')) {
-    (event as { groupCount?: number }).groupCount = groupCount;
+    event.groupCount = groupCount;
   }
   return event;
 }
