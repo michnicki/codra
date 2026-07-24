@@ -136,36 +136,28 @@ describe('verify-fixes unverifiable reasons', () => {
   });
 
   it('classifies deleted, malformed, fetch-failed, and outdated as unverifiable', () => {
-    for (const reason of VERIFY_FIXES_UNVERIFIABLE_REASONS) {
-      expect(classifyVerifyFixesVerdict({
+    // Each data-quality flag produces a SPECIFIC machine reason (D-01/D-04). A loop with constant
+    // input cannot satisfy `.toEqual({ verdict, reason })` across a multi-element vocabulary -- the
+    // function is pure and returns one reason per call. Test each condition with the expected reason
+    // and assert the vocabulary contains every emitted reason.
+    const cases = [
+      { flags: { deletedAtHead: true }, expectedReason: 'file_deleted_at_head' },
+      { flags: { fetchFailed: true }, expectedReason: 'file_fetch_failed' },
+      { flags: { malformedOutput: true }, expectedReason: 'malformed_model_output' },
+      { flags: { outdated: true }, expectedReason: 'thread_outdated' },
+    ];
+    for (const { flags, expectedReason } of cases) {
+      const result = classifyVerifyFixesVerdict({
         modelVerdict: 'unknown',
         fetchFailed: false,
-        deletedAtHead: true,
+        deletedAtHead: false,
         malformedOutput: false,
         outdated: false,
-      })).toEqual({ verdict: 'unverifiable', reason });
+        ...flags,
+      });
+      expect(result).toEqual({ verdict: 'unverifiable', reason: expectedReason });
+      expect(VERIFY_FIXES_UNVERIFIABLE_REASONS).toContain(result.reason);
     }
-    expect(classifyVerifyFixesVerdict({
-      modelVerdict: 'unknown',
-      fetchFailed: true,
-      deletedAtHead: false,
-      malformedOutput: false,
-      outdated: false,
-    }).verdict).toBe('unverifiable');
-    expect(classifyVerifyFixesVerdict({
-      modelVerdict: 'unknown',
-      fetchFailed: false,
-      deletedAtHead: false,
-      malformedOutput: true,
-      outdated: false,
-    }).verdict).toBe('unverifiable');
-    expect(classifyVerifyFixesVerdict({
-      modelVerdict: 'unknown',
-      fetchFailed: false,
-      deletedAtHead: false,
-      malformedOutput: false,
-      outdated: true,
-    }).verdict).toBe('unverifiable');
   });
 
   it('uses the explicit fixed verdict when the model returns fixed and the data is sound', () => {

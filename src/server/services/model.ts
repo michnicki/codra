@@ -918,6 +918,113 @@ export class ModelService {
   }
 
   /**
+   * Phase 19 verify-fixes (THR-01 / THR-02): the provider-neutral seam the verify-fixes phase uses
+   * to grade every unresolved bot thread against current head content. The method accepts the
+   * caller-built system + user prompts (built by `prompts/verify-fixes.ts`) and returns the raw
+   * model response for `core/verify-fixes.ts` to parse in code.
+   *
+   * Mirrors `critiqueFindings` / `answerPrQuestion`'s fallback-chain + RetryableModelError
+   * discipline (a transient failure across the whole chain defers rather than wedges), with one
+   * verify-fixes-specific property:
+   *   - `applySizeOverrides: false` (D-04). Verification grades a thread SET, not a sized file;
+   *     with overrides applied, selectModel({ totalLineCount: 0 }) would match the FIRST
+   *     positive size override instead of using model.main.
+   *   - `temperature` is OPTIONAL: when supplied (the verify-fixes default), it forwards to every
+   *     provider adapter via callResolvedModel; when absent the provider's own default is used.
+   *     Phase 19 keeps verification at the same default as the main review so a model configured
+   *     for low-temperature review also verifies at low temperature.
+   *
+   * The call site (runVerifyFixesPhase) catches and degrades each call's exception to one
+   * unverifiable entry per batch thread -- this method does NOT swallow errors itself so the
+   * caller can record `malformedOutput=true` on the batch's classify call.
+   */
+  async callVerifierRaw(params: {
+    systemPrompt: string;
+    userPrompt: string;
+    temperature?: number;
+    config: RepoConfig;
+  }): Promise<{
+    rawText: string;
+    modelUsed: string;
+    inputTokens: number;
+    outputTokens: number;
+  }> {
+    const { primary, fallbacks } = this.selectModel({
+      totalLineCount: 0,
+      config: params.config,
+      applySizeOverrides: false,
+    });
+    const modelsToTry = [primary, ...fallbacks];
+
+    let lastError: unknown;
+    let lastTransientError: unknown;
+    let sawTransientFailure = false;
+    for (const currentModel of modelsToTry) {
+      let resolved: ResolvedModelConfig;
+      try {
+        resolved = await this.resolveModel(currentModel);
+      } catch (error) {
+        lastError = error;
+        logger.warn(`verify-fixes model ${currentModel} could not be resolved`, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
+
+      if (resolved.apiFormat === 'cloudflare-workers-ai' && await this.isProviderUnavailable(resolved.providerId)) {
+        logger.warn(`Skipping ${resolved.providerName} verify-fixes model ${currentModel} because the provider is unavailable`);
+        continue;
+      }
+
+      try {
+        const response = await this.callResolvedModel(
+          resolved,
+          {
+            systemPrompt: params.systemPrompt,
+            userPrompt: params.userPrompt,
+            temperature: params.temperature,
+          },
+          adaptiveModelTimeoutMs(0),
+        );
+
+        if (this.tracker) {
+          this.tracker.record(response.modelUsed, response.inputTokens, response.outputTokens);
+        }
+
+        return {
+          rawText: response.rawText,
+          modelUsed: response.modelUsed,
+          inputTokens: response.inputTokens,
+          outputTokens: response.outputTokens,
+        };
+      } catch (error) {
+        lastError = error;
+        if (isTransientModelFailure(error)) {
+          sawTransientFailure = true;
+          lastTransientError = error;
+        }
+        if (resolved.apiFormat === 'cloudflare-workers-ai' && isCloudflareAllocationError(error)) {
+          await this.markProviderUnavailable(resolved.providerId, error instanceof Error ? error.message : String(error));
+        }
+        logger.warn(`verify-fixes model ${currentModel} failed`, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    if (sawTransientFailure) {
+      const retryCause = lastTransientError ?? lastError;
+      const lastMessage = retryCause instanceof Error ? retryCause.message : String(retryCause ?? 'Unknown model error');
+      throw new RetryableModelError(
+        `All configured verify-fixes models failed; retrying later. Last error: ${lastMessage}`,
+        retryCause,
+      );
+    }
+
+    throw lastError ?? new Error('No verify-fixes model produced a result; all configured models were skipped or unavailable.');
+  }
+
+  /**
    * WT-03 (Plan 09-03): the OPTIONAL, best-effort Mermaid sequence-diagram call. Unlike
    * generateSummary/reviewFile this tries ONLY the selected PRIMARY model — there is NO
    * `...fallbacks` iteration — so the "one whole-diff diagram call" is literally exactly ONE outbound
