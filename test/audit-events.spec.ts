@@ -6,16 +6,26 @@
 // behaviors are exercised directly via dependency injection (mocking appendJobAuditEvents).
 //
 // Mirrors the buildEnsembleVoteAuditEvent / recordEnsembleAudit test pattern in test/ensemble.spec.ts.
+//
+// Phase 20.1 BLOCKER 1 (D-06): the audit-event builders now route finding titles through
+// `redactFindingTitle` (./audit-redact). The redaction tests at the bottom of this file pin
+// the new contract: titles <= 100 chars pass through unchanged; titles > 100 chars are wrapped
+// in a fixed-shape marker. The schema-cap bump from .max(200) -> .max(100) is exercised by
+// constructing identifier cards directly with redacted titles and asserting the schema accepts.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   buildWalkthroughEnrichmentAuditEvent,
   recordWalkthroughAudit,
+  buildFinalizeDropEvents,
+  buildCriticDecisionsAuditEvent,
 } from '@server/core/audit';
 import { appendJobAuditEvents } from '@server/db/jobs';
 import * as jobsModule from '@server/db/jobs';
 import { logger } from '@server/core/logger';
 import { jobAuditEventSchema } from '@shared/schema';
+import type { DropRecord } from '@server/core/noise-filter';
+import type { CriticDecision } from '@shared/schema';
 
 beforeEach(() => {
   vi.restoreAllMocks();
@@ -147,5 +157,152 @@ describe('recordWalkthroughAudit best-effort recorder (D-04)', () => {
   it('imports the recorder without side effects', () => {
     expect(typeof recordWalkthroughAudit).toBe('function');
     expect(typeof appendJobAuditEvents).toBe('function');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 20.1 BLOCKER 1 (D-06): the audit-event builders now route finding titles through
+// `redactFindingTitle`, which caps titles to 100 chars and wraps over-length input in a
+// fixed-shape marker. These tests pin the producer-side enforcement contract so a regression
+// that reverts to the prior `.slice(0, 200)` or pass-through `d.title` is caught here, not
+// in production. The three cases mirror the three producer sites in audit.ts:
+//   - buildFinalizeDropEvents (filtered / deduped)
+//   - buildCriticDecisionsAuditEvent (critic.decisions sample)
+//   - and as a bonus, the toAuditIdentifier helper used by buildFinalizeDropEvents.
+// ---------------------------------------------------------------------------
+
+describe('BLOCKER 1: buildFinalizeDropEvents redacts sample titles (D-06)', () => {
+  const longTitle = 'x'.repeat(250);
+
+  function dropRecord(overrides: Partial<DropRecord> = {}): DropRecord {
+    return {
+      path: 'src/long.ts',
+      line: 42,
+      title: longTitle,
+      severity: 'P2',
+      category: 'quality',
+      confidence: 0.5,
+      ...overrides,
+    };
+  }
+
+  it('redacts the title in a confidence-floor filter sample', () => {
+    const events = buildFinalizeDropEvents(
+      { confidenceFloor: [dropRecord()], severityFloor: [], cap: [], merges: [] },
+      { severityFloor: 'P2', cap: 100 },
+    );
+    expect(events).toHaveLength(1);
+    const event = events[0] as Extract<typeof events[0], { stage: 'filtered' }>;
+    expect(event.sample[0].title).toMatch(/^\[clamped:head 100 chars /);
+    expect(event.sample[0].title.length).toBeLessThanOrEqual(100);
+    expect(event.sample[0].title).not.toBe(longTitle);
+  });
+
+  it('redacts the title in a severity-floor filter sample', () => {
+    const events = buildFinalizeDropEvents(
+      { confidenceFloor: [], severityFloor: [dropRecord()], cap: [], merges: [] },
+      { severityFloor: 'P2', cap: 100 },
+    );
+    expect(events).toHaveLength(1);
+    const event = events[0] as Extract<typeof events[0], { stage: 'filtered' }>;
+    expect(event.sample[0].title).not.toBe(longTitle);
+    expect(event.sample[0].title.length).toBeLessThanOrEqual(100);
+  });
+
+  it('redacts the title in a cap filter sample', () => {
+    const events = buildFinalizeDropEvents(
+      { confidenceFloor: [], severityFloor: [], cap: [dropRecord()], merges: [] },
+      { severityFloor: 'P2', cap: 100 },
+    );
+    expect(events).toHaveLength(1);
+    const event = events[0] as Extract<typeof events[0], { stage: 'filtered' }>;
+    expect(event.sample[0].title).not.toBe(longTitle);
+    expect(event.sample[0].title.length).toBeLessThanOrEqual(100);
+  });
+
+  it('redacts both survivor and suppressed titles in a deduped merge', () => {
+    const survivor = dropRecord({ path: 'src/survivor.ts' });
+    const suppressed = dropRecord({ path: 'src/suppressed.ts' });
+    const events = buildFinalizeDropEvents(
+      {
+        confidenceFloor: [],
+        severityFloor: [],
+        cap: [],
+        merges: [
+          {
+            rule: 'rule1',
+            survivor: { ...survivor, body: 'body', severity: 'P2', category: 'quality' } as any,
+            suppressed: { ...suppressed, body: 'body', severity: 'P2', category: 'quality' } as any,
+            titleSimilarity: 0.95,
+            bodySimilarity: null,
+          },
+        ],
+      },
+      { severityFloor: 'P2', cap: 100 },
+    );
+    expect(events).toHaveLength(1);
+    const event = events[0] as Extract<typeof events[0], { stage: 'deduped' }>;
+    expect(event.survivor.title).not.toBe(longTitle);
+    expect(event.survivor.title.length).toBeLessThanOrEqual(100);
+    expect(event.suppressed.title).not.toBe(longTitle);
+    expect(event.suppressed.title.length).toBeLessThanOrEqual(100);
+  });
+
+  it('passes short titles through unchanged', () => {
+    const short = dropRecord({ title: 'short title' });
+    const events = buildFinalizeDropEvents(
+      { confidenceFloor: [short], severityFloor: [], cap: [], merges: [] },
+      { severityFloor: 'P2', cap: 100 },
+    );
+    const event = events[0] as Extract<typeof events[0], { stage: 'filtered' }>;
+    expect(event.sample[0].title).toBe('short title');
+  });
+
+  it('emits events that validate against the schema-deployed jobAuditEventSchema', () => {
+    const events = buildFinalizeDropEvents(
+      { confidenceFloor: [dropRecord()], severityFloor: [], cap: [], merges: [] },
+      { severityFloor: 'P2', cap: 100 },
+    );
+    for (const event of events) {
+      const parsed = jobAuditEventSchema.safeParse(event);
+      expect(parsed.success).toBe(true);
+    }
+  });
+});
+
+describe('BLOCKER 1: buildCriticDecisionsAuditEvent redacts sample titles (D-06)', () => {
+  const longTitle = 'x'.repeat(250);
+
+  it('redacts the title in each critic sample row', () => {
+    const decisions: CriticDecision[] = [
+      { id: 0, path: 'src/a.ts', line: 1, severity: 'P2', category: 'quality', title: longTitle, body: 'body', confidence: 0.9, verdict: 'proven', outcome: 'kept', reason: 'evidence-supported' },
+      { id: 1, path: 'src/b.ts', line: 2, severity: 'P2', category: 'quality', title: longTitle, body: 'body', confidence: 0.9, verdict: 'unsupported', outcome: 'dropped', reason: 'evidence-unsupported' },
+    ];
+    const event = buildCriticDecisionsAuditEvent(decisions, 'completed');
+    expect(event).not.toBeNull();
+    const sample = event!.sample;
+    expect(sample).toHaveLength(2);
+    for (const row of sample) {
+      expect(row.title).not.toBe(longTitle);
+      expect(row.title.length).toBeLessThanOrEqual(100);
+      expect(row.title).toMatch(/^\[clamped:head 100 chars /);
+    }
+  });
+
+  it('passes short titles through unchanged', () => {
+    const decisions: CriticDecision[] = [
+      { id: 0, path: 'src/a.ts', line: 1, severity: 'P2', category: 'quality', title: 'short', body: 'body', confidence: 0.9, verdict: 'proven', outcome: 'kept', reason: 'evidence-supported' },
+    ];
+    const event = buildCriticDecisionsAuditEvent(decisions, 'completed');
+    expect(event!.sample[0].title).toBe('short');
+  });
+
+  it('emits an event that validates against the schema-deployed jobAuditEventSchema', () => {
+    const decisions: CriticDecision[] = [
+      { id: 0, path: 'src/a.ts', line: 1, severity: 'P2', category: 'quality', title: longTitle, body: 'body', confidence: 0.9, verdict: 'proven', outcome: 'kept', reason: 'evidence-supported' },
+    ];
+    const event = buildCriticDecisionsAuditEvent(decisions, 'completed');
+    const parsed = jobAuditEventSchema.safeParse(event);
+    expect(parsed.success).toBe(true);
   });
 });
