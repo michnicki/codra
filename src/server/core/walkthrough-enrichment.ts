@@ -69,13 +69,16 @@ const ENRICHMENT_FRESH_INVOCATION_YIELD_SECONDS = 60;
 
 // Phase 20 (D-05 reviewer LOW #6): a local helper that consolidates persist + audit emission so
 // every terminal branch writes the durable blob AND emits exactly one bounded audit event. The
-// helper owns the throwable surface — it never rethrows (recordWalkthroughAudit is best-effort) so
-// a broken audit write can never fail the caller. The next-phase hand-off is the caller's
-// responsibility, the helper only owns the (persist, audit) pair.
+// helper does NOT own the throwable surface for the persist — `setJobWalkthroughEnrichment` is the
+// durable source of truth for the idempotency guard, so a persist failure MUST surface to the
+// caller (the next-phase hand-off would have no blob to feed, and the workflow's retry path
+// depends on the persist throwing). The audit half is best-effort (`recordWalkthroughAudit` never
+// rethrows), so a broken audit write can never fail the caller. The next-phase hand-off is the
+// caller's responsibility, the helper only owns the (persist, audit) pair.
 async function persistAndAudit(
   env: AppBindings,
   jobId: string,
-  persistence: Parameters<typeof setJobWalkthroughEnrichment>[2],
+  persistence: WalkthroughEnrichment | null,
   auditStatus: 'completed' | 'partial' | 'failed',
   auditReason?: string,
   auditGroupCount?: number,
