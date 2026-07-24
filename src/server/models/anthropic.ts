@@ -1,7 +1,7 @@
 import { logger } from '@server/core/logger';
 import { withTimeout } from '@server/core/timeout';
 import { isValidPublicUrl } from '@server/core/ssrf';
-import { ProviderRequestError, providerErrorMessage, type ModelResponse } from './types';
+import { ProviderRequestError, providerErrorMessage, type ModelRequestInput, type ModelResponse } from './types';
 
 const ANTHROPIC_TIMEOUT_MS = 80_000;
 const ANTHROPIC_MAX_OUTPUT_TOKENS = 4096;
@@ -18,7 +18,7 @@ export interface AnthropicResponse {
 export async function reviewWithAnthropic(
   config: { apiKey: string; baseUrl?: string | null; providerName: string; timeoutMs?: number },
   model: string,
-  input: { systemPrompt: string; userPrompt: string },
+  input: ModelRequestInput,
   tracker?: { incrementSubrequests(count?: number): void },
 ): Promise<ModelResponse> {
   logger.info(`Calling Anthropic model: ${model}`);
@@ -48,7 +48,7 @@ export async function reviewWithAnthropic(
           { role: 'assistant', content: '{' }
         ],
         max_tokens: ANTHROPIC_MAX_OUTPUT_TOKENS,
-        temperature: 0,
+        temperature: input.temperature ?? 0,
       }),
     }),
   );

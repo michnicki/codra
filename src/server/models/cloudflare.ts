@@ -1,7 +1,7 @@
 import { logger } from '@server/core/logger';
 import type { AppBindings } from '@server/env';
 import { TimeoutError } from '@server/core/timeout';
-import { ProviderRequestError, UnparseableModelResponseError, type ModelResponse } from './types';
+import { ProviderRequestError, UnparseableModelResponseError, type ModelRequestInput, type ModelResponse } from './types';
 
 /**
  * Default max wall-clock time allowed for a single Workers-AI call when the caller doesn't
@@ -199,7 +199,7 @@ function extractCloudflareUsage(result: unknown) {
  * The single-request inference payload sent to Workers AI. Shared by the synchronous path and
  * the asynchronous batch path so both send an identical prompt/schema/decoding configuration.
  */
-function buildCloudflareInferenceRequest(input: { systemPrompt: string; userPrompt: string }) {
+function buildCloudflareInferenceRequest(input: ModelRequestInput) {
   return {
     messages: [
       {
@@ -217,7 +217,7 @@ function buildCloudflareInferenceRequest(input: { systemPrompt: string; userProm
         schema: REVIEW_RESPONSE_SCHEMA,
       },
     },
-    temperature: 0,
+    temperature: input.temperature ?? 0,
     top_p: 0.1,
   } as const;
 }
@@ -265,7 +265,7 @@ function extractBatchInnerResult(result: unknown): unknown {
 export async function submitCloudflareBatch(
   env: Pick<AppBindings, 'AI'>,
   model: string,
-  input: { systemPrompt: string; userPrompt: string },
+  input: ModelRequestInput,
   tracker?: { incrementSubrequests(count?: number): void },
 ): Promise<string> {
   if (tracker) tracker.incrementSubrequests(1);
@@ -322,7 +322,7 @@ export async function pollCloudflareBatch(
 export async function reviewWithCloudflare(
   env: Pick<AppBindings, 'AI'>,
   model: string,
-  input: { systemPrompt: string; userPrompt: string },
+  input: ModelRequestInput,
   tracker?: { incrementSubrequests(count?: number): void },
   providerName = 'Cloudflare',
   options?: { timeoutMs?: number },

@@ -1,3 +1,9 @@
+export type ModelRequestInput = {
+  systemPrompt: string;
+  userPrompt: string;
+  temperature?: number;
+};
+
 export type ModelResponse = {
   rawText: string;
   inputTokens: number;

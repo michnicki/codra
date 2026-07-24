@@ -12,7 +12,7 @@ import { parseFileReviewResponse, parseAnswerResponse } from '../core/model-outp
 import { truncateFileDiff, chunkFileDiff, type FileDiff } from '../core/diff';
 import type { RepoConfig } from '@shared/schema';
 import type { TokenTracker } from '../core/token-tracker';
-import { UnparseableModelResponseError, type ModelResponse } from '../models/types';
+import { UnparseableModelResponseError, type ModelRequestInput, type ModelResponse } from '../models/types';
 import { logger } from '../core/logger';
 import { normalizeModelId } from '@shared/schema';
 import { isTimeoutMessage, matchesAnyTransientSubstring } from '@shared/transient-errors';
@@ -259,7 +259,7 @@ export class ModelService {
 
   private async callResolvedModel(
     config: ResolvedModelConfig,
-    input: { systemPrompt: string; userPrompt: string },
+    input: ModelRequestInput,
     timeoutMs?: number,
   ): Promise<ModelResponse> {
     // Resolve credentials *before* taking a gate slot so slow KV/crypto work never occupies a
@@ -323,6 +323,7 @@ export class ModelService {
     // the prompt — model resolution, chunking, fallback chain, and retry classification are shared
     // (D-02: there is NO per-pass model override).
     pass?: 'main' | 'security';
+    temperature?: number;
   }) {
     const configuredLineCap = params.config.review.max_diff_lines_per_file;
     const modelLineCap = params.compactPrompt
@@ -514,6 +515,7 @@ export class ModelService {
     totalLineCount: number;
     compactPrompt?: boolean;
     pass?: 'main' | 'security';
+    temperature?: number;
   }) {
     // The security pass swaps in buildSecurityReviewPrompts (same input shape, identical findings
     // JSON contract so parseFileReviewResponse handles it unchanged). Everything below —
@@ -604,7 +606,11 @@ export class ModelService {
       // outage is handled by deferring the whole file to a fresh invocation), so on failure we just
       // fall through to the next model in the fallback chain.
       try {
-        const response = await this.callResolvedModel(resolved, { systemPrompt, userPrompt }, timeoutMs);
+        const response = await this.callResolvedModel(
+          resolved,
+          { systemPrompt, userPrompt, temperature: params.temperature },
+          timeoutMs,
+        );
 
         if (this.tracker) {
           this.tracker.record(response.modelUsed, response.inputTokens, response.outputTokens);

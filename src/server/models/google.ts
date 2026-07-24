@@ -1,7 +1,7 @@
 import { logger } from '@server/core/logger';
 import { withTimeout } from '@server/core/timeout';
 import { isValidPublicUrl } from '@server/core/ssrf';
-import { ProviderRequestError, UnparseableModelResponseError, providerErrorMessage, type ModelResponse } from './types';
+import { ProviderRequestError, UnparseableModelResponseError, providerErrorMessage, type ModelRequestInput, type ModelResponse } from './types';
 
 /** Default max wall-clock time for a single Google AI Studio call when the caller doesn't
  * supply a diff-size-aware budget. */
@@ -59,7 +59,7 @@ function isRetryableTransportError(error: unknown) {
 export async function reviewWithGoogle(
   config: { apiKey: string; baseUrl?: string | null; providerName?: string; timeoutMs?: number },
   model: string,
-  input: { systemPrompt: string; userPrompt: string },
+  input: ModelRequestInput,
   tracker?: { incrementSubrequests(count?: number): void },
 ): Promise<ModelResponse> {
   const timeoutMs = config.timeoutMs ?? GEMINI_TIMEOUT_MS;
@@ -106,6 +106,7 @@ export async function reviewWithGoogle(
               },
             ],
             generationConfig: {
+              ...(input.temperature === undefined ? {} : { temperature: input.temperature }),
               ...(model.toLowerCase().includes('gemma') ? {} : { responseMimeType: 'application/json' }),
               maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS,
             },

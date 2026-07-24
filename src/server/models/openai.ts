@@ -1,7 +1,7 @@
 import { logger } from '@server/core/logger';
 import { withTimeout } from '@server/core/timeout';
 import { isValidPublicUrl } from '@server/core/ssrf';
-import { ProviderRequestError, providerErrorMessage, type ModelResponse } from './types';
+import { ProviderRequestError, providerErrorMessage, type ModelRequestInput, type ModelResponse } from './types';
 
 const OPENAI_TIMEOUT_MS = 80_000;
 const OPENAI_MAX_OUTPUT_TOKENS = 4096;
@@ -35,7 +35,7 @@ function extractOpenAiText(data: OpenAIResponse) {
 export async function reviewWithOpenAI(
   config: { apiKey: string | null; baseUrl: string; providerName: string; timeoutMs?: number },
   model: string,
-  input: { systemPrompt: string; userPrompt: string },
+  input: ModelRequestInput,
   tracker?: { incrementSubrequests(count?: number): void },
 ): Promise<ModelResponse> {
   logger.info(`Calling OpenAI-format model: ${model}`);
@@ -65,7 +65,7 @@ export async function reviewWithOpenAI(
           },
           { role: 'user', content: `${input.userPrompt}\n\nRespond with the required JSON object only.` },
         ],
-        temperature: 0,
+        temperature: input.temperature ?? 0,
         max_tokens: OPENAI_MAX_OUTPUT_TOKENS,
         response_format: { type: 'json_object' },
       }),
