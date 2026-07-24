@@ -19,6 +19,7 @@ import { isTimeoutMessage, matchesAnyTransientSubstring } from '@shared/transien
 import { getResolvedModelConfig, type ResolvedModelConfig } from '@server/db/model-configs';
 import { decryptLlmApiKey } from '@server/core/llm-crypto';
 import { ModelCallGate, adaptiveModelTimeoutMs, MODEL_FALLBACK_CHAIN_BUDGET_MS } from '../models/limits';
+import { admitEnsembleUnit, type EnsembleRun, type EnsembleAdmissionShape } from '../core/ensemble';
 
 const PROVIDER_UNAVAILABLE_TTL_SECONDS = 24 * 60 * 60;
 const COMPACT_REVIEW_PROMPT_LINE_CAP = 400;
@@ -386,6 +387,153 @@ export class ModelService {
       reviewedLineCount: results.reduce((sum, r) => sum + r.reviewedLineCount, 0),
       wasPromptTruncated: chunks.length < totalChunkCount || results.length < chunks.length,
     };
+  }
+
+  /**
+   * Phase 19 (PASS-02 / D-13): ensemble fan-out. Dispatches N main-pass samples of the SAME
+   * file review, each independently walked through the existing chunking + fallback chain +
+   * Google retry pipeline. Returns the per-run results so the caller can reconcile / persist
+   * the consensus finding list.
+   *
+   * **D-13 contract:**
+   *   - Main units call this with `runs > 1`. The primary sample (runIndex 0) uses the configured
+   *     review settings exactly as the scalar/async path does; only the N-1 extras are given
+   *     `ensembleTemperature` (D-13: extras only).
+   *   - Security units are NEVER fanned out — the caller is responsible for clamping
+   *     `runs` to 1 when pass='security' so this method sees runs=1 and falls through to the
+   *     scalar reviewFile (NREG-01).
+   *   - When `runs === 1`, this method delegates to `reviewFile` directly so the scalar/async
+   *     path is preserved byte-identically.
+   *
+   * **Admission (D-13 / T-19-07):**
+   *   Before fanning out, the worst-case subrequest cost is computed as
+   *   `samples × chunks × (1 + fallbacks + Google retries) + ENSEMBLE_ADMISSION_HEADROOM` and
+   *   admitted against the remaining safe budget. A rejected unit throws a `RetryableModelError`
+   *   whose message includes 'subrequest' so `isSubrequestBudgetError` catches it and the
+   *   orchestrator fresh-hands-off to a new invocation.
+   *
+   * **Fan-out (D-13):**
+   *   The N samples are dispatched via `Promise.allSettled`; each sample's individual model
+   *   call still flows through the shared `ModelCallGate` (max 3 concurrent), so this method
+   *   never inflates the per-invocation connection pool above the existing ceiling.
+   *
+   * **Returns:** `{ runs: EnsembleRun[] }` — one entry per requested sample, in stable
+   * `runIndex` order. A sample whose call rejected is recorded as `{ failed: true, reason }`
+   * with `findings: []` so the caller can subtract it from the D-10 denominator.
+   */
+  async runFileWithEnsemble(params: {
+    file: any;
+    prTitle: string | null;
+    prDescription: string | null;
+    config: RepoConfig;
+    totalLineCount: number;
+    compactPrompt?: boolean;
+    pass?: 'main' | 'security';
+    runs: number;
+    ensembleTemperature?: number;
+  }): Promise<{ runs: EnsembleRun[] }> {
+    // Defensive: when runs=1, fall through to the scalar/async path so the existing reviewFile
+    // contract is byte-identically preserved. The caller (review.ts) is the source of truth for
+    // when to fan out — model service does not silently expand runs.
+    if (params.runs <= 1) {
+      const result = await this.reviewFile({ ...params });
+      return {
+        runs: [
+          {
+            runIndex: 0,
+            findings: result.parsed.comments,
+            model: result.modelUsed,
+            inputTokens: result.inputTokens,
+            outputTokens: result.outputTokens,
+            failed: false,
+          },
+        ],
+      };
+    }
+
+    // Compute admission shape from the actual file + configured model strategy. chunkFileDiff is
+    // pure (no I/O) so calling it here for admission is cheap; the same chunks are recomputed
+    // inside each sample's reviewFile call (N+1 chunkFileDiff invocations total, but each is
+    // trivial). The fallback count comes from the same selectModel that reviewFile uses, so
+    // admission matches the per-sample worst case.
+    const configuredLineCap = params.config.review.max_diff_lines_per_file;
+    const modelLineCap = params.compactPrompt
+      ? Math.min(configuredLineCap, COMPACT_REVIEW_PROMPT_LINE_CAP)
+      : configuredLineCap;
+    const chunks = chunkFileDiff(params.file, modelLineCap);
+    const MAX_CHUNKS = 4;
+    const chunkCount = Math.min(chunks.length, MAX_CHUNKS);
+    const { fallbacks } = this.selectModel({
+      totalLineCount: params.totalLineCount,
+      config: params.config,
+    });
+    const admissionShape: EnsembleAdmissionShape = {
+      runs: params.runs,
+      chunkCount,
+      fallbackCount: fallbacks.length,
+      googleMaxRetries: 2, // matches google.ts GEMINI_MAX_RETRIES
+    };
+    if (this.tracker) {
+      const admission = admitEnsembleUnit(this.tracker, admissionShape);
+      if (!admission.admitted) {
+        // Surface as a RetryableModelError with a "subrequest" marker so isSubrequestBudgetError
+        // catches it and the orchestrator fresh-hands-off. The orchestrator's subrequest-budget
+        // branch re-throws with retryAfterSeconds=FRESH_INVOCATION_YIELD_SECONDS.
+        throw new RetryableModelError(admission.reason ?? 'Ensemble admission rejected: would exceed safe subrequest budget.');
+      }
+    }
+
+    // Fan out N samples. Each sample is a complete reviewFile call: same chunking, same fallback
+    // chain, same Google retry behavior. The three-slot ModelCallGate inside callResolvedModel
+    // bounds the actual concurrency — Promise.allSettled only schedules the promises, the gate
+    // throttles dispatch.
+    const settled = await Promise.allSettled(
+      Array.from({ length: params.runs }, async (_, i) => {
+        const isPrimary = i === 0;
+        // For the primary, delete the temperature from the spread so the inner reviewFile
+        // receives NO temperature field at all (rather than `temperature: undefined`). The
+        // reviewFile path then leaves it undefined and the providers omit it from the request
+        // body. Explicit-undefined on the spread is also fine but the explicit delete makes
+        // the contract obvious.
+        const { temperature: _ignored, ...paramsWithoutTemperature } = params;
+        void _ignored;
+        return this.reviewFile({
+          ...paramsWithoutTemperature,
+          // D-13: only extras receive the ensemble temperature; the primary call uses its normal
+          // review settings (undefined preserves the existing per-adapter default).
+          ...(isPrimary ? {} : { temperature: params.ensembleTemperature }),
+        });
+      }),
+    );
+
+    // Convert settled -> EnsembleRun[]. D-10: failed runs are removed from the denominator by the
+    // reconciler; the caller reads `successfulRuns` to decide between degrade and consensus.
+    const runs: EnsembleRun[] = settled.map((result, runIndex) => {
+      if (result.status === 'fulfilled') {
+        const value = result.value;
+        return {
+          runIndex,
+          findings: value.parsed.comments,
+          model: value.modelUsed,
+          inputTokens: value.inputTokens,
+          outputTokens: value.outputTokens,
+          failed: false,
+        };
+      }
+      // Failed run — record a machine-readable reason so the audit can explain the gap.
+      const reason = result.reason instanceof Error ? result.reason.message : String(result.reason ?? 'unknown');
+      return {
+        runIndex,
+        findings: [],
+        model: null,
+        inputTokens: 0,
+        outputTokens: 0,
+        failed: true,
+        reason: reason.slice(0, 200),
+      };
+    });
+
+    return { runs };
   }
 
   /**

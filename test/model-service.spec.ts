@@ -961,3 +961,194 @@ describe('ModelService', () => {
     expect(response.outputTokens).toBe(2);
   });
 });
+
+// Phase 19 (PASS-02 / D-13): runFileWithEnsemble fan-out + admission tests.
+describe('ModelService.runFileWithEnsemble (PASS-02 / D-13)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function okGoogleResponse(body: object) {
+    return new Response(
+      JSON.stringify({
+        candidates: [{ content: { parts: [{ text: JSON.stringify(body) }] } }],
+        usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 3 },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+  }
+
+  function fileDiff(lineCount = 1) {
+    return {
+      path: 'src/a.ts',
+      previousPath: null,
+      isNew: false,
+      isDeleted: false,
+      isBinary: false,
+      lineCount,
+      hunks: [],
+    };
+  }
+
+  it('runs=1 falls through to the scalar reviewFile path (NREG-01: byte-identical)', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      okGoogleResponse({ findings: [], verdict: 'approve', file_summary: 'ok' }),
+    );
+    const env = createTestEnv();
+    await saveTestProviderApiKey(env);
+    const service = new ModelService(env, new TokenTracker());
+
+    const result = await service.runFileWithEnsemble({
+      file: fileDiff(),
+      prTitle: 'Test',
+      prDescription: null,
+      config: {
+        ...defaultRepoConfig,
+        model: { main: 'gemma-4-31b-it', fallbacks: [], size_overrides: [] },
+      },
+      totalLineCount: 1,
+      runs: 1,
+    });
+
+    expect(result.runs).toHaveLength(1);
+    expect(result.runs[0].runIndex).toBe(0);
+    expect(result.runs[0].failed).toBeFalsy();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs=N fans out N samples via Promise.allSettled (one fetch per sample)', async () => {
+    // mockImplementation (not mockResolvedValue) so each parallel call gets a fresh Response;
+    // sharing one Response across N parallel consumers fails with 'Body is unusable'.
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      okGoogleResponse({ findings: [], verdict: 'approve', file_summary: 'ok' }),
+    );
+    const env = createTestEnv();
+    await saveTestProviderApiKey(env);
+    const service = new ModelService(env, new TokenTracker());
+
+    const result = await service.runFileWithEnsemble({
+      file: fileDiff(),
+      prTitle: 'Test',
+      prDescription: null,
+      config: {
+        ...defaultRepoConfig,
+        model: { main: 'gemma-4-31b-it', fallbacks: [], size_overrides: [] },
+      },
+      totalLineCount: 1,
+      runs: 3,
+      ensembleTemperature: 0.4,
+    });
+
+    expect(result.runs).toHaveLength(3);
+    expect(result.runs.map((r) => r.runIndex)).toEqual([0, 1, 2]);
+    for (const r of result.runs) {
+      expect(r.failed).toBeFalsy();
+      expect(r.model).toBe('gemma-4-31b-it');
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('D-13: only extras receive the ensemble temperature; the primary call uses undefined', async () => {
+    // mockImplementation so each parallel call gets a fresh Response body.
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      okGoogleResponse({ findings: [], verdict: 'approve', file_summary: 'ok' }),
+    );
+    const env = createTestEnv();
+    await saveTestProviderApiKey(env);
+    const service = new ModelService(env, new TokenTracker());
+
+    await service.runFileWithEnsemble({
+      file: fileDiff(),
+      prTitle: 'Test',
+      prDescription: null,
+      config: {
+        ...defaultRepoConfig,
+        model: { main: 'gemma-4-31b-it', fallbacks: [], size_overrides: [] },
+      },
+      totalLineCount: 1,
+      runs: 2,
+      ensembleTemperature: 0.55,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const primaryBody = JSON.parse(String(fetchMock.mock.calls[0][1]?.body));
+    const extraBody = JSON.parse(String(fetchMock.mock.calls[1][1]?.body));
+    expect(primaryBody.generationConfig).not.toHaveProperty('temperature');
+    expect(extraBody.generationConfig.temperature).toBe(0.55);
+  });
+
+  it('a failed sample is recorded as { failed: true, reason } so the denominator removes it', async () => {
+    // For this test the success path is the FIRST call. We can't use mockResolvedValueOnce
+    // because parallel calls may consume mocks in non-deterministic order, so we use a flag
+    // that flips on the first call. Every subsequent call returns the 500 response (with a
+    // fresh Response per call so retries inside google.ts don't share a consumed body).
+    let firstCall = true;
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      if (firstCall) {
+        firstCall = false;
+        return okGoogleResponse({ findings: [], verdict: 'approve', file_summary: 'ok' });
+      }
+      return new Response(
+        JSON.stringify({ error: { code: 500, message: 'Internal error encountered.' } }),
+        { status: 500, headers: { 'content-type': 'application/json' } },
+      );
+    });
+    const env = createTestEnv();
+    await saveTestProviderApiKey(env);
+    const service = new ModelService(env, new TokenTracker());
+
+    const result = await service.runFileWithEnsemble({
+      file: fileDiff(),
+      prTitle: 'Test',
+      prDescription: null,
+      config: {
+        ...defaultRepoConfig,
+        model: { main: 'gemma-4-31b-it', fallbacks: [], size_overrides: [] },
+      },
+      totalLineCount: 1,
+      runs: 2,
+    });
+
+    expect(result.runs).toHaveLength(2);
+    // Exactly one of the two samples should be failed; the success run gets succeeded.
+    const successCount = result.runs.filter((r) => !r.failed).length;
+    const failedCount = result.runs.filter((r) => r.failed).length;
+    expect(successCount).toBe(1);
+    expect(failedCount).toBe(1);
+    const failedRun = result.runs.find((r) => r.failed);
+    expect(failedRun!.findings).toEqual([]);
+    expect(failedRun!.reason).toBeTruthy();
+  });
+
+  it('rejects a runs=N / multi-chunk unit when the budget is partially spent (no fetch fires)', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+    const env = createTestEnv();
+    await saveTestProviderApiKey(env);
+    const tracker = new TokenTracker();
+    tracker.incrementSubrequests(18); // 25 - 18 = 7 remaining safe budget
+    const service = new ModelService(env, tracker);
+
+    await expect(
+      service.runFileWithEnsemble({
+        file: {
+          ...fileDiff(800),
+          hunks: [
+            { header: '@@ -1 +1 @@', lines: Array.from({ length: 200 }, (_, i) => ({ kind: 'add' as const, content: `line ${i}`, newLineNumber: i + 1, position: i + 1 })) },
+            { header: '@@ -300 +300 @@', lines: Array.from({ length: 200 }, (_, i) => ({ kind: 'add' as const, content: `line ${i}`, newLineNumber: 300 + i, position: 300 + i })) },
+          ],
+        },
+        prTitle: 'Test',
+        prDescription: null,
+        config: {
+          ...defaultRepoConfig,
+          review: { ...defaultRepoConfig.review, max_diff_lines_per_file: 200 },
+          model: { main: 'gemma-4-31b-it', fallbacks: ['gemma-4-26b-a4b-it'], size_overrides: [] },
+        },
+        totalLineCount: 400,
+        runs: 4,
+      }),
+    ).rejects.toSatisfy(isRetryableModelError);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});

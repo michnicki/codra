@@ -35,6 +35,12 @@ export type EnsembleRun =
       findings: ParsedReviewComment[];
       failed?: false;
       reason?: never;
+      // Per-run model/tokens are populated by the model-service fan-out (runFileWithEnsemble);
+      // pure reconcilers (test/ensemble.spec.ts) leave them undefined. The audit builder reads
+      // `failed === true` first and ignores these on failure.
+      model?: string | null;
+      inputTokens?: number;
+      outputTokens?: number;
     }
   | {
       runIndex: number;
@@ -43,6 +49,9 @@ export type EnsembleRun =
       findings: readonly ParsedReviewComment[];
       failed: true;
       reason: string;
+      model?: null;
+      inputTokens?: number;
+      outputTokens?: number;
     };
 
 // ---------------------------------------------------------------------------
