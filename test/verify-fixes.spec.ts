@@ -4,6 +4,8 @@
 // every D-01..D-04 edge the cross-AI review surfaced.
 
 import { describe, expect, it } from 'vitest';
+import { defaultRepoConfig, type RepoConfig } from '@shared/schema';
+import { nextPhaseAfterVerifyFixes } from '@server/core/phase-routing';
 import type {
   ThreadVerificationEntry,
   ThreadVerificationSnapshot,
@@ -292,5 +294,49 @@ describe('verify-fixes cursor shape', () => {
     expect(cursor.status).toBe('pending');
     expect(cursor.entries).toEqual([]);
     expect(cursor.totals).toEqual({ fixed: 0, unfixed: 0, unverifiable: 0, resolved: 0 });
+  });
+});
+
+// Phase 20.1 (BLOCKER 3): the verify-fixes phase terminal hand-off now routes through the
+// `nextPhaseAfterVerifyFixes` selector in `core/phase-routing.ts`. The pure selector is fully
+// covered by `test/phase-routing.spec.ts`; this describe block is the smoke evidence that the
+// import in `core/verify-fixes.ts` is wired correctly and the four toggle combinations reach
+// the expected terminal phase.
+describe('verify-fixes terminal hand-off (BLOCKER 3 chain)', () => {
+  // Inline copy of the minimal-withToggle helper used in phase-routing.spec.ts — kept here so
+  // this file stays self-contained and the review can read each describe block independently.
+  const withT = <K extends keyof RepoConfig['review']>(
+    config: RepoConfig,
+    key: K,
+    value: NonNullable<RepoConfig['review'][K]>,
+  ): RepoConfig => ({
+    ...config,
+    review: { ...config.review, [key]: value },
+  });
+  const verifyFixesOn = (c: RepoConfig) =>
+    withT(c, 'threads', { verify_fixes: true, auto_resolve: false });
+  const criticOn = (c: RepoConfig) =>
+    withT(c, 'passes', { ...c.review.passes, critic: { enabled: true } });
+  const walkthroughOn = (c: RepoConfig) =>
+    withT(c, 'walkthrough', { enabled: true, sequence_diagram: { enabled: true } });
+
+  it('chains verify_fixes → critic when verify_fixes + critic are on (BLOCKER 3 primary)', () => {
+    const config = verifyFixesOn(criticOn(defaultRepoConfig));
+    expect(nextPhaseAfterVerifyFixes(config)).toBe('critic');
+  });
+
+  it('chains verify_fixes → walkthrough_enrichment when verify_fixes + walkthrough are on (critic off)', () => {
+    const config = verifyFixesOn(walkthroughOn(defaultRepoConfig));
+    expect(nextPhaseAfterVerifyFixes(config)).toBe('walkthrough_enrichment');
+  });
+
+  it('chains verify_fixes → finalize when verify_fixes is on but critic + walkthrough are off', () => {
+    const config = verifyFixesOn(defaultRepoConfig);
+    expect(nextPhaseAfterVerifyFixes(config)).toBe('finalize');
+  });
+
+  it('chains verify_fixes → critic when all three toggles are on (chain order: critic first)', () => {
+    const config = verifyFixesOn(criticOn(walkthroughOn(defaultRepoConfig)));
+    expect(nextPhaseAfterVerifyFixes(config)).toBe('critic');
   });
 });

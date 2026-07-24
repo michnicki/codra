@@ -49,6 +49,15 @@ vi.mock('@server/services/github', () => {
         async addIssueLabels() { return {}; }
         async removeIssueLabelsIfPresent() { return {}; }
         async removeIssueLabel() { return {}; }
+        // Phase 20.1 (BLOCKER 3 chain integration): the verify-fixes phase needs these methods
+        // on the GitHubService so the GithubAdapter can satisfy the VcsProvider contract. Defaults
+        // are inert (no threads, content returns null, identity resolves to a fake bot) so the
+        // verify-fixes phase runs through the no-threads path without needing per-test spies.
+        // Individual tests override these via vi.spyOn(GitHubService.prototype, ...) as needed.
+        async getRepoFileContent() { return null; }
+        async getReviewThreads() { return []; }
+        async resolveReviewThread() { return true; }
+        async resolveBotUserIdentity() { return { accountId: '0', login: 'codra-bot' }; }
     }
     return { GitHubService: MockGitHubService };
 });
@@ -1272,6 +1281,110 @@ dbDescribe('Review Flow Lifecycle', () => {
       expect(await readCriticResult(job.id)).toBeNull();
 
       const finalJob = await findExistingJobForHead(env, { owner: 'test-owner', repo, prNumber: 8, commitSha: sha('e'), trigger: 'auto' });
+      expect(finalJob?.status).toBe('done');
+
+      critiqueSpy.mockRestore();
+      reviewSpy.mockRestore();
+      getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    // Phase 20.1 (BLOCKER 3 + chain-order integration): end-to-end proof that the full chain
+    // review → verify_fixes → critic → walkthrough_enrichment → finalize runs through `runReviewJob`
+    // when all v1.2 toggles are ON. The verify-fixes phase uses the existing MockGitHubService
+    // defaults (no unresolved threads, no file content) so it completes via the no-work-found path.
+    // The critic phase runs `critiqueFindings` which returns a keep-all prune. The walkthrough
+    // enrichment phase runs the default buildWalkthroughData path. The draining helper captures
+    // every `next_phase` action so the chain order is asserted explicitly.
+    it('chains review → verify_fixes → critic → walkthrough_enrichment → finalize at all-v1.2-toggles-on (BLOCKER 3 + chain integration)', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { ModelService } = await import('@server/services/model');
+      const repo = `test-repo-${Date.now()}-blocker3-chain`;
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([
+          { path: 'src/one.ts', content: 'console.log(1);' },
+          { path: 'src/two.ts', content: 'console.log(2);' },
+        ]),
+      );
+      const reviewSpy = vi.spyOn(ModelService.prototype as any, 'reviewFile').mockImplementation(findingReview);
+      // Critic v2 calls `parseCriticV2Response(response.rawText)` (review.ts:2846). The mock must
+      // return a `rawText` string containing the v2 envelope `{ verdicts: [{id, verdict, reason}] }`
+      // (see critic-v2.ts:parseCriticV2Response). The default MockModelService.critiqueFindings
+      // returns the legacy `{"prune": []}` shape which the v2 parser rejects → fail-open.
+      const critiqueSpy = vi.spyOn(ModelService.prototype as any, 'critiqueFindings').mockResolvedValue({
+        rawText: JSON.stringify({
+          verdicts: [
+            { id: 0, verdict: 'keep', reason: 'kept' },
+            { id: 1, verdict: 'keep', reason: 'kept' },
+          ],
+        }),
+        modelUsed: 'critic-model',
+        inputTokens: 5,
+        outputTokens: 2,
+      });
+      // The MockGitHubService defaults (added with the verify-fixes fix) make the verify-fixes
+      // phase run via the no-threads path: getReviewThreads returns [] and resolveReviewThread
+      // returns true. No per-test spy required.
+
+      // All v1.2 toggles ON: the full chain review → verify_fixes → critic → walkthrough_enrichment → finalize.
+      const allOnConfig: RepoConfig = {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          threads: { verify_fixes: true, auto_resolve: false },
+          passes: {
+            ...defaultRepoConfig.review.passes,
+            critic: { enabled: true, skip_threshold: 1 },
+          },
+          walkthrough: { enabled: true, sequence_diagram: { enabled: true } },
+        },
+      };
+
+      const job = await insertCriticJob(repo, allOnConfig, 'g');
+      await updateJobFileCount(env, job.id, 2);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+
+      // Drain the chain, capturing every `next_phase` action so the chain order is asserted explicitly.
+      const phasesObserved: string[] = [];
+      await runWithDb(env, async () => {
+        let currentMessage: any = { jobId: job.id, deliveryId: 'delivery-blocker3-chain', phase: 'review' };
+        let retries = 0;
+        while (currentMessage) {
+          const result = await runReviewJob(env, currentMessage);
+          if (result.action === 'next_phase') {
+            phasesObserved.push(result.phase);
+            currentMessage = { ...currentMessage, phase: result.phase };
+            retries = 0;
+            await queryRows(env, `UPDATE jobs SET last_queue_message_at = now() - interval '5 seconds' WHERE id = $1`, [job.id]);
+          } else if (result.action === 'retry') {
+            if (++retries > 5) throw new Error('Max retries exceeded');
+            break;
+          } else {
+            currentMessage = null;
+          }
+        }
+      });
+
+      // Pin the chain order: verify_fixes first (after review), then critic, then walkthrough_enrichment, then finalize.
+      const verifyIdx = phasesObserved.indexOf('verify_fixes');
+      const criticIdx = phasesObserved.indexOf('critic');
+      const walkIdx = phasesObserved.indexOf('walkthrough_enrichment');
+      const finalizeIdx = phasesObserved.indexOf('finalize');
+      expect(verifyIdx).toBeGreaterThanOrEqual(0);
+      expect(criticIdx).toBeGreaterThan(verifyIdx);
+      expect(walkIdx).toBeGreaterThan(criticIdx);
+      expect(finalizeIdx).toBeGreaterThan(walkIdx);
+
+      // The critic phase actually ran (not skipped) — proves BLOCKER 3 chained verify_fixes → critic.
+      expect(critiqueSpy).toHaveBeenCalled();
+
+      // The critic result was persisted (BLOCKER 3 evidence: the critic passed the verify_fixes
+      // gate, which is the chain the audit identified as missing).
+      const criticResult = await readCriticResult(job.id);
+      expect(criticResult).not.toBeNull();
+      expect(criticResult?.skipped).toBe(false);
+
+      // The job reached 'done' — the finalize step ran successfully.
+      const finalJob = await findExistingJobForHead(env, { owner: 'test-owner', repo, prNumber: 8, commitSha: sha('g'), trigger: 'auto' });
       expect(finalJob?.status).toBe('done');
 
       critiqueSpy.mockRestore();
