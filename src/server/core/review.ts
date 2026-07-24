@@ -2842,15 +2842,14 @@ async function runCriticPhase(
     };
     await recordCriticAudit(env, job.id, [skippedAuditEvent]);
 
-    // Phase 20.1 (BLOCKER 5 chain correctness): the skip path matches the no-skip path at
-    // line 2945 — verify_fixes (when enabled — first hop after review) then walkthrough_enrichment
-    // (when enabled — last hop before finalize) then finalize. Routing verify_fixes only when
-    // `review.threads.verify_fixes` is on prevents the critic → verify_fixes loop the all-v1.2-
-    // toggles-on chain test asserts against (test/review-flow.spec.ts:1371-1379). The skip branch
-    // mirrors the no-skip branch so the audit viewer + chain are identical for the two outcomes.
-    const handOff = config.review.threads?.verify_fixes
-      ? 'verify_fixes'
-      : nextPhaseAfterCritic(config);
+    // Phase 20.1 (BLOCKER 5 chain correctness): the skip path MUST use the same hand-off as
+    // the no-skip path at line 2951 (`nextPhaseAfterCritic(config)`) — UNCONDITIONALLY. The
+    // verify_fixes hop has ALREADY happened before this phase (it is the FIRST hop after review,
+    // not a hop after critic). Re-entering verify_fixes from the critic terminal would recreate
+    // the critic → verify_fixes → critic → verify_fixes loop that Plan 20.1-02 / commit caf2eef
+    // explicitly fixed. The skip path is therefore byte-equivalent to the no-skip path's hand-off
+    // selector: walkthrough_enrichment (when enabled) → finalize. No verify_fixes branch.
+    const handOff = nextPhaseAfterCritic(config);
     await enqueueJobPhase(env, job.id, handOff, FRESH_INVOCATION_YIELD_SECONDS);
     return;
   }

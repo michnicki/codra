@@ -1851,7 +1851,7 @@ dbDescribe('Review Flow Lifecycle', () => {
       getDiffSpy.mockRestore();
     }, REVIEW_FLOW_TIMEOUT_MS);
 
-    it('BLOCKER 5: explicit skip_threshold hit + verify_fixes enabled emits audit + routes to verify_fixes', async () => {
+    it('BLOCKER 5: explicit skip_threshold hit + verify_fixes enabled emits audit + does NOT re-enter verify_fixes', async () => {
       const { GitHubService } = await import('@server/services/github');
       const { ModelService } = await import('@server/services/model');
       const repo = `test-repo-${Date.now()}-blocker5-skip-threshold`;
@@ -1864,8 +1864,10 @@ dbDescribe('Review Flow Lifecycle', () => {
 
       // v1.2 toggles: critic ON with skip_threshold=1, verify_fixes ON, walkthrough OFF.
       // The single-finding candidate set is BELOW the skip_threshold, so the skip branch fires
-      // with reason='below-skip-threshold'. The skip path then routes to verify_fixes (the first
-      // hop after review), which is the BLOCKER 5 chain correctness fix.
+      // with reason='below-skip-threshold'. The verify_fixes phase MUST have already run before
+      // critic (chain order: review → verify_fixes → critic). The skip path's hand-off must NOT
+      // route back to verify_fixes (that would recreate the critic → verify_fixes loop Plan
+      // 20.1-02 fixed). The skip path routes via nextPhaseAfterCritic → finalize (walkthrough OFF).
       const config: RepoConfig = {
         ...defaultRepoConfig,
         review: {
@@ -1882,9 +1884,10 @@ dbDescribe('Review Flow Lifecycle', () => {
       await updateJobFileCount(env, job.id, 1);
       await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
 
-      // The skip path routes to verify_fixes first (chain correctness: verify_fixes is the FIRST
-      // hop after review, NOT a hop after critic). The verify_fixes phase will see no thread
-      // verifications (the MockGitHubService returns []) and route onward via NextPhaseError.
+      // The chain is: review → verify_fixes (no threads, routes to critic) → critic (skip) → finalize.
+      // The skip path's hand-off is via nextPhaseAfterCritic(config); with walkthrough OFF, that
+      // returns 'finalize'. The verify_fixes phase already ran BEFORE the critic — the skip
+      // terminal must NOT re-enter it.
       const phasesObserved: string[] = [];
       await runWithDb(env, async () => {
         let currentMessage: any = { jobId: job.id, deliveryId: 'delivery-blocker5-skip-threshold', phase: 'review' };
@@ -1915,10 +1918,26 @@ dbDescribe('Review Flow Lifecycle', () => {
       expect(criticResult?.status).toBe('skipped');
       expect(criticResult?.reason).toBe('below-skip-threshold');
 
-      // The chain reached verify_fixes (the skip path's first hop after the critic terminal).
-      expect(phasesObserved).toContain('verify_fixes');
-      // verify_fixes comes BEFORE finalize (the chain must continue, not stop at verify_fixes).
-      expect(phasesObserved.indexOf('verify_fixes')).toBeLessThan(phasesObserved.indexOf('finalize'));
+      // Chain correctness: verify_fixes was visited at most once (BEFORE the critic skip).
+      // The skip terminal must NOT re-enter verify_fixes — that would loop.
+      const verifyFixesCount = phasesObserved.filter((p) => p === 'verify_fixes').length;
+      expect(verifyFixesCount).toBeLessThanOrEqual(1);
+
+      // The chain reached finalize (the skip path → walkthrough_enrichment (OFF) → finalize).
+      expect(phasesObserved).toContain('finalize');
+
+      // The critic skip terminal's hand-off is the next phase AFTER the critic in the observed
+      // sequence. The phase immediately AFTER the 'critic' hand-off must be 'finalize' (or
+      // 'walkthrough_enrichment' when walkthrough is on, but in this test walkthrough is OFF).
+      // It MUST NOT be 'verify_fixes' — that's the loop.
+      const criticIdx = phasesObserved.indexOf('critic');
+      if (criticIdx >= 0 && criticIdx < phasesObserved.length - 1) {
+        // The critic's hand-off is the next phase the runReviewJob sees after the critic phase
+        // runs. Actually, the chain emits the hand-off via `next_phase` action from runReviewJob
+        // and the message is then re-routed. The observed phase after critic is the hand-off.
+        const phaseAfterCritic = phasesObserved[criticIdx + 1];
+        expect(phaseAfterCritic).not.toBe('verify_fixes');
+      }
 
       critiqueSpy.mockRestore();
       reviewSpy.mockRestore();
@@ -2021,7 +2040,13 @@ dbDescribe('Review Flow Lifecycle', () => {
       getDiffSpy.mockRestore();
     }, REVIEW_FLOW_TIMEOUT_MS);
 
-    it('BLOCKER 5: skip_threshold + verify_fixes + walkthrough enabled routes to verify_fixes first (chain correctness)', async () => {
+    it('BLOCKER 5: skip_threshold + verify_fixes + walkthrough all on — chain has no second verify_fixes hop after critic', async () => {
+      // Phase 20.1 (BLOCKER 5 chain correctness): when verify_fixes + critic + walkthrough are
+      // all enabled, the chain order is review → verify_fixes (BEFORE critic) → critic (skip)
+      // → walkthrough_enrichment (AFTER critic) → finalize. The skip path MUST NOT re-enter
+      // verify_fixes — that would recreate the critic → verify_fixes loop Plan 20.1-02 fixed.
+      // Test 14 proves the skip path's hand-off is to walkthrough_enrichment (NOT verify_fixes)
+      // and that verify_fixes appears exactly once in the chain (before the critic, not after).
       const { GitHubService } = await import('@server/services/github');
       const { ModelService } = await import('@server/services/model');
       const repo = `test-repo-${Date.now()}-blocker5-chain`;
@@ -2032,10 +2057,10 @@ dbDescribe('Review Flow Lifecycle', () => {
       const reviewSpy = vi.spyOn(ModelService.prototype as any, 'reviewFile').mockImplementation(findingReview);
       const critiqueSpy = vi.spyOn(ModelService.prototype as any, 'critiqueFindings');
 
-      // All v1.2 toggles ON: critic + verify_fixes + walkthrough. The skip path mirrors the
-      // no-skip path's chain at line 2945: verify_fixes FIRST (not walkthrough_enrichment) so
-      // the chain correctly avoids the critic → verify_fixes loop BLOCKER 3 warned about.
-      // The walkthrough hop comes AFTER verify_fixes (it's the last hop before finalize).
+      // All v1.2 toggles ON: critic + verify_fixes + walkthrough. The candidate set is at the
+      // skip_threshold (single finding), so the critic skip path fires with reason
+      // 'below-skip-threshold'. The skip path's hand-off is via nextPhaseAfterCritic(config),
+      // which returns 'walkthrough_enrichment' (walkthrough ON) → 'finalize'.
       const config: RepoConfig = {
         ...defaultRepoConfig,
         review: {
@@ -2083,16 +2108,33 @@ dbDescribe('Review Flow Lifecycle', () => {
       expect(criticResult?.status).toBe('skipped');
       expect(criticResult?.reason).toBe('below-skip-threshold');
 
-      // The chain order matches the no-skip path: verify_fixes first, then walkthrough_enrichment,
-      // then finalize. The skip path mirrors the no-skip path at line 2945 exactly.
-      const verifyIdx = phasesObserved.indexOf('verify_fixes');
+      // CHAIN CORRECTNESS ASSERTION: verify_fixes appears BEFORE the critic phase (it is the
+      // hop after review, not the hop after critic). The skip path's hand-off does NOT re-enter
+      // verify_fixes — verify_fixes is observed EXACTLY ONCE in the chain, and that observation
+      // occurs BEFORE the critic. This is the loop-prevention invariant.
+      const verifyIndices = phasesObserved
+        .map((p, i) => (p === 'verify_fixes' ? i : -1))
+        .filter((i) => i >= 0);
+      const criticIdx = phasesObserved.indexOf('critic');
+      expect(verifyIndices).toHaveLength(1);
+      expect(verifyIndices[0]).toBeLessThan(criticIdx);
+
+      // The skip path's hand-off is walkthrough_enrichment (walkthrough ON), then finalize.
       const walkIdx = phasesObserved.indexOf('walkthrough_enrichment');
       const finalizeIdx = phasesObserved.indexOf('finalize');
-      expect(verifyIdx).toBeGreaterThanOrEqual(0);
-      expect(walkIdx).toBeGreaterThanOrEqual(0);
+      expect(walkIdx).toBeGreaterThan(criticIdx);
       expect(finalizeIdx).toBeGreaterThan(walkIdx);
-      // verify_fixes comes BEFORE walkthrough_enrichment (chain correctness).
-      expect(verifyIdx).toBeLessThan(walkIdx);
+
+      // The phase immediately after the critic (the skip path's hand-off) is walkthrough_enrichment,
+      // NOT verify_fixes. This is the load-bearing assertion: the skip terminal routes through
+      // walkthrough, never back to verify_fixes.
+      const phaseAfterCritic = phasesObserved[criticIdx + 1];
+      expect(phaseAfterCritic).toBe('walkthrough_enrichment');
+      expect(phaseAfterCritic).not.toBe('verify_fixes');
+
+      // The chain terminates — the job reaches 'done'.
+      const finalJob = await findExistingJobForHead(env, { owner: 'test-owner', repo, prNumber: 8, commitSha: sha('d'), trigger: 'auto' });
+      expect(finalJob?.status).toBe('done');
 
       critiqueSpy.mockRestore();
       reviewSpy.mockRestore();
