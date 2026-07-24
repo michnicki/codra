@@ -2718,10 +2718,13 @@ async function runCriticPhase(
     await enqueueJobPhase(
       env,
       job.id,
-      // Post-critic routing: verify_fixes (when enabled) → walkthrough_enrichment (when enabled) →
-      // finalize. The walkthrough enrichment runs on its own fresh budget regardless of the
-      // preceding verify_fixes presence so the durable chain stays correct in either toggle config.
-      config.review.threads?.verify_fixes ? 'verify_fixes' : nextPhaseAfterCritic(config),
+      // Phase 20.1 (BLOCKER 3 chain correctness): post-critic hand-off is walkthrough_enrichment
+      // (when enabled) → finalize. The verify_fixes is the FIRST hop after review (not a hop after
+      // critic) — chaining critic → verify_fixes would create a loop (review → verify_fixes →
+      // critic → verify_fixes → ...). The walkthrough_enrichment runs on its own fresh budget
+      // regardless of the preceding verify_fixes presence so the durable chain stays correct in
+      // either toggle config.
+      nextPhaseAfterCritic(config),
       FRESH_INVOCATION_YIELD_SECONDS,
     );
     return;
@@ -2729,18 +2732,18 @@ async function runCriticPhase(
 
   // (2) TOGGLE-OFF fail-open: a critic phase reached with passes.critic off (config drift / a stale
   // in-flight message after the toggle was turned off) must NOT run — fail open to the next phase
-  // (verify_fixes if enabled, else finalize) so behavior is byte-identical to the critic-off engine
-  // (NREG-01, Pitfall 5).
+  // (walkthrough_enrichment if enabled, else finalize) so behavior is byte-identical to the
+  // critic-off engine (NREG-01, Pitfall 5).
   if (!config.review.passes?.critic?.enabled) {
     logger.info(`Critic phase reached for job ${job.id} but passes.critic is off; failing open.`);
     await enqueueJobPhase(
       env,
       job.id,
-      // Same routing as the idempotency branch above — verify_fixes (when enabled) →
-      // walkthrough_enrichment (when enabled) → finalize. The walkthrough enrichment runs on its
-      // own fresh budget regardless of the preceding verify_fixes presence so the durable chain
-      // stays correct in either toggle config.
-      config.review.threads?.verify_fixes ? 'verify_fixes' : nextPhaseAfterCritic(config),
+      // Same routing as the idempotency branch above — walkthrough_enrichment (when enabled) →
+      // finalize. The critic-to-verify_fixes branch is intentionally absent (the verify_fixes
+      // is the FIRST hop after review, not a hop after critic; routing back to verify_fixes
+      // would create a loop — see the (1) comment above).
+      nextPhaseAfterCritic(config),
       FRESH_INVOCATION_YIELD_SECONDS,
     );
     return;
@@ -2939,10 +2942,13 @@ async function runCriticPhase(
   await enqueueJobPhase(
     env,
     job.id,
-    // Post-critic hand-off: verify_fixes (when enabled) → walkthrough_enrichment (when enabled) →
-    // finalize. The walkthrough enrichment runs on its own fresh budget regardless of the
-    // preceding verify_fixes presence so the durable chain stays correct in either toggle config.
-    config.review.threads?.verify_fixes ? 'verify_fixes' : nextPhaseAfterCritic(config),
+    // Phase 20.1 (BLOCKER 3 chain correctness): post-critic hand-off is walkthrough_enrichment
+    // (when enabled) → finalize. The verify_fixes is the FIRST hop after review (not a hop after
+    // critic) — chaining critic → verify_fixes would create a loop (review → verify_fixes →
+    // critic → verify_fixes → ...). The walkthrough_enrichment runs on its own fresh budget
+    // regardless of the preceding verify_fixes presence so the durable chain stays correct in
+    // either toggle config.
+    nextPhaseAfterCritic(config),
     FRESH_INVOCATION_YIELD_SECONDS,
   );
 }
