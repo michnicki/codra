@@ -45,9 +45,9 @@ describe('matchCompositeRule (exported)', () => {
     const b = finding({ path: 'src/a.ts', line: 5, title: 'null check user identifier' });
     const match: CompositeMatch | null = matchCompositeRule(a, b);
     expect(match).not.toBeNull();
-    expect(match?.rule).toBe('rule1');
-    expect(match?.titleSimilarity === null || typeof match.titleSimilarity === 'number').toBe(true);
-    expect(match?.bodySimilarity === null || typeof match.bodySimilarity === 'number').toBe(true);
+    expect(match!.rule).toBe('rule1');
+    expect(match!.titleSimilarity === null || typeof match!.titleSimilarity === 'number').toBe(true);
+    expect(match!.bodySimilarity === null || typeof match!.bodySimilarity === 'number').toBe(true);
   });
 });
 
@@ -103,7 +103,14 @@ describe('pickClusterRepresentative', () => {
   it('returns the primary-run finding when the primary belongs to the cluster', () => {
     const primaryFinding = finding({ line: 5, title: 'null check on user id', severity: 'P3' });
     const extraFinding = finding({ line: 5, title: 'null check on user id', severity: 'P0' });
-    const cluster = { id: 'c1', voters: [0, 1], findings: [primaryFinding, extraFinding] };
+    const cluster = {
+      id: 'c1',
+      voters: [0, 1],
+      members: [
+        { finding: primaryFinding, sourceRun: 0 },
+        { finding: extraFinding, sourceRun: 1 },
+      ],
+    };
     expect(pickClusterRepresentative(cluster, 0)).toBe(primaryFinding);
   });
 
@@ -111,7 +118,14 @@ describe('pickClusterRepresentative', () => {
     const extraFindingA = finding({ line: 5, title: 'null check on user id', severity: 'P1', confidence: 0.9, body: 'a' });
     const extraFindingB = finding({ line: 5, title: 'null check on user id', severity: 'P0', confidence: null, body: 'b' });
     const primaryFinding = finding({ line: 5, title: 'unrelated primary', severity: 'P3' });
-    const cluster = { id: 'c1', voters: [1, 2], findings: [extraFindingA, extraFindingB] };
+    const cluster = {
+      id: 'c1',
+      voters: [1, 2],
+      members: [
+        { finding: extraFindingA, sourceRun: 1 },
+        { finding: extraFindingB, sourceRun: 2 },
+      ],
+    };
     // P0 wins over P1 (even with lower confidence, since null ranks -1 < 0.9) — actual pick is severity-first.
     expect(pickClusterRepresentative(cluster, 0)).toBe(extraFindingB);
     expect(pickClusterRepresentative(cluster, 0)).not.toBe(primaryFinding);
@@ -121,7 +135,15 @@ describe('pickClusterRepresentative', () => {
     const a = finding({ line: 5, title: 'null check on user id', severity: 'P2', confidence: 0.5, body: 'first' });
     const b = finding({ line: 5, title: 'null check on user id', severity: 'P2', confidence: 0.5, body: 'second' });
     const c = finding({ line: 5, title: 'null check on user id', severity: 'P2', confidence: 0.9, body: 'third' });
-    const cluster = { id: 'c1', voters: [1, 2], findings: [a, b, c] };
+    const cluster = {
+      id: 'c1',
+      voters: [1, 2],
+      members: [
+        { finding: a, sourceRun: 1 },
+        { finding: b, sourceRun: 2 },
+        { finding: c, sourceRun: 3 },
+      ],
+    };
     // Highest confidence wins: c.
     expect(pickClusterRepresentative(cluster, 0)).toBe(c);
   });
@@ -135,7 +157,7 @@ describe('reconcileEnsembleRuns', () => {
   it('returns zero winners and drops everything when only one run is successful (D-13 — runs:1 inert path)', () => {
     const r0 = run(0, [finding({ line: 5 })]);
     const result = reconcileEnsembleRuns([r0]);
-    expect(result.winningFindings).toEqual([]);
+    expect(result.winners).toEqual([]);
     expect(result.droppedClusters).toHaveLength(1);
     expect(result.successfulRuns).toBe(1);
     expect(result.failedRuns).toBe(0);
@@ -145,11 +167,12 @@ describe('reconcileEnsembleRuns', () => {
     const r0 = run(0, [finding({ line: 5, title: 'null check on user id' })]);
     const r1 = run(1, [finding({ line: 5, title: 'null check on user id' })]);
     const r2 = run(2, [finding({ line: 5, title: 'null check on user id' })]);
-    const r3 = run(3, [finding({ line: 5, title: 'unrelated other concern' })]);
+    const r3 = run(3, [finding({ line: 5, category: 'bugs', title: 'unrelated other concern' })]);
     const result = reconcileEnsembleRuns([r0, r1, r2, r3]);
-    // cluster "null check" has 3 of 4 votes -> strictly greater than 2 -> wins.
-    expect(result.winningFindings).toHaveLength(1);
-    expect(result.droppedClusters).toHaveLength(0);
+    // "null check" cluster has 3 of 4 votes -> strictly greater than 2 -> wins.
+    expect(result.winners).toHaveLength(1);
+    // r3's unrelated finding forms its own cluster with 1 voter -> loses -> dropped.
+    expect(result.droppedClusters).toHaveLength(1);
     expect(result.successfulRuns).toBe(4);
     expect(result.failedRuns).toBe(0);
   });
@@ -157,40 +180,43 @@ describe('reconcileEnsembleRuns', () => {
   it('drops 2-of-3 only when the cluster has fewer than half+1 votes', () => {
     const r0 = run(0, [finding({ line: 5, title: 'null check on user id' })]);
     const r1 = run(1, [finding({ line: 5, title: 'null check on user id' })]);
-    const r2 = run(2, [finding({ line: 5, title: 'something completely different here' })]);
+    const r2 = run(2, [finding({ line: 5, category: 'bugs', title: 'something completely different here' })]);
     const result = reconcileEnsembleRuns([r0, r1, r2]);
     // 2 of 3 successful -> strictly greater than 1.5 -> wins.
-    expect(result.winningFindings).toHaveLength(1);
-    expect(result.droppedClusters).toHaveLength(0);
+    expect(result.winners).toHaveLength(1);
+    // r2's unrelated finding forms its own cluster with 1 voter -> loses -> dropped.
+    expect(result.droppedClusters).toHaveLength(1);
   });
 
   it('removes failed runs from the denominator (D-10)', () => {
     const r0 = run(0, [finding({ line: 5, title: 'null check on user id' })]);
     const r1 = run(1, [finding({ line: 5, title: 'null check on user id' })]);
     const r2Failed = { runIndex: 2, findings: [], failed: true as const, reason: 'transient' };
-    const r3 = run(3, [finding({ line: 5, title: 'unrelated concern other words here' })]);
+    const r3 = run(3, [finding({ line: 5, category: 'bugs', title: 'unrelated concern other words here' })]);
     // Successful: r0, r1, r3 -> denominator is 3. "null check" cluster has 2 votes -> > 1.5 -> wins.
     const result = reconcileEnsembleRuns([r0, r1, r2Failed, r3]);
     expect(result.successfulRuns).toBe(3);
     expect(result.failedRuns).toBe(1);
-    expect(result.winningFindings).toHaveLength(1);
+    expect(result.winners).toHaveLength(1);
   });
 
   it('drops a cluster when only 1 of 4 successful runs casts a vote', () => {
-    const r0 = run(0, [finding({ line: 5, title: 'null check on user id' })]);
-    const r1 = run(1, [finding({ line: 5, title: 'different concern alpha beta' })]);
-    const r2 = run(2, [finding({ line: 5, title: 'different concern gamma delta' })]);
-    const r3 = run(3, [finding({ line: 5, title: 'different concern epsilon zeta' })]);
+    // Use entirely disjoint findings (different paths AND different titles) so every cluster has
+    // exactly 1 voter; with successfulRuns=4 the threshold is 2 -> all clusters are dropped.
+    const r0 = run(0, [finding({ path: 'src/a.ts', line: 5, title: 'null check on user id' })]);
+    const r1 = run(1, [finding({ path: 'src/b.ts', line: 1, category: 'bugs', title: 'totally unrelated beta' })]);
+    const r2 = run(2, [finding({ path: 'src/c.ts', line: 1, category: 'bugs', title: 'totally unrelated gamma' })]);
+    const r3 = run(3, [finding({ path: 'src/d.ts', line: 1, category: 'bugs', title: 'totally unrelated delta' })]);
     const result = reconcileEnsembleRuns([r0, r1, r2, r3]);
-    expect(result.winningFindings).toEqual([]);
-    expect(result.droppedClusters.length).toBeGreaterThan(0);
+    expect(result.winners).toEqual([]);
+    expect(result.droppedClusters.length).toBe(4);
   });
 
   it('zero successful runs yields zero winners (not a winner from a single primary)', () => {
     const r0Failed = { runIndex: 0, findings: [], failed: true as const, reason: 'boom' };
     const r1Failed = { runIndex: 1, findings: [], failed: true as const, reason: 'boom' };
     const result = reconcileEnsembleRuns([r0Failed, r1Failed]);
-    expect(result.winningFindings).toEqual([]);
+    expect(result.winners).toEqual([]);
     expect(result.successfulRuns).toBe(0);
     expect(result.failedRuns).toBe(2);
   });
@@ -201,7 +227,7 @@ describe('reconcileEnsembleRuns', () => {
     const result = reconcileEnsembleRuns([r0Failed, r1]);
     // With successfulRuns == 1 the existing per-file degradation path runs; reconcile reports the
     // primary finding as a candidate but does NOT classify it as a winner (D-10 strict-majority).
-    expect(result.winningFindings).toEqual([]);
+    expect(result.winners).toEqual([]);
     expect(result.successfulRuns).toBe(1);
   });
 
@@ -210,7 +236,7 @@ describe('reconcileEnsembleRuns', () => {
     const r1 = run(1, [finding({ line: 5, title: 'null check user identifier', severity: 'P0', confidence: 0.9 })]);
     const r2 = run(2, [finding({ line: 5, title: 'null pointer check on user', severity: 'P1', confidence: 0.7 })]);
     const result = reconcileEnsembleRuns([r0, r1, r2]);
-    expect(result.winningFindings).toHaveLength(1);
+    expect(result.winners).toHaveLength(1);
     expect(result.droppedClusters).toHaveLength(0);
   });
 
@@ -221,8 +247,8 @@ describe('reconcileEnsembleRuns', () => {
     const r1 = run(1, [extra]);
     const r2 = run(2, [extra]);
     const result = reconcileEnsembleRuns([r0, r1, r2]);
-    expect(result.winningFindings).toHaveLength(1);
-    expect(result.winningFindings[0]).toBe(primary);
+    expect(result.winners).toHaveLength(1);
+    expect(result.winners[0].finding).toBe(primary);
   });
 });
 
@@ -241,15 +267,16 @@ describe('buildEnsembleVoteAuditEvent', () => {
   it('emits one bounded event with winner + dropped samples and reason list', () => {
     const r0 = run(0, [finding({ line: 5, title: 'null check on user id' })]);
     const r1 = run(1, [finding({ line: 5, title: 'null check on user id' })]);
-    const r2 = run(2, [finding({ line: 5, title: 'unrelated concern alpha beta' })]);
+    const r2 = run(2, [finding({ line: 5, category: 'bugs', title: 'unrelated concern alpha beta' })]);
     const result = reconcileEnsembleRuns([r0, r1, r2]);
-    const event = buildEnsembleVoteAuditEvent('src/a.ts', result);
+    const event = buildEnsembleVoteAuditEvent('src/a.ts', result, ['timeout']);
     expect(event).not.toBeNull();
     expect(event!.stage).toBe('ensemble.voted');
     expect(event!.successfulRuns).toBe(3);
     expect(event!.winnerCount).toBe(1);
     expect(event!.winningSample).toHaveLength(1);
     expect(event!.winningSample[0].votes).toBe(2);
+    expect(event!.failedRunReasons).toEqual(['timeout']);
   });
 
   it('caps the winningSample at 20 entries even when many clusters win', () => {
@@ -261,7 +288,7 @@ describe('buildEnsembleVoteAuditEvent', () => {
     const r1 = run(1, findings);
     const r2 = run(2, findings);
     const result = reconcileEnsembleRuns([r0, r1, r2]);
-    expect(result.winningFindings.length).toBeGreaterThan(20);
+    expect(result.winners.length).toBeGreaterThan(20);
     const event = buildEnsembleVoteAuditEvent('src/a.ts', result);
     expect(event!.winningSample.length).toBeLessThanOrEqual(20);
   });
@@ -284,7 +311,7 @@ describe('buildEnsembleVoteAuditEvent', () => {
     const r1 = run(1, [finding({ line: 5, title: 'null check on user id' })]);
     const r2 = run(2, [finding({ line: 5, title: 'null check on user id' })]);
     const result = reconcileEnsembleRuns([r0Failed, r1, r2]);
-    const event = buildEnsembleVoteAuditEvent('src/a.ts', result);
+    const event = buildEnsembleVoteAuditEvent('src/a.ts', result, ['timeout']);
     expect(event!.failedRuns).toBe(1);
     expect(event!.failedRunReasons).toBeDefined();
     expect(event!.failedRunReasons!.length).toBe(1);
