@@ -194,7 +194,10 @@ export type MergeRecord = {
   bodySimilarity: number | null;
 };
 
-type CompositeMatch = Omit<MergeRecord, 'survivor' | 'suppressed'>;
+// Phase 19 (PASS-02, D-11): the composite-match vocabulary is reused by ensemble voting so the
+// cluster/vote and the post-pass dedup pipeline share ONE rule table. Exported additively
+// without changing behavior.
+export type CompositeMatch = Omit<MergeRecord, 'survivor' | 'suppressed'>;
 
 /**
  * Evaluate the FILT-03 4-rule table (D-02) for one already-kept survivor against one candidate, both
@@ -215,7 +218,13 @@ type CompositeMatch = Omit<MergeRecord, 'survivor' | 'suppressed'>;
  * char-trigram 0.7 because word-set Jaccard is a coarser, more forgiving measure of the same-issue
  * relationship (a reworded restatement shares more words than character trigrams).
  */
-function matchCompositeRule(survivor: ParsedReviewComment, candidate: ParsedReviewComment): CompositeMatch | null {
+// Phase 19 (PASS-02, D-11): exported (was module-private) so ensemble voting can build clusters
+// against the same 4-rule table without forking a second similarity algorithm. Behavior is
+// unchanged from the private predecessor — every threshold and branch is byte-for-byte preserved.
+export function matchCompositeRule(
+  survivor: ParsedReviewComment,
+  candidate: ParsedReviewComment,
+): CompositeMatch | null {
   const titleSim = wordJaccardSimilarity(survivor.title, candidate.title);
 
   if (survivor.path === candidate.path) {
