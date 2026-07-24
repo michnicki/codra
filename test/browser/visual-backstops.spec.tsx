@@ -13,6 +13,11 @@ import {
   type StatsPayload,
 } from '@shared/schema';
 import { renderPage } from './render';
+import {
+  loadProductionStylesheet,
+  removeProductionStylesheet,
+  VISUAL_BACKSTOP_WINDOW_KEY,
+} from '../support/visual-backstop-runtime';
 
 vi.mock('@client/lib/api', () => ({
   api: {
@@ -41,32 +46,33 @@ const LONG_FILE_PATH = `src/${'provider-boundary/'.repeat(28)}review-handler-wit
 const LONG_AUDIT_PATH = `src/${'audit-boundary/'.repeat(30)}decision-recorder.ts`;
 const LONG_AUDIT_REASON = `provider_rejected_${'bounded_structural_metadata_'.repeat(7)}without_retry`;
 
-let utilityStyles: HTMLStyleElement;
+// Phase 20.1 WARNING 1 closure: load the production Vite/Tailwind build instead of injecting
+// hardcoded utility CSS. The vitest server has a Vite plugin (`test/support/visual-backstop-vite-plugin.ts`)
+// that serves `dist/client/` at `${window.__VISUAL_BACKSTOP_BASE__}` — the path segment is
+// injected into the iframe HTML via `transformIndexHtml`. We derive the served origin from
+// `window.location.origin`, fetch the served `/index.html` to discover the hashed CSS asset,
+// and inject the production stylesheet as a real `<link>` element on the test document. The
+// computed-style assertions below now prove the production Tailwind build applies the
+// expected CSS — not just that some stylesheet (real or hardcoded) assigns the declaration.
+let productionStylesheetLink: HTMLLinkElement | null = null;
 
-beforeAll(() => {
-  // vitest.config.ts intentionally omits the Tailwind Vite plugin. These are the exact declarations
-  // emitted by the installed Tailwind compiler for the five production utility candidates below.
-  // Each assertion also checks the real surface node's class, so this stylesheet supplies browser
-  // computation without replacing the source-level utility contract with a test-only mechanism.
-  utilityStyles = document.createElement('style');
-  utilityStyles.dataset.visualBackstops = 'tailwind-utilities';
-  utilityStyles.textContent = `
-    .line-clamp-2 {
-      overflow: hidden;
-      display: -webkit-box;
-      -webkit-box-orient: vertical;
-      -webkit-line-clamp: 2;
-    }
-    .overflow-hidden { overflow: hidden; }
-    .break-words { overflow-wrap: break-word; }
-    .break-all { word-break: break-all; }
-    .min-w-0 { min-width: 0; }
-  `;
-  document.head.appendChild(utilityStyles);
-});
+beforeAll(async () => {
+  const basePath = (window as unknown as Record<string, string | undefined>)[VISUAL_BACKSTOP_WINDOW_KEY];
+  if (!basePath) {
+    throw new Error(
+      [
+        'visual-backstops.spec.tsx: window.__VISUAL_BACKSTOP_BASE__ was not injected.',
+        'The Vite plugin at test/support/visual-backstop-vite-plugin.ts must be loaded by vitest.config.ts.',
+        'Check vitest.config.ts has plugins: [react(), visualBackstopPlugin()].',
+      ].join('\n'),
+    );
+  }
+  productionStylesheetLink = await loadProductionStylesheet(`${window.location.origin}${basePath}`);
+}, 120_000);
 
 afterAll(() => {
-  utilityStyles?.remove();
+  removeProductionStylesheet(productionStylesheetLink);
+  productionStylesheetLink = null;
 });
 
 function setTheme(theme: TestTheme) {
