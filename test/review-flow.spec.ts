@@ -1278,6 +1278,52 @@ dbDescribe('Review Flow Lifecycle', () => {
       reviewSpy.mockRestore();
       getDiffSpy.mockRestore();
     }, REVIEW_FLOW_TIMEOUT_MS);
+
+    // Phase 20.1 (BLOCKER 3 + chain-order smoke): the review-phase hand-off routes through
+    // `nextPhaseAfterReview` (now in `core/phase-routing.ts`). When all three toggles are ON,
+    // the review phase must hand off to `verify_fixes` (the first hop in the chain). This is
+    // the integration smoke for the SELECTOR WIRING — the chain semantics are pinned in
+    // `test/phase-routing.spec.ts` (22 cases covering all 16 toggle combinations).
+    it('routes review → verify_fixes when all v1.2 toggles are on (BLOCKER 3 + chain-order smoke)', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { ModelService } = await import('@server/services/model');
+      const repo = `test-repo-${Date.now()}-blocker3-review-routing`;
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/one.ts', content: 'console.log(1);' }]),
+      );
+      const reviewSpy = vi.spyOn(ModelService.prototype as any, 'reviewFile').mockImplementation(findingReview);
+
+      // All v1.2 toggles ON.
+      const allOnConfig: RepoConfig = {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          threads: { verify_fixes: true, auto_resolve: false },
+          passes: {
+            ...defaultRepoConfig.review.passes,
+            critic: { enabled: true, skip_threshold: 1 },
+          },
+          walkthrough: { enabled: true, sequence_diagram: { enabled: true } },
+        },
+      };
+
+      const job = await insertCriticJob(repo, allOnConfig, 'g');
+      await updateJobFileCount(env, job.id, 1);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+
+      // Run the review phase only and assert the hand-off target is 'verify_fixes' (chain order:
+      // review → verify_fixes first, per the BLOCKER 3 + chain-order selector).
+      await runWithDb(env, async () => {
+        const result = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-blocker3-routing', phase: 'review' });
+        expect(result.action).toBe('next_phase');
+        if (result.action === 'next_phase') {
+          expect(result.phase).toBe('verify_fixes');
+        }
+      });
+
+      reviewSpy.mockRestore();
+      getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
   });
 
   it('marks completed jobs with skipped files as partial reviews', async () => {
