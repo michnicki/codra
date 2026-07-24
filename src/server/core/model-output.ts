@@ -900,6 +900,9 @@ export function parseWalkthroughEnrichmentResponse(raw: string): ParsedWalkthrou
     return { kind: 'fail_open', reason: 'all_fields_invalid' };
   }
 
-  return { kind: 'parsed', groups, confidence, effort, malformedFields };
+  // WR-04: freeze the internal mutable accumulator so the runtime shape matches the declared
+  // `readonly WalkthroughEnrichmentField[]` contract on ParsedWalkthroughEnrichment. The internal
+  // `malformedFields` is left mutable above so the per-field push sites stay readable.
+  return { kind: 'parsed', groups, confidence, effort, malformedFields: Object.freeze(malformedFields) };
 }
 
