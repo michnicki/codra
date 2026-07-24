@@ -24,7 +24,8 @@ describe('Phase 19 default-path byte identity', () => {
 
     expect(fixture.provenance.captureCommit).toBe('3d5f4150f8ff88787c10a3067ddc59176285eb25');
     expect(fixture.provenance.source).toBe('detached pre-Phase-19 worktree');
-    expect(actual).toEqual({ ...fixture, provenance: undefined });
+    const { provenance: _provenance, ...oracle } = fixture;
+    expect(actual).toBe(canonicalizePhase19Baseline(oracle));
   });
 
   it('keeps all Phase-19 toggles inert and records no Phase-19 calls/results at defaults', () => {
