@@ -348,6 +348,18 @@ const ENSEMBLE_WINNING_SAMPLE_CAP = 20;
 const ENSEMBLE_DROPPED_SAMPLE_CAP = 20;
 const ENSEMBLE_FAILED_RUN_REASONS_CAP = 4;
 
+// Phase 21 (EVID-03): evidence_missing_summary bounded sample cap (schema .max(20) constant for the builder).
+const EVIDENCE_MISSING_SAMPLE_CAP = 20;
+
+export type EvidenceMissingSummaryAuditEvent = Extract<JobAuditEvent, { stage: 'evidence_missing_summary' }>;
+
+export interface EvidenceMissingEntry {
+  path: string;
+  line: number | null;
+  title: string;
+  reason: 'absent' | 'not_in_hunk';
+}
+
 export type EnsembleVoteAuditEvent = Extract<JobAuditEvent, { stage: 'ensemble.voted' }>;
 
 /**
@@ -562,6 +574,65 @@ export function buildWalkthroughEnrichmentAuditEvent(
     event.groupCount = groupCount;
   }
   return event;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 21 (EVID-03) — bounded evidence_missing_summary audit builder.
+//
+// Replaces N per-finding `evidence_missing` events with ONE aggregate per
+// (file, pass) unit, preventing a non-compliant model's flood of events from
+// evicting other telemetry from the 500-event ring buffer.
+// ---------------------------------------------------------------------------
+
+/**
+ * PURE evidence-missing-summary audit builder (EVID-03 / D-05 / D-06 / D-07).
+ * Derives ONE `evidence_missing_summary` event from an array of
+ * `EvidenceMissingEntry` objects. Returns null when entries is empty (D-05 —
+ * no zero-count event for empty input).
+ *
+ * Counts are always aggregate (D-06): `absentCount` and `notInHunkCount`
+ * reflect the FULL total passed in, NOT the capped sample length. The `sample`
+ * array is bounded to at most `EVIDENCE_MISSING_SAMPLE_CAP` (20) entries and
+ * preserves model emission order per D-07 — entries are NOT grouped by reason.
+ *
+ * Privacy boundary (T-15-04-01 / Phase 20.1 D-06): every sample entry's title
+ * passes through `redactFindingTitle` before storage. The builder never
+ * includes body/diff/existingCode/codeSuggestion in the event payload.
+ *
+ * Precedent: follows `buildFileSkipEvents` (lines 228-257) pattern — pure
+ * function, no I/O, never throws, returns typed event via `satisfies`.
+ */
+export function buildEvidenceMissingSummary(
+  file: string,
+  pass: FileReviewPass,
+  entries: EvidenceMissingEntry[],
+): EvidenceMissingSummaryAuditEvent | null {
+  if (entries.length === 0) return null;
+
+  const absentCount = entries.filter((e) => e.reason === 'absent').length;
+  const notInHunkCount = entries.length - absentCount;
+
+  const sample = entries.slice(0, EVIDENCE_MISSING_SAMPLE_CAP).map((e) => ({
+    path: e.path,
+    line: e.line,
+    title: redactFindingTitle(e.title),
+    reason: e.reason,
+  }));
+
+  const event = {
+    stage: 'evidence_missing_summary' as const,
+    file,
+    pass,
+    absentCount,
+    notInHunkCount,
+    sample,
+    timestamp: new Date().toISOString(),
+  };
+
+  // `satisfies` is a compile-time check — if the literal ever diverges from
+  // the `JobAuditEvent` union member, TypeScript rejects at compile time
+  // rather than silently widening (Codex REVIEWS finding). NEVER cast `as`.
+  return event satisfies JobAuditEvent;
 }
 
 /**
