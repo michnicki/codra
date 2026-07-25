@@ -163,10 +163,9 @@ describe('recordWalkthroughAudit best-effort recorder (D-04)', () => {
 
 // ---------------------------------------------------------------------------
 // Phase 20.1 BLOCKER 1 (D-06): the audit-event builders now route finding titles through
-// `redactFindingTitle`, which caps titles to 100 chars and wraps over-length input in a
-// fixed-shape marker. These tests pin the producer-side enforcement contract so a regression
-// that reverts to the prior `.slice(0, 200)` or pass-through `d.title` is caught here, not
-// in production. The three cases mirror the three producer sites in audit.ts:
+// `redactFindingTitle`, which maps every non-empty title to one fixed structural marker. These
+// tests pin the producer-side enforcement contract so a regression that restores raw title
+// content is caught here, not in production. The three cases mirror the three producer sites in audit.ts:
 //   - buildFinalizeDropEvents (filtered / deduped)
 //   - buildCriticDecisionsAuditEvent (critic.decisions sample)
 //   - and as a bonus, the toAuditIdentifier helper used by buildFinalizeDropEvents.
@@ -194,7 +193,7 @@ describe('BLOCKER 1: buildFinalizeDropEvents redacts sample titles (D-06)', () =
     );
     expect(events).toHaveLength(1);
     const event = events[0] as Extract<typeof events[0], { stage: 'filtered' }>;
-    expect(event.sample[0].title).toMatch(/^\[clamped:head 100 chars /);
+    expect(event.sample[0].title).toBe('[title-redacted]');
     expect(event.sample[0].title.length).toBeLessThanOrEqual(100);
     expect(event.sample[0].title).not.toBe(longTitle);
   });
@@ -249,14 +248,16 @@ describe('BLOCKER 1: buildFinalizeDropEvents redacts sample titles (D-06)', () =
     expect(event.suppressed.title.length).toBeLessThanOrEqual(100);
   });
 
-  it('passes short titles through unchanged', () => {
-    const short = dropRecord({ title: 'short title' });
+  it('redacts short sensitive titles in finalize-drop samples', () => {
+    const sensitiveTitle = 'token sk_live_finalize_secret';
+    const short = dropRecord({ title: sensitiveTitle });
     const events = buildFinalizeDropEvents(
       { confidenceFloor: [short], severityFloor: [], cap: [], merges: [] },
       { severityFloor: 'P2', cap: 100 },
     );
     const event = events[0] as Extract<typeof events[0], { stage: 'filtered' }>;
-    expect(event.sample[0].title).toBe('short title');
+    expect(event.sample[0].title).toBe('[title-redacted]');
+    expect(event.sample[0].title).not.toContain(sensitiveTitle);
   });
 
   it('emits events that validate against the schema-deployed jobAuditEventSchema', () => {
@@ -286,16 +287,18 @@ describe('BLOCKER 1: buildCriticDecisionsAuditEvent redacts sample titles (D-06)
     for (const row of sample) {
       expect(row.title).not.toBe(longTitle);
       expect(row.title.length).toBeLessThanOrEqual(100);
-      expect(row.title).toMatch(/^\[clamped:head 100 chars /);
+      expect(row.title).toBe('[title-redacted]');
     }
   });
 
-  it('passes short titles through unchanged', () => {
+  it('redacts short sensitive titles in critic samples', () => {
+    const sensitiveTitle = 'api-key critic-secret';
     const decisions: CriticDecision[] = [
-      { id: 0, path: 'src/a.ts', line: 1, severity: 'P2', category: 'quality', title: 'short', body: 'body', confidence: 0.9, verdict: 'proven', outcome: 'kept', reason: 'evidence-supported' },
+      { id: 0, path: 'src/a.ts', line: 1, severity: 'P2', category: 'quality', title: sensitiveTitle, body: 'body', confidence: 0.9, verdict: 'proven', outcome: 'kept', reason: 'evidence-supported' },
     ];
     const event = buildCriticDecisionsAuditEvent(decisions, 'completed');
-    expect(event!.sample[0].title).toBe('short');
+    expect(event!.sample[0].title).toBe('[title-redacted]');
+    expect(event!.sample[0].title).not.toContain(sensitiveTitle);
   });
 
   it('emits an event that validates against the schema-deployed jobAuditEventSchema', () => {

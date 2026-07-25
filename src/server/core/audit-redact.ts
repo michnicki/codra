@@ -27,26 +27,14 @@ import {
   type MachineErrorReason,
 } from '@shared/transient-errors';
 
-// D-06: the length cap for a raw title that the redactor treats as "unchanged". A title at or
-// below this length passes through verbatim — a long title is preserved for operator debug, not
-// dropped, so the audit trail still names the finding. The 100-char ceiling matches the existing
-// clampAuditTitle semantics so the audit-event schema can move `.max(200)` -> `.max(100)` without
-// breaking any other producer.
-const FINDING_TITLE_MAX_LENGTH = 100;
-
-// Worst-case length of the redacted marker for a title at FINDING_TITLE_MAX_LENGTH:
-//   "[clamped:head 100 chars " + 100 chars + "...]" = 22 + 100 + 4 = 126 chars.
-// Plus the trim() / whitespace collapse introduced in the D-06 substring step (worst case: the
-// head is all whitespace and collapses to "" so the marker is shorter than 100). The schema cap
-// of 100 is therefore strict — the redactor must truncate BEFORE the marker wrapping. The
-// explicit clamp on the head slice keeps the conditional "<= 110" in the spec literal-shaped.
-const REDACTED_TITLE_HEAD_LENGTH = 100;
-const REDACTED_MARKER_HEAD_BUDGET = 72;
-
 // Defensive marker for null / undefined / empty input. A non-empty placeholder keeps the
-// downstream schema's `min(1)` truth value (the relaxed proposal still wants a non-empty cell
-// so the audit viewer does not have to special-case a totally empty title).
+// downstream schema's `min(1)` truth value so the audit viewer does not need to special-case
+// a totally empty title.
 const EMPTY_TITLE_MARKER = '[clamped:empty]';
+
+// Every non-empty title maps to one input-independent value. This intentionally sacrifices
+// title-level debugging so jobs.audit can never retain model-supplied title content.
+const REDACTED_FINDING_TITLE_MARKER = '[title-redacted]';
 
 // Provider 5xx substrings (D-07 bucket). Substring match on lowercased message — a hostile
 // provider payload is classified by the presence of any of these tokens, never by parsing the
@@ -58,29 +46,13 @@ const PROVIDER_5XX_SUBSTRINGS = ['5xx', '500', '502', '503'] as const;
 const NETWORK_RESET_SUBSTRINGS = ['fetch', 'network', 'econnreset'] as const;
 
 /**
- * D-06 length-bounded head clamp. Returns the title unchanged when its length is <= 100 chars.
- * Returns a fixed-shape marker `<prefix> <head>...` for longer input where:
- *   - prefix       = "[clamped:head 100 chars "  (always literal, never varies)
- *   - head         = the first 100 chars of the title with whitespace collapsed + trimmed
- *   - suffix       = "..."                       (always literal)
- * Returns the EMPTY_TITLE_MARKER for null / undefined / empty input so downstream code never
- * sees a slip-through empty string. The marker is always non-empty and <= 110 chars.
- *
- * Never throws on unicode / control chars / surrogate pairs — the head is sliced at a char
- * boundary (JavaScript string `.slice` is character-index based, which is safe for the
- * scalar values in a finding title; no UTF-16 surrogate splitting is possible here because
- * `length` returns code-unit count, so a slice at `length` is a code-unit slice — acceptable
- * for the audit boundary where the head is a human-debug elision, not a parser input).
+ * Maps every non-empty finding title to a fixed structural marker before audit persistence.
+ * No source-derived prefix, digest, length, or other title content is retained. Nullish and empty
+ * defensive inputs use a separate non-empty marker. Both outputs satisfy the audit title schema.
  */
 export function redactFindingTitle(title: string | null | undefined): string {
   if (title == null || title === '') return EMPTY_TITLE_MARKER;
-  if (title.length <= FINDING_TITLE_MAX_LENGTH) return title;
-  const head = title
-    .slice(0, REDACTED_TITLE_HEAD_LENGTH)
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, REDACTED_MARKER_HEAD_BUDGET);
-  return `[clamped:head 100 chars ${head}...]`;
+  return REDACTED_FINDING_TITLE_MARKER;
 }
 
 /**

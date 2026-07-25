@@ -413,25 +413,20 @@ dbDescribe('recordEnsembleAudit best-effort recorder (T-19-05-01)', () => {
     const audited = detail!.audit[0] as Extract<NonNullable<typeof detail>['audit'][0], { stage: 'ensemble.voted' }>;
     expect(audited.winnerCount).toBe(1);
     expect(audited.winningSample).toHaveLength(1);
+    expect(audited.winningSample[0].title).toBe('[title-redacted]');
   });
 
-  it('BLOCKER 1 (D-06): winningSample and droppedSample titles are redacted when over 100 chars', () => {
-    const longTitle = 'x'.repeat(250);
-    const r0 = run(0, [finding({ line: 5, title: longTitle })]);
-    const r1 = run(1, [finding({ line: 5, title: longTitle })]);
-    const r2 = run(2, [finding({ line: 10, category: 'bugs', title: longTitle })]);
+  it('BLOCKER 1 (D-06): winningSample and droppedSample titles use the fixed marker', () => {
+    const sensitiveTitle = 'token ensemble-secret';
+    const r0 = run(0, [finding({ line: 5, title: sensitiveTitle })]);
+    const r1 = run(1, [finding({ line: 5, title: sensitiveTitle })]);
+    const r2 = run(2, [finding({ line: 10, category: 'bugs', title: sensitiveTitle })]);
     const reconciliation = reconcileEnsembleRuns([r0, r1, r2]);
     const event = buildEnsembleVoteAuditEvent('src/a.ts', reconciliation, []);
     expect(event).not.toBeNull();
-    for (const sample of event!.winningSample) {
-      expect(sample.title).not.toBe(longTitle);
-      expect(sample.title).toMatch(/^\[clamped:head 100 chars /);
-      expect(sample.title.length).toBeLessThanOrEqual(100);
-    }
-    for (const sample of event!.droppedSample) {
-      expect(sample.title).not.toBe(longTitle);
-      expect(sample.title).toMatch(/^\[clamped:head 100 chars /);
-      expect(sample.title.length).toBeLessThanOrEqual(100);
+    for (const sample of [...event!.winningSample, ...event!.droppedSample]) {
+      expect(sample.title).toBe('[title-redacted]');
+      expect(sample.title).not.toContain(sensitiveTitle);
     }
   });
 
