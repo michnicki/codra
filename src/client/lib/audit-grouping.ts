@@ -33,6 +33,10 @@ export const STAGE_ORDER = [
  * and it lands in the `rounds` group. The original `event.stage` is preserved on each event so
  * the viewer / future per-variant switch can still distinguish them.
  *
+ * Phase 24: the synthetic `evidence_missing` display group now also covers
+ * `evidence_missing_summary` aggregate events alongside the legacy per-finding
+ * `evidence_missing` events.
+ *
  * Closed union matching STAGE_ORDER. Non-round stages pass through unchanged.
  */
 export type AuditDisplayStage = typeof STAGE_ORDER[number];
@@ -64,6 +68,9 @@ export function normalizeAuditDisplayStage(stage: JobAuditEvent['stage']): Audit
   if (stage === 'critic.decisions') return 'critic';
   if (stage === 'ensemble.voted') return 'ensemble';
   if (stage === 'walkthrough.enrichment') return 'walkthrough';
+  // Phase 24: evidence_missing_summary maps to the existing evidence_missing display stage
+  // so the aggregate event lands in the same Evidence missing group as legacy per-finding events.
+  if (stage === 'evidence_missing_summary') return 'evidence_missing';
   return stage as AuditDisplayStage;
 }
 
