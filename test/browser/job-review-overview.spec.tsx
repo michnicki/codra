@@ -40,6 +40,8 @@ function makeJob(overrides: Partial<JobDetail> = {}): JobDetail {
     summaryMarkdown: null,
     reviewId: null,
     summaryModel: null,
+    audit: [],
+    auditTruncated: false,
     files: [],
     ...overrides,
   };

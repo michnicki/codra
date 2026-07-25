@@ -6,6 +6,22 @@ export const fileStatuses = ['pending', 'done', 'skipped', 'failed'] as const;
 export const reviewVerdicts = ['approve', 'comment'] as const;
 export const reviewSeverities = ['P0', 'P1', 'P2', 'P3', 'nit'] as const;
 export const reviewCategories = ['security', 'bugs', 'performance', 'correctness', 'quality'] as const; // Keeping for DB compatibility but will deprecate usage in prompts
+export type ReviewSeverity = typeof reviewSeverities[number];
+export type ReviewCategory = typeof reviewCategories[number];
+
+// v1.2 severity-band map (SEV-04). Maps every review severity to its PRD display band. Per the
+// REQUIREMENTS.md standing decision the PRD bands are: blocker = P0/P1, warning = P2, suggestion =
+// P3, nitpick = nit (no historical-row migration). Review fix (OpenCode LOW): P0 and P1 MUST resolve
+// to the IDENTICAL 'blocker' band — a Record<ReviewSeverity, ...> alone permitted them to diverge,
+// so both are written to the literal string 'blocker' here AND asserted equal in the contract test.
+// `as const satisfies` locks the exact value shape so the type checker rejects any drift.
+export const severityBandMap = {
+  P0: 'blocker',
+  P1: 'blocker',
+  P2: 'warning',
+  P3: 'suggestion',
+  nit: 'nitpick',
+} as const satisfies Record<ReviewSeverity, 'blocker' | 'warning' | 'suggestion' | 'nitpick'>;
 export const llmApiFormats = ['openai', 'anthropic', 'gemini', 'cloudflare-workers-ai'] as const;
 export const vcsProviders = ['github', 'bitbucket'] as const;
 export type VcsProvider = typeof vcsProviders[number];
@@ -26,10 +42,16 @@ export const parsedReviewCommentSchema = z.object({
   line: z.number().int().positive().nullable().optional(),
   position: z.number().int().positive().nullable().optional(),
   severity: z.enum(reviewSeverities),
-  category: z.enum(reviewCategories).default('quality'),
+  // D-05: default changed 'quality' -> 'correctness'. Now that category is meaningful (v1.2 severity
+  // engine) rather than a universal catch-all, 'correctness' is the neutral fail-open default.
+  category: z.enum(reviewCategories).default('correctness'),
   title: z.string().min(1),
   body: z.string().min(1),
   codeSuggestion: z.string().min(1).nullable().optional(),
+  // v1.2: the ORIGINAL code the finding refers to (used by later phases for dedup / fix-verification
+  // context). nullable + optional following the same fail-open convention as codeSuggestion/confidence
+  // so a provider that omits it is representable and never throws the parse.
+  existingCode: z.string().nullable().optional(),
   // Per-finding model confidence (0..1). Threaded parse -> persist -> reconstruct -> finalize.
   // nullable + optional so a provider that omits it is representable and treated fail-open.
   confidence: z.number().min(0).max(1).nullable().optional(),
@@ -42,6 +64,11 @@ export const fileReviewModelOutputSchema = z.object({
       body: z.string().min(1),
       confidence_score: z.number().min(0).max(1).optional(),
       priority: z.number().int().min(0).max(3).optional(),
+      // v1.2: the model-emitted category, kept as a LOOSE z.string() (NOT z.enum(reviewCategories))
+      // on purpose — an enum here would throw the ENTIRE per-file parse when the model returns free
+      // text or an invalid value. D-06 requires exact-match-or-fail-open, which is resolved downstream
+      // in core/severity.ts (Plan 13-02), not at parse time.
+      category: z.string().optional(),
       code_location: z.object({
         absolute_file_path: z.string(),
         line_range: z.object({
@@ -51,6 +78,14 @@ export const fileReviewModelOutputSchema = z.object({
         line: z.number().int().positive().optional(),
       }),
       code_suggestion: z.string().optional(),
+      // v1.2 EVID-01 (D-15): the model-emitted evidence string the soft evidence gate (Plan 15-04)
+      // checks against the cleaned hunk. NULLABLE-AND-OPTIONAL, not bare .optional() (Codex 15-01 HIGH):
+      // this per-file parse (model-output.ts) runs BEFORE the evidence check, so a bare .optional()
+      // would throw the WHOLE response on a JSON `existing_code: null` and break the fail-open 'still
+      // posts' soft-gate guarantee. null AND omission both flow to the `absent` branch (15-04), never a
+      // parse failure — mirroring the loose/fail-open posture of `category` above and the already
+      // nullable parsedReviewCommentSchema.existingCode.
+      existing_code: z.string().nullable().optional(),
     }),
   ),
   overall_correctness: z.string().optional().default('patch is correct'),
@@ -138,8 +173,17 @@ export const reviewConfigSchema = z.object({
           input_char_budget: z.number().int().positive().optional(),
         })
         .default({ enabled: false }),
+      // v1.2 ensemble pass (PASS-02, consumed by Phase 19). `runs: 1` is the INERT default — no
+      // extra ensemble model calls fire at the default, so NREG-01 holds. Bounds guard against an
+      // authenticated-but-malicious config write (T-13-01-01): runs 1-5, temperature 0-2.
+      ensemble: z
+        .object({
+          runs: z.number().int().min(1).max(5).default(1),
+          temperature: z.number().min(0).max(2).default(0.7),
+        })
+        .default({ runs: 1, temperature: 0.7 }),
     })
-    .default({ security: { enabled: false }, critic: { enabled: false } }),
+    .default({ security: { enabled: false }, critic: { enabled: false }, ensemble: { runs: 1, temperature: 0.7 } }),
   interactive: z
     .object({
       commands: z
@@ -169,6 +213,43 @@ export const reviewConfigSchema = z.object({
       commands: { enabled: false, bitbucket_allowed_account_ids: [], bitbucket_bot_account_id: null },
       qa: { enabled: false, rate_limit_per_hour: 10 },
     }),
+  // v1.2 severity/category engine + lifecycle toggle blocks (SEV-01..04, consumed by Phases 14/18/19).
+  // Follows the existing uniform `{ enabled: boolean }` toggle-block shape.
+  // DELIBERATE DEFAULT EXCEPTION (D-01/D-02): every other Phase-7 toggle defaults `false` for NREG-01
+  // inertness, but `severity_engine.enabled` and `dedup.enabled` default `true` — they are documented
+  // correctness-fix / always-on exceptions (FILT-03), not new opt-in features.
+  severity_engine: z.object({ enabled: z.boolean().default(true) }).default({ enabled: true }),
+  dedup: z.object({ enabled: z.boolean().default(true) }).default({ enabled: true }),
+  // Priority file selection + generated-file detection toggle (PRIO-01/PRIO-02, consumed by Plan 15-03's
+  // core/diff.ts selection routine). DELIBERATE DEFAULT EXCEPTION (D-01/D-02): defaults `true` — it is
+  // the documented NREG-01 always-on exception #3, alongside severity_engine and dedup, framed as a
+  // correctness improvement (review the highest-signal files first, skip generated noise) rather than a
+  // new opt-in feature. ONE combined key governs BOTH the priority sort AND the generated detector
+  // (D-02) — deliberately NOT split into two toggles; the single escape hatch reverts both at once.
+  file_selection: z.object({ enabled: z.boolean().default(true) }).default({ enabled: true }),
+  // Per-category confidence-floor overrides (FILT-02, consumed by Phase 14). MUST be z.partialRecord,
+  // NOT z.record: under this repo's Zod 4 (4.4.3) `z.record(z.enum(reviewCategories), ...)` demands
+  // EVERY enum key, so a sparse override like `{ security: 0.85 }` throws for the other four
+  // categories. z.partialRecord accepts the sparse object and leaves absent keys genuinely absent.
+  // Empty {} is the inert default (no per-category override; global `min_confidence` still governs).
+  // Value bounds 0-1 guard against an out-of-range malicious config write (T-13-01-01).
+  category_confidence: z.partialRecord(z.enum(reviewCategories), z.number().min(0).max(1)).default({}),
+  // Phase 19 fix-threading toggles (THR-01/THR-02). Both default false for NREG-01 inertness.
+  threads: z
+    .object({
+      verify_fixes: z.boolean().default(false),
+      auto_resolve: z.boolean().default(false),
+    })
+    .default({ verify_fixes: false, auto_resolve: false }),
+  // Phase 18 incremental-round toggles. `incremental` defaults false per ROADMAP Phase 18's stated
+  // default; `escalate_floors` defaults true but is inert at the schema level since it only takes
+  // effect once `rounds.incremental` is also true (Phase 18's concern, not this phase's).
+  rounds: z
+    .object({
+      incremental: z.boolean().default(false),
+      escalate_floors: z.boolean().default(true),
+    })
+    .default({ incremental: false, escalate_floors: true }),
 });
 
 export const repoConfigSchema = z.object({
@@ -196,15 +277,23 @@ export const repoConfigSchema = z.object({
       on_file_types: ['.ts', '.tsx', '.js'],
       command: 'npm run lint && npm run typecheck',
     },
-    // Mirror the Phase 7 toggle blocks all-off in the inline literal default too, so
-    // `repoConfigSchema.parse({})` yields every toggle false regardless of Zod default
-    // short-circuit semantics for the nested `review` object (RESEARCH Open Q2).
+    // Mirror the toggle blocks in the inline literal default too, so `repoConfigSchema.parse({})`
+    // yields each toggle at its documented default regardless of Zod default short-circuit semantics
+    // for the nested `review` object (RESEARCH Open Q2). All Phase-7 toggles remain OFF here, but the
+    // two documented always-on v1.2 exceptions — `severity_engine.enabled` and `dedup.enabled` —
+    // deliberately default `true` (D-01/D-02, FILT-03), so this is no longer an "all-off" literal.
     walkthrough: { enabled: false, sequence_diagram: { enabled: true } },
-    passes: { security: { enabled: false }, critic: { enabled: false } },
+    passes: { security: { enabled: false }, critic: { enabled: false }, ensemble: { runs: 1, temperature: 0.7 } },
     interactive: {
       commands: { enabled: false, bitbucket_allowed_account_ids: [], bitbucket_bot_account_id: null },
       qa: { enabled: false, rate_limit_per_hour: 10 },
     },
+    severity_engine: { enabled: true },
+    dedup: { enabled: true },
+    file_selection: { enabled: true },
+    category_confidence: {},
+    threads: { verify_fixes: false, auto_resolve: false },
+    rounds: { incremental: false, escalate_floors: true },
   }),
   model: z
     .object({
@@ -228,14 +317,23 @@ export const repoConfigSchema = z.object({
     }),
 });
 
+// Phase 18 (RND-01 / RND-02 / RND-03 / RND-05): the locked review-mode value-set for jobs.review_mode
+// (mirrors the migration-011 review_mode CHECK constraint in db/migrations/011_*.sql). Kept in sync
+// with the producer surface (Plan 01's recordRoundAudit + the future Plan 02 selectDiffForRound
+// consumer) so an out-of-vocabulary mode string fails at parse rather than silently bypassing the
+// contract. Matches fileReviewPassSchema's enum-of-literals shape; future modes require a coordinated
+// schema + DB CHECK + producer edit.
+export const reviewModes = ['full', 'incremental', 'fallback', 'no_changes', 'rest'] as const;
+export type ReviewMode = typeof reviewModes[number];
+export const reviewModeSchema = z.enum(reviewModes);
+
 export const reviewJobMessageSchema = z.object({
   jobId: z.uuid().optional(),
   deliveryId: z.string().min(1),
-  // WIRE contract widened with 'critic' (D-07). The INTERNAL ReviewJobRunResult.phase union
-  // (review.ts:57) and the dispatch switch (review.ts:412-417) intentionally stay
-  // prepare|review|finalize — Phase 10 owns critic dispatch. A stray phase:'critic' message is
-  // REJECTED at the resolveQueuedJob boundary (return null → acked), never coerced/run.
-  phase: z.enum(['prepare', 'review', 'finalize', 'critic']).optional(),
+  // WIRE contract widened with durable auxiliary phases. The INTERNAL ReviewJobRunResult.phase union
+  // and dispatch switch are widened only when each phase's worker lands; accepting the values here
+  // lets fresh Workflow handoffs carry their persisted cursor without another contract edit.
+  phase: z.enum(['prepare', 'review', 'finalize', 'critic', 'verify_fixes', 'walkthrough_enrichment']).optional(),
   // Optional multi-pass routing fields (D-07). Kept `.optional()` (no default) so every
   // pre-widening producer/fixture — and ReviewJobMessage = z.input<...> — keeps compiling.
   kind: z.enum(['review', 'qa', 'command']).optional(),
@@ -323,6 +421,177 @@ export const reviewJobMessageSchema = z.object({
   });
 });
 
+// Phase 19 machine reasons are persisted and rendered after Workflow hibernation. Keep them
+// intentionally small and non-empty: producers store stable reason codes/descriptions, never raw
+// provider responses, thread bodies, prompts, or model output (T-19-01-02).
+export const phase19MachineReasonSchema = z.string().trim().min(1).max(200);
+
+export const threadVerificationVerdicts = ['fixed', 'unfixed', 'unverifiable'] as const;
+export const threadVerificationVerdictSchema = z.enum(threadVerificationVerdicts);
+
+// Durable identifier/location snapshot for one unresolved bot thread. The provider's opaque ref is
+// retained for idempotency, but its body is deliberately absent from the persistence contract.
+export const threadVerificationSnapshotSchema = z
+  .object({
+    threadRef: z.string().min(1).max(512),
+    path: z.string().min(1).max(1_024),
+    lineStart: z.number().int().positive().nullable().optional(),
+    lineEnd: z.number().int().positive().nullable().optional(),
+    outdated: z.boolean().optional(),
+  })
+  .passthrough();
+export type ThreadVerificationSnapshot = z.infer<typeof threadVerificationSnapshotSchema>;
+
+// Canonical per-thread result (D-01/D-02/D-04). Every outcome, including `fixed`, requires a
+// bounded machine reason. `resolved` records a confirmed provider side effect and is independent
+// from the model verdict, so verify-only and capability-degraded runs remain truthful.
+export const threadVerificationEntrySchema = threadVerificationSnapshotSchema
+  .extend({
+    verdict: threadVerificationVerdictSchema,
+    reason: phase19MachineReasonSchema,
+    resolved: z.boolean(),
+  })
+  .passthrough();
+export type ThreadVerificationEntry = z.infer<typeof threadVerificationEntrySchema>;
+
+export const threadVerificationTotalsSchema = z
+  .object({
+    fixed: z.number().int().nonnegative(),
+    unfixed: z.number().int().nonnegative(),
+    unverifiable: z.number().int().nonnegative(),
+    resolved: z.number().int().nonnegative(),
+  })
+  .passthrough();
+export type ThreadVerificationTotals = z.infer<typeof threadVerificationTotalsSchema>;
+
+// The same JSONB value serves as the resumable cursor and final report. Cursor fields are optional
+// so completed rows remain compact and historical/pre-Phase-19 rows can omit the entire object.
+export const threadVerificationsSchema = z
+  .object({
+    version: z.literal(1).default(1),
+    status: z.enum(['pending', 'running', 'completed', 'fail_open']),
+    reason: phase19MachineReasonSchema.optional(),
+    threads: z.array(threadVerificationSnapshotSchema).optional(),
+    contentCursor: z.number().int().nonnegative().optional(),
+    modelCursor: z.number().int().nonnegative().optional(),
+    resolutionCursor: z.number().int().nonnegative().optional(),
+    entries: z.array(threadVerificationEntrySchema),
+    totals: threadVerificationTotalsSchema,
+  })
+  .passthrough();
+export type ThreadVerifications = z.infer<typeof threadVerificationsSchema>;
+
+export const criticVerdictSchema = z.enum(['proven', 'plausible', 'unsupported']);
+export const criticRunStatusSchema = z.enum(['completed', 'skipped', 'fail_open']);
+
+// One immutable, bounded row per original Critic-v2 candidate. The stable numeric id is assigned by
+// code before the model call; verdict/outcome reconciliation remains code-owned (D-05/D-07/D-09).
+export const criticDecisionSchema = z
+  .object({
+    id: z.number().int().nonnegative(),
+    path: z.string().min(1).max(1_024),
+    line: z.number().int().positive().nullable().optional(),
+    severity: z.enum(reviewSeverities),
+    category: z.enum(reviewCategories),
+    title: z.string().min(1).max(200),
+    body: z.string().min(1).max(4_000),
+    confidence: z.number().min(0).max(1).nullable(),
+    verdict: criticVerdictSchema.nullable(),
+    outcome: z.enum(['kept', 'dropped']),
+    reason: phase19MachineReasonSchema,
+  })
+  .passthrough();
+export type CriticDecision = z.infer<typeof criticDecisionSchema>;
+
+// Provider-neutral Critic-v2 model output. Partial arrays are valid; reconciliation creates a
+// no-verdict decision for every omitted candidate. Extra model metadata is ignored additively.
+export const criticV2OutputSchema = z
+  .object({
+    verdicts: z.array(
+      z
+        .object({
+          id: z.number().int().nonnegative(),
+          verdict: criticVerdictSchema,
+          reason: phase19MachineReasonSchema.optional(),
+        })
+        .passthrough(),
+    ),
+  })
+  .passthrough();
+export type CriticV2Output = z.infer<typeof criticV2OutputSchema>;
+
+export const ensembleRunOutcomeSchema = z
+  .object({
+    run: z.number().int().min(0).max(4),
+    status: z.enum(['succeeded', 'failed']),
+    model: z.string().min(1).max(200).optional(),
+    inputTokens: z.number().int().nonnegative().optional(),
+    outputTokens: z.number().int().nonnegative().optional(),
+    reason: phase19MachineReasonSchema.optional(),
+  })
+  .passthrough();
+export type EnsembleRunOutcome = z.infer<typeof ensembleRunOutcomeSchema>;
+
+// Durable per-file ensemble metadata. Full cluster/cursor detail may extend this object in later
+// plans; these canonical totals remain sufficient for reload, audit projection, and degraded-state
+// reporting without persisting provider response bodies.
+export const ensembleResultSchema = z
+  .object({
+    version: z.literal(1).default(1),
+    status: z.enum(['inert', 'completed', 'partial', 'failed']),
+    requestedRuns: z.number().int().min(1).max(5),
+    successfulRuns: z.number().int().min(0).max(5),
+    failedRuns: z.number().int().min(0).max(5),
+    winnerCount: z.number().int().nonnegative(),
+    droppedClusterCount: z.number().int().nonnegative(),
+    runOutcomes: z.array(ensembleRunOutcomeSchema).max(5).optional(),
+  })
+  .passthrough();
+export type EnsembleResult = z.infer<typeof ensembleResultSchema>;
+
+export const walkthroughChangeGroupSchema = z
+  .object({
+    label: z.string().trim().min(1).max(200),
+    paths: z.array(z.string().min(1).max(1_024)).max(150),
+  })
+  .passthrough();
+export type WalkthroughChangeGroup = z.infer<typeof walkthroughChangeGroupSchema>;
+
+export const walkthroughConfidenceSchema = z
+  .object({
+    score: z.number().int().min(1).max(5),
+    label: z.string().trim().min(1).max(100),
+    reason: phase19MachineReasonSchema,
+  })
+  .passthrough();
+export type WalkthroughConfidence = z.infer<typeof walkthroughConfidenceSchema>;
+
+export const walkthroughEffortSchema = z
+  .object({
+    level: z.number().int().min(1).max(5),
+    label: z.string().trim().min(1).max(100),
+    minutes: z.number().int().nonnegative().max(10_080),
+  })
+  .passthrough();
+export type WalkthroughEffort = z.infer<typeof walkthroughEffortSchema>;
+
+// Persist only validated enrichment metadata. Each optional field is independently nullable/absent
+// so a tolerant parser can preserve valid groups when confidence or effort is malformed (D-17).
+export const walkthroughEnrichmentSchema = z
+  .object({
+    version: z.literal(1).default(1),
+    status: z.enum(['completed', 'partial', 'failed']),
+    reason: phase19MachineReasonSchema.optional(),
+    groups: z.array(walkthroughChangeGroupSchema).max(150).optional(),
+    confidence: walkthroughConfidenceSchema.nullable().optional(),
+    effort: walkthroughEffortSchema.nullable().optional(),
+    model: z.string().min(1).max(200).optional(),
+    inputTokens: z.number().int().nonnegative().optional(),
+    outputTokens: z.number().int().nonnegative().optional(),
+  })
+  .passthrough();
+export type WalkthroughEnrichment = z.infer<typeof walkthroughEnrichmentSchema>;
+
 // Critic-pass result (D-08). The critic re-judges main-review findings, keeping some and pruning
 // others (each pruned finding carries a human-readable reason). `.passthrough()` so Phase 10 can
 // add prune/audit metadata fields WITHOUT a breaking contract edit (the D-08 additive guardrail).
@@ -348,6 +617,12 @@ export const criticResultSchema = z
     // still parses unchanged.
     skipped: z.boolean().optional(),
     dedupedCount: z.number().int().optional(),
+    // Phase 19 Critic-v2 adds a canonical one-row-per-candidate ledger. All fields stay optional so
+    // historical prune-only blobs remain readable and distinguishable as legacy (D-08).
+    version: z.literal(2).optional(),
+    status: criticRunStatusSchema.optional(),
+    reason: phase19MachineReasonSchema.optional(),
+    decisions: z.array(criticDecisionSchema).optional(),
   })
   .passthrough();
 export type CriticResult = z.infer<typeof criticResultSchema>;
@@ -415,6 +690,10 @@ export const jobSummarySchema = z.object({
   // still parse; `.nullable()` because the DB columns are nullable and unset until a later phase.
   walkthroughCommentRef: z.string().nullable().optional(),
   criticResult: criticResultSchema.nullable().optional(),
+  // Phase 19 durable auxiliary results. Both columns are nullable JSONB and every field is optional
+  // on the job contract so pre-Phase-19 rows/fixtures remain byte-compatible.
+  threadVerification: threadVerificationsSchema.nullable().optional(),
+  walkthroughEnrichment: walkthroughEnrichmentSchema.nullable().optional(),
   // Phase 11 (REVIEW: Codex 11-05 HIGH): pass-through for the migration-009 jobs.review_scope /
   // jobs.scope_source_job_id columns so the review-rest scope lives on the PERSISTED job row and
   // survives fresh-instance handoff + lease recovery (not the transient queue message). Both are
@@ -422,6 +701,25 @@ export const jobSummarySchema = z.object({
   // (NREG-01). `.nullable().optional()` so pre-widening fixtures still parse.
   reviewScope: z.enum(['all', 'rest', 'head']).nullable().optional(),
   scopeSourceJobId: z.uuid().nullable().optional(),
+  // Phase 18 (RND-01 / D-16): durable round/mode snapshot persisted by the prepare-time round
+  // detection (Phase 18 Plan 02). review_round is the resolved round (>= 1); review_mode is the
+  // selected diff source ('full' | 'incremental' | 'fallback' | 'no_changes' | 'rest'). Both are
+  // NULL on a freshly-inserted job (Plan 01 has no writer wired — Plan 02 populates them). `.nullable()
+  // .optional()` so pre-Phase-18 fixtures (and every existing insert until Plan 02's prepare change
+  // lands) still parse without throwing. rounds_incremental is the durable snapshot of
+  // config.review.rounds.incremental at insert time — NOT NULL DEFAULT false in the DB, surfaced as
+  // boolean with `.optional()` so a pre-Phase-18 fixture (which never had the column) still parses.
+  reviewRound: z.number().int().min(1).nullable().optional(),
+  reviewMode: reviewModeSchema.nullable().optional(),
+  roundsIncremental: z.boolean().optional(),
+  // Phase 18 (migration 012, RND-02 / D-08): the immutable diff-selection descriptor (fromSha +
+  // toSha). Both nullable so pre-Phase-18 jobs read back as null/undefined and the consumer
+  // helpers fall through to the existing full-diff path (NREG-01). The `mode` column already
+  // encodes the selection (`'full' | 'incremental' | 'fallback' | 'no_changes' | 'rest'`); these
+  // two fields carry the anchor SHA range the consumer must re-fetch when mode is 'incremental' /
+  // 'fallback' / 'no_changes' (D-08: finalize never anchors a freshly-fetched live head).
+  roundsFromSha: z.string().nullable().optional(),
+  roundsToSha: z.string().nullable().optional(),
 });
 
 export const jobsQuerySchema = z.object({
@@ -480,9 +778,336 @@ export const fileReviewRecordSchema = z.object({
   fileSummary: z.string().nullable(),
   overallCorrectness: z.string().nullable().optional(),
   confidenceScore: z.number().nullable().optional(),
+  // Phase 19 PASS-02 durable consensus metadata. Nullable/optional keeps runs=1 and historical rows
+  // inert; the file-review DB reader validates malformed JSON fail-soft before exposing this field.
+  ensembleResult: ensembleResultSchema.nullable().optional(),
   errorMessage: z.string().nullable(),
   createdAt: dateStringSchema,
 });
+
+// v1.2 job audit trail (AUD-01). A discriminated union on `stage` — two variants this phase:
+//   - `drafted`: a per-file review pass was drafted. REUSES the canonical fileReviewPassSchema for
+//     its `pass` field (Codex LOW: pass validation was previously duplicated inline) (D-10).
+//   - `severity_adjusted`: a severity rule promoted/demoted a finding (D-09).
+// Each variant ends with `.passthrough()`, mirroring criticResultSchema's additive-extension
+// precedent (D-08) so Phases 14/15/18/19 can ADD new fields non-breakingly. This union deliberately
+// REJECTS an unknown `stage` at the single-event level so a malformed event is detectable (Codex
+// MEDIUM): AUD-01's "open event union" is served by later phases ADDING new `stage` variants AND by
+// Plan 13-03's READ side parsing the stored array PER-ELEMENT so one unknown/future event never
+// erases the whole trail — do NOT loosen this schema to a catch-all here.
+export const jobAuditEventSchema = z.discriminatedUnion('stage', [
+  z
+    .object({
+      stage: z.literal('drafted'),
+      file: z.string(),
+      pass: fileReviewPassSchema,
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  z
+    .object({
+      stage: z.literal('severity_adjusted'),
+      rule: z.string(),
+      matched: z.string(),
+      from: z.enum(reviewSeverities),
+      to: z.enum(reviewSeverities),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // Phase 14 FILT-04 drop events. `filtered` is an AGGREGATE event (one per rule; for
+  // confidence_floor one per DISTINCT effective floor — 14-02 finding #2) recording how many
+  // findings a noise-filter rule dropped, with a bounded (<=20 downstream) `sample` of the
+  // findings it dropped. `deduped` is a PER-MERGE event (one per near-duplicate merge). Both are
+  // additive per D-06 (the two variants above are byte-unchanged) and privacy-bounded per the
+  // Phase 13 T-13-03-03 posture: the `sample` / `survivor` / `suppressed` identifiers admit ONLY
+  // { path, line, title } and NEVER body / diff / existingCode / codeSuggestion. The extra
+  // severity/category/confidence (on filtered.sample) and titleSimilarity/bodySimilarity (on
+  // deduped) fields are non-sensitive DECISION METRICS — "the values that dropped it" — added for
+  // FILT-04 explainability (review finding #4), not raw finding content.
+  z
+    .object({
+      stage: z.literal('filtered'),
+      rule: z.enum(['confidence_floor', 'severity_floor', 'cap']),
+      count: z.number().int(),
+      // The effective threshold the rule applied: the confidence floor max(global, category) as a
+      // float, a min_severity band, or the effectiveMaxComments integer.
+      threshold: z.union([z.number(), z.enum(reviewSeverities)]),
+      sample: z.array(
+        z.object({
+          path: z.string(),
+          line: z.number().nullable().optional(),
+          title: z.string(),
+          // Non-sensitive decision metrics explaining WHY each sampled finding fell below the rule
+          // (review finding #4) — optional; never body/diff/existingCode/codeSuggestion.
+          severity: z.enum(reviewSeverities).optional(),
+          category: z.enum(reviewCategories).optional(),
+          confidence: z.number().min(0).max(1).nullable().optional(),
+        }),
+      ),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  z
+    .object({
+      stage: z.literal('deduped'),
+      rule: z.enum(['rule1', 'rule2', 'rule3', 'rule4']),
+      survivor: z.object({ path: z.string(), line: z.number().nullable().optional(), title: z.string() }),
+      suppressed: z.object({ path: z.string(), line: z.number().nullable().optional(), title: z.string() }),
+      // The word-Jaccard scores that caused the merge (review finding #4) — nullable because rule1
+      // has no title check and only rule4 uses a body measure.
+      titleSimilarity: z.number().nullable().optional(),
+      bodySimilarity: z.number().nullable().optional(),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // Phase 15 drop events. Both additive per D-08 (the four variants above stay byte-unchanged) and
+  // privacy-bounded per the Phase 13 T-13-03-03 posture: the sample / identifier objects admit ONLY
+  // { path, line?, title? } and NEVER body / diff / existingCode / codeSuggestion. Privacy is
+  // ultimately enforced by exact PRODUCER construction (audit.ts 15-05 / model-output.ts 15-04); the
+  // .passthrough() here preserves additive-compat but does not by itself strip an extra top-level key.
+  //
+  // `file_skipped` (D-11/D-12): an AGGREGATE event — priority file selection skipped `count` files for
+  // one `reason`, with a bounded `sample` of the skipped paths. `reason` is `generated` (content-based
+  // generated-file detector) or `over_cap` (below the priority cut). `skip_glob` is deliberately NOT a
+  // reason value (D-12) — glob-skipped files never enter the selection routine. NOTE: `line` and
+  // `title` on the sample are kept ONLY for event-shape consistency with the other audit variants —
+  // they are unused for file-level skips (a skipped file has no finding line or title) (Antigravity LOW).
+  z
+    .object({
+      stage: z.literal('file_skipped'),
+      reason: z.enum(['generated', 'over_cap']),
+      count: z.number().int(),
+      sample: z.array(
+        z.object({
+          path: z.string(),
+          line: z.number().nullable().optional(),
+          title: z.string().optional(),
+        }),
+      ),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // `evidence_missing` (D-17, EVID-01): a PER-FINDING event — the soft evidence gate could not confirm
+  // a finding's model-emitted `existing_code` against the cleaned hunk. `reason` discriminates `absent`
+  // (no/empty evidence string emitted) from `not_in_hunk` (evidence present but not found in the diff).
+  z
+    .object({
+      stage: z.literal('evidence_missing'),
+      reason: z.enum(['absent', 'not_in_hunk']),
+      path: z.string(),
+      line: z.number().nullable().optional(),
+      title: z.string(),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // Phase 18 round/anchor audit events (RND-01 / RND-02 / RND-03 / RND-05). All five variants share
+  // the `rounds.` stage prefix; the client-side AuditDisplayStage normalization (see audit-grouping.ts)
+  // collapses them to the single `rounds` display group while preserving the original event stage
+  // and insertion order. Every variant ends with `.passthrough()` (Phase 13 D-08 pattern) so a future
+  // phase can add fields non-breakingly. Privacy bounded: NEVER body / diff / existingCode /
+  // thread bodies — the producer (`core/rounds.ts::recordRoundAudit`) is the only writer.
+  //
+  // - `rounds.detected` (RND-01 / D-02): the resolution that set this job's review_round + review_mode.
+  //   `mode` is one of the locked reviewModes; `round` is the resolved integer; `incremental` records
+  //   the durable config snapshot of `rounds.incremental` at prepare time. Optional `anchorSha` and
+  //   `hasUnresolvedThreads` capture the two resolution signals (prior anchor / unresolved threads).
+  z
+    .object({
+      stage: z.literal('rounds.detected'),
+      mode: reviewModeSchema,
+      round: z.number().int().min(1),
+      incremental: z.boolean(),
+      anchorSha: z.string().nullable().optional(),
+      hasUnresolvedThreads: z.boolean().optional(),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // - `rounds.no_changes` (RND-02 / D-08): finalize produced a silent `no_changes` placeholder
+  //   (genuinely empty incremental diff with no full-diff fallback content). The D-08 exact producer
+  //   fields: { from, to, round, incremental: true }. `from`/`to` are the SHA anchors the compare
+  //   ran between (from = last_reviewed_sha; to = current pr.headSha).
+  z
+    .object({
+      stage: z.literal('rounds.no_changes'),
+      from: z.string(),
+      to: z.string(),
+      round: z.number().int().min(1),
+      incremental: z.literal(true),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // - `rounds.anchor_skipped` (D-15): finalize completed but the anchor write was skipped because
+  //   the head SHA was empty / zero-length. `reason` carries the skip rationale (today: 'empty_head');
+  //   kept as a free-form string so a future failure mode can extend it without a breaking edit.
+  z
+    .object({
+      stage: z.literal('rounds.anchor_skipped'),
+      reason: z.string(),
+      round: z.number().int().min(1).nullable().optional(),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // - `rounds.escalated` (RND-03): the prepare-time round raised the effective confidence floor
+  //   and/or severity floor. `from`/`to` are the locked value-set of round 2 (0.8/P2) and round 3+
+  //   (0.85/P2). `effective` records the COMPOSED minConfidence / minSeverity the finalize actually
+  //   used (max(round, global, category_confidence)) so the audit trail explains the user-visible
+  //   escalation rather than only the round's own floor.
+  z
+    .object({
+      stage: z.literal('rounds.escalated'),
+      from: z.object({
+        minConfidence: z.number(),
+        minSeverity: z.enum(reviewSeverities),
+      }),
+      to: z.object({
+        minConfidence: z.number(),
+        minSeverity: z.enum(reviewSeverities),
+      }),
+      effective: z.object({
+        minConfidence: z.number(),
+        minSeverity: z.enum(reviewSeverities),
+      }),
+      round: z.number().int().min(1),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // - `rounds.suppressed` (RND-04): a per-finding event emitted on the POSTING path only when an
+  //   open-thread overlap suppressed a finding. `path` / `line` / `title` mirror the privacy-bounded
+  //   identifier shape used by the other variants (T-13-03-03); the thread's content / ref are
+  //   NEVER persisted (the audit trail is decision telemetry, not raw thread data).
+  z
+    .object({
+      stage: z.literal('rounds.suppressed'),
+      path: z.string(),
+      line: z.number().nullable().optional(),
+      title: z.string(),
+      threadPath: z.string(),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // Phase 19 verify-fixes decisions (THR-01/THR-02). These are per-thread identifier rows with a
+  // mandatory bounded machine reason for every verdict, including verified-fixed (D-04). They never
+  // persist the thread body, file content, prompt, or raw provider/model payload.
+  z
+    .object({
+      stage: z.literal('threads.verified_fixed'),
+      threadRef: z.string().min(1).max(512),
+      path: z.string().min(1).max(1_024),
+      line: z.number().int().positive().nullable().optional(),
+      reason: phase19MachineReasonSchema,
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  z
+    .object({
+      stage: z.literal('threads.unfixed'),
+      threadRef: z.string().min(1).max(512),
+      path: z.string().min(1).max(1_024),
+      line: z.number().int().positive().nullable().optional(),
+      reason: phase19MachineReasonSchema,
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  z
+    .object({
+      stage: z.literal('threads.unverifiable'),
+      threadRef: z.string().min(1).max(512),
+      path: z.string().min(1).max(1_024),
+      line: z.number().int().positive().nullable().optional(),
+      reason: phase19MachineReasonSchema,
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  z
+    .object({
+      stage: z.literal('threads.resolved'),
+      threadRef: z.string().min(1).max(512),
+      path: z.string().min(1).max(1_024),
+      line: z.number().int().positive().nullable().optional(),
+      reason: phase19MachineReasonSchema,
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  z
+    .object({
+      stage: z.literal('threads.resolve_failed'),
+      threadRef: z.string().min(1).max(512),
+      path: z.string().min(1).max(1_024),
+      line: z.number().int().positive().nullable().optional(),
+      reason: phase19MachineReasonSchema,
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // One aggregate Critic-v2 event per persisted ledger. The canonical result remains jobs JSONB;
+  // audit receives only a privacy-bounded sample so a large candidate set cannot flood the 500-event
+  // ring buffer or duplicate full finding bodies.
+  z
+    .object({
+      stage: z.literal('critic.decisions'),
+      status: criticRunStatusSchema,
+      count: z.number().int().nonnegative(),
+      reason: phase19MachineReasonSchema.optional(),
+      sample: z.array(
+        z.object({
+          id: z.number().int().nonnegative(),
+          path: z.string().min(1).max(1_024),
+          line: z.number().int().positive().nullable().optional(),
+          title: z.string().min(1).max(200),
+          verdict: criticVerdictSchema.nullable(),
+          outcome: z.enum(['kept', 'dropped']),
+          reason: phase19MachineReasonSchema,
+        }),
+      ).max(20),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // PASS-02 vote telemetry is one bounded aggregate per ensemble-enabled file. Successful/failed
+  // denominator totals and both winner/drop samples are independent; failed reasons are capped by
+  // the configured maximum of four extra runs and never carry provider response bodies.
+  z
+    .object({
+      stage: z.literal('ensemble.voted'),
+      file: z.string().min(1).max(1_024),
+      requestedRuns: z.number().int().min(2).max(5),
+      successfulRuns: z.number().int().min(0).max(5),
+      failedRuns: z.number().int().min(0).max(5),
+      winnerCount: z.number().int().nonnegative(),
+      droppedClusterCount: z.number().int().nonnegative(),
+      winningSample: z.array(
+        z.object({
+          clusterId: z.string().min(1).max(100),
+          votes: z.number().int().positive(),
+          path: z.string().min(1).max(1_024),
+          line: z.number().int().positive().nullable().optional(),
+          title: z.string().min(1).max(200),
+        }),
+      ).max(20),
+      droppedSample: z.array(
+        z.object({
+          clusterId: z.string().min(1).max(100),
+          votes: z.number().int().nonnegative(),
+          path: z.string().min(1).max(1_024),
+          line: z.number().int().positive().nullable().optional(),
+          title: z.string().min(1).max(200),
+        }),
+      ).max(20),
+      failedRunReasons: z.array(phase19MachineReasonSchema).max(4).optional(),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // Walkthrough enrichment is auxiliary/fail-open. This aggregate records whether valid metadata was
+  // completed, partially recovered, or unavailable; raw grouping/model output stays out of audit.
+  z
+    .object({
+      stage: z.literal('walkthrough.enrichment'),
+      status: z.enum(['completed', 'partial', 'failed']),
+      reason: phase19MachineReasonSchema.optional(),
+      groupCount: z.number().int().nonnegative().optional(),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+]);
+export type JobAuditEvent = z.infer<typeof jobAuditEventSchema>;
 
 export const jobDetailSchema = jobSummarySchema.extend({
   baseSha: z.string(),
@@ -494,6 +1119,14 @@ export const jobDetailSchema = jobSummarySchema.extend({
   retryOfJobId: z.uuid().nullable(),
   summaryModel: z.string().nullable(),
   files: z.array(fileReviewRecordSchema),
+  // v1.2 audit trail (D-11). These live on the DETAIL contract ONLY, never on jobSummarySchema.
+  // Review fix (Codex, Divergent Views): jobSummarySchema is mapped by listJobs (every row on a
+  // 100-job page) AND by the workflow lease-claim (getJobForProcessing) via mapJob — placing the
+  // audit array there would fetch + Zod-validate up to ~50,000 events per page and on every lease
+  // claim. On jobDetailSchema (a single-job getJobDetail read) the array is parsed exactly once when
+  // a user opens one job. Defaults ([] / false) so a pre-Phase-13 job object with neither key parses.
+  audit: z.array(jobAuditEventSchema).default([]),
+  auditTruncated: z.boolean().default(false),
 });
 
 export const repoConfigRecordSchema = z.object({

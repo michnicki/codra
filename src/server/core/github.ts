@@ -423,9 +423,13 @@ export class GitHubClient {
     });
   }
 
-  async getRepoFileOrNull(owner: string, repo: string, path: string) {
-    return withRetry(`getRepoFileOrNull ${owner}/${repo}/${path}`, async () => {
-      const response = await this.request(`${repoApiPath(owner, repo)}/contents/${encodeGitHubContentPath(path)}`);
+  async getRepoFileOrNull(owner: string, repo: string, path: string, ref?: string) {
+    return withRetry(`getRepoFileOrNull ${owner}/${repo}/${path}${ref ? `@${ref}` : ''}`, async () => {
+      // PROV-01 (D-08): when `ref` is supplied, append `?ref=<encoded>` so the endpoint resolves
+      // against any git ref (branch / tag / commit SHA). The legacy no-arg path is preserved
+      // byte-compatibly for the existing call sites (NREG-01).
+      const query = ref ? `?ref=${encodeURIComponent(ref)}` : '';
+      const response = await this.request(`${repoApiPath(owner, repo)}/contents/${encodeGitHubContentPath(path)}${query}`);
       if (response.status === 404) {
         return null;
       }
@@ -439,13 +443,264 @@ export class GitHubClient {
         );
       }
 
-      const data = (await response.json()) as { content?: string; encoding?: string };
-      if (!data.content) {
-        return null;
+      const data = (await response.json()) as { content?: unknown; encoding?: unknown };
+      // D-08 contract: null is reserved for 404 only. A valid 200 with empty string content
+      // is a real (empty) file, NOT the absent-file signal. A malformed successful payload
+      // (missing/non-string content or non-base64 encoding) must throw so the consumer can
+      // distinguish "the endpoint is lying" from "the file is gone".
+      if (typeof data.content !== 'string') {
+        throw new GitHubError(
+          200,
+          `GitHub repo file fetch returned a malformed payload (content is ${data.content === undefined ? 'missing' : typeof data.content})`,
+          path,
+          `GitHub repo file fetch succeeded but content is not a string`,
+        );
+      }
+      if (data.encoding !== 'base64') {
+        throw new GitHubError(
+          200,
+          `GitHub repo file fetch returned a malformed payload (unsupported encoding: ${String(data.encoding)})`,
+          path,
+          `GitHub repo file fetch succeeded but encoding is not 'base64'`,
+        );
+      }
+      if (data.content === '') {
+        return '';
       }
 
-      return data.encoding === 'base64' ? atob(data.content.replace(/\n/g, '')) : data.content;
+      return atob(data.content.replace(/\n/g, ''));
     });
+  }
+
+  // PROV-01 (D-09): compare-diff primitive. The GitHub REST compare endpoint orders operands
+  // `BASE...HEAD` (NOT `HEAD..BASE` — the opposite of Bitbucket's diff); see R-5/R-6. The
+  // `application/vnd.github.diff` media type returns the raw unified diff as text. An empty
+  // response is a real, expected result (same SHA on both sides) and is passed through as `''`
+  // so a Phase 18 consumer can distinguish a genuinely-empty diff from an errored one.
+  async getCompareDiff(owner: string, repo: string, base: string, head: string) {
+    const spec = `${encodeURIComponent(base)}...${encodeURIComponent(head)}`;
+    return withRetry(`getCompareDiff ${owner}/${repo} ${base}...${head}`, async () => {
+      const response = await this.requestAndCheck(
+        `${repoApiPath(owner, repo)}/compare/${spec}`,
+        {},
+        'application/vnd.github.diff',
+      );
+      return response.text();
+    });
+  }
+
+  // --- PROV-02 GraphQL plumbing (review-thread listing + resolution) ---
+  //
+  // The thread family (D-05..D-07) is exposed only via GraphQL -- the REST review-comment endpoint
+  // cannot list resolved threads or call resolveReviewThread. This is the project's FIRST GraphQL
+  // path; the helper is hand-rolled to satisfy the zero-new-deps constraint (PROJECT.md). Variables
+  // travel as a JSON object so owner/repo/PR/thread-id NEVER cross into query text (T-17-02-01 --
+  // Tampering).
+
+  /**
+   * Thin POST-to-/graphql helper. JSON-serializes `{ query, variables }`, sets
+   * `content-type: application/json`, and runs through the same `request()` so installation-token
+   * auth and subrequest tracking stay consistent with the REST surface. The returned body is the
+   * raw `{ data, errors }` envelope -- callers inspect `errors` themselves.
+   */
+  async graphql<T = unknown>(query: string, variables: Record<string, unknown>): Promise<T> {
+    return withRetry('graphql', async () => {
+      const response = await this.requestAndCheck(
+        '/graphql',
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ query, variables }),
+        },
+        'application/vnd.github+json',
+      );
+      return (await response.json()) as T;
+    });
+  }
+
+  /**
+   * PROV-02 (D-05/D-06/D-07/R-2): cursor-paged thread-list walk. Each page is a single GraphQL
+   * request carrying `comments(first: 1)` alongside the thread nodes (the nested connection does
+   * NOT add an extra HTTP call -- R-9). A GraphQL `errors` envelope OR an absent/empty
+   * `data.repository.pullRequest.reviewThreads.nodes` is treated as a traversal failure (Pitfall 5);
+   * the catch is the adapter's, not this client's -- preserve provider detail for the adapter's
+   * neutral return (D-02). Bounded by `MAX_THREAD_LIST_PAGES` (R-9): a large PR can otherwise tip
+   * over Cloudflare's 50-subrequest cap before the consumer can review.
+   *
+   * `MAX_THREAD_LIST_PAGES = 10` is a TUNED EMPIRICAL CAP, not an API feature:
+   *   - 100 threads per page x 10 pages = 1000 threads, well above any realistic PR.
+   *   - Each page is exactly 1 GraphQL subrequest (`comments(first:1)` rides inside it -- R-9).
+   *   - 10 + the existing token-fetch / bot-identity / potential resolve calls leaves headroom
+   *     inside the Workers 50/invocation cap (token-tracker.ts:SAFE_MARGIN=25 + this=10 + bot=1).
+   * Going higher risks subrequest exhaustion during a long diff. Going lower risks silently
+   * dropping legitimate threads on the largest PRs the bot services.
+   */
+  static readonly MAX_THREAD_LIST_PAGES = 10;
+
+  async getReviewThreads(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    tracker?: { hasRemainingSafeBudget?(needed?: number): boolean },
+  ): Promise<unknown[]> {
+    const maxPages = GitHubClient.MAX_THREAD_LIST_PAGES;
+    const collected: unknown[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < maxPages; page += 1) {
+      // R-9 / token-tracker: consult the live budget before issuing the next page so a near-limit
+      // tracker fails closed at the boundary rather than mid-pagination. `hasRemainingSafeBudget`
+      // is optional because legacy callers / tests can omit it; falling back to "always proceed"
+      // matches the R-9 "track-aware but not gated" semantics.
+      if (tracker?.hasRemainingSafeBudget && !tracker.hasRemainingSafeBudget(1)) {
+        throw new GitHubError(
+          503,
+          `GitHub thread pagination exceeded safe subrequest budget on page ${page + 1}/${maxPages}`,
+          '/graphql',
+          `GitHub thread list aborted: safe subrequest budget exhausted at page ${page + 1}`,
+        );
+      }
+      const variables: Record<string, unknown> = {
+        owner,
+        repo,
+        number: prNumber,
+        after: cursor,
+      };
+      const data = await this.graphql<{
+        repository?: {
+          pullRequest?: {
+            reviewThreads?: {
+              nodes?: unknown[];
+              pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+            };
+          };
+        };
+        errors?: Array<{ message?: string }>;
+      }>(
+        `query ListReviewThreads($owner: String!, $repo: String!, $number: Int!, $after: String) {
+          repository(owner: $owner, name: $repo) {
+            pullRequest(number: $number) {
+              reviewThreads(first: 100, after: $after) {
+                nodes {
+                  id
+                  path
+                  line
+                  startLine
+                  originalLine
+                  originalStartLine
+                  isResolved
+                  isOutdated
+                  comments(first: 1) {
+                    nodes {
+                      body
+                      replyTo { id }
+                      author {
+                        __typename
+                        ... on Bot { databaseId }
+                        ... on User { databaseId }
+                      }
+                    }
+                  }
+                }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        }`,
+        variables,
+      );
+
+      // Treat a non-empty errors envelope as a failure (Pitfall 5 -- data MUST be inspected).
+      if (data?.errors?.length) {
+        throw new GitHubError(
+          200,
+          `GraphQL reviewThreads returned errors (page ${page + 1})`,
+          '/graphql',
+          `GitHub GraphQL reviewThreads query reported errors`,
+        );
+      }
+
+      // GraphQL responses wrap the payload under a top-level `data` key. The client reads
+      // `data.data` so the same envelope-shape (`{ data, errors }`) is honored across queries.
+      const payload = (data as { data?: unknown })?.data as {
+        repository?: {
+          pullRequest?: {
+            reviewThreads?: {
+              nodes?: unknown[];
+              pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+            };
+          };
+        };
+      } | null | undefined;
+      const nodes = payload?.repository?.pullRequest?.reviewThreads?.nodes ?? null;
+      const pageInfo = payload?.repository?.pullRequest?.reviewThreads?.pageInfo;
+
+      if (!nodes) {
+        throw new GitHubError(
+          200,
+          `GraphQL reviewThreads returned no reviewThreads nodes (page ${page + 1})`,
+          '/graphql',
+          `GitHub GraphQL reviewThreads returned no thread data`,
+        );
+      }
+
+      for (const node of nodes) collected.push(node);
+      // R-9: a clean `hasNextPage === false` is the legitimate end-of-pages and returns the
+      // collected set. A `hasNextPage === true` with an absent/empty `endCursor` is an
+      // INCONSISTENT traversal signal (the provider claims more pages exist but offers no
+      // cursor to fetch them) and MUST fail closed - the adapter's `catch {}` converts the
+      // throw to `[]` so a partial set never leaks to the consumer.
+      if (pageInfo?.hasNextPage === false) {
+        return collected;
+      }
+      const endCursor = pageInfo?.endCursor;
+      if (typeof endCursor !== 'string' || endCursor.length === 0) {
+        throw new GitHubError(
+          503,
+          `GitHub thread pagination returned incomplete page metadata (hasNextPage=true but endCursor is ${endCursor === undefined ? 'undefined' : endCursor === null ? 'null' : 'empty'}) on page ${page + 1}/${maxPages}`,
+          '/graphql',
+          `GitHub thread list halted: incomplete page metadata on page ${page + 1}`,
+        );
+      }
+      cursor = endCursor;
+    }
+    // Cap reached with `hasNextPage: true` still outstanding. FAIL-CLOSED (R-9): the adapter
+    // converts this throw to [] rather than returning a partial thread set.
+    throw new GitHubError(
+      503,
+      `GitHub thread pagination exceeded MAX_THREAD_LIST_PAGES (${maxPages}); aborting partial traversal`,
+      '/graphql',
+      `GitHub thread list exceeded MAX_THREAD_LIST_PAGES=${maxPages}`,
+    );
+  }
+
+  /**
+   * PROV-02: mark a review thread resolved via `resolveReviewThread` (R-2). Returns the (possibly
+   * absent) resolved `thread` payload so the adapter can decide success vs. failure. The threadId
+   * travels as a GraphQL variable (T-17-02-01) -- NEVER interpolated into query text.
+   */
+  async resolveReviewThread(threadId: string): Promise<unknown> {
+    const envelope = await this.graphql<{
+      data?: {
+        resolveReviewThread?: { thread?: { id?: string; isResolved?: boolean } | null };
+      };
+      errors?: Array<{ message?: string }>;
+    }>(
+      `mutation ResolveReviewThread($threadId: ID!) {
+        resolveReviewThread(input: { threadId: $threadId }) {
+          thread { id isResolved }
+        }
+      }`,
+      { threadId },
+    );
+    if (envelope?.errors?.length || !envelope?.data?.resolveReviewThread?.thread) {
+      throw new GitHubError(
+        200,
+        'GitHub resolveReviewThread returned an errors envelope or no thread payload',
+        '/graphql',
+        `GitHub GraphQL resolveReviewThread reported failure`,
+      );
+    }
+    return envelope.data.resolveReviewThread.thread;
   }
 
   async createCheckRun(

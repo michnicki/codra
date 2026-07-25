@@ -32,7 +32,10 @@ describe('getDiffFiles', () => {
     const env = createTestEnv();
     const job = { ...baseJob, id: `diff-cache-hit-${Date.now()}` };
     const rawDiff = generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]);
-    const github = { getPullRequestDiff: vi.fn().mockResolvedValue(rawDiff) };
+    const github = {
+      getPullRequestDiff: vi.fn().mockResolvedValue(rawDiff),
+      getCompareDiff: vi.fn().mockResolvedValue(''),
+    };
 
     const first = await getDiffFiles(env, job, github, defaultRepoConfig);
     const second = await getDiffFiles(env, job, github, defaultRepoConfig);
@@ -48,8 +51,14 @@ describe('getDiffFiles', () => {
     const env = createTestEnv();
     const jobA = { ...baseJob, id: `diff-cache-job-a-${Date.now()}` };
     const jobB = { ...baseJob, id: `diff-cache-job-b-${Date.now()}` };
-    const githubA = { getPullRequestDiff: vi.fn().mockResolvedValue(generateMockDiff([{ path: 'src/one.ts', content: 'a' }])) };
-    const githubB = { getPullRequestDiff: vi.fn().mockResolvedValue(generateMockDiff([{ path: 'src/two.ts', content: 'b' }])) };
+    const githubA = {
+      getPullRequestDiff: vi.fn().mockResolvedValue(generateMockDiff([{ path: 'src/one.ts', content: 'a' }])),
+      getCompareDiff: vi.fn().mockResolvedValue(''),
+    };
+    const githubB = {
+      getPullRequestDiff: vi.fn().mockResolvedValue(generateMockDiff([{ path: 'src/two.ts', content: 'b' }])),
+      getCompareDiff: vi.fn().mockResolvedValue(''),
+    };
 
     const filesA = await getDiffFiles(env, jobA, githubA, defaultRepoConfig);
     const filesB = await getDiffFiles(env, jobB, githubB, defaultRepoConfig);
@@ -64,7 +73,10 @@ describe('getDiffFiles', () => {
     const env = createTestEnv();
     (env.APP_KV as any).put = vi.fn().mockRejectedValue(new Error('KV unavailable'));
     const job = { ...baseJob, id: `diff-cache-put-fail-${Date.now()}` };
-    const github = { getPullRequestDiff: vi.fn().mockResolvedValue(generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }])) };
+    const github = {
+      getPullRequestDiff: vi.fn().mockResolvedValue(generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }])),
+      getCompareDiff: vi.fn().mockResolvedValue(''),
+    };
 
     const files = await getDiffFiles(env, job, github, defaultRepoConfig);
 

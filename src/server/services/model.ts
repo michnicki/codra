@@ -8,17 +8,19 @@ import { buildSecurityReviewPrompts } from '../prompts/security-review';
 import { buildCriticPrompts, type CriticCandidateFinding } from '../prompts/critic';
 import { buildSummaryPrompt, SUMMARY_SYSTEM_PROMPT } from '../prompts/summary';
 import { WALKTHROUGH_DIAGRAM_SYSTEM_PROMPT, buildWalkthroughDiagramPrompt } from '../prompts/walkthrough-diagram';
+import { WALKTHROUGH_ENRICHMENT_SYSTEM_PROMPT, buildWalkthroughEnrichmentPrompt, type EnrichmentFileEntry } from '../prompts/walkthrough-enrichment';
 import { parseFileReviewResponse, parseAnswerResponse } from '../core/model-output';
 import { truncateFileDiff, chunkFileDiff, type FileDiff } from '../core/diff';
 import type { RepoConfig } from '@shared/schema';
 import type { TokenTracker } from '../core/token-tracker';
-import { UnparseableModelResponseError, type ModelResponse } from '../models/types';
+import { UnparseableModelResponseError, type ModelRequestInput, type ModelResponse } from '../models/types';
 import { logger } from '../core/logger';
 import { normalizeModelId } from '@shared/schema';
 import { isTimeoutMessage, matchesAnyTransientSubstring } from '@shared/transient-errors';
 import { getResolvedModelConfig, type ResolvedModelConfig } from '@server/db/model-configs';
 import { decryptLlmApiKey } from '@server/core/llm-crypto';
 import { ModelCallGate, adaptiveModelTimeoutMs, MODEL_FALLBACK_CHAIN_BUDGET_MS } from '../models/limits';
+import { admitEnsembleUnit, type EnsembleRun, type EnsembleAdmissionShape } from '../core/ensemble';
 
 const PROVIDER_UNAVAILABLE_TTL_SECONDS = 24 * 60 * 60;
 const COMPACT_REVIEW_PROMPT_LINE_CAP = 400;
@@ -259,7 +261,7 @@ export class ModelService {
 
   private async callResolvedModel(
     config: ResolvedModelConfig,
-    input: { systemPrompt: string; userPrompt: string },
+    input: ModelRequestInput,
     timeoutMs?: number,
   ): Promise<ModelResponse> {
     // Resolve credentials *before* taking a gate slot so slow KV/crypto work never occupies a
@@ -323,6 +325,7 @@ export class ModelService {
     // the prompt — model resolution, chunking, fallback chain, and retry classification are shared
     // (D-02: there is NO per-pass model override).
     pass?: 'main' | 'security';
+    temperature?: number;
   }) {
     const configuredLineCap = params.config.review.max_diff_lines_per_file;
     const modelLineCap = params.compactPrompt
@@ -365,6 +368,9 @@ export class ModelService {
     }
 
     const combinedFindings = results.flatMap(r => r.parsed.comments);
+    // Merge every chunk's severity audit events (same .flatMap pattern as combinedFindings) so a
+    // multi-chunk file surfaces adjustments from all chunks, not just the primary chunk's.
+    const combinedSeverityAuditEvents = results.flatMap(r => r.parsed.severityAuditEvents);
     // Report the file with the most serious chunk's verdict/summary/correctness, not just the last
     // chunk's: taking `results[results.length - 1]` would let a clean final chunk mask real findings
     // from an earlier chunk of the same file (reporting verdict 'approve' while carrying its comments).
@@ -377,10 +383,158 @@ export class ModelService {
       parsed: {
         ...primaryResult.parsed,
         comments: combinedFindings,
+        severityAuditEvents: combinedSeverityAuditEvents,
       },
       reviewedLineCount: results.reduce((sum, r) => sum + r.reviewedLineCount, 0),
       wasPromptTruncated: chunks.length < totalChunkCount || results.length < chunks.length,
     };
+  }
+
+  /**
+   * Phase 19 (PASS-02 / D-13): ensemble fan-out. Dispatches N main-pass samples of the SAME
+   * file review, each independently walked through the existing chunking + fallback chain +
+   * Google retry pipeline. Returns the per-run results so the caller can reconcile / persist
+   * the consensus finding list.
+   *
+   * **D-13 contract:**
+   *   - Main units call this with `runs > 1`. The primary sample (runIndex 0) uses the configured
+   *     review settings exactly as the scalar/async path does; only the N-1 extras are given
+   *     `ensembleTemperature` (D-13: extras only).
+   *   - Security units are NEVER fanned out — the caller is responsible for clamping
+   *     `runs` to 1 when pass='security' so this method sees runs=1 and falls through to the
+   *     scalar reviewFile (NREG-01).
+   *   - When `runs === 1`, this method delegates to `reviewFile` directly so the scalar/async
+   *     path is preserved byte-identically.
+   *
+   * **Admission (D-13 / T-19-07):**
+   *   Before fanning out, the worst-case subrequest cost is computed as
+   *   `samples × chunks × (1 + fallbacks + Google retries) + ENSEMBLE_ADMISSION_HEADROOM` and
+   *   admitted against the remaining safe budget. A rejected unit throws a `RetryableModelError`
+   *   whose message includes 'subrequest' so `isSubrequestBudgetError` catches it and the
+   *   orchestrator fresh-hands-off to a new invocation.
+   *
+   * **Fan-out (D-13):**
+   *   The N samples are dispatched via `Promise.allSettled`; each sample's individual model
+   *   call still flows through the shared `ModelCallGate` (max 3 concurrent), so this method
+   *   never inflates the per-invocation connection pool above the existing ceiling.
+   *
+   * **Returns:** `{ runs: EnsembleRun[] }` — one entry per requested sample, in stable
+   * `runIndex` order. A sample whose call rejected is recorded as `{ failed: true, reason }`
+   * with `findings: []` so the caller can subtract it from the D-10 denominator.
+   */
+  async runFileWithEnsemble(params: {
+    file: any;
+    prTitle: string | null;
+    prDescription: string | null;
+    config: RepoConfig;
+    totalLineCount: number;
+    compactPrompt?: boolean;
+    pass?: 'main' | 'security';
+    runs: number;
+    ensembleTemperature?: number;
+    // Internal: when an inner reviewFile call returns, this method may need to know the
+    // per-sample temperature. The primary call leaves it undefined; extras receive
+    // `ensembleTemperature`. The field is set internally by the fan-out loop.
+    temperature?: number;
+  }): Promise<{ runs: EnsembleRun[] }> {
+    // Defensive: when runs=1, fall through to the scalar/async path so the existing reviewFile
+    // contract is byte-identically preserved. The caller (review.ts) is the source of truth for
+    // when to fan out — model service does not silently expand runs.
+    if (params.runs <= 1) {
+      const result = await this.reviewFile({ ...params });
+      return {
+        runs: [
+          {
+            runIndex: 0,
+            findings: result.parsed.comments,
+            model: result.modelUsed,
+            inputTokens: result.inputTokens,
+            outputTokens: result.outputTokens,
+            failed: false,
+          },
+        ],
+      };
+    }
+
+    // Compute admission shape from the actual file + configured model strategy. chunkFileDiff is
+    // pure (no I/O) so calling it here for admission is cheap; the same chunks are recomputed
+    // inside each sample's reviewFile call (N+1 chunkFileDiff invocations total, but each is
+    // trivial). The fallback count comes from the same selectModel that reviewFile uses, so
+    // admission matches the per-sample worst case.
+    const configuredLineCap = params.config.review.max_diff_lines_per_file;
+    const modelLineCap = params.compactPrompt
+      ? Math.min(configuredLineCap, COMPACT_REVIEW_PROMPT_LINE_CAP)
+      : configuredLineCap;
+    const chunks = chunkFileDiff(params.file, modelLineCap);
+    const MAX_CHUNKS = 4;
+    const chunkCount = Math.min(chunks.length, MAX_CHUNKS);
+    const { fallbacks } = this.selectModel({
+      totalLineCount: params.totalLineCount,
+      config: params.config,
+    });
+    const admissionShape: EnsembleAdmissionShape = {
+      runs: params.runs,
+      chunkCount,
+      fallbackCount: fallbacks.length,
+      googleMaxRetries: 2, // matches google.ts GEMINI_MAX_RETRIES
+    };
+    if (this.tracker) {
+      const admission = admitEnsembleUnit(this.tracker, admissionShape);
+      if (!admission.admitted) {
+        // Surface as a RetryableModelError with a "subrequest" marker so isSubrequestBudgetError
+        // catches it and the orchestrator fresh-hands-off. The orchestrator's subrequest-budget
+        // branch re-throws with retryAfterSeconds=FRESH_INVOCATION_YIELD_SECONDS.
+        throw new RetryableModelError(admission.reason ?? 'Ensemble admission rejected: would exceed safe subrequest budget.');
+      }
+    }
+
+    // Fan out N samples. Each sample is a complete reviewFile call: same chunking, same fallback
+    // chain, same Google retry behavior. The three-slot ModelCallGate inside callResolvedModel
+    // bounds the actual concurrency — Promise.allSettled only schedules the promises, the gate
+    // throttles dispatch.
+    const settled = await Promise.allSettled(
+      Array.from({ length: params.runs }, async (_, i) => {
+        const isPrimary = i === 0;
+        // D-13: only extras receive the ensemble temperature; the primary call uses its normal
+        // review settings (undefined preserves the existing per-adapter default). The primary
+        // call is therefore made WITHOUT a `temperature` field on its params object, so the
+        // providers' `input.temperature === undefined ? {} : { temperature: ... }` guards
+        // omit the field from the request body.
+        const reviewParams: typeof params = isPrimary
+          ? params
+          : { ...params, temperature: params.ensembleTemperature };
+        return this.reviewFile(reviewParams);
+      }),
+    );
+
+    // Convert settled -> EnsembleRun[]. D-10: failed runs are removed from the denominator by the
+    // reconciler; the caller reads `successfulRuns` to decide between degrade and consensus.
+    const runs: EnsembleRun[] = settled.map((result, runIndex) => {
+      if (result.status === 'fulfilled') {
+        const value = result.value;
+        return {
+          runIndex,
+          findings: value.parsed.comments,
+          model: value.modelUsed,
+          inputTokens: value.inputTokens,
+          outputTokens: value.outputTokens,
+          failed: false,
+        };
+      }
+      // Failed run — record a machine-readable reason so the audit can explain the gap.
+      const reason = result.reason instanceof Error ? result.reason.message : String(result.reason ?? 'unknown');
+      return {
+        runIndex,
+        findings: [],
+        model: null,
+        inputTokens: 0,
+        outputTokens: 0,
+        failed: true,
+        reason: reason.slice(0, 200),
+      };
+    });
+
+    return { runs };
   }
 
   /**
@@ -443,7 +597,7 @@ export class ModelService {
    * Poll a previously submitted async batch review. Returns 'pending' while still queued/running,
    * 'done' with the parsed review once complete, or 'failed' if the poll or parse errored.
    */
-  async pollReviewBatch(params: { model: string; requestId: string; file: any }): Promise<
+  async pollReviewBatch(params: { model: string; requestId: string; file: any; config?: RepoConfig; compactPrompt?: boolean }): Promise<
     | { status: 'pending' }
     | { status: 'done'; response: ModelResponse & { parsed: ReturnType<typeof parseFileReviewResponse>; reviewedLineCount: number; wasPromptTruncated: boolean; userPrompt: string } }
     | { status: 'failed'; error: unknown }
@@ -465,15 +619,36 @@ export class ModelService {
       if (this.tracker) {
         this.tracker.record(response.modelUsed, response.inputTokens, response.outputTokens);
       }
-      const parsed = parseFileReviewResponse(response.rawText, params.file);
+      // EVID-01 (Codex 15-04 HIGH): reconstruct the EXACT bounded file the model actually saw before
+      // parsing. submitReviewBatch truncated the file to `modelLineCap` (compact-aware) and submitted
+      // ONLY that prefix; parsing the FULL untruncated params.file here would let evidence present only
+      // in the truncated-away tail falsely pass the soft evidence gate (it would never emit not_in_hunk).
+      // Reproduce the SAME modelLineCap formula so the evidence haystack matches the submitted prefix.
+      // When config is absent (the type allows it; no caller omits it today) fall back to params.file
+      // unchanged — no worse than the pre-EVID-01 behavior.
+      let fileForParse = params.file;
+      if (params.config) {
+        const configuredLineCap = params.config.review.max_diff_lines_per_file;
+        const modelLineCap = params.compactPrompt
+          ? Math.min(configuredLineCap, COMPACT_REVIEW_PROMPT_LINE_CAP)
+          : configuredLineCap;
+        fileForParse = truncateFileDiff(params.file, modelLineCap);
+      }
+
+      // The async batch path is main-pass-only (see this method's contract). `config` is OPTIONAL:
+      // fail open to engine-enabled when absent.
+      const parsed = parseFileReviewResponse(response.rawText, fileForParse, {
+        pass: 'main',
+        severityEngineEnabled: params.config?.review.severity_engine.enabled ?? true,
+      });
       return {
         status: 'done',
         response: {
           ...response,
           parsed,
           userPrompt: '',
-          reviewedLineCount: params.file.lineCount,
-          wasPromptTruncated: params.file.isTruncated === true,
+          reviewedLineCount: fileForParse.lineCount,
+          wasPromptTruncated: fileForParse.isTruncated === true,
         },
       };
     } catch (error) {
@@ -489,6 +664,7 @@ export class ModelService {
     totalLineCount: number;
     compactPrompt?: boolean;
     pass?: 'main' | 'security';
+    temperature?: number;
   }) {
     // The security pass swaps in buildSecurityReviewPrompts (same input shape, identical findings
     // JSON contract so parseFileReviewResponse handles it unchanged). Everything below —
@@ -579,13 +755,20 @@ export class ModelService {
       // outage is handled by deferring the whole file to a fresh invocation), so on failure we just
       // fall through to the next model in the fallback chain.
       try {
-        const response = await this.callResolvedModel(resolved, { systemPrompt, userPrompt }, timeoutMs);
+        const response = await this.callResolvedModel(
+          resolved,
+          { systemPrompt, userPrompt, temperature: params.temperature },
+          timeoutMs,
+        );
 
         if (this.tracker) {
           this.tracker.record(response.modelUsed, response.inputTokens, response.outputTokens);
         }
 
-        const parsed = parseFileReviewResponse(response.rawText, params.file);
+        const parsed = parseFileReviewResponse(response.rawText, params.file, {
+          pass: params.pass ?? 'main',
+          severityEngineEnabled: params.config.review.severity_engine.enabled,
+        });
         return {
           ...response,
           parsed,
@@ -884,6 +1067,113 @@ export class ModelService {
   }
 
   /**
+   * Phase 19 verify-fixes (THR-01 / THR-02): the provider-neutral seam the verify-fixes phase uses
+   * to grade every unresolved bot thread against current head content. The method accepts the
+   * caller-built system + user prompts (built by `prompts/verify-fixes.ts`) and returns the raw
+   * model response for `core/verify-fixes.ts` to parse in code.
+   *
+   * Mirrors `critiqueFindings` / `answerPrQuestion`'s fallback-chain + RetryableModelError
+   * discipline (a transient failure across the whole chain defers rather than wedges), with one
+   * verify-fixes-specific property:
+   *   - `applySizeOverrides: false` (D-04). Verification grades a thread SET, not a sized file;
+   *     with overrides applied, selectModel({ totalLineCount: 0 }) would match the FIRST
+   *     positive size override instead of using model.main.
+   *   - `temperature` is OPTIONAL: when supplied (the verify-fixes default), it forwards to every
+   *     provider adapter via callResolvedModel; when absent the provider's own default is used.
+   *     Phase 19 keeps verification at the same default as the main review so a model configured
+   *     for low-temperature review also verifies at low temperature.
+   *
+   * The call site (runVerifyFixesPhase) catches and degrades each call's exception to one
+   * unverifiable entry per batch thread -- this method does NOT swallow errors itself so the
+   * caller can record `malformedOutput=true` on the batch's classify call.
+   */
+  async callVerifierRaw(params: {
+    systemPrompt: string;
+    userPrompt: string;
+    temperature?: number;
+    config: RepoConfig;
+  }): Promise<{
+    rawText: string;
+    modelUsed: string;
+    inputTokens: number;
+    outputTokens: number;
+  }> {
+    const { primary, fallbacks } = this.selectModel({
+      totalLineCount: 0,
+      config: params.config,
+      applySizeOverrides: false,
+    });
+    const modelsToTry = [primary, ...fallbacks];
+
+    let lastError: unknown;
+    let lastTransientError: unknown;
+    let sawTransientFailure = false;
+    for (const currentModel of modelsToTry) {
+      let resolved: ResolvedModelConfig;
+      try {
+        resolved = await this.resolveModel(currentModel);
+      } catch (error) {
+        lastError = error;
+        logger.warn(`verify-fixes model ${currentModel} could not be resolved`, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
+
+      if (resolved.apiFormat === 'cloudflare-workers-ai' && await this.isProviderUnavailable(resolved.providerId)) {
+        logger.warn(`Skipping ${resolved.providerName} verify-fixes model ${currentModel} because the provider is unavailable`);
+        continue;
+      }
+
+      try {
+        const response = await this.callResolvedModel(
+          resolved,
+          {
+            systemPrompt: params.systemPrompt,
+            userPrompt: params.userPrompt,
+            temperature: params.temperature,
+          },
+          adaptiveModelTimeoutMs(0),
+        );
+
+        if (this.tracker) {
+          this.tracker.record(response.modelUsed, response.inputTokens, response.outputTokens);
+        }
+
+        return {
+          rawText: response.rawText,
+          modelUsed: response.modelUsed,
+          inputTokens: response.inputTokens,
+          outputTokens: response.outputTokens,
+        };
+      } catch (error) {
+        lastError = error;
+        if (isTransientModelFailure(error)) {
+          sawTransientFailure = true;
+          lastTransientError = error;
+        }
+        if (resolved.apiFormat === 'cloudflare-workers-ai' && isCloudflareAllocationError(error)) {
+          await this.markProviderUnavailable(resolved.providerId, error instanceof Error ? error.message : String(error));
+        }
+        logger.warn(`verify-fixes model ${currentModel} failed`, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    if (sawTransientFailure) {
+      const retryCause = lastTransientError ?? lastError;
+      const lastMessage = retryCause instanceof Error ? retryCause.message : String(retryCause ?? 'Unknown model error');
+      throw new RetryableModelError(
+        `All configured verify-fixes models failed; retrying later. Last error: ${lastMessage}`,
+        retryCause,
+      );
+    }
+
+    throw lastError ?? new Error('No verify-fixes model produced a result; all configured models were skipped or unavailable.');
+  }
+
+  /**
    * WT-03 (Plan 09-03): the OPTIONAL, best-effort Mermaid sequence-diagram call. Unlike
    * generateSummary/reviewFile this tries ONLY the selected PRIMARY model — there is NO
    * `...fallbacks` iteration — so the "one whole-diff diagram call" is literally exactly ONE outbound
@@ -914,6 +1204,47 @@ export class ModelService {
           prTitle: params.prTitle,
           files: params.files,
           fileSummaries: params.fileSummaries,
+        }),
+      },
+      adaptiveModelTimeoutMs(0),
+    );
+
+    if (this.tracker) {
+      this.tracker.record(response.modelUsed, response.inputTokens, response.outputTokens);
+    }
+
+    return response;
+  }
+
+  /**
+   * Phase 19 Plan 19-08 (PASS-03, D-14..D-18): the walkthrough enrichment model call. Generates a
+   * groups + confidence + effort assessment for the reviewed files. Mirrors generateWalkthroughDiagram
+   * in shape: it makes EXACTLY ONE outbound request (primary model only) so the enrichment phase
+   * stays inside the per-invocation subrequest budget (PASS-03 / D-13). The caller parses the raw
+   * text with parseWalkthroughEnrichmentResponse (tolerant, independent per-field validation)
+   * and persists the validated payload via setJobWalkthroughEnrichment. May throw on a transient
+   * provider failure; the runWalkthroughEnrichmentPhase caller wraps it in a best-effort try/catch
+   * and degrades to a `status: 'failed'` enrichment row (D-17 fail-open contract).
+   */
+  async generateWalkthroughEnrichment(params: {
+    prTitle: string | null;
+    files: EnrichmentFileEntry[];
+    config: RepoConfig;
+  }): Promise<ModelResponse> {
+    // Primary model ONLY — deliberately NOT `[primary, ...fallbacks]`. One outbound request. The
+    // enrichment runs AFTER critic on its own fresh invocation; widening to a fallback chain would
+    // multiply the subrequest cost (D-13). A transient failure degrades to a `status: 'failed'`
+    // row so finalize still posts the deterministic coverage walkthrough.
+    const { primary } = this.selectModel({ totalLineCount: 0, config: params.config });
+    const resolved = await this.resolveModel(primary);
+
+    const response = await this.callResolvedModel(
+      resolved,
+      {
+        systemPrompt: WALKTHROUGH_ENRICHMENT_SYSTEM_PROMPT,
+        userPrompt: buildWalkthroughEnrichmentPrompt({
+          prTitle: params.prTitle,
+          files: params.files,
         }),
       },
       adaptiveModelTimeoutMs(0),

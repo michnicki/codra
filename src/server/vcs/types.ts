@@ -72,6 +72,40 @@ export type VcsSubmitReviewInput = {
 };
 
 /**
+ * Provider-agnostic review-thread shape (D-05/D-06). Every field is plain data so the seam
+ * surface never exposes a raw provider id to `core/`. `ref` is PROVIDER-OPAQUE: GitHub uses the
+ * GraphQL PullRequestReviewThread node id; Bitbucket uses the self-encoding `${prId}:${rootId}`
+ * convention. `outdated` is the union of GitHub's native `isOutdated` and Bitbucket's local
+ * anchor-validity heuristic (R-4).
+ *
+ * `lineStart`/`lineEnd` are the head/new-side line range. Phase 18 (RND-04) suppresses
+ * findings whose range overlaps. `rootBody` is the thread's root comment text only; the
+ * comment chain is not surfaced (D-05).
+ */
+export type VcsReviewThread = {
+  ref: string;
+  path: string;
+  lineStart: number;
+  lineEnd: number;
+  rootBody: string;
+  outdated: boolean;
+};
+
+/**
+ * Per-adapter capability flags (D-03/D-04). The block is the single extension point for future
+ * capability flags (Phase 8 D-09). `supportsThreadListing` and `supportsThreadResolution` are
+ * both `static: true` for GitHub and `static: true` for Bitbucket today, but Bitbucket's
+ * `supportsThreadResolution` is ALSO backed by a mutable adapter field that can downgrade on a
+ * real 403/404/501 resolve call (R-1). Declared as a getter-on-class shape (not a frozen `as
+ * const`) so the adapter can expose a mutable field without re-typing the interface.
+ */
+export type VcsCapabilities = {
+  readonly supportsMermaid: boolean;
+  readonly supportsThreadListing: boolean;
+  readonly supportsThreadResolution: boolean;
+};
+
+/**
  * The provider-agnostic seam every later phase rides on (mirrors the `ModelService`/
  * `models/types.ts` strategy pattern). Status-check/review methods return an opaque
  * `{ ref: string }`, never a numeric id (D-01/D-02) -- Bitbucket's build-status API has no
@@ -86,9 +120,69 @@ export interface VcsProvider {
    * declare it — this is the single extension point where future capability flags join the same
    * block, avoiding a per-flag interface refactor (D-09). `supportsMermaid` lets a later phase's
    * walkthrough formatter gate its Mermaid diagram per-provider (GitHub renders Mermaid in
-   * markdown; Bitbucket Cloud does not). Inert this phase — no consumer reads it yet.
+   * markdown; Bitbucket Cloud does not). `supportsThreadListing` and `supportsThreadResolution`
+   * (D-03) are static on GitHub and mutable on Bitbucket (D-04). Inert this phase — no consumer
+   * reads any of them yet.
    */
-  readonly capabilities: { readonly supportsMermaid: boolean };
+  readonly capabilities: VcsCapabilities;
+
+  /**
+   * Read the file at `path` at `ref` (any git ref: branch / tag / commit SHA). Returns the
+   * decoded raw text on success, `null` ONLY when the provider responds with a 404 (D-08 -- a
+   * deleted-at-head file is a "can't-verify" signal, not a crash). Throws on any other non-2xx
+   * (network, 5xx, auth) so real failures are not masked. Both providers implement this on the
+   * same semantic contract (PROV-01).
+   */
+  getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null>;
+
+  /**
+   * Read the unified diff between `base` and `head` (any git refs). Returns the raw diff text
+   * on success, including the empty string `''` when the providers' diff is empty (D-09 --
+   * Phase 18 must distinguish a genuinely-empty incremental diff from an errored one). Throws
+   * on any non-2xx. Provider-specific compare direction is preserved: GitHub uses BASE...HEAD
+   * with the `application/vnd.github.diff` media type; Bitbucket uses HEAD..BASE with
+   * `context=3&topic=true` (R-5).
+   */
+  getCompareDiff(owner: string, repo: string, base: string, head: string): Promise<string>;
+
+  /**
+   * Resolve the bot's own immutable identity for the comment self-filter (Phase 11, CMD-07). Returns
+   * the bot's immutable provider account id (GitHub bot-user numeric id as a string / Bitbucket
+   * `account_id`) plus its optional login.
+   *
+   * Surfaced on the seam so the webhook-ingest dispatch layer (Plan 06) can build a
+   * `BotIdentityResolver` from the already-constructed provider WITHOUT reaching into the private
+   * underlying client — mirroring how `getUserRepoPermission` was exposed through the adapter. The
+   * resolved id is the load-bearing echo-loop defense key (classifyComment self-filters on it before
+   * any parse, D-03).
+   */
+  resolveBotUserIdentity(): Promise<{ accountId: string; login?: string }>;
+
+  /**
+   * List unresolved bot threads for a PR (D-05/D-06/D-07). Returns ONLY unresolved root
+   * comments authored by the immutable bot identity; the consumer never iterates the comment
+   * chain. Path/line range are the head/new-side anchors so Phase 18 can suppress overlapping
+   * findings. `ref` is PROVIDER-OPAQUE -- the adapter alone transforms it back to a
+   * provider-specific id for `resolveThread`.
+   *
+   * Always callable on both adapters (D-01); an unsupported op returns `[]` so a consumer that
+   * forgets to check `capabilities.supportsThreadListing` still degrades safely. Phase 17
+   * leaves the implementation as a neutral stub (PLAN-02-IMPL) -- Plan 17-02 wires the
+   * provider GraphQL/REST plumbing.
+   */
+  getUnresolvedBotThreads(owner: string, repo: string, prNumber: number): Promise<VcsReviewThread[]>;
+
+  /**
+   * Resolve a thread by its opaque `ref` (D-05). Returns `true` on a successful resolve,
+   * `false` on any failure or unsupported op. Always callable on both adapters (D-01); an
+   * unsupported op returns `false` so a consumer that forgets to check
+   * `capabilities.supportsThreadResolution` still degrades safely. On Bitbucket this is the
+   * observed-downgrade trigger (D-04): the first 403/404/501 flips the backing
+   * `supportsThreadResolution` flag to `false`, and subsequent calls short-circuit without
+   * making a request. Phase 17 leaves the implementation as a neutral stub (PLAN-02-IMPL) --
+   * Plan 17-02 wires the provider GraphQL/REST plumbing.
+   */
+  resolveThread(owner: string, repo: string, ref: string): Promise<boolean>;
 
   getPullRequest(owner: string, repo: string, prNumber: number): Promise<VcsPullRequest>;
   getPullRequestDiff(owner: string, repo: string, prNumber: number): Promise<string>;
@@ -192,19 +286,6 @@ export interface VcsProvider {
     authorId: string,
     authorLogin?: string,
   ): Promise<'admin' | 'write' | 'read' | 'none' | null>;
-
-  /**
-   * Resolve the bot's OWN immutable identity for the comment self-filter (Phase 11, CMD-07). Returns
-   * the bot's immutable provider account id (GitHub bot-user numeric id as a string / Bitbucket
-   * `account_id`) plus its optional login.
-   *
-   * Surfaced on the seam so the webhook-ingest dispatch layer (Plan 06) can build a
-   * `BotIdentityResolver` from the already-constructed provider WITHOUT reaching into the private
-   * underlying client — mirroring how `getUserRepoPermission` was exposed through the adapter. The
-   * resolved id is the load-bearing echo-loop defense key (classifyComment self-filters on it before
-   * any parse, D-03).
-   */
-  resolveBotUserIdentity(): Promise<{ accountId: string; login?: string }>;
 
   labels?: {
     ensure(owner: string, repo: string, name: string, color: string): Promise<void>;

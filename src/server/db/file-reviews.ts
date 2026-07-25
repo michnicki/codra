@@ -1,4 +1,4 @@
-import type { FileReviewPass, ParsedReviewComment } from '@shared/schema';
+import { ensembleResultSchema, type FileReviewPass, type ParsedReviewComment } from '@shared/schema';
 import type { AppBindings } from '@server/env';
 import { parseJsonColumn, queryRows, queryTransaction } from './client';
 
@@ -365,6 +365,39 @@ export async function bulkInheritFileReviews(
 }
 
 /**
+ * Phase 19 (PASS-02): update the per-file ensemble result (ensembleResultSchema-shaped) on the
+ * (job_id, file_path, pass) row. Mirrors `updateJobCriticResult` (jobs.ts): a single UPDATE
+ * writes the JSONB column with the versioned blob, treating the column as a fully-owned durable
+ * cursor. The caller owns the reconciliation logic and the runOutcomes array; this function is
+ * the single write boundary.
+ *
+ * `result` MUST validate against `ensembleResultSchema`; the schema's additive `.passthrough()`
+ * means future Phase-19 fields are accepted by older readers (NREG-01) and any new fields are
+ * already-shaped at the call site. Returns the number of rows updated.
+ */
+export async function updateFileReviewEnsembleResult(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  input: {
+    jobId: string;
+    filePath: string;
+    pass: FileReviewPass;
+    result: unknown;
+  },
+): Promise<number> {
+  const rows = await queryRows<{ count: number }>(
+    env,
+    `
+      UPDATE file_reviews
+      SET ensemble_result = $4::jsonb
+      WHERE job_id = $1::uuid AND file_path = $2 AND pass = $3
+      RETURNING 1::int AS count
+    `,
+    [input.jobId, input.filePath, input.pass, JSON.stringify(input.result)],
+  );
+  return rows.length;
+}
+
+/**
  * Mark many files 'failed' in a single INSERT. Finalize backfills reviews for files that never got
  * one (e.g. files that appeared mid-review, or unrecoverable ones); doing that one-by-one through
  * upsertFileReview runs a transaction per file (several Hyperdrive round-trips each), which for a
@@ -444,6 +477,10 @@ export async function getFileReviewsForJobs(env: Pick<AppBindings, 'HYPERDRIVE'>
     transient_error_count: number;
     async_request_id: string | null;
     async_model: string | null;
+    // Phase 19 (PASS-02): per-file ensemble result (ensemble_resultSchema) — read alongside the
+    // other columns so a downstream review-flow consumer can read the durable cursor in one
+    // round-trip. Defaulted to null (parseJsonColumn degrades) for the runs:1 inert path.
+    ensemble_result: unknown;
   }>(
     env,
     `
@@ -475,8 +512,17 @@ export async function getFileReviewsForJobs(env: Pick<AppBindings, 'HYPERDRIVE'>
     [jobIds],
   );
 
-  return rows.map((row) => ({
-    ...row,
-    parsed_comments: parseJsonColumn(row.parsed_comments, []),
-  }));
+  return rows.map((row) => {
+    const rawEnsembleResult = parseJsonColumn<unknown>(row.ensemble_result, null);
+    const ensembleParsed = rawEnsembleResult === null
+      ? null
+      : ensembleResultSchema.safeParse(rawEnsembleResult);
+    return {
+      ...row,
+      parsed_comments: parseJsonColumn(row.parsed_comments, []),
+      // A malformed durable ensemble cursor must not poison the file-review list; the reconciler
+      // can treat null as an absent cursor and recover from the persisted comments row.
+      ensemble_result: ensembleParsed?.success ? ensembleParsed.data : null,
+    };
+  });
 }

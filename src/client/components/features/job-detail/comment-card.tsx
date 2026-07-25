@@ -4,6 +4,7 @@ import rehypeRaw from 'rehype-raw';
 import rehypeSanitize from 'rehype-sanitize';
 import { FileText } from 'lucide-react';
 import { cn } from '@client/lib/utils';
+import { confidencePercent, displayCategory } from '@client/lib/job-telemetry';
 import type { ParsedReviewComment } from '@shared/schema';
 import { severityConfig } from './constants';
 
@@ -17,6 +18,10 @@ interface CommentCardProps {
 export function CommentCard({ comment, filePath }: CommentCardProps) {
   const sev = severityConfig[comment.severity] ?? severityConfig.nit;
   const SevIcon = sev.icon;
+  // Fail-open display (Plan 16-02 helpers): absent category -> 'correctness'; null confidence -> null
+  // so the chip is omitted entirely (never 'N/A'/'0%').
+  const category = displayCategory(comment.category);
+  const confidence = confidencePercent(comment.confidence);
 
   return (
     <article
@@ -33,15 +38,22 @@ export function CommentCard({ comment, filePath }: CommentCardProps) {
           ) : (
             <SevIcon size={15} className={cn('shrink-0 mt-px', sev.iconColor)} />
           )}
-          <span className="font-bold text-sm text-foreground leading-snug">{comment.title}</span>
+          <span className="font-bold text-sm text-foreground leading-snug line-clamp-2">{comment.title}</span>
         </div>
-        <span className={`severity-tag ${comment.severity} shrink-0`}>{comment.severity}</span>
+        {/* Category tag + confidence chip pair visually with (do not out-size) the severity tag */}
+        <div className="flex items-center gap-2 shrink-0">
+          <span className={`category-tag ${category}`}>{category}</span>
+          {confidence != null && (
+            <span className="text-xs font-medium text-muted-foreground tabular-nums">{confidence}%</span>
+          )}
+          <span className={`severity-tag ${comment.severity}`}>{comment.severity}</span>
+        </div>
       </div>
 
       {/* Meta: file · line */}
       <div className="flex flex-wrap items-center gap-2 mb-3 text-xs text-muted-foreground">
-        <span className="flex items-center gap-1 font-mono bg-card/60 px-1.5 py-0.5 rounded text-foreground/70">
-          <FileText size={10} /> {filePath}
+        <span className="flex items-center gap-1 min-w-0 font-mono bg-card/60 px-1.5 py-0.5 rounded text-foreground/70">
+          <FileText size={10} className="shrink-0" /> <span className="break-all">{filePath}</span>
         </span>
         {comment.line != null && (
           <span className="text-muted-foreground font-medium">line {comment.line}</span>

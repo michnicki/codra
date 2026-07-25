@@ -1,6 +1,20 @@
 import type { AppBindings } from '@server/env';
 import { parseJsonColumn, queryRows } from './client';
-import { criticResultSchema, defaultRepoConfig, jobDetailSchema, jobSummarySchema, repoConfigSchema, type CriticResult, type RepoConfig } from '@shared/schema';
+import {
+  criticResultSchema,
+  defaultRepoConfig,
+  jobAuditEventSchema,
+  jobDetailSchema,
+  jobSummarySchema,
+  repoConfigSchema,
+  threadVerificationsSchema,
+  walkthroughEnrichmentSchema,
+  type CriticResult,
+  type JobAuditEvent,
+  type RepoConfig,
+  type ThreadVerifications,
+  type WalkthroughEnrichment,
+} from '@shared/schema';
 import { logger } from '@server/core/logger';
 import { getOrCreateRepository } from './repositories';
 
@@ -63,6 +77,15 @@ export type JobRow = {
   // criticResultSchema. In Phase 7 no writer is wired, so critic_result is always null.
   walkthrough_comment_ref: string | null;
   critic_result: CriticResult | string | null;
+  // Phase 19 (migration 013, THR-01/THR-02): durable verify-fixes cursor/result. The JSONB value is
+  // validated fail-soft in mapJob so malformed external/model-derived data degrades only the
+  // threadVerification field, never the job summary, lease claim, or detail response.
+  thread_verifications: ThreadVerifications | string | null;
+  // Phase 19 (migration 013, PASS-03): durable walkthrough enrichment metadata. The JSONB value
+  // mirrors walkthroughEnrichmentSchema (status + optional groups/confidence/effort + reason +
+  // token accounting). Validated fail-soft in mapJob so a malformed JSONB blob degrades only the
+  // walkthroughEnrichment field — the durable completeJob write and post are unaffected.
+  walkthrough_enrichment: WalkthroughEnrichment | string | null;
   // Phase 11 (migration 009, REVIEW: Codex 11-05 HIGH): durable review-rest scope. Both NULLABLE and
   // NOT written by insertJob's explicit column list unless a caller supplies them, so every existing
   // insert reads them back as null (behaviorally inert, NREG-01). review_scope mirrors
@@ -71,6 +94,31 @@ export type JobRow = {
   // j.* / SELECT i.* the existing accessors already use.
   review_scope: 'all' | 'rest' | 'head' | null;
   scope_source_job_id: string | null;
+  // Phase 13 (migration 010, AUD-01): durable per-job audit trail. Both NULLABLE / defaulted and NOT
+  // written by insertJob's explicit column list, so every existing insert reads them back inert
+  // (audit === NULL, audit_truncated === false) until appendJobAuditEvents runs (NREG-01). `audit` is
+  // a raw JSONB array parsed on read; the per-element parse + exposure lives in getJobDetail ONLY
+  // (D-11 — never on mapJob's summary/lease-claim hot path). `audit_truncated` is the ring-buffer
+  // eviction flag set by appendJobAuditEvents when the 500-event cap trims the oldest entries.
+  audit: unknown;
+  audit_truncated: boolean | null;
+  // Phase 18 (migration 011, RND-01 / D-02 / D-16 widened): durable round/mode snapshot persisted
+  // by the prepare-time round detection (Phase 18 Plan 02). review_round is the resolved round
+  // (>= 1); review_mode is the selected diff source ('full' | 'incremental' | 'fallback' |
+  // 'no_changes' | 'rest'). Both NULLABLE because Plan 01 has no writer wired and Phase 18 Plan 02
+  // populates them on the prepare-phase path. rounds_incremental is the durable snapshot of
+  // config.review.rounds.incremental at insert time — NOT NULL DEFAULT false in the DB.
+  review_round: number | null;
+  review_mode: string | null;
+  rounds_incremental: boolean;
+  // Phase 18 (migration 012, RND-02 / D-08 widened): the immutable diff-selection descriptor.
+  // rounds_from_sha is the prepare-time anchor SHA (the prior PR head, or '' for full / rest).
+  // rounds_to_sha is the prepare-time head SHA captured BEFORE the review started — finalize
+  // never anchors a freshly-fetched live head. Both NULLABLE so pre-Phase-18 rows read back
+  // without throwing, and the consumer helpers treat NULL as "no descriptor recorded" (the
+  // existing full-diff path stays byte-identical, NREG-01).
+  rounds_from_sha: string | null;
+  rounds_to_sha: string | null;
 };
 
 type JobStep = {
@@ -159,6 +207,38 @@ export function mapJob(row: JobRow) {
     }
   }
 
+  // Phase 19 mirrors critic_result's fail-soft trust boundary. Stored JSONB may be malformed or may
+  // come from a future schema version; validate it out-of-band so only this optional field degrades
+  // to null while the job remains claimable and its detail page remains readable (T-19-01-01).
+  const rawThreadVerification = parseJsonColumn<unknown>(row.thread_verifications, null);
+  const threadParsed = rawThreadVerification === null
+    ? null
+    : threadVerificationsSchema.safeParse(rawThreadVerification);
+  let threadVerification: ThreadVerifications | null = null;
+  if (threadParsed !== null) {
+    if (threadParsed.success) {
+      threadVerification = threadParsed.data;
+    } else {
+      logger.warn(`Ignoring unparseable thread_verifications for job ${row.id}`);
+    }
+  }
+
+  // Phase 19 Plan 19-08 (PASS-03): independent fail-soft parse of walkthrough_enrichment. Mirrors
+  // the thread_verifications boundary above — malformed JSONB degrades only the
+  // walkthroughEnrichment field, never the job summary, lease claim, or detail response.
+  const rawWalkthroughEnrichment = parseJsonColumn<unknown>(row.walkthrough_enrichment, null);
+  const enrichmentParsed = rawWalkthroughEnrichment === null
+    ? null
+    : walkthroughEnrichmentSchema.safeParse(rawWalkthroughEnrichment);
+  let walkthroughEnrichment: WalkthroughEnrichment | null = null;
+  if (enrichmentParsed !== null) {
+    if (enrichmentParsed.success) {
+      walkthroughEnrichment = enrichmentParsed.data;
+    } else {
+      logger.warn(`Ignoring unparseable walkthrough_enrichment for job ${row.id}`);
+    }
+  }
+
   return jobSummarySchema.parse({
     id: row.id,
     owner: row.owner,
@@ -208,10 +288,31 @@ export function mapJob(row: JobRow) {
     // WR-01: pass the out-of-band-validated value (see above); a bad blob has already degraded to
     // null so the strict schema field never throws on the whole-row parse.
     criticResult,
+    // Phase 19: publish only the independently validated thread result. Malformed JSONB has already
+    // degraded to null above and cannot poison the strict jobSummarySchema parse.
+    threadVerification,
+    // Phase 19 Plan 19-08 (PASS-03): publish only the independently validated enrichment result.
+    // Malformed JSONB has already degraded to null above and cannot poison jobSummarySchema parse.
+    walkthroughEnrichment,
     // Phase 11: surface the migration-009 review-rest scope columns. Both are null on every existing
     // insert (no writer supplies them) -- additive, behaviorally inert (NREG-01).
     reviewScope: row.review_scope,
     scopeSourceJobId: row.scope_source_job_id,
+    // Phase 18 (RND-01 / D-02 / D-16 widened): surface the durable round/mode snapshot. reviewRound
+    // and reviewMode are NULL until Phase 18 Plan 02 wires the prepare-time writer; roundsIncremental
+    // is the durable config snapshot at insert time (NOT NULL DEFAULT false in the DB, so this
+    // resolves to false for every pre-Phase-18 insert and every future insert where the config is
+    // inert at the schema-default).
+    reviewRound: row.review_round,
+    reviewMode: row.review_mode,
+    roundsIncremental: row.rounds_incremental,
+    // Phase 18 (RND-02 / D-08, migration 012): surface the immutable diff-selection descriptor.
+    // Both NULL when no descriptor was written (pre-Phase-18 rows + a fresh job whose prepare
+    // phase hasn't run yet). The consumer helpers (getCachedRawDiff / runFinalizePhase's no_changes
+    // branch) treat NULL as "no incremental selection recorded" and fall through to the existing
+    // full-diff path (NREG-01).
+    roundsFromSha: row.rounds_from_sha,
+    roundsToSha: row.rounds_to_sha,
   });
 }
 
@@ -368,9 +469,10 @@ export async function insertJob(
           base_ref,
           retry_of_job_id,
           review_scope,
-          scope_source_job_id
+          scope_source_job_id,
+          rounds_incremental
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8::jsonb, $9, $10, $11::uuid, $12, $13::uuid)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8::jsonb, $9, $10, $11::uuid, $12, $13::uuid, $14)
         RETURNING *
       )
       SELECT i.*, r.owner, r.repo, r.installation_id, r.vcs_provider AS "repositoryVcsProvider", r.workspace AS "repositoryWorkspace", i.status_check_ref
@@ -391,6 +493,13 @@ export async function insertJob(
       input.retryOfJobId ?? null,
       input.reviewScope ?? null,
       input.scopeSourceJobId ?? null,
+      // Phase 18 (D-02 / D-16): capture the durable rounds_incremental snapshot from the config at
+      // insert time so every subsequent read (mapJob's hot path, the lease-claim path, the
+      // audit-trail read) sees the same value the webhook route saw. Default-false on the
+      // schema-resolved config (review.rounds.incremental defaults false) means a pre-Phase-18
+      // configSnapshot without rounds.* is inert -- false here, false in the DB, no behavior change.
+      // Using a triple-null coalesce so the bitwise comparison stays a non-null boolean column.
+      Boolean(input.configSnapshot?.review?.rounds?.incremental ?? false),
     ],
   );
 
@@ -503,6 +612,8 @@ export async function getJobDetail(env: Pick<AppBindings, 'HYPERDRIVE'>, jobId: 
         r.owner,
         r.repo,
         r.installation_id,
+        r.vcs_provider AS "repositoryVcsProvider",
+        r.workspace AS "repositoryWorkspace",
         COALESCE(
           (
             SELECT JSON_AGG(
@@ -533,7 +644,8 @@ export async function getJobDetail(env: Pick<AppBindings, 'HYPERDRIVE'>, jobId: 
                         'category', rc.category,
                         'title', rc.title,
                         'body', rc.body,
-                        'codeSuggestion', rc.code_suggestion
+                        'codeSuggestion', rc.code_suggestion,
+                        'confidence', rc.confidence
                       )
                       ORDER BY rc.id ASC
                     ) FROM review_comments rc WHERE rc.file_review_id = fr.id
@@ -557,6 +669,35 @@ export async function getJobDetail(env: Pick<AppBindings, 'HYPERDRIVE'>, jobId: 
 
   if (!row) return null;
 
+  // AUD-01 / D-11 fail-soft PER-ELEMENT audit read. This lives in getJobDetail ONLY (NOT mapJob), so
+  // listJobs and the workflow lease-claim (both via mapJob) never read, validate, or return the audit
+  // array — keeping the summary/list/lease-claim hot path audit-free (review fix: Codex, Divergent
+  // Views). Parse each element individually through jobAuditEventSchema.safeParse: a single malformed
+  // or future-`stage` event is dropped (and warned once) while every valid event is retained, so one
+  // bad entry never erases the whole trail (review fix: Codex MEDIUM — a whole-array safeParse would
+  // discard all valid audit evidence, and the "open union" would be closed at read time). Mirrors the
+  // critic_result degrade-and-warn posture in mapJob above.
+  const rawAudit = parseJsonColumn<unknown>(row.audit, []);
+  const auditEvents: JobAuditEvent[] = [];
+  let droppedAuditCount = 0;
+  if (Array.isArray(rawAudit)) {
+    for (const element of rawAudit) {
+      const parsed = jobAuditEventSchema.safeParse(element);
+      if (parsed.success) {
+        auditEvents.push(parsed.data);
+      } else {
+        droppedAuditCount += 1;
+      }
+    }
+  } else {
+    // A non-array stored value (should never happen — appendJobAuditEvents only ever writes arrays)
+    // degrades to an empty trail rather than throwing.
+    droppedAuditCount += 1;
+  }
+  if (droppedAuditCount > 0) {
+    logger.warn(`Ignoring ${droppedAuditCount} unparseable audit event(s) for job ${row.id}`);
+  }
+
   return jobDetailSchema.parse({
     ...mapJob(row),
     baseSha: bytesToHex(row.base_sha),
@@ -568,6 +709,9 @@ export async function getJobDetail(env: Pick<AppBindings, 'HYPERDRIVE'>, jobId: 
     retryOfJobId: row.retry_of_job_id,
     summaryModel: row.summary_model,
     files: parseJsonColumn(row.files_json, []),
+    // AUD-01: valid, per-element-parsed events (oldest first) + the ring-buffer eviction flag.
+    audit: auditEvents,
+    auditTruncated: row.audit_truncated ?? false,
   });
 }
 
@@ -1252,6 +1396,113 @@ export async function updateJobCriticResult(
 }
 
 /**
+ * Phase 19 THR-01/THR-02: persist the resumable verify-fixes state/result as one JSONB value. The
+ * caller writes after each bounded batch so a fresh Workflow instance can resume from durable
+ * cursors; mapJob validates the value fail-soft on every processing/detail reload. Parameterized
+ * JSONB binding keeps external identifiers and model-derived reasons out of SQL text.
+ */
+export async function setJobThreadVerifications(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  threadVerifications: ThreadVerifications | null,
+): Promise<void> {
+  await queryRows(
+    env,
+    `UPDATE jobs SET thread_verifications = $2::jsonb WHERE id = $1`,
+    [jobId, threadVerifications === null ? null : JSON.stringify(threadVerifications)],
+  );
+}
+
+/**
+ * Phase 19 Plan 19-08 (PASS-03): persist the walkthrough enrichment metadata as one JSONB value.
+ * The caller writes once per job when the enrichment phase completes (or fails) so finalize can
+ * merge the validated groups / confidence / effort onto WalkthroughData without re-calling the
+ * model. Mirrors setJobThreadVerifications' parameterized JSONB binding so external identifiers
+ * and model-derived labels never enter SQL text. Fail-soft trust boundary: mapJob re-validates the
+ * blob with walkthroughEnrichmentSchema.safeParse on every read so a malformed value degrades to
+ * null without poisoning the job summary.
+ */
+export async function setJobWalkthroughEnrichment(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  enrichment: WalkthroughEnrichment | null,
+): Promise<void> {
+  await queryRows(
+    env,
+    `UPDATE jobs SET walkthrough_enrichment = $2::jsonb WHERE id = $1`,
+    [jobId, enrichment === null ? null : JSON.stringify(enrichment)],
+  );
+}
+
+/**
+ * Phase 18 (RND-01 / D-02 / D-16 widened): write the resolved round + selected review mode onto
+ * the job row. Plan 02's runPreparePhase calls this once per job with the pure resolveRoundContext
+ * result so the durable round/mode snapshot survives fresh-instance handoff + lease recovery
+ * (audit is intentionally excluded from mapJob). Both values are NULL-able, so a pre-Phase-18
+ * insert reads them back as null without throwing (NREG-01). The CHECK constraints installed by
+ * migration 011 (review_round >= 1, review_mode in 'full'|'incremental'|'fallback'|'no_changes'|
+ * 'rest') reject out-of-vocabulary mode strings at the DB layer; this setter trusts the schema
+ * surface and does not revalidate. Single parameterized UPDATE, no string interpolation.
+ */
+export async function setJobReviewRoundAndMode(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  state: { reviewRound: number; reviewMode: 'full' | 'incremental' | 'fallback' | 'no_changes' | 'rest' },
+): Promise<void> {
+  await queryRows(
+    env,
+    `
+      UPDATE jobs
+      SET review_round = $2,
+          review_mode = $3
+      WHERE id = $1
+    `,
+    [jobId, state.reviewRound, state.reviewMode],
+  );
+}
+
+/**
+ * Phase 18 (RND-02 / D-08, migration 012): persist the IMMUTABLE diff-selection descriptor on
+ * the job row so the review/finalize phases re-fetch the EXACT same compare range the prepare
+ * phase selected (D-08: finalize never anchors a freshly-fetched live head). The descriptor
+ * is the durable fact; the KV diff cache is only a best-effort accelerator and is NEVER allowed
+ * to silently switch the source (Codex/Antigravity HIGH consensus — incremental-mode cache miss
+ * MUST NOT call the implicit full-diff helper).
+ *
+ * `fromSha` / `toSha` are populated for modes 'incremental' / 'fallback' / 'no_changes' (the
+ * cases where the prepare phase made a non-trivial selection against the prior anchor). For
+ * 'full' / 'rest' the descriptor is just the mode (the consumer uses the existing full-diff
+ * path, byte-identically with NREG-01). The writer is idempotent — re-calling with the same
+ * descriptor overwrites with the same values — and never throws into the caller (a failed
+ * write is logged + swallowed by the caller's try/catch so the prepare phase can continue).
+ * Single parameterized UPDATE; no string interpolation.
+ */
+export async function setJobDiffSelection(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  descriptor:
+    | { mode: 'full' | 'rest' }
+    | { mode: 'incremental' | 'fallback' | 'no_changes'; fromSha: string; toSha: string },
+): Promise<void> {
+  const fromSha: string | null = descriptor.mode === 'full' || descriptor.mode === 'rest'
+    ? null
+    : (descriptor as { fromSha: string; toSha: string }).fromSha;
+  const toSha: string | null = descriptor.mode === 'full' || descriptor.mode === 'rest'
+    ? null
+    : (descriptor as { fromSha: string; toSha: string }).toSha;
+  await queryRows(
+    env,
+    `
+      UPDATE jobs
+      SET rounds_from_sha = $2,
+          rounds_to_sha = $3
+      WHERE id = $1
+    `,
+    [jobId, fromSha, toSha],
+  );
+}
+
+/**
  * D-04: return the most recent job for a given (vcs_provider, workspace, owner, repo, prNumber)
  * tuple. Used by the Bitbucket webhook route's `pullrequest:updated` commit-hash dedup -- when a
  * push to the same PR head brings a new commit, the route looks up the prior job and skips
@@ -1378,6 +1629,62 @@ export async function supersedeOlderJobs(
   );
 
   return rows.length;
+}
+
+/**
+ * AUD-01 (D-12/D-13/D-14): atomically append audit events onto jobs.audit, capped at the most-recent
+ * 500 by a server-side drop-oldest ring buffer, tracking eviction in jobs.audit_truncated.
+ *
+ * Concurrency (T-13-03-01 / lost-update safety): multiple (file, pass) units can complete and call
+ * this in the same Promise.all-chunked invocation. This is a SINGLE atomic `UPDATE ... SET audit =
+ * <expr over the old row>` — there is NO application-level read-modify-write, so every concurrent
+ * caller's events survive (each UPDATE serializes on the row and composes onto the prior value).
+ *
+ * Security (T-13-03-02): event content is bound as a single `$2` parameter (`JSON.stringify(events)`),
+ * never string-concatenated into the SQL text — mirroring updateJobCriticResult / completeJob's
+ * parameterized JSONB style. It is referenced as `$2::text::jsonb` (NOT `$2::jsonb`): postgres.js
+ * infers the bind OID from the first cast it sees, and `::jsonb` makes it send a double-encoded jsonb
+ * *string* scalar (the same double-encoding this codebase's config uses — see repo_configs), which
+ * would make jsonb_array_length/jsonb_array_elements fail with "cannot get array length of a scalar".
+ * Forcing `::text` first sends the raw JSON array text, so `::text::jsonb` parses to a real jsonb array.
+ *
+ * Ordering (review fix, OpenCode MEDIUM): the trim re-aggregates with an EXPLICIT ordinality so the
+ * stored array always ends oldest-first (ascending chronological / insertion order): the combined
+ * `old || new` array is expanded WITH ORDINALITY, the newest 500 selected via `ORDER BY ord DESC
+ * LIMIT 500`, then re-aggregated with `jsonb_agg(elem ORDER BY ord ASC)`.
+ *
+ * `audit_truncated` uses integer array lengths (jsonb_array_length), never a fractional threshold, so
+ * there is no rounding/precision mode at the 500 boundary; it is set once true and never cleared
+ * (`audit_truncated OR ...`). The 500-boundary case (total === 500) does NOT set the flag.
+ */
+export async function appendJobAuditEvents(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  events: JobAuditEvent[],
+): Promise<void> {
+  // No-op fast path: zero events means zero DB work (never issue an empty UPDATE).
+  if (events.length === 0) return;
+
+  await queryRows(
+    env,
+    `
+      UPDATE jobs
+      SET audit = (
+            SELECT COALESCE(jsonb_agg(elem ORDER BY ord ASC), '[]'::jsonb)
+            FROM (
+              SELECT elem, ord
+              FROM jsonb_array_elements(COALESCE(audit, '[]'::jsonb) || $2::text::jsonb)
+                WITH ORDINALITY AS combined(elem, ord)
+              ORDER BY ord DESC
+              LIMIT 500
+            ) recent
+          ),
+          audit_truncated = audit_truncated
+            OR (jsonb_array_length(COALESCE(audit, '[]'::jsonb)) + jsonb_array_length($2::text::jsonb) > 500)
+      WHERE id = $1
+    `,
+    [jobId, JSON.stringify(events)],
+  );
 }
 
 export async function getOtherRunningJobsCount(env: Pick<import('@server/env').AppBindings, 'HYPERDRIVE'>, excludeJobId: string): Promise<number> {

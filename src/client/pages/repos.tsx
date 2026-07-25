@@ -37,6 +37,8 @@ import {
   type ModelRouteConfig,
   type ProviderOption,
 } from '@client/components/features/models/model-chain';
+import { ReviewSettingsPanel } from '@client/components/features/repos/review-settings-panel';
+import { mergeReviewPatch, type ReviewSettingsDraft } from '@client/lib/review-config-draft';
 
 const EMPTY_MODEL_ROUTE: ModelRouteConfig = {
   main: null,
@@ -468,6 +470,7 @@ function RepoModelModal({
   const [saving, setSaving] = useState<'apply' | 'reset' | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [interactiveDraft, setInteractiveDraft] = useState<InteractiveDraft | null>(null);
+  const [reviewSettingsDraft, setReviewSettingsDraft] = useState<ReviewSettingsDraft | null>(null);
 
   useEffect(() => {
     if (!repo) return;
@@ -477,27 +480,38 @@ function RepoModelModal({
     setSaving(null);
     setError(null);
     setInteractiveDraft(null);
+    setReviewSettingsDraft(null);
   }, [selectedRepoId, globalRouteKey]);
 
   const modelDirty = useMemo(() => !routesEqual(route, initialRoute), [initialRoute, route]);
   const interactiveDirty = interactiveDraft?.dirty ?? false;
   const interactiveValid = interactiveDraft?.valid ?? true;
-  const dirty = modelDirty || interactiveDirty;
-  const canApply = !!repo && dirty && interactiveValid && saving === null;
+  const reviewSettingsDirty = reviewSettingsDraft?.dirty ?? false;
+  const reviewSettingsValid = reviewSettingsDraft?.valid ?? true;
+  const dirty = modelDirty || interactiveDirty || reviewSettingsDirty;
+  const canApply = !!repo && dirty && interactiveValid && reviewSettingsValid && saving === null;
   const hasStoredStrategy = repo ? hasStoredModelStrategy(repo) : false;
 
   // Single save action: persists the model strategy and the interactive (commands/Q&A) settings
   // together in one PATCH. Each key is sent only when its section changed; `review` spreads the
   // full current review so mention_trigger/max_files/etc. survive the server's shallow merge.
   const handleApply = async () => {
-    if (!repo || !dirty || !interactiveValid) return;
+    if (!repo || !dirty || !interactiveValid || !reviewSettingsValid) return;
     setSaving('apply');
     setError(null);
     const tid = toast.loading('Saving repository settings…');
     try {
+      // Merge both review sub-editors into ONE review object (NREG-02): mergeReviewPatch spreads
+      // the full current review first, overlays the settings draft, then applies the fresh
+      // interactive draft LAST so a simultaneous Interactive edit wins over the settings draft's
+      // own (stale) interactive block (REVIEW #4). Null when neither sub-editor is dirty.
       const nextReview =
-        interactiveDirty && interactiveDraft
-          ? { ...repo.parsedJson.review, interactive: interactiveDraft.interactive }
+        interactiveDirty || reviewSettingsDirty
+          ? mergeReviewPatch(
+              repo.parsedJson.review,
+              interactiveDirty && interactiveDraft ? interactiveDraft.interactive : null,
+              reviewSettingsDirty && reviewSettingsDraft ? reviewSettingsDraft.review : null,
+            )
           : null;
       const patch: Parameters<typeof api.updateRepoConfig>[2] = {};
       if (modelDirty) {
@@ -597,6 +611,8 @@ function RepoModelModal({
               <>
                 <div className="my-6 border-t border-border" />
                 <InteractivePanel key={selectedRepoId} repo={repo} onChange={setInteractiveDraft} />
+                <div className="my-6 border-t border-border" />
+                <ReviewSettingsPanel key={`${selectedRepoId}-review`} repo={repo} onChange={setReviewSettingsDraft} />
               </>
             )}
           </div>

@@ -2,17 +2,20 @@ import type { AppBindings } from '@server/env';
 import { logger } from '@server/core/logger';
 import { BitbucketClient } from '@server/core/bitbucket';
 import { decryptSecret } from '@server/core/crypto';
-import { parseUnifiedDiff, type FileDiff } from '@server/core/diff';
+import { parseUnifiedDiff, getValidNewLines, type FileDiff } from '@server/core/diff';
 import { getVcsCredentialSecrets } from '@server/db/vcs-credentials';
 import {
   REPORT_TYPE,
   REPORT_RESULT,
 } from '@server/bitbucket/constants';
+import type { RepoConfig } from '@shared/schema';
 import type {
+  VcsCapabilities,
   VcsCreateStatusCheckInput,
   VcsProvider,
   VcsPullRequest,
   VcsReviewComment,
+  VcsReviewThread,
   VcsSubmitReviewInput,
   VcsUpdateStatusCheckInput,
 } from './types';
@@ -53,13 +56,19 @@ type JobLike = {
   repositoryVcsProvider?: string | null;
   repositoryWorkspace?: string | null;
   headSha?: string | null;
+  // PROV-02 (D-07): the resolved repo config snapshot — supplies the configured bot account id
+  // for thread-filter self-resolution. Optional so existing call sites without the snapshot
+  // (NREG-01) still compile.
+  configSnapshot?: RepoConfig | null;
 };
 
 type BitbucketJob = JobLike & {
   repositoryWorkspace: string;
+  // PROV-02 (D-07): optional configSnapshot pass-through — `undefined` is allowed because tests
+  // and non-wire callers may not have it in scope (NREG-01).
 };
 
-type TrackerLike = { incrementSubrequests(count?: number): void };
+type TrackerLike = { incrementSubrequests(count?: number): void; hasRemainingSafeBudget?(needed?: number): boolean };
 
 // In-memory cache of fetched PR comments used by submitReview's dedup step (REV-R-A). One fetch
 // per submitReview call — the API list is paginated by pagelen=100 which already covers all PRs
@@ -111,8 +120,20 @@ function parsePrCommentRef(ref: string): { prId: number; commentId: number } {
 export class BitbucketAdapter implements VcsProvider {
   readonly name = 'bitbucket' as const;
   // Bitbucket Cloud does not render Mermaid diagrams in PR markdown, so the walkthrough formatter
-  // MUST NOT emit one for Bitbucket PRs (D-09). Required member on VcsProvider; inert this phase.
-  readonly capabilities = { supportsMermaid: false } as const;
+  // MUST NOT emit one for Bitbucket PRs (D-09). `supportsThreadListing` is static-true (the
+  // comments endpoint is always available). `supportsThreadResolution` is OBSERVED-DOWNGRADE
+  // (D-04): it starts optimistic (true) and the first real 403/404/501 from POST /resolve flips
+  // the private backing boolean to false, cached for the rest of the invocation. Exposed via a
+  // class getter so the mutable field can be read through the immutable interface shape. Plan
+  // 17-02 wires the real POST /resolve plumbing behind the neutral stub.
+  private threadResolutionSupported = true;
+  get capabilities(): VcsCapabilities {
+    return {
+      supportsMermaid: false,
+      supportsThreadListing: true,
+      supportsThreadResolution: this.threadResolutionSupported,
+    };
+  }
   // Bitbucket Cloud has no native PR-labels feature (Pattern 2). The interface marks `labels`
   // optional; this adapter intentionally does NOT assign the property so callers must feature-
   // detect `if (vcs.labels)` (mirrors `GithubAdapter` which DOES assign it).
@@ -121,6 +142,7 @@ export class BitbucketAdapter implements VcsProvider {
     private env: AppBindings,
     private readonly client: BitbucketClient,
     private readonly job: BitbucketJob,
+    private readonly tracker?: TrackerLike,
   ) {}
 
   /**
@@ -156,7 +178,7 @@ export class BitbucketAdapter implements VcsProvider {
     const token = await decryptSecret(env, secrets.encryptedAccessToken);
 
     const client = new BitbucketClient(env, token, tracker);
-    const adapter = new BitbucketAdapter(env, client, { ...job, repositoryWorkspace: workspace });
+    const adapter = new BitbucketAdapter(env, client, { ...job, repositoryWorkspace: workspace }, tracker);
     return adapter;
   }
 
@@ -166,6 +188,134 @@ export class BitbucketAdapter implements VcsProvider {
 
   async getPullRequestDiff(owner: string, repo: string, prNumber: number): Promise<string> {
     return this.client.getPullRequestDiff(owner, repo, prNumber);
+  }
+
+  // PROV-01 (D-08): content primitive. Delegates to BitbucketClient.getFileContent
+  // (`/src/{ref}/{path}`); 404 -> null at the client; non-2xx throws BitbucketError. Bitbucket's
+  // `owner` parameter is the workspace (canonical per repo), so we pass it through.
+  async getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null> {
+    return this.client.getFileContent(owner, repo, ref, path);
+  }
+
+  // PROV-01 (D-09): compare-diff primitive. Delegates to BitbucketClient.getCompareDiff which
+  // builds the REVERSED spec `HEAD..BASE` so the seam's `(base, head)` semantics survive
+  // (R-5). Empty success passes through as `''`; non-2xx throws BitbucketError.
+  async getCompareDiff(owner: string, repo: string, base: string, head: string): Promise<string> {
+    return this.client.getCompareDiff(owner, repo, base, head);
+  }
+
+  // PROV-02 (D-05/D-06/D-07): unresolved-bot-thread listing. Walks paginated comments, filters to
+  // UNRESOLVED root comments authored by the immutable bot account_id (configured FIRST, then
+  // `GET /2.0/user` fallback), and computes `outdated` locally via the current PR diff (R-4).
+  // Any client-side failure is caught and converted to `[]` (D-02). The op supports the safe-budget
+  // tracker so Phase 18/19 can size work against the live budget (R-9).
+  async getUnresolvedBotThreads(owner: string, repo: string, prNumber: number): Promise<VcsReviewThread[]> {
+    void owner;
+    try {
+      // D-07: configured bot id PRECEDES the live `GET /2.0/user` lookup. A repository access
+      // token 403s on the live discovery call (A1), so the configured id is the only viable path
+      // for many installs. Fall back to the live resolver only when no configuration exists.
+      const configuredBotId = this.job.configSnapshot?.review.interactive.commands.bitbucket_bot_account_id ?? null;
+      const botIdentity = configuredBotId ? { accountId: configuredBotId } : await this.client.resolveBotUserIdentity();
+      const botAccountId = botIdentity.accountId;
+
+      const allComments = await this.client.listRawPullRequestComments(this.job.repositoryWorkspace, this.job.repo, prNumber, this.tracker);
+
+      // Pre-filter deleted / replies / resolved / wrong-id / no-inline so the diff fetch only
+      // runs when there are SURVIVING candidates. Each survivor still gets an `outdated` flag
+      // computed against the live PR diff below.
+      const survivors = allComments.filter((comment) => {
+        if (comment.deleted === true) return false;
+        if (comment.parent && Object.keys(comment.parent).length > 0) return false;
+        if (comment.resolution) return false;
+        if (!comment.inline || typeof comment.inline.path !== 'string' || comment.inline.path.length === 0) return false;
+        if (typeof comment.id !== 'number') return false;
+        if (comment.user?.account_id === undefined || comment.user.account_id !== botAccountId) return false;
+        return true;
+      });
+
+      if (survivors.length === 0) return [];
+
+      // Parse the current PR diff once. We don't render the diff itself — only its line-validity
+      // set per file. Survivors whose path is absent OR whose new-side anchor is invalid become
+      // outdated (R-4).
+      const diffRaw = await this.client.getPullRequestDiff(this.job.repositoryWorkspace, this.job.repo, prNumber);
+      const files = parseUnifiedDiff(diffRaw);
+      const fileByPath = new Map<string, FileDiff>();
+      for (const file of files) fileByPath.set(file.path, file);
+
+      const out: VcsReviewThread[] = [];
+      for (const comment of survivors) {
+        const inline = comment.inline!;
+        const path = inline.path;
+        const file = fileByPath.get(path);
+        // new-side anchor: start_to / to. Old-side only: start_from / from, ALWAYS marked outdated.
+        const hasNewSide = typeof inline.to === 'number';
+        const toVal = inline.to;
+        const fromVal = inline.from;
+        const startToVal = inline.start_to;
+        const startFromVal = inline.start_from;
+        const lineEnd = toVal ?? fromVal;
+        const lineStart = startToVal ?? toVal ?? startFromVal ?? fromVal;
+        const body = typeof comment.content?.raw === 'string' ? comment.content.raw : '';
+        if (body.length === 0) continue;
+
+        // Range guards BEFORE emitting the row. Skip rather than fabricate.
+        if (lineStart === undefined || lineEnd === undefined) continue;
+        if (!Number.isSafeInteger(lineStart) || !Number.isSafeInteger(lineEnd)) continue;
+        if (lineStart <= 0 || lineEnd <= 0 || lineStart > lineEnd) continue;
+
+        const newSideValid = file !== undefined &&
+          getValidNewLines(file).has(lineStart) && getValidNewLines(file).has(lineEnd);
+        const outdated = !hasNewSide || file === undefined || !newSideValid;
+
+        out.push({
+          ref: `${prNumber}:${comment.id}`,
+          path,
+          lineStart,
+          lineEnd,
+          rootBody: body,
+          outdated,
+        });
+      }
+      return out;
+    } catch {
+      // D-02: silent neutral degradation — no log, no audit, no throw.
+      return [];
+    }
+  }
+
+  // PROV-02 (D-04): resolve a thread. The opaque `ref` is self-encoding `prId:commentId`; validate
+  // via the existing `parsePrCommentRef` BEFORE any HTTP request so a malformed ref cannot
+  // reach the wire (T-17-02-01). Any operation failure returns `false` (D-02). 403/404/501 are
+  // the ONLY statuses that flip `threadResolutionSupported` to false (Pitfall 2): 500/501/etc.
+  // are exactly one HTTP attempt via `resolvePullRequestCommentThreadStatus` (no retry).
+  async resolveThread(_owner: string, _repo: string, ref: string): Promise<boolean> {
+    void _owner; void _repo;
+    // Downgrade short-circuit (D-04): once a real 403/404/501 happened, every later call returns
+    // false WITHOUT a request.
+    if (!this.threadResolutionSupported) return false;
+    let parsed: { prId: number; commentId: number };
+    try {
+      parsed = parsePrCommentRef(ref);
+    } catch (error) {
+      throw new Error(`resolveThread received a malformed ref: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try {
+      const status = await this.client.resolvePullRequestCommentThreadStatus(
+        this.job.repositoryWorkspace,
+        this.job.repo,
+        parsed.prId,
+        parsed.commentId,
+      );
+      if (status === 200 || status === 204) return true;
+      if (status === 403 || status === 404 || status === 501) {
+        this.threadResolutionSupported = false;
+      }
+      return false;
+    } catch {
+      return false;
+    }
   }
 
   async createStatusCheck(

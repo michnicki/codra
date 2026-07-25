@@ -1,0 +1,32 @@
+-- Phase 18 (v1.2 Review Engine Quality & Re-review Lifecycle) / Incremental Re-review & Rounds:
+-- provision the durable, immutable diff-selection descriptor for RND-02 (Plan 18-02). The
+-- descriptor is the load-bearing record Plan 02 persists on the job so a fresh Workflow
+-- instance / lease recovery / finalize redelivery re-fetches the EXACT same compare range the
+-- prepare phase selected — the selection is the durable fact, the KV cache is only an
+-- accelerator. Critical invariants (Codex/Antigravity HIGH consensus):
+--
+--   * An incremental-mode cache miss MUST NEVER call the implicit full-diff helper. The
+--     descriptor's mode='incremental' means the consumer must re-fetch the compare range.
+--   * Finalize never anchors a freshly-fetched live head. The `rounds_to_sha` column is the
+--     head SHA captured at prepare time; the next-push anchor is computed FROM this column.
+--   * A successful empty compare is a LEGITIMATE no_changes answer (Antigravity/Codex HIGH),
+--     NOT a fallback signal. The no_changes status is durable (mode='no_changes' + from/to).
+--
+-- EVERY change here is INERT for the existing review pipeline (NREG-01): both new columns are
+-- NULL-able so every existing row reads back without throwing, and the consumer helpers
+-- (`getCachedRawDiff` etc.) only diverge when review_mode is populated. Pre-Phase-18 jobs
+-- without a review_mode still hit the existing full-diff path byte-identically.
+--
+-- Additive and re-run safe: only IF NOT EXISTS / existence-guarded verbs -- no drop, rename,
+-- backfill, or destructive rewrite. Applied under the advisory lock in a single BEGIN/COMMIT
+-- by scripts/migrate.mjs (schema_migrations tracked). The highest previously-applied migration
+-- is 011. Re-run safety is asserted by the migration's own existence guards (the IF NOT EXISTS
+-- additions are themselves idempotent in Postgres).
+
+-- 1. jobs rounds_from_sha + rounds_to_sha (RND-02 descriptor). rounds_from_sha is the
+--    prepare-time anchor SHA (NULL when mode is 'full' / 'rest' / pre-Phase-18). rounds_to_sha
+--    is the prepare-time head SHA — the LOCKED anchor for the next push (D-08). Both columns
+--    are NULL-able: a pre-Phase-18 row reads back without throwing, and the new consumer
+--    helpers treat NULL as "no incremental selection recorded" (the existing full-diff path).
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS rounds_from_sha TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS rounds_to_sha TEXT;

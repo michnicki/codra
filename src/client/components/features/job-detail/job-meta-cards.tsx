@@ -5,6 +5,7 @@ import { Badge, StatusBadge } from '@client/components/ui/badge';
 import type { JobDetail, JobStep } from '@shared/schema';
 import { formatDuration } from '@client/lib/utils';
 import { commitUrl, reviewUrl, vcsProviderLabel } from '@client/lib/vcs';
+import { formatRoundBadge } from '@client/lib/rounds-badge';
 
 interface JobMetaCardsProps {
   job: JobDetail;
@@ -102,6 +103,12 @@ export function JobMetaCards({ job }: JobMetaCardsProps) {
   // Only link when the helper yields a validated http(s) URL; otherwise fall
   // back to plain text rather than rendering a broken/dangerous anchor.
   const commitHref = job.commitSha ? commitUrl(job, job.commitSha) : undefined;
+  const roundLabel = formatRoundBadge({
+    round: job.reviewRound,
+    mode: job.reviewMode,
+    incrementalEnabled: job.roundsIncremental,
+    escalateFloors: job.configSnapshot?.review.rounds.escalate_floors,
+  });
 
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -125,6 +132,9 @@ export function JobMetaCards({ job }: JobMetaCardsProps) {
                     {(job.totalInputTokens + job.totalOutputTokens).toLocaleString()}
                   </span>
               },
+              ...(roundLabel
+                ? [{ label: 'Round', value: <Badge variant="neutral">{roundLabel}</Badge> }]
+                : []),
             ].map(({ label, value }) => (
               <div key={label}>
                 <dt className="text-[10px] font-bold uppercase tracking-[0.12em] text-muted-foreground mb-1.5">

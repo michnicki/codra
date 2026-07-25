@@ -1,0 +1,170 @@
+{
+  "provenance": {
+    "captureCommit": "3d5f4150f8ff88787c10a3067ddc59176285eb25",
+    "source": "detached pre-Phase-19 worktree",
+    "harness": "test/support/phase19-baseline-harness.ts",
+    "canonicalization": "JSON.stringify with fixed object insertion order"
+  },
+  "schemaVersion": 1,
+  "config": {
+    "threads": {
+      "verify_fixes": false,
+      "auto_resolve": false
+    },
+    "critic": {
+      "enabled": false
+    },
+    "ensemble": {
+      "runs": 1,
+      "temperature": 0.7
+    },
+    "walkthrough": {
+      "enabled": false
+    }
+  },
+  "paths": {
+    "full": {
+      "round": {
+        "round": 1,
+        "mode": "full",
+        "roundsIncremental": false,
+        "anchorSha": null,
+        "hasUnresolvedThreads": false
+      },
+      "selection": {
+        "mode": "full"
+      },
+      "floors": {
+        "minConfidence": 0.7,
+        "minSeverity": "nit",
+        "effectiveChanged": false
+      },
+      "review": {
+        "comments": [
+          {
+            "path": "src/app.ts",
+            "line": 1,
+            "severity": "P0",
+            "title": "Critical finding",
+            "body": "critical finding body"
+          },
+          {
+            "path": "src/app.ts",
+            "line": 2,
+            "severity": "P2",
+            "title": "Warning finding",
+            "body": "warning finding body"
+          }
+        ],
+        "overview": "### OpenCodra Review\n\n**Verdict:** Changes requested\n\n🚨 P0 ×1  ⚠️ P2 ×1\n\n**Top findings**\n- <img src=\"https://baseline.invalid/icons/p0-icon.svg\" width=\"20\" height=\"20\" alt=\"P0\" style=\"vertical-align:middle\" /> Critical finding — `src/app.ts`\n- <img src=\"https://baseline.invalid/icons/p2-icon.svg\" width=\"20\" height=\"20\" alt=\"P2\" style=\"vertical-align:middle\" /> Warning finding — `src/app.ts`\n\n_1 file reviewed_\n\n<details>\n<summary>About OpenCodra</summary>\n\n<br/>\n\n[Your team has set up OpenCodra to review pull requests in this repo](https://baseline.invalid/repos). Reviews are triggered when you:\n\n- **Open** a pull request for review\n- **Mark** a draft as ready\n- **Comment** \"@opencodra review\"\n\nIf OpenCodra has suggestions, it will comment; otherwise it will react with 👍.\n\nOpenCodra can also answer questions or update the PR. Try commenting \"@opencodra address that feedback\".\n\n</details>",
+        "walkthrough": "### OpenCodra Walkthrough\n\n🚨 P0 ×1  ⚠️ P2 ×1\n\n| File | Summary | Findings |\n| --- | --- | --- |\n| src/app.ts | one-line file summary | 🚨 P0×1 ⚠️ P2×1 |\n\n_1 file reviewed_"
+      },
+      "phase19": {
+        "modelCalls": 0,
+        "auditEvents": [],
+        "results": {
+          "threadVerification": null,
+          "critic": null,
+          "ensemble": null,
+          "walkthroughEnrichment": null
+        }
+      }
+    },
+    "incremental": {
+      "round": {
+        "round": 2,
+        "mode": "incremental",
+        "roundsIncremental": true,
+        "anchorSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hasUnresolvedThreads": false
+      },
+      "selection": {
+        "mode": "incremental",
+        "fromSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "toSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "floors": {
+        "minConfidence": 0.8,
+        "minSeverity": "P2",
+        "effectiveChanged": true
+      },
+      "review": {
+        "comments": [
+          {
+            "path": "src/app.ts",
+            "line": 1,
+            "severity": "P0",
+            "title": "Critical finding",
+            "body": "critical finding body"
+          },
+          {
+            "path": "src/app.ts",
+            "line": 2,
+            "severity": "P2",
+            "title": "Warning finding",
+            "body": "warning finding body"
+          }
+        ],
+        "overview": "### OpenCodra Review\n\n**Verdict:** Changes requested\n\n🚨 P0 ×1  ⚠️ P2 ×1\n\n**Top findings**\n- <img src=\"https://baseline.invalid/icons/p0-icon.svg\" width=\"20\" height=\"20\" alt=\"P0\" style=\"vertical-align:middle\" /> Critical finding — `src/app.ts`\n- <img src=\"https://baseline.invalid/icons/p2-icon.svg\" width=\"20\" height=\"20\" alt=\"P2\" style=\"vertical-align:middle\" /> Warning finding — `src/app.ts`\n\n_1 file reviewed_\n\n<details>\n<summary>About OpenCodra</summary>\n\n<br/>\n\n[Your team has set up OpenCodra to review pull requests in this repo](https://baseline.invalid/repos). Reviews are triggered when you:\n\n- **Open** a pull request for review\n- **Mark** a draft as ready\n- **Comment** \"@opencodra review\"\n\nIf OpenCodra has suggestions, it will comment; otherwise it will react with 👍.\n\nOpenCodra can also answer questions or update the PR. Try commenting \"@opencodra address that feedback\".\n\n</details>",
+        "walkthrough": "### OpenCodra Walkthrough\n\n🚨 P0 ×1  ⚠️ P2 ×1\n\n| File | Summary | Findings |\n| --- | --- | --- |\n| src/app.ts | one-line file summary | 🚨 P0×1 ⚠️ P2×1 |\n\n_1 file reviewed_"
+      },
+      "phase19": {
+        "modelCalls": 0,
+        "auditEvents": [],
+        "results": {
+          "threadVerification": null,
+          "critic": null,
+          "ensemble": null,
+          "walkthroughEnrichment": null
+        }
+      }
+    },
+    "review-rest": {
+      "round": {
+        "round": 1,
+        "mode": "rest",
+        "roundsIncremental": false,
+        "anchorSha": null,
+        "hasUnresolvedThreads": false
+      },
+      "selection": {
+        "mode": "rest"
+      },
+      "floors": {
+        "minConfidence": 0.7,
+        "minSeverity": "nit",
+        "effectiveChanged": false
+      },
+      "review": {
+        "comments": [
+          {
+            "path": "src/app.ts",
+            "line": 1,
+            "severity": "P0",
+            "title": "Critical finding",
+            "body": "critical finding body"
+          },
+          {
+            "path": "src/app.ts",
+            "line": 2,
+            "severity": "P2",
+            "title": "Warning finding",
+            "body": "warning finding body"
+          }
+        ],
+        "overview": "### OpenCodra Review\n\n**Verdict:** Changes requested\n\n🚨 P0 ×1  ⚠️ P2 ×1\n\n**Top findings**\n- <img src=\"https://baseline.invalid/icons/p0-icon.svg\" width=\"20\" height=\"20\" alt=\"P0\" style=\"vertical-align:middle\" /> Critical finding — `src/app.ts`\n- <img src=\"https://baseline.invalid/icons/p2-icon.svg\" width=\"20\" height=\"20\" alt=\"P2\" style=\"vertical-align:middle\" /> Warning finding — `src/app.ts`\n\n_1 file reviewed_\n\n<details>\n<summary>About OpenCodra</summary>\n\n<br/>\n\n[Your team has set up OpenCodra to review pull requests in this repo](https://baseline.invalid/repos). Reviews are triggered when you:\n\n- **Open** a pull request for review\n- **Mark** a draft as ready\n- **Comment** \"@opencodra review\"\n\nIf OpenCodra has suggestions, it will comment; otherwise it will react with 👍.\n\nOpenCodra can also answer questions or update the PR. Try commenting \"@opencodra address that feedback\".\n\n</details>",
+        "walkthrough": "### OpenCodra Walkthrough\n\n🚨 P0 ×1  ⚠️ P2 ×1\n\n| File | Summary | Findings |\n| --- | --- | --- |\n| src/app.ts | one-line file summary | 🚨 P0×1 ⚠️ P2×1 |\n\n_1 file reviewed_"
+      },
+      "phase19": {
+        "modelCalls": 0,
+        "auditEvents": [],
+        "results": {
+          "threadVerification": null,
+          "critic": null,
+          "ensemble": null,
+          "walkthroughEnrichment": null
+        }
+      }
+    }
+  }
+}

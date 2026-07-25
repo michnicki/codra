@@ -258,7 +258,10 @@ dbDescribe('getJobDiffFiles scope-aware wrapper + producer round-trip (Plan 11-0
     });
 
     const restJob = jobLike({ reviewScope: 'rest', commitSha: headSha });
-    const vcs = { getPullRequestDiff: async () => fourFileDiff };
+    const vcs = {
+      getPullRequestDiff: async () => fourFileDiff,
+      getCompareDiff: async () => '',
+    };
     // Uses the DEFAULT (max_files 150) config: the rest set comes from skipped_files, not the slice.
     const files = await getJobDiffFiles(env, restJob, vcs, defaultRepoConfig as RepoConfig);
     expect(files.map((f) => f.path)).toEqual(['src/c.ts', 'src/d.ts']);
@@ -266,16 +269,22 @@ dbDescribe('getJobDiffFiles scope-aware wrapper + producer round-trip (Plan 11-0
 
   it('reviewScope="rest" with zero recorded skips is a no-op (empty set, not an error)', async () => {
     const restJob = jobLike({ reviewScope: 'rest', commitSha: sha('9') });
-    const vcs = { getPullRequestDiff: async () => fourFileDiff };
+    const vcs = {
+      getPullRequestDiff: async () => fourFileDiff,
+      getCompareDiff: async () => '',
+    };
     const files = await getJobDiffFiles(env, restJob, vcs, defaultRepoConfig as RepoConfig);
     expect(files).toEqual([]);
   });
 
   it('undefined scope is byte-identical to getDiffFiles (NREG-01)', async () => {
     const job = jobLike({ reviewScope: null });
-    const vcs = { getPullRequestDiff: async () => fourFileDiff };
+    const vcs = {
+      getPullRequestDiff: async () => fourFileDiff,
+      getCompareDiff: async () => '',
+    };
     const viaJob = await getJobDiffFiles(env, job, vcs, restConfig);
-    const viaPlain = await getDiffFiles(env, { id: job.id, owner: job.owner, repo: job.repo, prNumber: job.prNumber }, vcs, restConfig);
+    const viaPlain = await getDiffFiles(env, { id: job.id, owner: job.owner, repo: job.repo, prNumber: job.prNumber, reviewMode: null, roundsFromSha: null, roundsToSha: null }, vcs, restConfig);
     expect(viaJob.map((f) => f.path)).toEqual(viaPlain.map((f) => f.path));
     // max_files=2 -> only the first two kept, honoring the slice exactly like today.
     expect(viaJob.map((f) => f.path)).toEqual(['src/a.ts', 'src/b.ts']);
@@ -283,7 +292,10 @@ dbDescribe('getJobDiffFiles scope-aware wrapper + producer round-trip (Plan 11-0
 
   it('reviewScope="all" reviews the full current head (delegates to getDiffFiles)', async () => {
     const job = jobLike({ reviewScope: 'all' });
-    const vcs = { getPullRequestDiff: async () => fourFileDiff };
+    const vcs = {
+      getPullRequestDiff: async () => fourFileDiff,
+      getCompareDiff: async () => '',
+    };
     const files = await getJobDiffFiles(env, job, vcs, defaultRepoConfig as RepoConfig);
     expect(files.map((f) => f.path)).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts']);
   });

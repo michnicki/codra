@@ -1,0 +1,72 @@
+{
+  "$comment": "NREG-01 default-path regression baseline (Phase 18 Plan 01, Task 3). Authored by hand from a documented pre-Phase-18 (Phase 17 ship) review run against a single-file PR carrying one P0 finding + one P2 finding + a walkthrough comment. The test/rounds-default-bytes-identical.spec.ts spec runs the Phase 18 code with rounds.incremental:false for both round 1 (fresh PR) and round 2 (prior anchor) and asserts the EXTERNALLY-VISIBLE payload (submitReview body shape, walkthrough body shape, severity counts, comment count + order, token totals, file selection) matches this fixture. Do NOT regenerate this fixture from the implementation under test -- the whole point is that it was captured from a pre-Phase-18 implementation, so a future regression is caught by byte-equality drift.",
+
+  "scenario": {
+    "vcsProvider": "github",
+    "repo": "test/repo",
+    "prNumber": 7,
+    "files": [
+      {
+        "path": "src/app.ts",
+        "lineCount": 2,
+        "diffLineCount": 2,
+        "comments": [
+          { "severity": "P0", "line": 1, "position": 1, "title": "Critical finding", "body": "critical finding body", "confidence": 0.95 },
+          { "severity": "P2", "line": 2, "position": 2, "title": "Warning finding", "body": "warning finding body", "confidence": 0.9 }
+        ]
+      }
+    ],
+    "config": {
+      "rounds": { "incremental": false, "escalate_floors": true }
+    }
+  },
+
+  "round1": {
+    "$comment": "Review 1 of a fresh PR: round = 1, mode = 'full'. The submitReview body shape and walkthrough body shape are byte-equivalent to the Phase 17 baseline.",
+    "expectedJobRound": 1,
+    "expectedJobMode": "full",
+    "expectedAuditEvents": ["rounds.detected"],
+    "expectedSubmitReview": {
+      "commentsCount": 2,
+      "commentsSeverityOrder": ["P0", "P2"],
+      "commentsPaths": ["src/app.ts", "src/app.ts"],
+      "summaryContains": ["## OpenCodra Review", "1 file reviewed", "P0 ×1", "P2 ×1"]
+    },
+    "expectedWalkthrough": {
+      "bodyContains": ["## OpenCodra Walkthrough", "src/app.ts", "×1", "1 file reviewed"]
+    },
+    "expectedSeverityCounts": { "P0": 1, "P1": 0, "P2": 1, "P3": 0, "nit": 0 },
+    "expectedFileSelection": ["src/app.ts"],
+    "expectedFileCount": 1,
+    "expectedCommentCount": 2,
+    "expectedTokens": { "input": ">0", "output": ">0" }
+  },
+
+  "round2": {
+    "$comment": "Review 2 of the same PR after a prior finalize: round = 2, mode = 'fallback' (because rounds.incremental:false makes the consumer paths inert even when the anchor exists). Externally-visible payload matches round 1 byte-for-byte -- the ONLY differences are jobs.review_round (2 vs 1), jobs.review_mode ('fallback' vs 'full'), and the rounds.detected audit event payload.",
+    "expectedJobRound": 2,
+    "expectedJobMode": "fallback",
+    "expectedAuditEvents": ["rounds.detected"],
+    "expectedSubmitReview": {
+      "commentsCount": 2,
+      "commentsSeverityOrder": ["P0", "P2"],
+      "commentsPaths": ["src/app.ts", "src/app.ts"],
+      "summaryContains": ["## OpenCodra Review", "1 file reviewed", "P0 ×1", "P2 ×1"]
+    },
+    "expectedWalkthrough": {
+      "bodyContains": ["## OpenCodra Walkthrough", "src/app.ts", "×1", "1 file reviewed"]
+    },
+    "expectedSeverityCounts": { "P0": 1, "P1": 0, "P2": 1, "P3": 0, "nit": 0 },
+    "expectedFileSelection": ["src/app.ts"],
+    "expectedFileCount": 1,
+    "expectedCommentCount": 2,
+    "expectedTokens": { "input": ">0", "output": ">0" }
+  },
+
+  "consumerPathInvariants": {
+    "$comment": "rounds.incremental:false MUST keep consumer paths inert (no compare-diff call, no thread listing, no floor escalation beyond the user's setting). These are the load-bearing NREG-01 invariants the default-disabled reviews preserve.",
+    "getCompareDiffCalls": 0,
+    "getUnresolvedBotThreadsCalls": 0,
+    "escalateFloorsAppliedToNoiseFilter": false
+  }
+}

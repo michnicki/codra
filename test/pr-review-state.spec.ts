@@ -3,6 +3,7 @@ import {
   getPrReviewState,
   markPrPaused,
   markPrResumed,
+  setLastReviewedSha,
   type PrReviewStateKey,
 } from '@server/db/pr-review-state';
 import { queryRows } from '@server/db/client';
@@ -106,5 +107,69 @@ dbDescribe('pr_review_state pause accessors (SC1 pause portion)', () => {
     await markPrPaused(env, key, 'account-b');
 
     expect(await countRows(env, key)).toBe(1);
+  });
+});
+
+// Phase 18 (RND-05 / D-14 / D-15): the migration-011 anchor accessors. Pause fields are
+// PRESERVED across anchor writes (Phase 18 Plan 02 D-13), the anchor is MONOTONIC (a stale
+// redelivery cannot regress the anchor below a newer one), and an empty head SHA is a no-op
+// guarded by an explicit `rounds.anchor_skipped` audit event emitted by the caller.
+dbDescribe('pr_review_state anchor accessors (RND-05 / D-14)', () => {
+  const env = createTestEnv();
+  const sha = (ch: string) => ch.repeat(40);
+
+  it('setLastReviewedSha: first write lazy-creates the row with anchor + round', async () => {
+    const key = githubKey(`anchor-first-${Date.now()}`);
+    const row = await setLastReviewedSha(env, key, { headSha: sha('a'), reviewRound: 2 });
+    expect(row).not.toBeNull();
+    expect(row!.last_reviewed_sha).toBe(sha('a'));
+    expect(row!.last_review_round).toBe(2);
+  });
+
+  it('setLastReviewedSha: a monotonic round advance (round 2 -> 3) updates the row', async () => {
+    const key = githubKey(`anchor-mono-${Date.now()}`);
+    await setLastReviewedSha(env, key, { headSha: sha('b'), reviewRound: 2 });
+    const after = await setLastReviewedSha(env, key, { headSha: sha('c'), reviewRound: 3 });
+    expect(after).not.toBeNull();
+    expect(after!.last_reviewed_sha).toBe(sha('c'));
+    expect(after!.last_review_round).toBe(3);
+  });
+
+  it('setLastReviewedSha: a stale round (round 3 -> 2) is rejected -- no anchor regression', async () => {
+    const key = githubKey(`anchor-stale-${Date.now()}`);
+    await setLastReviewedSha(env, key, { headSha: sha('d'), reviewRound: 3 });
+    const after = await setLastReviewedSha(env, key, { headSha: sha('e'), reviewRound: 2 });
+    // The UPDATE was rejected by the WHERE clause so RETURNING is empty.
+    expect(after).toBeNull();
+    const state = await getPrReviewState(env, key);
+    expect(state!.last_reviewed_sha).toBe(sha('d'));
+    expect(state!.last_review_round).toBe(3);
+  });
+
+  it('setLastReviewedSha: empty / whitespace head SHA is a no-op (D-15 defensive guard)', async () => {
+    const key = githubKey(`anchor-empty-${Date.now()}`);
+    const result = await setLastReviewedSha(env, key, { headSha: '', reviewRound: 1 });
+    expect(result).toBeNull();
+    const resultWs = await setLastReviewedSha(env, key, { headSha: '   ', reviewRound: 1 });
+    expect(resultWs).toBeNull();
+    expect(await getPrReviewState(env, key)).toBeNull();
+  });
+
+  it('anchor writes DO NOT clobber an existing pause state (pause columns preserved)', async () => {
+    // Phase 18 Plan 02 D-13: the anchor setter writes ONLY the anchor columns. A pre-existing
+    // pause must survive (no overwriting paused / paused_by / paused_at).
+    const key = githubKey(`anchor-pause-${Date.now()}`);
+    await markPrPaused(env, key, 'account-pauser');
+    const beforeAnchor = await getPrReviewState(env, key);
+    expect(beforeAnchor!.paused).toBe(true);
+    expect(beforeAnchor!.paused_by).toBe('account-pauser');
+
+    await setLastReviewedSha(env, key, { headSha: sha('f'), reviewRound: 1 });
+
+    const afterAnchor = await getPrReviewState(env, key);
+    expect(afterAnchor!.last_reviewed_sha).toBe(sha('f'));
+    expect(afterAnchor!.last_review_round).toBe(1);
+    expect(afterAnchor!.paused).toBe(true);
+    expect(afterAnchor!.paused_by).toBe('account-pauser');
   });
 });

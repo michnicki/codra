@@ -1,6 +1,6 @@
 import { logger } from './logger';
 import { isSupportedGitHubWebhookEvent, type GitHubWebhookEventName, type GitHubWebhookPayload, type IssueCommentWebhookPayload, type PullRequestWebhookPayload } from '@shared/github';
-import { defaultRepoConfig, normalizeModelId, reviewUnitKey, type CriticResult, type FileReviewPass, type ParsedReviewComment, type RepoConfig, type ReviewJobMessage } from '@shared/schema';
+import { defaultRepoConfig, normalizeModelId, reviewUnitKey, type CriticResult, type FileReviewPass, type JobAuditEvent, type ParsedReviewComment, type RepoConfig, type ReviewJobMessage } from '@shared/schema';
 import { isTimeoutMessage, matchesAnyTransientSubstring } from '@shared/transient-errors';
 import type { AppBindings } from '@server/env';
 import { bulkInheritFileReviews, bulkMarkFilesFailed, getFileReviewsForJobs, recordRetryableFileReviewFailure, upsertFileReview } from '@server/db/file-reviews';
@@ -20,7 +20,9 @@ import {
   markJobContinuationQueued,
   resetJobContinuationCount,
   releaseJobLease,
+  setJobDiffSelection,
   setJobPullRequestMeta,
+  setJobReviewRoundAndMode,
   setJobWorkflowInstance,
   supersedeOlderJobs,
   updateJobCheckRun,
@@ -28,18 +30,63 @@ import {
   updateJobStatusCheckRef,
   updateJobStep,
 } from '@server/db/jobs';
-import { filterReviewableFiles, parseUnifiedDiff, partitionReviewableFiles } from './diff';
+import { getPrReviewState, setLastReviewedSha, type PrReviewStateKey } from '@server/db/pr-review-state';
+import { filterReviewableFiles, parseUnifiedDiff, partitionReviewableFiles, selectReviewableFiles, type FileDiff, type FileSelectionResult } from './diff';
 import { insertSkippedFiles, listSkippedFilesForHead, type SkippedFilesHeadKey } from '@server/db/skipped-files';
-import { dedupeFindings, SEVERITY_RANK } from './dedup';
-import { parseCriticPruneResponse, parseSummaryResponse, parseWalkthroughDiagram } from './model-output';
+import { dedupeComposite, dedupeFindings } from './dedup';
+import { applyNoiseFilter, type NoiseFilterOptions } from './noise-filter';
+import { parseSummaryResponse, parseWalkthroughDiagram } from './model-output';
+import { buildCriticDecisionsAuditEvent, recordCriticAudit } from './audit';
+import {
+  CRITIC_REASON_BELOW_SKIP_THRESHOLD,
+  CRITIC_REASON_OVER_CHAR_BUDGET,
+  CRITIC_REASON_PARSE_FAILURE,
+  CRITIC_REASON_WHOLE_CALL_EXCEPTION,
+  CRITIC_V2_VERSION,
+  parseCriticV2Response,
+  reconcileCriticDecisions,
+} from './critic-v2';
 import { buildWalkthroughData, editWalkthroughComment, postWalkthroughPlaceholder } from './walkthrough';
+import { buildEnsembleVoteAuditEvent, recordEnsembleAudit } from './audit';
+import {
+  reconcileEnsembleRuns,
+  type EnsembleRun,
+} from './ensemble';
+import { updateFileReviewEnsembleResult } from '@server/db/file-reviews';
+import {
+  buildFileSkipEvents,
+  buildFinalizeDropEvents,
+  recordFileSkips,
+  recordFinalizeDrops,
+  recordRoundAudit,
+  recordUnitAudit,
+  recordVerifyFixesAudit,
+} from './audit';
+import { runVerifyFixesPhase } from './verify-fixes';
+import {
+  buildRoundInputsFromConfig,
+  buildRoundsAnchorSkippedEvent,
+  buildRoundsDetectedEvent,
+  buildRoundsEscalatedEvent,
+  buildRoundsNoChangesEvent,
+  buildRoundsSuppressedEvent,
+  composeRoundFloors,
+  isRoundSuppressionEligible,
+  resolveRoundContext,
+  selectDiffForRound,
+  suppressByOpenThreads,
+  type DiffSelectionDescriptor,
+  type ResolvedRoundContext,
+} from './rounds';
 
 import { VcsService } from '../services/vcs';
-import type { VcsProvider, VcsPullRequest, VcsUpdateStatusCheckInput } from '../vcs/types';
+import type { VcsProvider, VcsPullRequest, VcsReviewThread, VcsUpdateStatusCheckInput } from '../vcs/types';
 import { isRetryableModelError, ModelService } from '../services/model';
 import { FormatterService } from '../services/formatter';
 import { TokenTracker } from './token-tracker';
 import { loadRepoConfig } from './config';
+import { NextPhaseError } from './next-phase-error';
+import { runWalkthroughEnrichmentPhase } from './walkthrough-enrichment';
 import { getWebhookDelivery } from '@server/db/webhook-deliveries';
 import { getReviewSettings } from '@server/db/app-settings';
 import { REVIEW_CONCURRENCY_LIMITS } from '@shared/schema';
@@ -58,7 +105,12 @@ export type ReviewJobRunResult =
   // subrequest budget anymore: either a subrequest-limit deferral (a long-lived instance has stopped
   // hibernating, so its budget never resets) or the transition into finalize (which needs ~20
   // subrequests at once to post the review). A fresh instance's first step always gets a clean budget.
-  | { action: 'next_phase'; phase: 'prepare' | 'review' | 'finalize' | 'critic'; delaySeconds: number; jobId?: string; freshInstance?: boolean };
+  //
+  // Phase 19 widens the phase union with 'verify_fixes' so the durable cursor-batched phase can
+  // hand off exactly like every other phase. The verify_fixes phase runs as its OWN fresh-budget
+  // step between critic and finalize (or review and finalize when critic is off) — see
+  // nextPhaseAfterCritic / nextPhaseAfterVerifyFixes below.
+  | { action: 'next_phase'; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment'; delaySeconds: number; jobId?: string; freshInstance?: boolean };
 
 const REVIEW_CHUNK_WALL_CLOCK_MS = 12 * 60 * 1000;
 const JOB_LEASE_SECONDS = 15 * 60;
@@ -98,12 +150,11 @@ const MAX_JOB_CONTINUATIONS = 20;
 // a clean budget, more retries won't help -- so cap them low and fail fast (the check-run reconciler
 // and an inheriting re-run recover) instead of churning ~20 min against the shared ceiling.
 const MAX_FINALIZE_CONTINUATIONS = 3;
-// Critic skip threshold (D-06): a deduped candidate set this small isn't worth a model round-trip.
-// The critic's value is triaging a LARGE finding set (deduping main+security noise); re-judging a
-// handful of findings risks pruning a genuine issue for negligible noise reduction. At or below this
-// count runCriticPhase keeps ALL findings and records { skipped: true } instead of calling the model.
-// Overridable per-repo via passes.critic.skip_threshold; kept low so the critic still runs on any set
-// big enough to plausibly contain duplicates.
+// Critic skip threshold (D-06, v2 revision): The Phase 10 implicit `length <= 3` skip that
+// qppeared to "save a round-trip" is GONE in v2. The critic v2 grades every non-empty candidate set
+// by default (D-06), so an explicit per-repo `passes.critic.skip_threshold` is the only integer
+// that drives a keep-all skip. The constant is kept named for migration traceability with the old
+// schema but is no longer used as a default.
 const CRITIC_SKIP_THRESHOLD = 3;
 // Critic input char budget (D-06): an upper bound on the serialized candidate set handed to the
 // single whole-set critic call. Beyond this the prompt would risk the model's context window and this
@@ -124,6 +175,18 @@ const DIFF_CACHE_TTL_SECONDS = 6 * 60 * 60;
 // (ModelService.resolveModel), so the recurring cost per unit is ~1 provider call per model
 // tried plus the persisted-review write -- roughly 5 in the worst case rather than 9. Lower
 // estimate => more units reviewed in parallel per chunk within the same 50-subrequest cap.
+//
+// PHASE 13 AUDIT-WRITE RE-DERIVATION (Codex HIGH, deliberate — the standing v1.2 decision forbids
+// silently changing this budget): each completed (file,pass) unit now ALSO issues ONE combined audit
+// append (core/audit.ts recordUnitAudit — a single DB write batching the unit's drafted + severity
+// events, 13-03/13-04) ON TOP OF the persisted-review write. So the true worst-case per-unit cost is
+// ~6, not ~5. The constant is KEPT AT 5 anyway, on purpose: at a fresh budget the max concurrency (4)
+// runs cost 4 × 6 == 24, still <= the 25-subrequest safe budget (SAFE_MARGIN), so 4 concurrent units
+// remain safe. Bumping the estimate to 6 to "account for" the audit write would make floor(22/6) == 3
+// after even a 3-subrequest getPullRequest preamble and SILENTLY cap the concurrency slider below its
+// max -- the exact "concurrency slider is dead above medium" regression chunk-concurrency.spec.ts
+// guards -- for zero safety benefit (24 <= 25 already holds). This audit-append re-derivation is
+// pinned non-silently by chunk-concurrency.spec.ts's `ESTIMATED_SUBREQUESTS_PER_FILE + 1` assertion.
 //
 // This is a per-(file,pass)-UNIT cost that governs CONCURRENCY (how many units run in one chunk),
 // NOT a per-file cost. Phase 10's security pass is modelled as a SEPARATE (file,'security') unit
@@ -443,6 +506,22 @@ export async function runReviewJob(env: AppBindings, message: ReviewJobMessage):
       await runFinalizePhase(env, job, leaseOwner, vcs, formatter);
     } else if (phase === 'critic') {
       await runCriticPhase(env, job, leaseOwner, model);
+    } else if (phase === 'verify_fixes') {
+      // Phase 19 (THR-01/THR-02): the durable cursor-batched verify_fixes phase. Always hands
+      // off to finalize on its own fresh-budget step (so a long-lived instance never accidentally
+      // shares the review/critic phase's near-empty budget).
+      await runVerifyFixesPhase(env, job, leaseOwner, vcs, model, tracker);
+    } else if (phase === 'walkthrough_enrichment') {
+      // Phase 19 Plan 19-08 (PASS-03): the durable walkthrough enrichment phase. Always hands off
+      // to finalize on its own fresh-budget step. Finalize performs ZERO enrichment model work —
+      // it reads the persisted blob via buildWalkthroughData and feeds it through formatWalkthrough.
+      const configForEnrichment = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
+      await runWalkthroughEnrichmentPhase({
+        env,
+        job,
+        config: configForEnrichment,
+        model,
+      });
     } else {
       await runReviewPhase(env, job, leaseOwner, vcs, model, tracker);
     }
@@ -459,12 +538,17 @@ export async function runReviewJob(env: AppBindings, message: ReviewJobMessage):
 
     if (error instanceof NextPhaseError) {
       await releaseJobLease(env, job.id, leaseOwner);
-      // Finalize AND critic each need a fresh instance for a clean subrequest budget: finalize posts
-      // the review (~20 subrequests at once) and critic makes its single whole-set model call on its
-      // OWN budget (D-07 — the critic must never share finalize's budget). Other phase transitions
+      // Finalize AND critic AND verify_fixes AND walkthrough_enrichment each need a fresh instance
+      // for a clean subrequest budget: finalize posts the review (~20 subrequests at once), critic
+      // makes its single whole-set model call on its OWN budget (D-07 — the critic must never share
+      // finalize's budget), verify_fixes runs an unbounded number of file-content fetches + model
+      // calls + resolution calls on its OWN budget (D-01/D-02 — never share the prior phase's
+      // spent budget), and walkthrough_enrichment makes its single whole-set enrichment call on
+      // its OWN budget (D-13 — never share the prior phase's spent budget). Other phase transitions
       // (e.g. the per-chunk review yield) stay in this instance and rely on the normal step.sleep
       // hibernation to reset the budget.
-      return { action: 'next_phase', phase: error.phase, delaySeconds: error.delaySeconds, jobId: job.id, freshInstance: error.phase === 'finalize' || error.phase === 'critic' };
+      const freshInstance = error.phase === 'finalize' || error.phase === 'critic' || error.phase === 'verify_fixes' || error.phase === 'walkthrough_enrichment';
+      return { action: 'next_phase', phase: error.phase, delaySeconds: error.delaySeconds, jobId: job.id, freshInstance };
     }
 
     if (isRetryableModelError(error)) {
@@ -515,18 +599,21 @@ async function continueOrFailWedgedJob(
   job: PersistedReviewJob,
   vcs: VcsProvider,
   leaseOwner: string,
-  phase: 'prepare' | 'review' | 'finalize' | 'critic',
+  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment',
   delaySeconds: number,
   reason: string,
 ): Promise<ReviewJobRunResult> {
   const continuationCount = await markJobContinuationQueued(env, job.id, delaySeconds);
 
-  // Finalize AND critic burn their low ceiling fast so a saturated instance that can't post the
-  // review / can't run the critic on a clean budget fails over within a few minutes instead of
-  // looping ~20 min against the review-sized ceiling; review keeps the generous ceiling because it
-  // makes real per-file progress. (Critic never terminal-fails on exceed — it fails OPEN to finalize
-  // in the branch below — but it still uses the low ceiling to bound its fresh-instance retries.)
-  const ceiling = phase === 'finalize' || phase === 'critic' ? MAX_FINALIZE_CONTINUATIONS : MAX_JOB_CONTINUATIONS;
+  // Finalize AND critic AND verify_fixes burn their low ceiling fast so a saturated instance that
+  // can't post the review / can't run the critic / can't finish verification on a clean budget
+  // fails over within a few minutes instead of looping ~20 min against the review-sized ceiling;
+  // review keeps the generous ceiling because it makes real per-file progress. (Critic and
+  // verify_fixes never terminal-fail on exceed — they fail OPEN to finalize in the branches
+  // below — but they still use the low ceiling to bound their fresh-instance retries.)
+  const ceiling = phase === 'finalize' || phase === 'critic' || phase === 'verify_fixes' || phase === 'walkthrough_enrichment'
+    ? MAX_FINALIZE_CONTINUATIONS
+    : MAX_JOB_CONTINUATIONS;
 
   if (continuationCount > ceiling) {
     if (phase === 'review') {
@@ -582,6 +669,20 @@ async function continueOrFailWedgedJob(
       await resetJobContinuationCount(env, job.id);
       await releaseJobLease(env, job.id, leaseOwner);
       return { action: 'next_phase', phase: 'finalize', delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
+    } else if (phase === 'verify_fixes') {
+      // FAIL-OPEN ceiling (D-03): a wedged verify_fixes (repeated subrequest-budget exhaustion on its
+      // fresh-instance retries) must NEVER terminal-fail the job. Reset the continuation counter and
+      // hand finalize its own fresh instance/budget; finalize reads the persisted
+      // thread_verifications JSONB idempotently so a fail-open verify_fixes still surfaces whatever
+      // entries the cursor had persisted before exhaustion.
+      logger.error(`verify_fixes phase exceeded the continuation ceiling; failing OPEN to finalize (verification halted at cursor): ${job.owner}/${job.repo} PR #${job.prNumber}`, {
+        phase,
+        continuationCount,
+        reason,
+      });
+      await resetJobContinuationCount(env, job.id);
+      await releaseJobLease(env, job.id, leaseOwner);
+      return { action: 'next_phase', phase: 'finalize', delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
     } else {
       const message = `Review could not make progress after ${continuationCount} continuation attempts (${reason}). Failing the job to avoid an endless retry loop; re-run it once the underlying provider issue clears.`;
       logger.error(`Review job exceeded the continuation ceiling; failing terminally: ${job.owner}/${job.repo} PR #${job.prNumber}`, {
@@ -606,7 +707,7 @@ async function continueOrFailWedgedJob(
 async function resolveQueuedJob(
   env: AppBindings,
   message: ReviewJobMessage,
-): Promise<{ job: PersistedReviewJob; phase: 'prepare' | 'review' | 'finalize' | 'critic' } | null> {
+): Promise<{ job: PersistedReviewJob; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' } | null> {
   // The WIRE contract (reviewJobMessageSchema.phase) includes 'critic' (D-07). Phase 10 DISPATCHES it
   // — but ONLY for a jobId-bearing message. A critic phase is only ever reached AFTER a job exists
   // (review→critic hands off keyed on the resolved jobId), so a phase:'critic' message WITHOUT a jobId
@@ -615,8 +716,24 @@ async function resolveQueuedJob(
   // payload and run against it. A jobId-bearing critic message falls through to the getJobForProcessing
   // branch below and is dispatched normally.
   const requestedPhase = message.phase;
+  // Contract-first safety gate: schema.ts already recognizes Phase 19's durable handoff values, but
+  // their workers land in later plans. Reject an early/spoofed delivery instead of letting the
+  // dispatch fallback misclassify it as a normal review phase. Each owning plan removes its value
+  // from this gate when it installs the corresponding explicit dispatch branch.
   if (requestedPhase === 'critic' && !message.jobId) {
     logger.warn('Queue message ignored: phase "critic" requires a jobId (a jobId-less critic message is treated as a spoof).');
+    return null;
+  }
+  if (requestedPhase === 'verify_fixes' && !message.jobId) {
+    logger.warn('Queue message ignored: phase "verify_fixes" requires a jobId (a jobId-less verify_fixes message is treated as a spoof).');
+    return null;
+  }
+  if (requestedPhase === 'walkthrough_enrichment' && !message.jobId) {
+    // Phase 19 Plan 19-08 (PASS-03): walkthrough_enrichment is a jobId-only phase, same posture as
+    // critic / verify_fixes. A phase:'walkthrough_enrichment' message WITHOUT a jobId is a
+    // spoof / premature delivery — REJECT it here so a stray queue message can never resolve a
+    // job by webhook payload and run against it.
+    logger.warn('Queue message ignored: phase "walkthrough_enrichment" requires a jobId (a jobId-less enrichment message is treated as a spoof).');
     return null;
   }
 
@@ -804,20 +921,201 @@ async function runPreparePhase(
     }
   }
 
-  const files = await getJobDiffFiles(env, job, vcs, config);
+  // Phase 18 (RND-01 / D-01..D-06): always-on round detection at prepare-time, INDEPENDENT of the
+  // `rounds.incremental` toggle. The resolved round / mode are persisted on the job and emitted as
+  // a `rounds.detected` audit event so the signal is observable at defaults. Consumer paths
+  // (compare-diff selection, floor escalation, thread suppression) are separately gated on the
+  // durable `rounds.incremental` snapshot. Thread listing here is a detection input only: it runs at
+  // most once and only when no prior anchor exists, because an anchor already resolves round 2+.
+  // The review-rest short-circuit (D-03) skips state + thread calls entirely.
+  //
+  // Phase 18 Plan 02 (RND-02): the SELECTED mode (the OUTPUT of selectDiffForRound) is what gets
+  // persisted as `review_mode` -- NOT the resolver's mode. The resolver's mode is the constraint
+  // (full / incremental / fallback), the selector's output is the actual review behavior
+  // (which may downgrade to 'no_changes' on a successful empty compare). The two writes
+  // (setJobReviewRoundAndMode + setJobDiffSelection) happen AFTER the compare/fetch so the
+  // job row's review_mode can transition from 'incremental' to 'no_changes' inline.
+  const roundsIncremental = Boolean(config.review.rounds?.incremental ?? false);
+  let preparedRoundContext: ResolvedRoundContext | null = null;
+  if (job.reviewScope !== 'rest') {
+    // Resolve exactly once. The helper reads the prior anchor first and lists threads only when no
+    // anchor exists, because only the thread-only round-detection branch needs that provider call.
+    // Detection stays independent of the incremental consumer toggle (D-02); compare/floors/
+    // suppression remain gated separately on the persisted toggle.
+    preparedRoundContext = await resolveRoundContextForJob(env, job, vcs, config);
+
+    // Emit the detected-event audit record NOW (before the diff fetch) so the round signal is
+    // observable at the prepare step regardless of whether the compare fetch succeeds. The
+    // best-effort recorder never throws into the caller.
+    await recordRoundAudit(env, job.id, [buildRoundsDetectedEvent(preparedRoundContext)]);
+  } else {
+    // D-03 review-rest short-circuit: NO state/thread calls, NO resolver. Persist round 1 / mode
+    // 'rest' directly so the dashboard reads the same round/mode pair this job will execute with,
+    // and emit a `rounds.detected` audit event with the explicit `rest` mode so the audit trail
+    // explains why this run did not participate in round detection.
+    try {
+      await setJobReviewRoundAndMode(env, job.id, { reviewRound: 1, reviewMode: 'rest' });
+    } catch (error) {
+      logger.warn(
+        `Failed to persist review-rest round for job ${job.id}`,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+    await recordRoundAudit(env, job.id, [
+      buildRoundsDetectedEvent({
+        round: 1,
+        mode: 'rest',
+        roundsIncremental,
+        anchorSha: null,
+        hasUnresolvedThreads: false,
+      }),
+    ]);
+  }
+
+  // Single-parse selection for the NON-rest path (Antigravity/Codex 15-05 MEDIUM): derive BOTH
+  // `files = kept` and the drop metadata from ONE selectReviewableFiles call instead of re-parsing the
+  // cached diff 2-3× (the former CMD-02 producer re-fetched + re-partitioned on its own). `kept` is
+  // byte-identical to what getJobDiffFiles->getDiffFiles->filterReviewableFiles returns for non-rest.
+  // The 'rest' path stays unchanged (getJobDiffFiles reconstructs the set from skipped_files) and emits
+  // NO file_skipped events (a review-rest job consumes prior skips, it does not re-record drops).
+  let files: FileDiff[];
+  let dropped: FileSelectionResult['dropped'] | null = null;
+  // Phase 18 Plan 02 (RND-02): the durable, immutable diff-selection descriptor. Persisted on
+  // the job row IMMEDIATELY after the prepare-time resolver + compare-fetch + selectDiffForRound
+  // classify the diff source so review/finalize can re-fetch the EXACT same compare range on
+  // fresh-instance handoff / lease recovery (Codex/Antigravity HIGH: incremental-mode cache miss
+  // MUST NOT call the implicit full-diff helper). The descriptor is the durable fact; the
+  // cache is only a best-effort accelerator.
+  let selectionDescriptor: DiffSelectionDescriptor | null = null;
+  if (job.reviewScope === 'rest') {
+    files = await getJobDiffFiles(env, job, vcs, config);
+  } else {
+    // Build the descriptor against the prepare-time round context. The full diff is fetched on
+    // 'full' (the default round 1 path) AND on the thrown-compare fallback path for 'incremental'.
+    // 'fallback' mode (thread-only D-04 path) uses the full diff as the source directly.
+    const roundContextForSelection = preparedRoundContext
+      ?? await resolveRoundContextForJob(env, job, vcs, config);
+    let compareDiff = '';
+    let compareFiles: FileDiff[] = [];
+    let compareThrew = false;
+    let fullDiff = '';
+    let fullFiles: FileDiff[] = [];
+
+    // For incremental mode (anchor + rounds.incremental), attempt the compare fetch first.
+    if (roundContextForSelection.mode === 'incremental' && roundContextForSelection.anchorSha) {
+      try {
+        compareDiff = await vcs.getCompareDiff(job.owner, job.repo, roundContextForSelection.anchorSha, pr.headSha);
+        compareFiles = parseUnifiedDiff(compareDiff, config.review);
+      } catch (error) {
+        // Thrown compare -> fall back to the full diff. The LOGGER + the descriptor's
+        // compareThrew flag flag this case distinctly from a successful empty compare.
+        compareThrew = true;
+        logger.warn(
+          `getCompareDiff threw for job ${job.id}; falling back to full PR diff`,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      }
+    }
+
+    // Always fetch the full diff in fallback mode (D-04) and on the thrown-compare path
+    // (the only legal fallback triggers). 'full' mode also fetches the full diff (today's path).
+    // 'incremental' with a successful compare does NOT fetch the full diff (the plan's "no full
+    // fetch" rule for legitimate empty compares).
+    const needsFullDiff =
+      roundContextForSelection.mode === 'full' ||
+      roundContextForSelection.mode === 'fallback' ||
+      compareThrew;
+    if (needsFullDiff) {
+      fullDiff = await vcs.getPullRequestDiff(job.owner, job.repo, job.prNumber);
+      fullFiles = parseUnifiedDiff(fullDiff, config.review);
+    }
+
+    selectionDescriptor = selectDiffForRound({
+      roundContext: { ...roundContextForSelection, round: roundContextForSelection.round },
+      compareThrew,
+      compareDiff,
+      compareFiles,
+      fullDiff,
+      fullFiles,
+      toSha: pr.headSha,
+    });
+
+    // Persist the SELECTED mode (not the resolver's mode) so the job row's review_mode
+    // reflects the ACTUAL review behavior. A selector that downgrades 'incremental' to
+    // 'no_changes' on an empty compare writes 'no_changes' here -- the placeholder finalize
+    // path sees the no_changes descriptor and short-circuits cleanly. Best-effort: a failed
+    // write is logged + swallowed so the prepare phase can continue.
+    try {
+      await setJobReviewRoundAndMode(env, job.id, {
+        reviewRound: roundContextForSelection.round,
+        reviewMode: selectionDescriptor.mode,
+      });
+    } catch (error) {
+      logger.warn(
+        `Failed to persist selected round/mode for job ${job.id}; round will be re-resolved on next prepare`,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+
+    // Persist the descriptor on the job row. Best-effort: a failed write is logged + swallowed
+    // so the prepare phase can continue (the descriptor is also captured in the audit trail,
+    // so an operational-state drift between jobs row and audit trail is recoverable).
+    try {
+      await setJobDiffSelection(env, job.id, selectionDescriptor);
+    } catch (error) {
+      logger.warn(
+        `Failed to persist diff-selection descriptor for job ${job.id}; finalize will re-resolve on next phase`,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+
+    // Now drive the file selection off the SELECTED source. `no_changes` short-circuits the
+    // review phase (placeholder finalize) — emit the audit event, skip file selection, and the
+    // review/finalize phases will see the no_changes descriptor and bail out cleanly.
+    if (selectionDescriptor.mode === 'no_changes') {
+      try {
+        await recordRoundAudit(env, job.id, [
+          buildRoundsNoChangesEvent({
+            from: selectionDescriptor.fromSha,
+            to: selectionDescriptor.toSha,
+            round: roundContextForSelection.round,
+          }),
+        ]);
+      } catch (error) {
+        logger.warn(
+          `Failed to record rounds.no_changes audit for job ${job.id}`,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      }
+      // Mark preparation complete with zero files; the gate below enqueues finalize, which
+      // short-circuits on the no_changes descriptor.
+      await completePreparationStep(env, job.id, 0);
+      heartbeatJobLease(env, job.id, leaseOwner, JOB_LEASE_SECONDS).catch(() => undefined);
+      await enqueueJobPhase(env, job.id, 'finalize');
+      return;
+    }
+
+    // Use the SELECTED raw diff for the file selection. The KV cache is keyed on the SELECTED
+    // mode + range so a cache miss never silently substitutes a different source (Codex HIGH).
+    const rawDiff = selectDiffForSelection(selectionDescriptor, compareDiff, fullDiff);
+    const selection = selectReviewableFiles(parseUnifiedDiff(rawDiff, config.review), config.review);
+    files = selection.kept;
+    dropped = selection.dropped;
+  }
 
   // CMD-02 / D-10 skipped-for-size producer: when the commands feature is active, persist the files
   // this full review DROPPED past max_files so a later `review-rest` job (a different job_id) can
   // re-review exactly them via listSkippedFilesForHead by PR identity + head. Only for a NORMAL full
   // review (scope !== 'rest' -- a review-rest job CONSUMES the skips, it must not re-record them) and
-  // only when we have a concrete head to key on. Best-effort: a bookkeeping-write failure must never
-  // block enqueuing the review phase. When the feature is off this whole block is skipped, so the
-  // disabled path is byte-identical (NREG-01).
+  // only when we have a concrete head to key on. It now consumes the already-computed `dropped.overCap`
+  // (no re-parse). Generated files are in `dropped.generated`, NOT overCap, so a generated file is
+  // NEVER inserted into the review-rest queue (T-15-03-03 / would be wrongly re-reviewed). Best-effort:
+  // a bookkeeping-write failure must never block enqueuing the review phase. When the feature is off
+  // this whole block is skipped, so the disabled path is byte-identical (NREG-01).
   const commandsEnabled = config.review.interactive?.commands?.enabled ?? false;
-  if (commandsEnabled && job.reviewScope !== 'rest' && job.commitSha) {
+  if (commandsEnabled && dropped && job.commitSha) {
     try {
-      const rawDiff = await getCachedRawDiff(env, job, vcs);
-      const { omitted } = partitionReviewableFiles(parseUnifiedDiff(rawDiff, config.review), config.review);
+      const omitted = dropped.overCap;
       if (omitted.length > 0) {
         await insertSkippedFiles(env, {
           jobId: job.id,
@@ -828,6 +1126,17 @@ async function runPreparePhase(
     } catch (error) {
       logger.warn(`Failed to record skipped-for-size files for job ${job.id}; review-rest may be unavailable for this head`, error instanceof Error ? error : new Error(String(error)));
     }
+  }
+
+  // PRIO-03 (D-11/D-12/D-13): surface a per-file reason for every drop THIS PHASE owns via the
+  // file_skipped audit variant, INDEPENDENT of the commands feature (the CMD-02 producer above is
+  // commands-gated; this deliberately is not — over_cap events appear with commands off). Gated on
+  // file_selection.enabled so the DISABLED path emits ZERO file_skipped events even though the selector
+  // still preserves `dropped.overCap` for review-rest reconstruction (Codex 15-03 HIGH — suppress
+  // EMISSION here, never the data). Prepare-only, non-'rest' (implied by `dropped` being non-null).
+  // Best-effort: recordFileSkips swallows failures and never blocks enqueuing the review phase.
+  if (dropped && config.review.file_selection.enabled) {
+    await recordFileSkips(env, job.id, buildFileSkipEvents(dropped));
   }
 
   await completePreparationStep(env, job.id, files.length);
@@ -995,6 +1304,13 @@ async function runReviewPhase(
           model: awaitingReview.async_model ?? awaitingReview.model_used,
           requestId: awaitingReview.async_request_id!,
           file,
+          // thread config so the async-batch parse path resolves the severity_engine.enabled escape
+          // hatch from this repo's config, matching the sync path (13-04)
+          config,
+          // EVID-01 (Codex 15-04 HIGH): the same compact-prompt derivation submitReviewBatch used, so
+          // pollReviewBatch reconstructs the EXACT bounded (truncated) file the model saw before the
+          // evidence gate builds its haystack — truncated-away evidence correctly emits not_in_hunk.
+          compactPrompt: (awaitingReview.transient_error_count ?? existingReview?.transient_error_count ?? 0) > 0,
         });
         if (poll.status === 'pending') {
           awaitingAsync += 1;
@@ -1050,6 +1366,28 @@ async function runReviewPhase(
               asyncModel: submitted.model,
             });
             awaitingAsync += 1;
+            return;
+          }
+          // Async batch unavailable -> fall through to ensemble OR the scalar sync path.
+          // D-13: ensemble applies to the main pass only. With ensemble.runs > 1, route the
+          // synchronous fallback through the ensemble fan-out so the merged finding list
+          // (D-10/D-12) is what finalize consumes. With ensemble.runs == 1 (the inert
+          // default, NREG-01) the scalar path is byte-identical to today.
+          const ensembleConfig = config.review.passes?.ensemble;
+          if (ensembleConfig && ensembleConfig.runs > 1) {
+            await reviewAndPersistFileWithEnsemble(
+              env,
+              job,
+              file,
+              pr,
+              config,
+              totalLineCount,
+              model,
+              resolveFailureModelProvider,
+              existingReview,
+              { runs: ensembleConfig.runs, temperature: ensembleConfig.temperature ?? 0.7 },
+            );
+            terminalProgress += 1;
             return;
           }
         }
@@ -1225,6 +1563,10 @@ async function persistCompletedReview(
       fileSummary: string;
       overallCorrectness?: string;
       confidenceScore?: number;
+      // The severity engine's per-finding audit events for this unit (13-02). Optional so existing
+      // mocks that return a `parsed` object without this field stay structurally valid; recordUnitAudit
+      // treats undefined/missing as "no extra events" (13-04).
+      severityAuditEvents?: JobAuditEvent[];
     };
   },
   // Defaults to 'main' (NREG-01). Threaded from the poll call site (IN-03) so a completed row is
@@ -1254,6 +1596,11 @@ async function persistCompletedReview(
     asyncRequestId: null,
     asyncModel: null,
   });
+
+  // AUD-01: record this completed (file, pass) unit's audit trail — one combined drafted+severity
+  // append via a SINGLE recordUnitAudit call (13-03/13-04). Best-effort: recordUnitAudit swallows and
+  // logs any failure, so a broken audit write can NEVER fail this async-batch persist or the job.
+  await recordUnitAudit(env, job.id, file.path, pass, response.parsed.severityAuditEvents);
 }
 
 /**
@@ -1346,6 +1693,11 @@ async function reviewAndPersistFile(
       confidenceScore: response.parsed.confidenceScore,
       errorMessage: null,
     });
+
+    // AUD-01: record this completed (file, pass) unit's audit trail — one combined drafted+severity
+    // append via a SINGLE recordUnitAudit call (13-03/13-04). Best-effort: recordUnitAudit swallows and
+    // logs any failure, so a broken audit write can NEVER fail this synchronous persist or the job.
+    await recordUnitAudit(env, job.id, file.path, pass, response.parsed.severityAuditEvents);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown file review error';
     const modelId = config.model?.main ?? 'unconfigured';
@@ -1437,6 +1789,244 @@ async function reviewAndPersistFile(
 }
 
 /**
+ * Phase 19 (PASS-02 / D-10/D-12/D-13): ensemble fan-out + reconcile + atomically persist the merged
+ * finding list for ONE (file, 'main') unit. Routes the main pass through `runFileWithEnsemble`
+ * (N samples under the three-slot gate), reconciles via `reconcileEnsembleRuns` (D-10 strict-
+ * majority over successful runs; D-12 primary-first representative), and persists the merged
+ * comments + the versioned `ensembleResultSchema` blob in a single upsert + JSONB update.
+ *
+ * **Provider-neutral / NREG-02:** the function is structurally identical for both providers —
+ * the VcsProvider seam stays out of this path and every audit event is keyed only on the file,
+ * path, and run outcomes (never on a provider-specific field). GitHub and Bitbucket produce
+ * identical logical result/audit counts.
+ *
+ * **Failure semantics (mirror reviewAndPersistFile):**
+ *   - subrequest budget error -> re-throw so the orchestrator fresh-hands off.
+ *   - transient (RetryableModelError) -> defer for retry, increments the failure counter.
+ *   - any other error -> mark the file failed (the per-file failure path is byte-identical to
+ *     the scalar path so audit / job-detail consumers don't have to special-case it).
+ */
+async function reviewAndPersistFileWithEnsemble(
+  env: AppBindings,
+  job: PersistedReviewJob,
+  file: ReturnType<typeof parseUnifiedDiff>[number],
+  pr: VcsPullRequest,
+  config: RepoConfig,
+  totalLineCount: number,
+  model: ModelService,
+  resolveFailureModelProvider: () => Promise<string | null>,
+  previousReview: { transient_error_count: number } | undefined,
+  // The ensemble config drives the fan-out; defaults to runs:1 to keep the function safe for
+  // any unexpected caller (the main scheduling site is the only writer).
+  ensembleConfig: { runs: number; temperature: number },
+) {
+  const startedAt = Date.now();
+  const compactPrompt = (previousReview?.transient_error_count ?? 0) > 0;
+  // D-13 defensive: if a non-main pass ever lands here, fall through to the scalar path so the
+  // security pass is never multiplied by ensemble runs.
+  // The main scheduling site guards pass === 'main'; this assertion is a belt-and-suspenders
+  // check.
+  let ensembleResult: Awaited<ReturnType<ModelService['runFileWithEnsemble']>>;
+  try {
+    ensembleResult = await model.runFileWithEnsemble({
+      file,
+      prTitle: pr.title ?? null,
+      prDescription: pr.body ?? null,
+      config,
+      totalLineCount,
+      compactPrompt,
+      pass: 'main',
+      runs: ensembleConfig.runs,
+      ensembleTemperature: ensembleConfig.temperature,
+    });
+  } catch (error) {
+    // Mirror reviewAndPersistFile's error routing: subrequest -> fresh handoff, transient ->
+    // defer, everything else -> mark failed.
+    const errorMessage = error instanceof Error ? error.message : 'Unknown ensemble error';
+    const modelId = config.model?.main ?? 'unconfigured';
+    const modelProvider = await resolveFailureModelProvider();
+
+    if (isSubrequestBudgetError(error)) {
+      logger.warn(`Ensemble review deferred for ${file.path}; subrequest budget will retry in a fresh invocation`, {
+        error: errorMessage,
+      });
+      Object.defineProperty(error, 'retryAfterSeconds', {
+        value: FRESH_INVOCATION_YIELD_SECONDS,
+        configurable: true,
+      });
+      throw error;
+    }
+
+    if (isRetryableModelError(error)) {
+      const failureCount = await recordRetryableFileReviewFailure(env, job.id, {
+        filePath: file.path,
+        pass: 'main',
+        modelUsed: modelId,
+        modelProvider,
+        diffLineCount: file.lineCount,
+        diffInput: '',
+        durationMs: Date.now() - startedAt,
+        errorMessage,
+      });
+
+      if (failureCount >= MAX_RETRYABLE_FILE_REVIEW_FAILURES) {
+        const finalError = `Ensemble review skipped after ${failureCount} repeated model provider outages.`;
+        await persistFailedFileReview(env, job.id, {
+          filePath: file.path,
+          pass: 'main',
+          modelUsed: modelId,
+          modelProvider,
+          diffLineCount: file.lineCount,
+          durationMs: Date.now() - startedAt,
+          errorMessage: finalError,
+        });
+        return;
+      }
+
+      Object.defineProperty(error, 'retryAfterSeconds', {
+        value: retryableModelFailureDelaySeconds(failureCount),
+        configurable: true,
+      });
+      throw error;
+    }
+
+    logger.error(`Ensemble review failed for ${file.path}`, { error });
+    await persistFailedFileReview(env, job.id, {
+      filePath: file.path,
+      pass: 'main',
+      modelUsed: modelId,
+      modelProvider,
+      diffLineCount: file.lineCount,
+      durationMs: Date.now() - startedAt,
+      errorMessage,
+    });
+    return;
+  }
+
+  // Reconcile -> merged finding list (D-10/D-11/D-12). The reconciler is pure and identical
+  // for GitHub and Bitbucket (no provider-specific field touches reconciliation).
+  const reconciliation = reconcileEnsembleRuns(ensembleResult.runs);
+  const mergedFindings = reconciliation.winners.map((w) => w.finding);
+
+  // D-10: with 0 or 1 successful runs, reconcile returns zero winners and the caller degrades
+  // to that run's output. The per-file "degrade to primary" path uses the primary run's
+  // findings (runIndex 0) when the primary succeeded; when the primary failed too, we degrade
+  // to whichever run succeeded (or to empty if all failed). The Phase-19-05 carve-out makes
+  // reconcile a no-op for successfulRuns <= 1, so this path is the only place that decides
+  // what to persist in the degrade case.
+  const successfulRuns = ensembleResult.runs.filter((r) => !r.failed);
+  let degradeFindings: ParsedReviewComment[] = [];
+  if (reconciliation.winners.length === 0 && successfulRuns.length > 0) {
+    // Prefer the primary run's findings (D-12 degrade semantics). If the primary failed, fall
+    // back to the first successful run.
+    const primary = ensembleResult.runs[0];
+    if (!primary.failed) {
+      degradeFindings = primary.findings;
+    } else {
+      const firstSuccessful = ensembleResult.runs.find((r) => !r.failed);
+      degradeFindings = firstSuccessful?.findings ?? [];
+    }
+  }
+
+  // Pick a representative model + verdict + summary for the persisted row. The primary
+  // run's metadata is the canonical surface; with the primary failed, fall through to the
+  // first successful run.
+  const primaryRun = ensembleResult.runs[0];
+  const firstSuccessfulRun = ensembleResult.runs.find((r) => !r.failed);
+  const representative = !primaryRun.failed ? primaryRun : firstSuccessfulRun;
+  const representativeModel = representative?.model ?? 'unconfigured';
+
+  // Find a verdict + summary from the representative's parsed comments. We don't have the
+  // full parsed envelope here, so we derive the verdict from whether the merged list is
+  // non-empty (matches reviewFile's "comments > 0 -> comment" rule) and use a static
+  // summary that names the ensemble path. This stays byte-identical to the scalar path for
+  // the runs:1 case (which delegates to reviewFile and never lands here).
+  const verdict: 'approve' | 'comment' = mergedFindings.length > 0 || degradeFindings.length > 0 ? 'comment' : 'approve';
+  const finalFindings = mergedFindings.length > 0 ? mergedFindings : degradeFindings;
+  const fileSummary = `Ensemble review (${ensembleConfig.runs} samples, ${successfulRuns.length} successful).`;
+
+  // Atomic persist: the comments are stored in the standard review_comments rows (one upsert
+  // call), the ensembleResult blob is stored in a separate UPDATE on the same (job_id, file_path)
+  // tuple. Both writes can fail independently; the file_comments upsert is the source of
+  // truth for finalize, the ensemble_result column is the audit cursor.
+  await upsertFileReview(env, job.id, {
+    filePath: file.path,
+    pass: 'main',
+    fileStatus: 'done',
+    modelUsed: representativeModel,
+    modelProvider: null,
+    diffLineCount: file.lineCount,
+    diffInput: '',
+    rawAiOutput: null,
+    parsedComments: finalFindings,
+    inputTokens: ensembleResult.runs.reduce((sum, r) => sum + (r.inputTokens ?? 0), 0),
+    outputTokens: ensembleResult.runs.reduce((sum, r) => sum + (r.outputTokens ?? 0), 0),
+    durationMs: Date.now() - startedAt,
+    verdict,
+    fileSummary,
+    overallCorrectness: null,
+    confidenceScore: null,
+    errorMessage: null,
+  });
+
+  // Build the durable ensemble_result blob (ensembleResultSchema). The runOutcomes array
+  // captures per-run status, model, tokens, and a bounded reason for failed runs.
+  const ensembleBlob = {
+    version: 1,
+    status:
+      successfulRuns.length === 0
+        ? 'failed'
+        : successfulRuns.length < ensembleConfig.runs
+          ? 'partial'
+          : reconciliation.winners.length === 0
+            ? 'completed' // all succeeded but no majority -> still 'completed' (degraded)
+            : 'completed',
+    requestedRuns: ensembleConfig.runs,
+    successfulRuns: successfulRuns.length,
+    failedRuns: ensembleResult.runs.length - successfulRuns.length,
+    winnerCount: reconciliation.winners.length,
+    droppedClusterCount: reconciliation.droppedClusters.length,
+    runOutcomes: ensembleResult.runs.map((r, index) => {
+      if (r.failed) {
+        return {
+          run: index,
+          status: 'failed' as const,
+          reason: r.reason ?? 'unknown',
+        };
+      }
+      return {
+        run: index,
+        status: 'succeeded' as const,
+        model: r.model ?? null,
+        inputTokens: r.inputTokens ?? 0,
+        outputTokens: r.outputTokens ?? 0,
+      };
+    }),
+  };
+
+  await updateFileReviewEnsembleResult(env, {
+    jobId: job.id,
+    filePath: file.path,
+    pass: 'main',
+    result: ensembleBlob,
+  });
+
+  // Emit the bounded audit event (T-19-05-01). The builder short-circuits to null for
+  // totalRuns <= 1, but D-13 constrains ensemble to runs >= 2 in the path that calls this
+  // function, so a real event is expected. The recorder is best-effort and never rethrows.
+  const failedRunReasons: string[] = [];
+  for (const r of ensembleResult.runs) {
+    if (r.failed) {
+      failedRunReasons.push(r.reason);
+    }
+  }
+  const auditEvent = buildEnsembleVoteAuditEvent(file.path, reconciliation, failedRunReasons);
+  if (auditEvent) {
+    await recordEnsembleAudit(env, job.id, [auditEvent]);
+  }
+}
+
+/**
  * Fail-open confidence floor for the finalize gate. A finding whose confidence is null OR undefined
  * is ALWAYS kept — a provider that omits confidence (or a review produced before the hardened prompt
  * took effect) must never be zeroed out. Only a finding that carries an explicit confidence below the
@@ -1455,6 +2045,19 @@ async function runFinalizePhase(
   formatter: FormatterService,
 ) {
   await updateJobStep(env, job.id, 'Generating Summary', { status: 'running' });
+
+  // Phase 18 Plan 02 (RND-02 / D-05 / D-13): the no_changes placeholder short-circuits the
+  // finalize phase. The audit event was already emitted in prepare; here we only need to:
+  //   (a) complete the provider status check with a neutral terminal result (D-05),
+  //   (b) complete the job with a NEUTRAL terminal payload (D-13: idempotent so retries do
+  //       not append duplicate audit events or repeat completion),
+  //   (c) advance the anchor once (D-07: round counter + anchor move in lockstep).
+  // NO submitReview, NO walkthrough edit, NO summary comment. The user sees nothing new on the
+  // PR; the audit trail shows the round happened.
+  if (job.reviewMode === 'no_changes') {
+    await finalizeNoChangesPlaceholder(env, job, vcs, leaseOwner);
+    return;
+  }
 
   const pr = await vcs.getPullRequest(job.owner, job.repo, job.prNumber);
   const config = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
@@ -1531,13 +2134,32 @@ async function runFinalizePhase(
   //   (iii) else                        -> the v1.0 main-only flatMap, byte-identical to the
   //         pre-multipass engine (NREG-01).
   // Pruned findings are never re-surfaced here (D-08): they live only in jobs.critic_result.pruned.
+  //
+  // Phase 14 (FILT-03) escape-hatch routing [D-04/D-05, review findings #1/#5]. `dedup.enabled`
+  // defaults true and governs the DEDUP dimension ONLY — it selects which dedup function runs inside
+  // applyNoiseFilter; the always-on FILT-01 tiered cap, FILT-02 per-category floors, and the FR-180
+  // confidence-desc sort apply regardless of the flag.
+  //   dedupEnabled === true (default): chosenDedup = dedupeComposite, which runs IN-CHAIN (FR-180
+  //     position) on WHICHEVER candidate set is selected — INCLUDING the critic-kept set. So ALL THREE
+  //     candidate branches stay UN-deduped at selection time (the legacy pre-chain dedupeFindings call
+  //     is dropped for the security branch); a critic review's kept set now gets always-on composite
+  //     dedup at finalize (FILT-03 "every review") and any merges emit `deduped` audit events (FILT-04).
+  //   dedupEnabled === false: preserve TODAY's exact DEDUP behavior — the legacy security-gated
+  //     dedupeFindings(union) stays in its pre-chain position for the non-critic security path ONLY
+  //     (RESEARCH Pitfall 1 / A6 — preserves survivor-vs-floor ordering); critic-kept and main-only are
+  //     consumed as-is; a no-op dedup is passed into applyNoiseFilter so the floors/sort/cap still run
+  //     but no re-dedup happens. This is a provable pre-v1.2 revert of the DEDUP dimension (SC3).
+  const dedupEnabled = config.review.dedup?.enabled ?? true;
+  const chosenDedup: NoiseFilterOptions['dedup'] = dedupEnabled
+    ? dedupeComposite
+    : (comments) => ({ survivors: comments, merges: [] });
   let reviewedComments: ParsedReviewComment[];
   if (job.criticResult) {
     reviewedComments = job.criticResult.kept;
   } else if (securityEnabled) {
-    reviewedComments = dedupeFindings(
-      reviews.flatMap((review) => review.parsed_comments as ParsedReviewComment[]),
-    );
+    reviewedComments = dedupEnabled
+      ? reviews.flatMap((review) => review.parsed_comments as ParsedReviewComment[])
+      : dedupeFindings(reviews.flatMap((review) => review.parsed_comments as ParsedReviewComment[]));
   } else {
     reviewedComments = reviews.flatMap((review) => review.parsed_comments as ParsedReviewComment[]);
   }
@@ -1565,20 +2187,92 @@ async function runFinalizePhase(
 
   const hasFailures = fileSummaries.some((file) => file.verdict === 'failed');
   const failedFileCount = fileSummaries.filter((file) => file.verdict === 'failed').length;
-  const severityRanks = SEVERITY_RANK; // single source of truth lives in ./dedup (IN-01, no drift)
-  const minRank = severityRanks[config.review.min_severity] ?? 4;
   const { maxComments: globalMaxComments } = await getReviewSettings(env);
   const effectiveMaxComments = Math.min(config.review.max_comments, globalMaxComments);
 
-  let finalComments = reviewedComments
-    .filter(c => (severityRanks[c.severity] ?? 4) <= minRank)
-    .filter(c => passesConfidenceFloor(c, config.review.min_confidence));
-  finalComments.sort((a, b) => (severityRanks[a.severity] ?? 4) - (severityRanks[b.severity] ?? 4));
+  // FR-180 always-on noise filter (FILT-01/02 + FR-180 sort + escape-hatched FILT-03 dedup). Both
+  // finalize paths call the SAME applyNoiseFilter over their respective candidate sets (SC5). The
+  // posting path keeps `dropped` for the posting-path-only audit emission below; omittedCount is the
+  // tiered-cap trim count ONLY (dropped.cap.length) — the "N comments trimmed to {max}" footer counts
+  // P3/nit cap trims exclusively, NOT confidence/severity/dedup drops nor the exempt P0/P1/P2
+  // (Pitfall 2 / A4 / review finding #3).
+  const composedFloors = composeRoundFloors({
+    reviewRound: job.reviewRound ?? 1,
+    reviewMode: job.reviewMode ?? 'full',
+    roundsIncremental: job.roundsIncremental ?? false,
+    escalateFloors: config.review.rounds?.escalate_floors ?? true,
+    base: {
+      minConfidence: config.review.min_confidence,
+      categoryConfidence: config.review.category_confidence,
+      minSeverity: config.review.min_severity,
+    },
+  });
 
-  const omittedCount = reviewedComments.length - Math.min(finalComments.length, effectiveMaxComments);
-  if (finalComments.length > effectiveMaxComments) {
-    finalComments = finalComments.slice(0, effectiveMaxComments);
+  // RND-04 durable consumer gate: suppression runs only for an enabled round-2+ incremental/fallback
+  // job. `roundsIncremental` is the prepare-time persisted snapshot, so a live config change cannot
+  // activate or deactivate suppression halfway through a durable workflow. no_changes returned above;
+  // full/rest modes and round 1 remain inert.
+  const suppressionEligible = isRoundSuppressionEligible({
+    reviewRound: job.reviewRound ?? 1,
+    reviewMode: job.reviewMode ?? 'full',
+    roundsIncremental: job.roundsIncremental ?? false,
+  });
+  let unresolvedThreads: VcsReviewThread[] = [];
+  let suppressionUnavailableReason: 'capability_unavailable' | 'listing_failed' | null = null;
+  if (suppressionEligible) {
+    if (!vcs.capabilities.supportsThreadListing) {
+      suppressionUnavailableReason = 'capability_unavailable';
+      logger.info(`Open-thread suppression unavailable for job ${job.id}`, {
+        reason: suppressionUnavailableReason,
+        provider: vcs.name,
+      });
+    } else {
+      try {
+        // One fresh finalize-time listing. Prepare's thread-only detection result is intentionally not
+        // reused because threads may have been resolved, deleted, or become outdated during review.
+        unresolvedThreads = await vcs.getUnresolvedBotThreads(job.owner, job.repo, job.prNumber);
+      } catch (error) {
+        suppressionUnavailableReason = 'listing_failed';
+        logger.warn(
+          `Open-thread suppression degraded for job ${job.id}`,
+          {
+            reason: suppressionUnavailableReason,
+            provider: vcs.name,
+            error: error instanceof Error ? error : new Error(String(error)),
+          },
+        );
+      }
+    }
   }
+
+  // Legitimate empty thread data still installs the seam (and suppresses nothing); unavailable data
+  // leaves it undefined and therefore fails open. The same callback instance feeds posting and main
+  // candidates, keeping their pre-cap behavior identical without another provider call.
+  const preCapSuppress: NoiseFilterOptions['preCapSuppress'] =
+    suppressionEligible && suppressionUnavailableReason === null
+      ? (comments) => {
+          const result = suppressByOpenThreads(comments, unresolvedThreads);
+          return {
+            survivors: result.survivors,
+            suppressed: result.suppressed.map(({ finding }) => finding),
+          };
+        }
+      : undefined;
+
+  const noiseFilterOptions: NoiseFilterOptions = {
+    minConfidence: composedFloors.minConfidence,
+    categoryConfidence: composedFloors.categoryConfidence,
+    minSeverity: composedFloors.minSeverity,
+    effectiveMaxComments,
+    preCapSuppress,
+    dedup: chosenDedup,
+  };
+  const postingResult = applyNoiseFilter(reviewedComments, noiseFilterOptions);
+  const finalComments = postingResult.kept;
+  const omittedCount = postingResult.dropped.cap.length;
+  const suppressionAuditEvents = postingResult.suppressed.map((finding) =>
+    buildRoundsSuppressedEvent({ finding, threadPath: finding.path }),
+  );
 
   // Pitfall 3 (corrected): buildWalkthroughData ALREADY filters its `reviews` arg to pass==='main'
   // internally (walkthrough.ts), but it derives per-file counts and global severity counts from its
@@ -1592,14 +2286,13 @@ async function runFinalizePhase(
   // as inline comments but must not change the overall approve/comment verdict). When both toggles are
   // off, mainReviews === reviews and reviewedComments is the main-only flatMap, so mainFinalComments
   // is element-wise identical to finalComments (NREG-01).
+  // SC5: the walkthrough path runs the IDENTICAL applyNoiseFilter (same transformation, same escape-
+  // hatched dedup) over the main-pass candidate set. D-11: its `dropped` is DISCARDED and nothing is
+  // recorded — audit suppression is caller-side, the pure fn has no I/O to suppress. Agreement with the
+  // posting path is asserted on the MAIN-PASS SUBSET (the walkthrough is intentionally main-only;
+  // posted totals include security).
   const mainCandidateComments = mainReviews.flatMap((review) => review.parsed_comments as ParsedReviewComment[]);
-  let mainFinalComments = mainCandidateComments
-    .filter(c => (severityRanks[c.severity] ?? 4) <= minRank)
-    .filter(c => passesConfidenceFloor(c, config.review.min_confidence));
-  mainFinalComments.sort((a, b) => (severityRanks[a.severity] ?? 4) - (severityRanks[b.severity] ?? 4));
-  if (mainFinalComments.length > effectiveMaxComments) {
-    mainFinalComments = mainFinalComments.slice(0, effectiveMaxComments);
-  }
+  const mainFinalComments = applyNoiseFilter(mainCandidateComments, noiseFilterOptions).kept;
 
   const verdictSummary = formatter.summarizeVerdict(mainFinalComments, hasFailures);
   await updateJobStep(env, job.id, 'Generating Summary', { status: 'done' });
@@ -1700,6 +2393,45 @@ async function runFinalizePhase(
     (step) => step.name === 'Completing' && (step.status === 'running' || step.status === 'done'),
   );
   await updateJobStep(env, job.id, 'Completing', { status: 'running' });
+
+  // FILT-04 / review finding #7: emit finalize drop audit events on the POSTING path ONLY and
+  // AT-MOST-ONCE across finalize retries. Gated on !finalizeRetriedPastPost and positioned AFTER the
+  // 'Completing' running transition was persisted: appendJobAuditEvents has no idempotency key and
+  // always concatenates, so a finalize retry that already reached posting (finalizeRetriedPastPost ===
+  // true) MUST skip re-appending or it would double the drop trail. buildFinalizeDropEvents derives the
+  // per-record confidence threshold from each DropRecord's effectiveFloor (review finding #2), so it
+  // takes only { severityFloor, cap }. recordFinalizeDrops is best-effort (never rethrows), so a broken
+  // audit write can never fail the already-posting review. The walkthrough path emits nothing (D-11).
+  // A crash between this persisted 'Completing' transition and the recorder loses these events (best-
+  // effort telemetry, accepted) while at-most-once still holds.
+  if (!finalizeRetriedPastPost) {
+    await recordFinalizeDrops(
+      env,
+      job.id,
+      buildFinalizeDropEvents(postingResult.dropped, {
+        severityFloor: composedFloors.minSeverity,
+        cap: effectiveMaxComments,
+      }),
+    );
+    if (composedFloors.effectiveChanged) {
+      await recordRoundAudit(env, job.id, [
+        buildRoundsEscalatedEvent({
+          from: {
+            minConfidence: config.review.min_confidence,
+            minSeverity: config.review.min_severity,
+          },
+          to: composedFloors.roundFloor,
+          effective: {
+            minConfidence: composedFloors.minConfidence,
+            minSeverity: composedFloors.minSeverity,
+          },
+          round: job.reviewRound ?? 1,
+          droppedAtEffectiveFloor:
+            postingResult.dropped.confidenceFloor.length + postingResult.dropped.severityFloor.length,
+        }),
+      ]);
+    }
+  }
   // The interface omits botLogin (Pitfall 5) -- the adapter injects env.BOT_USERNAME internally.
   const existingReview = finalizeRetriedPastPost
     ? await vcs.findExistingReviewForCommit(job.owner, job.repo, job.prNumber, pr.headSha)
@@ -1715,6 +2447,13 @@ async function runFinalizePhase(
       body: formatter.formatInlineComment(comment, { provider: vcs.name }),
     })),
   });
+
+  // Emit rounds.suppressed only after a successful posting boundary and at most once. A finalize
+  // retry that already entered Completing reuses the posted review and skips this append, matching
+  // the existing drop-audit retry posture. The main/walkthrough path never emits suppression audit.
+  if (!finalizeRetriedPastPost && suppressionAuditEvents.length > 0) {
+    await recordRoundAudit(env, job.id, suppressionAuditEvents);
+  }
 
   const fileInputTokens = reviews.reduce((sum, review) => sum + (review.input_tokens ?? 0), 0) + summaryInputTokens;
   const fileOutputTokens = reviews.reduce((sum, review) => sum + (review.output_tokens ?? 0), 0) + summaryOutputTokens;
@@ -1825,7 +2564,27 @@ async function runFinalizePhase(
         }
       }
       // (c) deterministic aggregation over the main-pass reviews + the floored/capped finalComments.
-      const data = buildWalkthroughData({ reviews: mainReviews, finalComments: mainFinalComments });
+      // Phase 19 Plan 19-08 (PASS-03, D-13): finalize does ZERO enrichment model work — it reads
+      // the persisted walkthrough_enrichment blob and feeds it through buildWalkthroughData's
+      // projection. A blob with status='completed' or 'partial' yields the grouped renderer
+      // branch; a 'failed' blob yields the historical flat branch (NREG-01). Absent blob
+      // (NREG-01 / walkthrough disabled) yields the historical flat branch as well.
+      const enrichment = job.walkthroughEnrichment && (
+        job.walkthroughEnrichment.status === 'completed' ||
+        job.walkthroughEnrichment.status === 'partial'
+      )
+        ? {
+            groups: job.walkthroughEnrichment.groups ?? [],
+            confidence: job.walkthroughEnrichment.confidence ?? null,
+            effort: job.walkthroughEnrichment.effort ?? null,
+          }
+        : null;
+      const data = buildWalkthroughData({
+        reviews: mainReviews,
+        finalComments: mainFinalComments,
+        threadVerification: job.threadVerification,
+        enrichment,
+      });
       // (d) single in-place edit (delete-recovery + bounded transient retry live in the helper). The
       // mermaid fence is added GitHub-only by formatWalkthrough (Plan 01), filling the Plan 02 seam.
       await editWalkthroughComment({ env, job, config, vcs, formatter, data, mermaid });
@@ -1952,19 +2711,38 @@ async function runCriticPhase(
   // (1) IDEMPOTENCY: a valid persisted result means the model call already ran (or was skipped) on a
   // prior invocation that then died before finalize picked up. mapJob has already safeParsed the blob
   // (a malformed one degrades to null), so a non-null criticResult is trustworthy. Skip straight to
-  // finalize with NO model call so a re-entry after hibernation never re-critiques (T-10-12 / cost).
+  // the next phase (verify_fixes if enabled, else finalize) with NO model call so a re-entry after
+  // hibernation never re-critiques (T-10-12 / cost).
   if (job.criticResult) {
-    logger.info(`Critic result already persisted for job ${job.id}; skipping the model call and transitioning to finalize.`);
-    await enqueueJobPhase(env, job.id, 'finalize', FRESH_INVOCATION_YIELD_SECONDS);
+    logger.info(`Critic result already persisted for job ${job.id}; skipping the model call and transitioning onward.`);
+    await enqueueJobPhase(
+      env,
+      job.id,
+      // Post-critic routing: verify_fixes (when enabled) → walkthrough_enrichment (when enabled) →
+      // finalize. The walkthrough enrichment runs on its own fresh budget regardless of the
+      // preceding verify_fixes presence so the durable chain stays correct in either toggle config.
+      config.review.threads?.verify_fixes ? 'verify_fixes' : nextPhaseAfterCritic(config),
+      FRESH_INVOCATION_YIELD_SECONDS,
+    );
     return;
   }
 
   // (2) TOGGLE-OFF fail-open: a critic phase reached with passes.critic off (config drift / a stale
-  // in-flight message after the toggle was turned off) must NOT run — fail open straight to finalize
-  // so behavior is byte-identical to the critic-off engine (NREG-01, Pitfall 5).
+  // in-flight message after the toggle was turned off) must NOT run — fail open to the next phase
+  // (verify_fixes if enabled, else finalize) so behavior is byte-identical to the critic-off engine
+  // (NREG-01, Pitfall 5).
   if (!config.review.passes?.critic?.enabled) {
-    logger.info(`Critic phase reached for job ${job.id} but passes.critic is off; failing open to finalize.`);
-    await enqueueJobPhase(env, job.id, 'finalize', FRESH_INVOCATION_YIELD_SECONDS);
+    logger.info(`Critic phase reached for job ${job.id} but passes.critic is off; failing open.`);
+    await enqueueJobPhase(
+      env,
+      job.id,
+      // Same routing as the idempotency branch above — verify_fixes (when enabled) →
+      // walkthrough_enrichment (when enabled) → finalize. The walkthrough enrichment runs on its
+      // own fresh budget regardless of the preceding verify_fixes presence so the durable chain
+      // stays correct in either toggle config.
+      config.review.threads?.verify_fixes ? 'verify_fixes' : nextPhaseAfterCritic(config),
+      FRESH_INVOCATION_YIELD_SECONDS,
+    );
     return;
   }
 
@@ -1987,32 +2765,67 @@ async function runCriticPhase(
   // deduping it would change the main-only finding set — an NREG-01 violation (Pitfall 4).
   const candidateSet = reviews.flatMap((review) => review.parsed_comments as ParsedReviewComment[]);
   const securityEnabled = config.review.passes?.security?.enabled ?? false;
+  // Phase 14: intentionally unchanged — critic dedup runs in the critic phase (Phase 19 scope); its
+  // legacy merges are not Phase-14-audited (14-03 known gap). When security+critic are both on, this
+  // legacy dedupeFindings pre-dedups BEFORE persisting criticResult.kept, so those critic-stage merges
+  // emit no Phase-14 `deduped` event — the finalize composite dedup only audits merges among the
+  // already-pruned kept set.
   const dedupedSet = securityEnabled ? dedupeFindings(candidateSet) : candidateSet;
 
-  // (5) SKIP conditions (D-06): a trivially small set isn't worth a round-trip, and an oversized set
-  // can't be chunked — both keep ALL findings and record skipped:true (nothing lost, audit-visible).
-  const skipThreshold = config.review.passes.critic.skip_threshold ?? CRITIC_SKIP_THRESHOLD;
+  // Build the v2 candidate input: stable numeric id + the locked finding snapshot. The id is the
+  // candidate's index in the deduped order, and the reconciler relies on it to map model verdicts
+  // back to findings. The review.ts contract is unchanged: every candidate is a parsedReviewComment
+  // produced by an earlier review; the v2 layer never rewrites or invents a candidate.
+  const candidates = dedupedSet.map((finding, index) => ({
+    id: index,
+    path: finding.path,
+    line: finding.line ?? null,
+    severity: finding.severity,
+    category: finding.category,
+    title: finding.title,
+    body: finding.body,
+    confidence: finding.confidence ?? null,
+  }));
+
+  // (5) SKIP conditions (D-06): an EXPLICIT `skip_threshold` config is an intentional cost override
+  // and continues to keep all findings. Empty input does not call the model. The prompt rendered
+  // against the input-char budget is bounded by the same metric used downstream so an over-budget
+  // set is classified as 'skipped' with machine reason 'over-char-budget' rather than being
+  // partially judged. The implicit small-set skip from Phase 10 is REMOVED (D-06 v2 rev).
+  const explicitSkipThreshold = config.review.passes.critic.skip_threshold;
   const charBudget = config.review.passes.critic.input_char_budget ?? CRITIC_INPUT_CHAR_BUDGET;
   const serializedChars = JSON.stringify(dedupedSet).length;
-  if (dedupedSet.length <= skipThreshold || serializedChars > charBudget) {
+  const explicitSkip = typeof explicitSkipThreshold === 'number' && candidates.length <= explicitSkipThreshold;
+  const overBudget = serializedChars > charBudget;
+  if (candidates.length === 0 || explicitSkip || overBudget) {
+    const reason = explicitSkip
+      ? CRITIC_REASON_BELOW_SKIP_THRESHOLD
+      : overBudget
+        ? CRITIC_REASON_OVER_CHAR_BUDGET
+        : 'empty-input';
+    const skippedDecisions = reconcileCriticDecisions(candidates, [], { status: 'skipped', reason });
     logger.info(`Critic skipping the model call for job ${job.id} (keep-all).`, {
       dedupedCount: dedupedSet.length,
-      skipThreshold,
+      skipThreshold: explicitSkipThreshold ?? null,
       serializedChars,
       charBudget,
-      reason: dedupedSet.length <= skipThreshold ? 'below-skip-threshold' : 'over-char-budget',
+      reason,
     });
     await updateJobCriticResult(env, job.id, {
       kept: dedupedSet,
       pruned: [],
       skipped: true,
       dedupedCount: dedupedSet.length,
+      version: CRITIC_V2_VERSION,
+      status: 'skipped',
+      reason,
+      decisions: skippedDecisions,
     });
     await enqueueJobPhase(env, job.id, 'finalize', FRESH_INVOCATION_YIELD_SECONDS);
     return;
   }
 
-  // (6) The single whole-set, ID-based, PRUNE-ONLY model call + in-code reconciliation. Wrapped in a
+  // (6) The single whole-set, verdict-only model call + in-code v2 reconciliation. Wrapped in a
   // fail-open try/catch (7): any error EXCEPT a subrequest-budget hit keeps all findings and continues.
   let criticResult: CriticResult;
   try {
@@ -2028,34 +2841,56 @@ async function runCriticPhase(
       config,
     });
 
-    // RECONCILE IN CODE (T-10-10): map each pruned INDEX id back to a finding. Ignore out-of-range and
-    // duplicate ids; a model keep-list is never trusted — kept = deduped MINUS pruned-by-index. This is
-    // what makes a hallucinated/injected finding structurally unable to enter the posted set.
-    const pruneList = parseCriticPruneResponse(response.rawText);
-    const prunedIndices = new Set<number>();
-    const pruned: CriticResult['pruned'] = [];
-    for (const { id, reason } of pruneList) {
-      if (!Number.isInteger(id) || id < 0 || id >= dedupedSet.length) continue; // out-of-range id ignored
-      if (prunedIndices.has(id)) continue; // duplicate id ignored
-      prunedIndices.add(id);
-      pruned.push({ finding: dedupedSet[id], reason });
-    }
-    const kept = dedupedSet.filter((_finding, index) => !prunedIndices.has(index));
+    // Parse the v2 envelope. A fail-open result (kind: 'fail_open') is one of whole-call exceptions
+    // (parse-failure / empty / malformed) and keeps every candidate with verdict/confidence null.
+    const parsed = parseCriticV2Response(response.rawText);
+    if (parsed.kind === 'fail_open') {
+      logger.warn(
+        `Critic v2 whole-call parse failed for job ${job.id}; failing open (no grading applied).`,
+        { reason: parsed.reason },
+      );
+      const failOpenDecisions = reconcileCriticDecisions(candidates, [], {
+        status: 'fail_open',
+        reason: parsed.reason,
+      });
+      criticResult = {
+        kept: dedupedSet,
+        pruned: [],
+        skipped: true,
+        dedupedCount: dedupedSet.length,
+        version: CRITIC_V2_VERSION,
+        status: 'fail_open',
+        reason: parsed.reason,
+        decisions: failOpenDecisions,
+      };
+    } else {
+      // RECONCILE IN CODE (D-05/D-09): map each verdict id back to a candidate. Ignore out-of-range
+      // and duplicate ids; a model keep-list is never trusted — kept = candidates whose decision
+      // outcome is 'kept'. The canonical decision array is the durable artifact (Phase 19).
+      const decisions = reconcileCriticDecisions(candidates, parsed.verdicts, { status: 'completed' });
+      const kept = decisions.filter((d) => d.outcome === 'kept').map((d) => dedupedSet[d.id]);
+      const pruned = decisions
+        .filter((d) => d.outcome === 'dropped')
+        .map((d) => ({ finding: dedupedSet[d.id], reason: d.reason }));
 
-    criticResult = {
-      kept,
-      pruned,
-      model: response.modelUsed,
-      inputTokens: response.inputTokens,
-      outputTokens: response.outputTokens,
-      dedupedCount: dedupedSet.length,
-      skipped: false,
-    };
-    logger.info(`Critic pruned ${pruned.length}/${dedupedSet.length} findings for job ${job.id}.`, {
-      kept: kept.length,
-      pruned: pruned.length,
-      model: response.modelUsed,
-    });
+      criticResult = {
+        kept,
+        pruned,
+        model: response.modelUsed,
+        inputTokens: response.inputTokens,
+        outputTokens: response.outputTokens,
+        dedupedCount: dedupedSet.length,
+        skipped: false,
+        version: CRITIC_V2_VERSION,
+        status: 'completed',
+        decisions,
+      };
+      logger.info(`Critic v2 graded ${decisions.length}/${dedupedSet.length} findings for job ${job.id}.`, {
+        kept: kept.length,
+        dropped: pruned.length,
+        model: response.modelUsed,
+      });
+    }
   } catch (error) {
     // (7) A subrequest-budget error is NOT a critic failure — it clears on a fresh invocation. Re-throw
     // so runReviewJob's catch routes it through continueOrFailWedgedJob (critic ceiling), which retries
@@ -2068,18 +2903,48 @@ async function runCriticPhase(
       `Critic model call failed for job ${job.id}; failing open (keeping all findings, no prune applied)`,
       error instanceof Error ? error : new Error(String(error)),
     );
+    const reason = CRITIC_REASON_WHOLE_CALL_EXCEPTION;
+    const failOpenDecisions = reconcileCriticDecisions(candidates, [], { status: 'fail_open', reason });
     criticResult = {
       kept: dedupedSet,
       pruned: [],
       skipped: true,
       dedupedCount: dedupedSet.length,
+      version: CRITIC_V2_VERSION,
+      status: 'fail_open',
+      reason,
+      decisions: failOpenDecisions,
     };
   }
 
-  // Persist BEFORE the (throwing) finalize hand-off so a persist-then-enqueue-failure re-enters this
-  // phase, hits the idempotency short-circuit (1), and never re-critiques.
+  // Persist BEFORE the (throwing) hand-off so a persist-then-enqueue-failure re-enters this phase,
+  // hits the idempotency short-circuit (1), and never re-critiques. When verify_fixes is enabled
+  // the hand-off routes through verify_fixes (THR-01/THR-02) so the durable cursor-batched phase
+  // runs after the critic; when verify_fixes is disabled the hand-off is byte-identical to the
+  // pre-Phase-19 finalize hand-off (NREG-01).
   await updateJobCriticResult(env, job.id, criticResult);
-  await enqueueJobPhase(env, job.id, 'finalize', FRESH_INVOCATION_YIELD_SECONDS);
+
+  // Best-effort bounded audit (D-05/D-13). One aggregate `critic.decisions` event per run carries
+  // a max-20 sample from the canonical decisions array. The recorder never rethrows; a broken
+  // audit write must never wreck the review (D-13-03-04 posture).
+  const auditEvent = buildCriticDecisionsAuditEvent(
+    criticResult.decisions ?? [],
+    criticResult.status ?? 'completed',
+    criticResult.reason,
+  );
+  if (auditEvent) {
+    await recordCriticAudit(env, job.id, [auditEvent]);
+  }
+
+  await enqueueJobPhase(
+    env,
+    job.id,
+    // Post-critic hand-off: verify_fixes (when enabled) → walkthrough_enrichment (when enabled) →
+    // finalize. The walkthrough enrichment runs on its own fresh budget regardless of the
+    // preceding verify_fixes presence so the durable chain stays correct in either toggle config.
+    config.review.threads?.verify_fixes ? 'verify_fixes' : nextPhaseAfterCritic(config),
+    FRESH_INVOCATION_YIELD_SECONDS,
+  );
 }
 
 async function heartbeatAndCheckSuperseded(env: AppBindings, jobId: string, leaseOwner: string) {
@@ -2090,11 +2955,7 @@ async function heartbeatAndCheckSuperseded(env: AppBindings, jobId: string, leas
   }
 }
 
-export class NextPhaseError extends Error {
-  constructor(public phase: 'prepare' | 'review' | 'finalize' | 'critic', public delaySeconds: number) {
-    super(`NextPhase: ${phase}`);
-  }
-}
+export { NextPhaseError } from './next-phase-error';
 
 /**
  * Single source of truth for where the review phase hands off (D-07 / MP-03). When the critic pass is
@@ -2104,15 +2965,53 @@ export class NextPhaseError extends Error {
  * — routes through this selector, so a degraded review can NEVER bypass the critic when it is enabled.
  * With passes.critic off this returns 'finalize' unconditionally, so routing is byte-identical to the
  * pre-critic engine (NREG-01).
+ *
+ * Phase 19 (THR-01/THR-02, D-03): when verify_fixes is enabled AND the job is not a review-rest
+ * job (reviewScope !== 'rest'), verify_fixes runs as its own fresh-budget phase BEFORE the critic.
+ * The verify_fixes phase is itself idempotent on re-entry (persisted thread_verifications
+ * cursor), so re-routing the same chain is safe and a failed-over verify_fixes still surfaces
+ * whatever entries the cursor had persisted.
  */
-function nextPhaseAfterReview(config: RepoConfig): 'critic' | 'finalize' {
+function nextPhaseAfterReview(config: RepoConfig): 'critic' | 'finalize' | 'verify_fixes' {
+  if (config.review.threads?.verify_fixes) {
+    return 'verify_fixes';
+  }
   return config.review.passes?.critic?.enabled ? 'critic' : 'finalize';
+}
+
+/**
+ * Phase 19 (THR-01/THR-02): post-verify_fixes hand-off. Routes to the critic when enabled
+ * (so verify_fixes runs BEFORE the critic in the durable chain), otherwise straight to finalize.
+ * The verify_fixes phase ends with this selector so a hand-off never bypasses the critic
+ * when it is enabled.
+ */
+function nextPhaseAfterVerifyFixes(config: RepoConfig): 'critic' | 'finalize' {
+  return config.review.passes?.critic?.enabled ? 'critic' : 'finalize';
+}
+
+/**
+ * Phase 19 Plan 19-08 (PASS-03, D-13): the durable walkthrough enrichment sits between the
+ * last LLM phase (critic or verify_fixes) and finalize. Walkthrough enrichment runs ONLY when
+ * `review.walkthrough.enabled` is on — otherwise the chain skips it and goes straight to finalize
+ * (NREG-01). This selector is shared by both `nextPhaseAfterCritic` and `nextPhaseAfterVerifyFixes`
+ * so the durable chain always inserts the enrichment phase exactly once.
+ */
+function maybeRouteToWalkthroughEnrichment(config: RepoConfig): 'walkthrough_enrichment' | 'finalize' {
+  return config.review.walkthrough?.enabled ? 'walkthrough_enrichment' : 'finalize';
+}
+
+/**
+ * Phase 19 Plan 19-08 (PASS-03): post-critic hand-off. Routes through the walkthrough enrichment
+ * phase when the walkthrough is enabled, otherwise straight to finalize.
+ */
+function nextPhaseAfterCritic(config: RepoConfig): 'walkthrough_enrichment' | 'finalize' {
+  return maybeRouteToWalkthroughEnrichment(config);
 }
 
 async function enqueueJobPhase(
   env: AppBindings,
   jobId: string,
-  phase: 'prepare' | 'review' | 'finalize' | 'critic',
+  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment',
   delaySeconds = 0,
 ) {
   await markJobContinuationQueued(env, jobId, delaySeconds);
@@ -2128,29 +3027,265 @@ function diffCacheKey(jobId: string) {
 }
 
 /**
+ * Phase 18 Plan 02 (RND-01 / D-01..D-06): re-resolve the round context for the prepare phase
+ * using the SAME inputs `resolveRoundContext` consumes (review scope, prior pr_review_state,
+ * unresolved bot threads, rounds.incremental). Centralized here so the diff-selection block
+ * above stays terse and the helper can be unit-tested in isolation. Returns the locked
+ * ResolvedRoundContext shape (mode + round + anchorSha + hasUnresolvedThreads +
+ * roundsIncremental).
+ */
+async function resolveRoundContextForJob(
+  env: AppBindings,
+  job: PersistedReviewJob,
+  vcs: VcsProvider,
+  config: RepoConfig,
+): Promise<import('@server/core/rounds').ResolvedRoundContext> {
+  const roundsIncremental = Boolean(config.review.rounds?.incremental ?? false);
+  if (job.reviewScope === 'rest') {
+    // D-03 short-circuit: review-rest is never subject to round detection.
+    return {
+      round: 1,
+      mode: 'rest',
+      roundsIncremental,
+      anchorSha: null,
+      hasUnresolvedThreads: false,
+    };
+  }
+
+  const prReviewStateKey: PrReviewStateKey = {
+    vcsProvider: (job.repositoryVcsProvider ?? 'github') as 'github' | 'bitbucket',
+    workspace: job.repositoryWorkspace ?? job.owner,
+    repoSlug: job.repo,
+    prNumber: job.prNumber,
+  };
+  const priorState = await getPrReviewState(env, prReviewStateKey);
+
+  // Thread listing is needed only for the thread-only round-detection branch. Read the durable anchor
+  // first; when it exists, it already proves round 2+ and a listing would add provider cost without
+  // changing the decision. The durable consumer toggle also gates this call so default-disabled jobs
+  // preserve NREG-01's zero-provider-call contract; enabled jobs can still detect thread-only rounds.
+  let unresolvedThreads: import('@server/vcs/types').VcsReviewThread[] = [];
+  if (roundsIncremental && !priorState?.last_reviewed_sha && vcs.capabilities.supportsThreadListing) {
+    try {
+      unresolvedThreads = await vcs.getUnresolvedBotThreads(job.owner, job.repo, job.prNumber);
+    } catch (error) {
+      logger.warn(
+        `Failed to list unresolved bot threads for job ${job.id}; round detection is degrading to no thread signal`,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+  }
+
+  return resolveRoundContext({
+    reviewScope: job.reviewScope ?? null,
+    priorState,
+    unresolvedThreads,
+    roundsIncremental,
+  });
+}
+
+/**
+ * Phase 18 Plan 02 (RND-02 / D-08): pick the raw diff string for the SELECTED mode. The
+ * caller has already fetched both the compare diff and the full diff (when applicable) and
+ * passed the strings in; this helper just chooses which one to feed into the file selector.
+ * The 'no_changes' branch is excluded by the caller (no_changes short-circuits before the
+ * file selection runs).
+ */
+function selectDiffForSelection(
+  descriptor: DiffSelectionDescriptor,
+  compareDiff: string,
+  fullDiff: string,
+): string {
+  if (descriptor.mode === 'incremental') return compareDiff;
+  if (descriptor.mode === 'fallback') return fullDiff;
+  // 'full' or 'rest' round-trips through the same full diff (today's behavior).
+  return fullDiff;
+}
+
+/**
+ * Phase 18 Plan 02 (RND-02 / D-05 / D-07 / D-13): the no_changes placeholder finalize. When
+ * the prepare-time selector classified the diff as no_changes (a legitimate empty compare, a
+ * zero-file compare, or a thrown-compare + empty full diff), the finalize phase MUST:
+ *
+ *   1. Complete the provider status check with a NEUTRAL terminal result (D-05). The status
+ *      is updated to `completed` with the existing `neutral` conclusion; the user sees no new
+ *      content on the PR — the audit trail records the round.
+ *   2. Complete the job with a NEUTRAL terminal payload (idempotent, D-13). A retry MUST NOT
+ *      append a duplicate `rounds.no_changes` audit event or repeat the completion. The
+ *      existing `completeJob` is idempotent on the row state (re-running after completion is
+ *      a no-op), and the audit event was already emitted in prepare. The terminal payload is
+ *      verdict 'comment' (no findings => no approve), zero file/comment/token counts, no
+ *      review id, no summary model.
+ *   3. Advance the anchor once (D-07: round counter + anchor move in lockstep). The anchor
+ *      write uses the EXACT prepare-time head SHA captured on the descriptor (D-08), not the
+ *      live head. The setter is monotonic, so a stale redelivery is a no-op.
+ *   4. Drop the diff cache (the descriptor is no_changes; the cached diff is empty anyway,
+ *      but this mirrors the existing non-placeholder post-completion cleanup).
+ *
+ * NO submitReview, NO walkthrough edit, NO summary comment: the user sees nothing new on the PR.
+ * The lease is released on the standard path; the runFinalizePhase caller's completion boundary
+ * handles the lease return.
+ */
+async function finalizeNoChangesPlaceholder(
+  env: AppBindings,
+  job: PersistedReviewJob,
+  vcs: VcsProvider,
+  leaseOwner: string,
+) {
+  // Best-effort status check update. The status-check handler on every provider expects a
+  // terminal `completed` state; we send the existing neutral conclusion so the PR's status
+  // badge reflects "no findings, no error" and the check-run reconciliation sweep does not
+  // re-process this job.
+  const neutralStatusRef = job.statusCheckRef ?? (job.checkRunId !== null ? String(job.checkRunId) : '');
+  if (neutralStatusRef) {
+    try {
+      await vcs.updateStatusCheck(job.owner, job.repo, neutralStatusRef, {
+        status: 'completed',
+        conclusion: 'neutral',
+        title: 'No changes',
+        summary: 'Codra reviewed this push and found no changes to comment on.',
+      });
+      await markJobCheckRunCompleted(env, job.id);
+    } catch (error) {
+      logger.warn(
+        `Failed to update no_changes status check for job ${job.id}; completing anyway`,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+  }
+
+  // D-13 idempotent completion. completeJob is idempotent on the row state (re-running after
+  // completion is a no-op), so a freeze/crash + retry of finalize lands the same done state +
+  // same payload.
+  //
+  // Re-emit risk on prepare-phase retry (NOT mitigated by recordRoundAudit — see audit.ts:287-300):
+  // `recordRoundAudit` -> `appendJobAuditEvents` concatenates events unconditionally; there is no
+  // per-stage `(job_id, stage)` idempotency guard. A prepare-phase subrequest-budget failure
+  // between the `rounds.detected` / `rounds.no_changes` emit and `enqueueJobPhase('finalize')`
+  // causes a re-run that re-emits both events. The duplicate is bounded by the 500-event ring
+  // buffer (Phase 13 D-12) and affects NO operational state (completeJob is idempotent, the
+  // anchor setter is monotonic, and the placeholder completion payload is identical). A future
+  // hardening pass could add a per-stage dedup check at the cost of one DB subrequest per emit
+  // — rejected for the finalize path to keep the subrequest budget intact.
+  await completeJob(env, job.id, {
+    verdict: 'comment',
+    fileCount: 0,
+    commentCount: 0,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    summaryMarkdown: '',
+    reviewId: null,
+    summaryModel: null,
+    overallConfidenceScore: null,
+    overallCorrectness: null,
+    errorMessage: null,
+  });
+
+  // D-07: advance the anchor once. The empty head guard (D-15) is honored by the setter's
+  // own trim/null check; the recorded anchor is the EXACT prepare-time head SHA captured on
+  // the descriptor (D-08), not the live head.
+  const prReviewStateKey: PrReviewStateKey = {
+    vcsProvider: (job.repositoryVcsProvider ?? 'github') as 'github' | 'bitbucket',
+    workspace: job.repositoryWorkspace ?? job.owner,
+    repoSlug: job.repo,
+    prNumber: job.prNumber,
+  };
+  // D-15 defensive guard: empty head SHA -> emit `rounds.anchor_skipped` audit event BEFORE
+  // calling the setter, so the audit trail makes the skip visible (D-15 rejected "log warning
+  // only" as an invisible skip). The setter still returns null on empty head (D-15 guard) so
+  // the anchor remains unwritten; the placeholder still completes with the existing neutral
+  // status check above.
+  const headSha = (job.roundsToSha ?? '').trim();
+  if (headSha.length === 0) {
+    try {
+      await recordRoundAudit(env, job.id, [
+        buildRoundsAnchorSkippedEvent({ reason: 'empty_head', round: job.reviewRound ?? null }),
+      ]);
+    } catch (error) {
+      logger.warn(
+        `Failed to record rounds.anchor_skipped audit for job ${job.id}`,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+  } else {
+    try {
+      await setLastReviewedSha(env, prReviewStateKey, {
+        headSha: job.roundsToSha ?? null,
+        reviewRound: job.reviewRound ?? 1,
+      });
+    } catch (error) {
+      logger.warn(
+        `Failed to advance anchor for no_changes finalize of job ${job.id}; next push will see the prior anchor`,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+  }
+
+  // Diff cache cleanup (the cached diff is empty for no_changes, but mirror the existing
+  // post-completion cleanup to keep the cache footprint tight).
+  try {
+    await env.APP_KV.delete(`diff:${job.id}:no_changes`);
+  } catch (error) {
+    logger.warn(`Failed to delete cached diff for no_changes job ${job.id}`, error instanceof Error ? error : new Error(String(error)));
+  }
+
+  // Lease release is the caller's responsibility (runFinalizePhase's outer try/catch). The
+  // helper returns so the caller's normal completion path runs.
+  logger.info(`No-changes placeholder finalized for job ${job.id}`);
+  void leaseOwner;
+}
+
+/**
  * Fetches and parses the PR diff from the VCS only once per job (cached in KV) instead of once per
  * phase invocation. Extracted from getDiffFiles so both getDiffFiles and the scope-aware
  * getJobDiffFiles / the prepare-phase skipped-for-size producer share one cached fetch (the diff is
  * immutable for a job's head, so re-reading it from KV never hits the VCS again).
+ *
+ * Phase 18 Plan 02 (RND-02 / D-08): the function is now SELECTION-AWARE. The cache key is
+ * scoped to the (jobId, mode) tuple so an incremental-mode cache entry can never be silently
+ * hit by a full-diff request (Codex/Antigravity HIGH). When the persisted descriptor is
+ * 'incremental' or 'no_changes', the cache miss path re-fetches the compare range — NEVER the
+ * implicit full-diff helper. When the descriptor is 'full' / 'rest' / null, the cache miss
+ * falls back to the full PR diff (today's behavior, NREG-01).
  */
 async function getCachedRawDiff(
   env: AppBindings,
-  job: Pick<PersistedReviewJob, 'id' | 'owner' | 'repo' | 'prNumber'>,
-  vcs: Pick<VcsProvider, 'getPullRequestDiff'>,
+  job: Pick<PersistedReviewJob, 'id' | 'owner' | 'repo' | 'prNumber' | 'reviewMode' | 'roundsFromSha' | 'roundsToSha'>,
+  vcs: Pick<VcsProvider, 'getPullRequestDiff' | 'getCompareDiff'>,
 ): Promise<string> {
-  const cacheKey = diffCacheKey(job.id);
-  let rawDiff = await env.APP_KV.get(cacheKey);
+  const mode = job.reviewMode ?? 'full';
+  // Per-mode cache key so a 'full' cache entry can never satisfy an 'incremental' request.
+  const cacheKey = `diff:${job.id}:${mode}`;
 
-  if (!rawDiff) {
-    rawDiff = await vcs.getPullRequestDiff(job.owner, job.repo, job.prNumber);
+  // 'no_changes' short-circuits: the descriptor already classifies the diff as empty, so the
+  // consumer never inspects raw content. Return an empty string and skip the VCS round-trip.
+  if (mode === 'no_changes') return '';
+
+  // 'incremental' mode: re-fetch the EXACT compare range from the durable descriptor. The
+  // compare response is cached separately from the full diff so a misconfigured cache miss can
+  // never splice in a different source (Codex HIGH).
+  if (mode === 'incremental' && job.roundsFromSha && job.roundsToSha) {
+    const cached = await env.APP_KV.get(cacheKey);
+    if (cached !== null) return cached;
+    const compareDiff = await vcs.getCompareDiff(job.owner, job.repo, job.roundsFromSha, job.roundsToSha);
     try {
-      await env.APP_KV.put(cacheKey, rawDiff, { expirationTtl: DIFF_CACHE_TTL_SECONDS });
+      await env.APP_KV.put(cacheKey, compareDiff, { expirationTtl: DIFF_CACHE_TTL_SECONDS });
     } catch (error) {
-      logger.warn(`Failed to cache PR diff for job ${job.id}; it will be re-fetched on the next phase`, error instanceof Error ? error : new Error(String(error)));
+      logger.warn(`Failed to cache compare diff for job ${job.id}; it will be re-fetched on the next phase`, error instanceof Error ? error : new Error(String(error)));
     }
+    return compareDiff;
   }
 
-  return rawDiff;
+  // 'fallback' / 'full' / 'rest' / null: the full PR diff is the source. Today's cache path.
+  const cached = await env.APP_KV.get(cacheKey);
+  if (cached !== null) return cached;
+  const fullDiff = await vcs.getPullRequestDiff(job.owner, job.repo, job.prNumber);
+  try {
+    await env.APP_KV.put(cacheKey, fullDiff, { expirationTtl: DIFF_CACHE_TTL_SECONDS });
+  } catch (error) {
+    logger.warn(`Failed to cache PR diff for job ${job.id}; it will be re-fetched on the next phase`, error instanceof Error ? error : new Error(String(error)));
+  }
+  return fullDiff;
 }
 
 /**
@@ -2159,8 +3294,8 @@ async function getCachedRawDiff(
  */
 export async function getDiffFiles(
   env: AppBindings,
-  job: Pick<PersistedReviewJob, 'id' | 'owner' | 'repo' | 'prNumber'>,
-  vcs: Pick<VcsProvider, 'getPullRequestDiff'>,
+  job: Pick<PersistedReviewJob, 'id' | 'owner' | 'repo' | 'prNumber' | 'reviewMode' | 'roundsFromSha' | 'roundsToSha'>,
+  vcs: Pick<VcsProvider, 'getPullRequestDiff' | 'getCompareDiff'>,
   config: RepoConfig,
 ) {
   const rawDiff = await getCachedRawDiff(env, job, vcs);
@@ -2200,15 +3335,22 @@ function skippedFilesKeyForJob(
  *               against the current diff, bypassing the max_files slice for this run. A head with
  *               zero recorded skips yields an empty set -> a no-op review (NOT an error); Plan 06
  *               short-circuits before creating such a job, so this is defense-in-depth.
+ *  - 'no_changes' -> the selected diff was a LEGITIMATE empty compare (Plan 02 / D-05). Return
+ *               an empty reviewable set so the review/finalize phases short-circuit on the
+ *               no_changes placeholder path (no model call, no review post, no walkthrough edit).
  *  - 'all' / 'head' / undefined -> delegate to getDiffFiles unchanged (undefined is byte-identical
  *               to today, NREG-01).
  */
 export async function getJobDiffFiles(
   env: AppBindings,
   job: PersistedReviewJob,
-  vcs: Pick<VcsProvider, 'getPullRequestDiff'>,
+  vcs: Pick<VcsProvider, 'getPullRequestDiff' | 'getCompareDiff'>,
   config: RepoConfig,
 ) {
+  if (job.reviewMode === 'no_changes') {
+    return [];
+  }
+
   if (job.reviewScope === 'rest') {
     const restPaths = new Set(await listSkippedFilesForHead(env, skippedFilesKeyForJob(job)));
     if (restPaths.size === 0) return [];

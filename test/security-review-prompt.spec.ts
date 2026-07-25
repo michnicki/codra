@@ -1,4 +1,4 @@
-import { buildSecurityReviewPrompts } from '@server/prompts/security-review';
+import { buildSecurityReviewPrompts, securityReviewSystemPromptBase } from '@server/prompts/security-review';
 import { UNTRUSTED_DIFF_BEGIN, UNTRUSTED_DIFF_END } from '@server/prompts/file-review';
 import { parseFileReviewResponse } from '@server/core/model-output';
 import type { FileDiff } from '@server/core/diff';
@@ -154,6 +154,21 @@ describe('Security Review Prompt — prompt-injection hardening', () => {
     expect(pathLine).toBeDefined();
     expect(pathLine).not.toContain(UNTRUSTED_DIFF_END);
     expect(pathLine).not.toContain(TRIPLE);
+  });
+});
+
+describe('Security Review Prompt — existing_code evidence field (EVID-01, D-15, Codex 15-04 HIGH)', () => {
+  // The security pass runs through its OWN dedicated prompt (services/model.ts selects
+  // buildSecurityReviewPrompts when pass === 'security'). If that prompt omitted existing_code,
+  // EVERY security finding would emit evidence_missing{reason:'absent'} and corrupt EVID-01 telemetry.
+  it('requests existing_code in the security SYSTEM prompt base', () => {
+    expect(securityReviewSystemPromptBase).toContain('existing_code');
+  });
+
+  it('requests existing_code in both the built security system and user prompts', () => {
+    const { systemPrompt, userPrompt } = build(makeFile());
+    expect(systemPrompt).toContain('existing_code');
+    expect(userPrompt).toContain('existing_code');
   });
 });
 

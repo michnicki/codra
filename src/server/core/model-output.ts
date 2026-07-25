@@ -1,6 +1,22 @@
-import { criticPruneOutputSchema, fileReviewModelOutputSchema, parsedReviewCommentSchema, summaryModelOutputSchema, type ParsedReviewComment, reviewSeverities } from '@shared/schema';
+import {
+  criticPruneOutputSchema,
+  fileReviewModelOutputSchema,
+  parsedReviewCommentSchema,
+  summaryModelOutputSchema,
+  walkthroughChangeGroupSchema,
+  walkthroughConfidenceSchema,
+  walkthroughEffortSchema,
+  type ParsedReviewComment,
+  type JobAuditEvent,
+  type WalkthroughChangeGroup,
+  type WalkthroughConfidence,
+  type WalkthroughEffort,
+  reviewSeverities,
+} from '@shared/schema';
 import { z } from 'zod';
 import { logger } from './logger';
+import { applySeverityRules } from './severity';
+import { clampAuditTitle } from './audit';
 import { findClosestValidLine, findPositionForLine, getValidNewLines, getValidPositions } from './diff';
 import type { FileDiff } from './diff';
 import { jsonrepair } from 'jsonrepair';
@@ -159,6 +175,24 @@ function coerceReviewNumber(value: unknown) {
   return undefined;
 }
 
+// CR-01 (D-14 fail-open): the file-review/security-review prompts ask the model to quote the "exact
+// unchanged original line(s)" in `existing_code`. "line(s)" invites a model to return an ARRAY of
+// strings (or, less often, a number/object) for multi-line evidence. But fileReviewModelOutputSchema
+// types existing_code as z.string().nullable().optional(), so a non-string-non-null value would throw
+// a ZodError in fileReviewModelOutputSchema.parse — rethrown as 'Response schema mismatch', aborting
+// the parse of the WHOLE file and losing EVERY finding for it. That breaks EVID-01's soft-gate
+// guarantee that findings must ALWAYS still post. Coerce here so the value can never fail validation:
+//   string  -> keep as-is
+//   Array   -> keep only string elements, joined by '\n' (multi-line array evidence stays checkable)
+//   null    -> keep null (schema allows; flows to the `absent` telemetry branch)
+//   else    -> undefined (number/object/boolean -> `absent`, never a parse throw)
+function coerceExistingCode(value: unknown): string | null | undefined {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.filter((x): x is string => typeof x === 'string').join('\n');
+  if (value === null) return null;
+  return undefined;
+}
+
 function normalizeFinding(finding: unknown) {
   if (!finding || typeof finding !== 'object') return null;
   const f = finding as Record<string, unknown>;
@@ -187,6 +221,9 @@ function normalizeFinding(finding: unknown) {
     ...f,
     title: f.title || 'Code finding',
     priority: priority === undefined ? undefined : Math.max(0, Math.min(3, Math.trunc(priority as number))),
+    // CR-01: coerce so a non-string existing_code (array/number/object) can never fail schema
+    // validation and abort the whole-file parse (D-14 fail-open).
+    existing_code: coerceExistingCode(f.existing_code),
     code_location: codeLocation,
     confidence_score: typeof f.confidence_score === 'number'
       ? Math.max(0, Math.min(1, f.confidence_score > 1 ? f.confidence_score / 10 : f.confidence_score))
@@ -240,6 +277,34 @@ function preprocessJson(json: string): string {
   return result;
 }
 
+/**
+ * Normalizer for the soft evidence gate (EVID-01, D-16). Collapses every whitespace run to a single
+ * space, trims, AND lower-cases — the substring match is therefore whitespace- AND case-INSENSITIVE,
+ * so trivial `Const` vs `const` / indentation differences do NOT inflate the `not_in_hunk` count and
+ * pollute the EVID-02 go/no-go signal (OpenCode C4 / Antigravity). No Unicode normalization.
+ *
+ * This is DELIBERATELY NOT `cleanText` (D-16 Anti-Pattern): cleanText strips leading tag/emoji
+ * prefixes (SECURITY/BUG/P0/…), which are meaningless for diff-line evidence and would corrupt the
+ * haystack/needle comparison. Never reuse cleanText here.
+ */
+export function normalizeForEvidence(s: string): string {
+  return s.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/**
+ * WR-02: The evidence haystack is built from hunk `content`, which is already diff-prefix-stripped
+ * (diff.ts strips the leading +/-/space marker). The needle (`existing_code`) is only produced by the
+ * model, which is merely ASKED not to prepend a `+`/`-` marker. When it disobeys (common), the needle
+ * keeps that leading char and fails the `includes()` test, producing a FALSE `not_in_hunk` that
+ * inflates the exact count EVID-02 reads as a go/no-go signal. Strip a single leading `+`/`-` from EACH
+ * line (evidence may be multi-line) so the needle is normalized the same way the haystack already is.
+ * Whitespace markers need no handling — normalizeForEvidence collapses/trims them anyway. Audit-only:
+ * no posting behavior changes.
+ */
+function stripLeadingDiffMarkers(s: string): string {
+  return s.split('\n').map((line) => line.replace(/^[+-]/, '')).join('\n');
+}
+
 function withSuggestion(body: string, codeSuggestion?: string) {
   if (!codeSuggestion) return body;
 
@@ -252,12 +317,17 @@ function withSuggestion(body: string, codeSuggestion?: string) {
   return `${cleanBody}\n\n\`\`\`suggestion\n${cleanSuggestion}\n\`\`\``;
 }
 
-export function parseFileReviewResponse(raw: string, file: FileDiff): {
+export function parseFileReviewResponse(
+  raw: string,
+  file: FileDiff,
+  opts: { pass?: 'main' | 'security'; severityEngineEnabled?: boolean } = {},
+): {
   comments: ParsedReviewComment[];
   verdict: 'approve' | 'comment';
   fileSummary: string;
   overallCorrectness?: string;
   confidenceScore?: number;
+  severityAuditEvents: JobAuditEvent[];
 } {
   let extracted = '';
   try {
@@ -354,6 +424,20 @@ export function parseFileReviewResponse(raw: string, file: FileDiff): {
   const validPositions = getValidPositions(file);
 
   const orphanedComments: string[] = [];
+  // Accumulate the severity engine's audit events across every finding this call produces. Only
+  // findings that survive the orphan check (i.e. become a persisted comment) contribute events, so
+  // the trail never references a dropped, off-diff finding.
+  const severityAuditEvents: JobAuditEvent[] = [];
+
+  // EVID-01 soft evidence gate (D-16). Build the cleaned-hunk haystack ONCE for this file: concat of
+  // ALL hunk lines (context + add + del) content — hunk `content` is already diff-prefix-stripped
+  // (diff.ts) — then normalizeForEvidence. Per surviving finding, we test whether its normalized
+  // existing_code is a substring of this haystack. This is audit-only (D-14): a miss NEVER drops or
+  // penalizes the finding, it only emits an `evidence_missing` telemetry event.
+  const evidenceHaystack = normalizeForEvidence(
+    file.hunks.flatMap((h) => h.lines).map((l) => l.content).join('\n'),
+  );
+
   const comments = (parsed.findings || [])
     .map((finding) => {
       // Codex style findings use start/end or line
@@ -414,15 +498,59 @@ export function parseFileReviewResponse(raw: string, file: FileDiff): {
         body = cleanText(body.slice(body.split('\n')[0].length));
       }
 
+      // Apply the deterministic severity/category engine (SEV-01/02/03/04). Category resolution is
+      // unconditional (D-02); severity rules run only when the engine is enabled. Defaults keep this
+      // a valid zero-opts call (pass 'main', engine enabled).
+      const ruled = applySeverityRules(
+        { severity, category: finding.category, title, body, pass: opts.pass ?? 'main' },
+        { enabled: opts.severityEngineEnabled ?? true },
+      );
+      severityAuditEvents.push(...ruled.auditEvents);
+
+      // EVID-01 soft evidence gate (D-14/D-16/D-17/D-18): only findings that SURVIVED the orphan check
+      // (they become a persisted comment) reach here, so the trail never references an off-diff finding.
+      // The finding ALWAYS still posts below regardless of the evidence outcome — this block only pushes
+      // telemetry into the SAME severityAuditEvents accumulator (D-18), never a new returned field, and
+      // NEVER carries body/diff/existingCode/codeSuggestion (privacy posture; T-15-04-01).
+      const evidence = finding.existing_code;
+      // WR-02: strip a leading +/- diff marker from each needle line BEFORE normalizeForEvidence, the
+      // same way the haystack is already diff-prefix-stripped. Computed once and used for both the
+      // absent/whitespace check and the includes() check so the needle is normalized identically.
+      const needle = evidence == null ? '' : normalizeForEvidence(stripLeadingDiffMarkers(evidence));
+      if (evidence == null || needle.length === 0) {
+        // null / undefined / whitespace-only -> `absent`. A JSON `null` reaches here (never a parse
+        // failure) because fileReviewModelOutputSchema.existing_code is nullable().optional() (15-01).
+        severityAuditEvents.push({
+          stage: 'evidence_missing',
+          reason: 'absent',
+          path: file.path,
+          line,
+          title: clampAuditTitle(title),
+          timestamp: new Date().toISOString(),
+        });
+      } else if (!evidenceHaystack.includes(needle)) {
+        severityAuditEvents.push({
+          stage: 'evidence_missing',
+          reason: 'not_in_hunk',
+          path: file.path,
+          line,
+          title: clampAuditTitle(title),
+          timestamp: new Date().toISOString(),
+        });
+      }
+
       return parsedReviewCommentSchema.parse({
         path: file.path,
         line: line,
         position,
-        severity,
-        category: 'quality', // Default for now
+        severity: ruled.severity,
+        category: ruled.category,
         title,
         body: withSuggestion(body, finding.code_suggestion),
         codeSuggestion: finding.code_suggestion,
+        // EVID-01 (D-15): map the model-emitted evidence into the parsed comment's existingCode field.
+        // `?? null` because parsedReviewCommentSchema.existingCode is nullable().optional().
+        existingCode: finding.existing_code ?? null,
         // Already validated/clamped by fileReviewModelOutputSchema + normalizeFinding.
         // Absent -> undefined, which parsedReviewCommentSchema accepts (fail-open at finalize).
         confidence: finding.confidence_score,
@@ -443,6 +571,7 @@ export function parseFileReviewResponse(raw: string, file: FileDiff): {
     fileSummary: fileSummary,
     overallCorrectness: parsed.overall_correctness,
     confidenceScore: parsed.overall_confidence_score,
+    severityAuditEvents,
   };
 }
 
@@ -637,3 +766,143 @@ export function parseAnswerResponse(raw: string): string {
     return raw.trim() || 'I was unable to produce an answer for this question.';
   }
 }
+
+/**
+ * Phase 19 Plan 19-08 (PASS-03, D-17): tolerant parse of the walkthrough enrichment response.
+ * Returns the parsed groups / confidence / effort fields INDEPENDENTLY — a malformed group list
+ * drops only groups; a malformed confidence drops only confidence; a malformed effort drops only
+ * effort. The caller always receives a structured result and decides what to persist.
+ *
+ * Never throws. The {kind: 'fail_open'} variant signals a whole-call parse failure (empty input,
+ * no JSON object found, schema mismatch on ALL three fields) so the caller can persist a
+ * `status: 'failed'` enrichment row without poisoning finalize (D-17 fail-soft contract).
+ */
+export type WalkthroughEnrichmentField = 'groups' | 'confidence' | 'effort';
+
+export type ParsedWalkthroughEnrichment =
+  | {
+      kind: 'parsed';
+      groups: WalkthroughChangeGroup[];
+      confidence: WalkthroughConfidence | null;
+      effort: WalkthroughEffort | null;
+      malformedFields: readonly WalkthroughEnrichmentField[];
+    }
+  | { kind: 'fail_open'; reason: string };
+
+export function parseWalkthroughEnrichmentResponse(raw: string): ParsedWalkthroughEnrichment {
+  if (typeof raw !== 'string' || raw.trim().length === 0) {
+    return { kind: 'fail_open', reason: 'empty_response' };
+  }
+
+  // Strip <think>...</think> reasoning (tolerant of a missing close tag) before extraction — mirrors
+  // parseWalkthroughDiagram / parseCriticPruneResponse. Reasoning text can contain JSON-looking
+  // fragments that would confuse the brace-scoring extractor.
+  const stripped = raw
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<think>[\s\S]*$/i, '');
+
+  let extracted: string;
+  try {
+    extracted = extractJson(stripped);
+  } catch {
+    return { kind: 'fail_open', reason: 'json_extract_failed' };
+  }
+
+  let repaired = extracted;
+  try {
+    repaired = jsonrepair(preprocessJson(extracted));
+  } catch {
+    // Fall back to the raw extracted text; the JSON.parse below is the final gate.
+  }
+
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(repaired);
+  } catch {
+    return { kind: 'fail_open', reason: 'json_parse_failed' };
+  }
+
+  if (!parsedJson || typeof parsedJson !== 'object' || Array.isArray(parsedJson)) {
+    return { kind: 'fail_open', reason: 'json_not_object' };
+  }
+
+  const obj = parsedJson as Record<string, unknown>;
+
+  // Phase 20 (D-05 reachability): independent field parsing with malformed-field provenance.
+  // Each optional field is validated independently so a malformed value drops ONLY that field
+  // (D-17). A field is marked 'malformed' ONLY when the model supplied it but it failed validation
+  // (or supplied it as the wrong shape, e.g. a non-array for `groups`). An absent field is NOT
+  // malformed — the operator only cares about fields the model claimed to emit. The provenance
+  // list is the durable signal the caller uses to derive 'completed' vs 'partial' status.
+  const malformedFields: WalkthroughEnrichmentField[] = [];
+
+  // groups: must be supplied as an array of objects. If the model supplied a non-array, the
+  // whole field is malformed. If an array was supplied and at least one item survived, the
+  // field is not malformed (a partial group list is still useful to the projection).
+  let groups: WalkthroughChangeGroup[] = [];
+  if ('groups' in obj) {
+    if (Array.isArray(obj.groups)) {
+      const seen = new Set<unknown>();
+      const collected: WalkthroughChangeGroup[] = [];
+      for (const item of obj.groups) {
+        if (item && typeof item === 'object' && !seen.has(item)) {
+          seen.add(item);
+          const parsed = walkthroughChangeGroupSchema.safeParse(item);
+          if (parsed.success) {
+            collected.push(parsed.data);
+          }
+        }
+      }
+      groups = collected;
+      if (groups.length === 0) {
+        malformedFields.push('groups');
+      }
+    } else {
+      malformedFields.push('groups');
+    }
+  }
+
+  // confidence: must be supplied as an object (so a non-object is malformed). Absent is fine.
+  let confidence: WalkthroughConfidence | null = null;
+  if ('confidence' in obj) {
+    if (obj.confidence && typeof obj.confidence === 'object' && !Array.isArray(obj.confidence)) {
+      const parsed = walkthroughConfidenceSchema.safeParse(obj.confidence);
+      if (parsed.success) {
+        confidence = parsed.data;
+      } else {
+        malformedFields.push('confidence');
+      }
+    } else {
+      malformedFields.push('confidence');
+    }
+  }
+
+  // effort: same shape contract as confidence — must be an object when supplied.
+  let effort: WalkthroughEffort | null = null;
+  if ('effort' in obj) {
+    if (obj.effort && typeof obj.effort === 'object' && !Array.isArray(obj.effort)) {
+      const parsed = walkthroughEffortSchema.safeParse(obj.effort);
+      if (parsed.success) {
+        effort = parsed.data;
+      } else {
+        malformedFields.push('effort');
+      }
+    } else {
+      malformedFields.push('effort');
+    }
+  }
+
+  // Whole-call fail_open if NO field survived validation — distinguishes "model emitted garbage"
+  // (fail_open, status='failed') from "model emitted a partial result we should still try to use"
+  // (status='partial', only valid fields kept). Callers use malformedFields to derive 'completed'
+  // vs 'partial' on the parsed path.
+  if (groups.length === 0 && confidence === null && effort === null) {
+    return { kind: 'fail_open', reason: 'all_fields_invalid' };
+  }
+
+  // WR-04: freeze the internal mutable accumulator so the runtime shape matches the declared
+  // `readonly WalkthroughEnrichmentField[]` contract on ParsedWalkthroughEnrichment. The internal
+  // `malformedFields` is left mutable above so the per-field push sites stay readable.
+  return { kind: 'parsed', groups, confidence, effort, malformedFields: Object.freeze(malformedFields) };
+}
+

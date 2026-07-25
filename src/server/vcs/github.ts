@@ -1,9 +1,11 @@
 import { GitHubService } from '../services/github';
 import type { AppBindings } from '../env';
 import type {
+  VcsCapabilities,
   VcsCreateStatusCheckInput,
   VcsProvider,
   VcsPullRequest,
+  VcsReviewThread,
   VcsSubmitReviewInput,
   VcsUpdateStatusCheckInput,
 } from './types';
@@ -23,17 +25,30 @@ export class GithubAdapter implements VcsProvider {
   readonly name = 'github' as const;
   // GitHub renders Mermaid fenced code blocks in markdown, so the walkthrough formatter may emit a
   // Mermaid diagram for GitHub PRs (D-09). Required member on VcsProvider; inert this phase.
-  readonly capabilities = { supportsMermaid: true } as const;
+  // GitHub's GraphQL `reviewThreads` and `resolveReviewThread` are always available with the
+  // installation token (D-03/D-04), so the two thread flags are static-true (R-2); Plan 17-02
+  // wires the GraphQL plumbing behind these neutral stubs.
+  readonly capabilities: VcsCapabilities = {
+    supportsMermaid: true,
+    supportsThreadListing: true,
+    supportsThreadResolution: true,
+  };
   private gh: GitHubService;
+  // PROV-02 (R-9): retain the construction-time tracker so we can forward it into the
+  // thread-listing call path. Mirrors BitbucketAdapter's `TrackerLike` shape widened to
+  // include `hasRemainingSafeBudget`; the incrementSubrequests half is required by the existing
+  // `GitHubService` constructor (transitively forwarded into the client).
+  private readonly tracker?: { incrementSubrequests(count?: number): void; hasRemainingSafeBudget?(needed?: number): boolean };
 
   constructor(
     private env: AppBindings,
     installationId: string,
-    tracker?: { incrementSubrequests(count?: number): void },
+    tracker?: { incrementSubrequests(count?: number): void; hasRemainingSafeBudget?(needed?: number): boolean },
   ) {
     // tracker MUST be forwarded -- it's an optional param on GitHubService's constructor, so
     // dropping it is silent: the subrequest budget regresses with no compile error (Pitfall 1).
     this.gh = new GitHubService(env, installationId, tracker);
+    this.tracker = tracker;
   }
 
   async getPullRequest(owner: string, repo: string, prNumber: number): Promise<VcsPullRequest> {
@@ -53,6 +68,124 @@ export class GithubAdapter implements VcsProvider {
 
   async getPullRequestDiff(owner: string, repo: string, prNumber: number): Promise<string> {
     return this.gh.getPullRequestDiff(owner, repo, prNumber);
+  }
+
+  // PROV-01 (D-08): content primitive. Delegates to GitHubService which forwards to the
+  // ref-aware `getRepoFileOrNull` (Task 2). 404 -> null; non-2xx -> GitHubError.
+  async getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null> {
+    return this.gh.getRepoFileContent(owner, repo, path, ref);
+  }
+
+  // PROV-01 (D-09): compare-diff primitive. Delegates to GitHubService.getCompareDiff which
+  // sends `/compare/{base}...{head}` with `application/vnd.github.diff` (Task 2). Empty success
+  // passes through as `''`; non-2xx throws GitHubError.
+  async getCompareDiff(owner: string, repo: string, base: string, head: string): Promise<string> {
+    return this.gh.getCompareDiff(owner, repo, base, head);
+  }
+
+  // PROV-02 (D-05/D-06/D-07): unresolved-bot-thread listing. Pulls every page from the GraphQL
+  // `reviewThreads` connection, filters to UNRESOLVED root comments authored by the immutable bot
+  // id, and projects to the canonical 6-field `VcsReviewThread` shape. Any GraphQL/transport
+  // failure is caught and converted to `[]` (D-02) — no seam log, no audit emission.
+  async getUnresolvedBotThreads(owner: string, repo: string, prNumber: number): Promise<VcsReviewThread[]> {
+    try {
+      const botIdentity = await this.gh.resolveBotUserIdentity();
+      const botAccountId = botIdentity.accountId;
+      // PROV-02 (R-9): forward the construction-time tracker so the client's per-page
+      // `hasRemainingSafeBudget` consult gates pagination at the boundary. The tracker shape
+      // accepted by the client is `hasRemainingSafeBudget?(needed?: number): boolean`; the
+      // adapter's `tracker` is wider (includes `incrementSubrequests` for the underlying
+      // REST path) so the structural narrow is intentional.
+      const rawThreads = await this.gh.getReviewThreads(owner, repo, prNumber, this.tracker);
+      const out: VcsReviewThread[] = [];
+      for (const rawThread of rawThreads) {
+        const thread = rawThread as {
+          id?: unknown;
+          path?: unknown;
+          line?: unknown;
+          startLine?: unknown;
+          originalLine?: unknown;
+          originalStartLine?: unknown;
+          isResolved?: unknown;
+          isOutdated?: unknown;
+          comments?: { nodes?: Array<unknown> };
+        };
+        // ID + path + bot filter first (cheapest rejections). Use `thread.comments.nodes[0]`
+        // (NEVER the unscoped `nodes[0]`) per review concern 13.
+        const rootCandidate = thread.comments?.nodes?.[0] as undefined | {
+          body?: unknown;
+          replyTo?: { id?: unknown } | null;
+          author?: { databaseId?: unknown; __typename?: unknown } | null;
+        };
+        if (!rootCandidate) continue;
+        // D-06 + R-4 / R-7: thread root MUST be a true root (not a reply), unresolved, and bot-authored.
+        if (rootCandidate.replyTo !== null && rootCandidate.replyTo !== undefined) continue;
+        if (thread.isResolved === true) continue;
+        if (typeof thread.id !== 'string' || thread.id.length === 0) continue;
+        if (typeof thread.path !== 'string' || thread.path.length === 0) continue;
+        const body = typeof rootCandidate.body === 'string' ? rootCandidate.body : '';
+        if (body.length === 0) continue;
+        const authorId = rootCandidate.author?.databaseId;
+        if (authorId === undefined || authorId === null) continue;
+        if (String(authorId) !== botAccountId) continue;
+
+        // R-3: current/original fallback for line range. Outdated threads still emit a numeric
+        // fallback (Phase 18 ignores outdated=true, so we never fabricate zero ranges).
+        const currentLine = typeof thread.line === 'number' ? thread.line : null;
+        const originalLine = typeof thread.originalLine === 'number' ? thread.originalLine : null;
+        const startLine = typeof thread.startLine === 'number' ? thread.startLine : null;
+        const originalStartLine = typeof thread.originalStartLine === 'number' ? thread.originalStartLine : null;
+
+        let lineStart: number;
+        let lineEnd: number;
+        if (currentLine !== null) {
+          lineEnd = currentLine;
+          // Prefer startLine (range start); fall back to line when only a single anchor is set.
+          lineStart = startLine !== null && startLine <= currentLine ? startLine : currentLine;
+        } else if (originalLine !== null) {
+          // Outdated fallback only: R-3 says surface original anchors when current is null.
+          lineEnd = originalLine;
+          lineStart = originalStartLine !== null && originalStartLine <= originalLine ? originalStartLine : originalLine;
+        } else {
+          // Truly no anchor available — skip rather than fabricate zero lines (R-3 / review F4).
+          continue;
+        }
+        if (!Number.isSafeInteger(lineStart) || !Number.isSafeInteger(lineEnd)) continue;
+        if (lineStart <= 0 || lineEnd <= 0 || lineStart > lineEnd) continue;
+
+        out.push({
+          ref: thread.id,
+          path: thread.path,
+          lineStart,
+          lineEnd,
+          rootBody: body,
+          outdated: thread.isOutdated === true,
+        });
+      }
+      return out;
+    } catch {
+      // D-02: silent neutral degradation — no log, no audit, no throw. Phase 18/19 emit the
+      // audit event with proper context.
+      return [];
+    }
+  }
+
+  // PROV-02 (D-04): resolve a thread. The opaque `ref` MUST be the GitHub GraphQL thread node id;
+  // reject empty / whitespace / control-character / overlong refs BEFORE any HTTP request so a
+  // malformed/forgeable id cannot reach the wire (T-17-02-01, R-7). On any transport or
+  // envelope failure return `false` (D-02) while leaving the static capability flag untouched
+  // (D-04: GitHub is static-true, observed-downgrade is Bitbucket-only).
+  async resolveThread(_owner: string, _repo: string, ref: string): Promise<boolean> {
+    void _owner; void _repo;
+    if (!isValidGraphQlThreadRef(ref)) {
+      throw new Error(`resolveThread received a malformed ref: ${JSON.stringify(ref)}`);
+    }
+    try {
+      await this.gh.resolveReviewThread(ref);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async createStatusCheck(
@@ -277,4 +410,30 @@ export class GithubAdapter implements VcsProvider {
     removeIfPresent: (owner: string, repo: string, prNumber: number, labels: string[]) =>
       this.gh.removeIssueLabelsIfPresent(owner, repo, prNumber, labels),
   };
+}
+
+// Maximum length of a GitHub GraphQL node id. The opaque id is base64 over the type+databaseId
+// pair, never assuming a specific alphabet; 256 bytes is generous headroom for any future schema.
+// Anything longer than this is either a typo or a forging attempt and must be rejected at the seam.
+const MAX_GITHUB_THREAD_REF_LEN = 256;
+
+/**
+ * Strict opaque-ref validator for GitHub GraphQL thread node ids (R-7, T-17-02-01).
+ *
+ * Rejects (BEFORE any HTTP request):
+ *   - empty / whitespace-only strings
+ *   - any control character (U+0000..U+001F, U+007F)
+ *   - refs longer than `MAX_GITHUB_THREAD_REF_LEN` (forging / typos)
+ *
+ * Does NOT enforce a `PRRT_` prefix or specific alphabet — the GraphQL id is opaque base64 over
+ * `{type}:{databaseId}` and the schema could change. This guard is intentionally permissive
+ * about content but strict about shape: it ensures a malformed value cannot reach the wire, while
+ * leaving future schema changes non-breaking.
+ */
+export function isValidGraphQlThreadRef(ref: string): boolean {
+  if (typeof ref !== 'string') return false;
+  if (ref.length === 0 || ref.length > MAX_GITHUB_THREAD_REF_LEN) return false;
+  if (/\s/.test(ref)) return false;
+  if (/[ -]/.test(ref)) return false;
+  return true;
 }

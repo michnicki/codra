@@ -63,8 +63,8 @@ describe('SC2: reviewJobMessageSchema widening is inert for pre-widening produce
   });
 });
 
-describe('SC3: reviewConfig feature toggles all default off (NREG-01 inertness)', () => {
-  it('repoConfigSchema.parse({}) yields every new toggle false', () => {
+describe('SC3: Phase-7 reviewConfig toggles default off; the three v1.2 always-on exceptions default on (NREG-01 inertness)', () => {
+  it('repoConfigSchema.parse({}) yields every opt-in toggle false and the documented default-ON exceptions true', () => {
     const cfg = repoConfigSchema.parse({});
 
     expect(cfg.review.passes.security.enabled).toBe(false);
@@ -78,6 +78,12 @@ describe('SC3: reviewConfig feature toggles all default off (NREG-01 inertness)'
     // CMD-07 (Layer 2): the config-based Bitbucket bot account_id defaults to null so an unconfigured
     // repo is byte-identical to today (NREG-01) and the resolver falls back to live discovery.
     expect(cfg.review.interactive.commands.bitbucket_bot_account_id).toBeNull();
+    // DOCUMENTED DEFAULT-ON EXCEPTIONS (D-01/D-02): severity_engine, dedup, and file_selection are
+    // framed as correctness fixes / always-on behavior, each with a single-key escape hatch — NOT
+    // opt-in features. They deliberately default TRUE, so this spec no longer implies "all off".
+    expect(cfg.review.severity_engine.enabled).toBe(true);
+    expect(cfg.review.dedup.enabled).toBe(true);
+    expect(cfg.review.file_selection.enabled).toBe(true);
   });
 
   it('the exported defaultRepoConfig yields the same all-off values', () => {

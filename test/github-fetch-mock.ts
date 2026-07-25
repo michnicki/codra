@@ -3,11 +3,22 @@ import { vi } from 'vitest';
 export type RecordedGitHubCall = {
   method: string;
   path: string;
+  search: string;
   accept: string | null;
   body: any;
 };
 
 export type ReviewResponseScript = Array<{ status: number; id?: number }>;
+
+/**
+ * Body for any of the new mock fixtures (content/compare). `body` is whatever the adapter
+ * expects to decode — a JSON object for `/contents`, a raw string for `/compare`.
+ */
+export type BitbucketLikeMockResponse = {
+  status?: number;
+  body?: unknown;
+  headers?: Record<string, string>;
+};
 
 /**
  * Scripted status sequence for successive PATCH /issues/comments/{id} calls (the edit-comment
@@ -66,6 +77,37 @@ export type GitHubFetchMockFixtures = {
    * `user` object so a spec can prove the adapter re-verifies the immutable id (id-mismatch → null).
    */
   permissionResponse?: { status?: number; permission?: string; userId?: number; userLogin?: string };
+  /**
+   * Response for GET /repos/{owner}/{repo}/contents/{path}?ref={ref} (PROV-01, D-08). `status`
+   * defaults to 200; when `body` is provided as `{ content, encoding }` the route returns it
+   * verbatim so a spec can verify base64 decoding. Use `status: 404` to exercise the null path.
+   */
+  contentResponses?: BitbucketLikeMockResponse;
+  /**
+   * Response for GET /repos/{owner}/{repo}/compare/{base}...{head} with the
+   * `application/vnd.github.diff` media type (PROV-01, D-09). `status` defaults to 200; `body`
+   * is returned as raw text. Use `status: 200, body: ''` to exercise the empty-success path.
+   */
+  compareResponses?: BitbucketLikeMockResponse;
+  /**
+   * Response for POST /graphql (PROV-02). Two flows are used by the fixtures:
+   *   - `threadListResponses`: a scripted sequence of bodies for successive `ListReviewThreads`
+   *     queries — each entry becomes one `{ data, errors? }` envelope sent verbatim, with the
+   *     last entry reused for any additional pages. Empty default returns `{ data: { repository:
+   *     { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null }}}}}}}`.
+   *   - `resolveReviewThreadResponse`: a single response body used by every `ResolveReviewThread`
+   *     mutation (default is the success envelope).
+   *   - `threadListNonRetriable`: when true, return the body with `status: 502` so the real
+   *     client surfaces the failure as a `GitHubError` rather than a GraphQL envelope.
+   */
+  threadListResponses?: Array<{ data?: unknown; errors?: unknown }>;
+  resolveReviewThreadResponse?: { status?: number; data?: unknown; errors?: unknown };
+  threadListNonRetriable?: boolean;
+  /**
+   * Numeric user id the bot-identity GET /users/{login} route returns. Defaults to 99999 so
+   * thread fixtures with `author.databaseId: GH_BOT_USER_ID (99999)` pass the immutable-id filter.
+   */
+  botUserId?: number;
 };
 
 /**
@@ -95,6 +137,31 @@ export function installGitHubFetchMock(fixtures: GitHubFetchMockFixtures) {
   const commentEditResponses = fixtures.commentEditResponses ?? [{ status: 200 }];
   let commentEditCallIndex = 0;
 
+  // PROV-02 bot identity: `resolveBotUserIdentity` (CMD-07) hits `GET /users/{botLogin}`. The
+  // thread filter (D-07) keys on the immutable numeric id the endpoint returns, so test
+  // fixtures seed a specific value here so author.databaseId from /graphql compares equal.
+  // Defaults to GH_BOT_USER_ID (99999) which matches the test fixture default.
+  const botUserId = fixtures.botUserId ?? 99999;
+  // PROV-02: GraphQL scripted responses. `threadListResponses` is consumed sequentially so a
+  // fixture can drive a two-page traversal; the final entry is reused for any later pages. The
+  // mutation response is a single body because each call returns fresh from the same fixture.
+  const threadListResponses = fixtures.threadListResponses ?? [
+    {
+      data: {
+        repository: {
+          pullRequest: {
+            reviewThreads: {
+              nodes: [],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      },
+    },
+  ];
+  let threadListCallIndex = 0;
+  const resolveReviewThreadFixture = fixtures.resolveReviewThreadResponse ?? {};
+
   const existingLabels = new Map<string, string>();
   const issueLabels = new Set<string>();
 
@@ -114,14 +181,34 @@ export function installGitHubFetchMock(fixtures: GitHubFetchMockFixtures) {
       }
     }
 
-    calls.push({ method, path: url.pathname, accept, body });
+    // Record BOTH the path's pathname (so existing pathname-only matchers keep working) AND the
+    // search query (so PROV-01 specs can assert the `?ref=` query on `/contents`).
+    calls.push({ method, path: url.pathname, search: url.search, accept, body });
 
     const json = (data: unknown, status = 200) =>
       new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
 
+    const text = (data: string, status = 200, extraHeaders: Record<string, string> = {}) =>
+      new Response(data, { status, headers: { 'content-type': 'text/plain', ...extraHeaders } });
+
+    // --- PROV-01: GET /compare/{base}...{head} (D-09) ---
+    // Match the canonical path; the compare accept hdr is `application/vnd.github.diff`. Order
+    // matters: this route must be checked BEFORE the getPullRequest `pathname === pulls/N` branch
+    // since `/compare/...` shares the prefix but never matches the bare pull endpoint.
+    if (method === 'GET' && url.pathname.includes('/compare/')) {
+      const fixture = fixtures.compareResponses ?? { status: 200, body: fixtures.diff };
+      const status = fixture.status ?? 200;
+      const headers = new Headers(fixture.headers ?? {});
+      if (!headers.has('content-type')) headers.set('content-type', 'text/plain');
+      if (typeof fixture.body === 'string') {
+        return new Response(fixture.body, { status, headers });
+      }
+      return new Response(JSON.stringify(fixture.body), { status, headers });
+    }
+
     if (method === 'GET' && url.pathname === `${repoPrefix}/pulls/${fixtures.prNumber}`) {
       if (accept === 'application/vnd.github.v3.diff') {
-        return new Response(fixtures.diff, { status: 200 });
+        return text(fixtures.diff, 200);
       }
       return json(fixtures.pull);
     }
@@ -147,6 +234,24 @@ export function installGitHubFetchMock(fixtures: GitHubFetchMockFixtures) {
         return json({ message: 'Unprocessable Entity' }, script.status);
       }
       return json({ id: script.id ?? 5150 }, script.status);
+    }
+
+    // --- PROV-01: GET /contents/{path}?ref={ref} (D-08) ---
+    // Match the contents path (any sub-path, with optional ?ref=). Status 404 maps to a null
+    // text body; 200 returns the supplied fixture body so a spec can verify base64 decoding.
+    if (method === 'GET' && /^\/repos\/[^/]+\/[^/]+\/contents\//.test(url.pathname)) {
+      const fixture = fixtures.contentResponses ?? {
+        status: 200,
+        body: { content: Buffer.from('default content').toString('base64'), encoding: 'base64' },
+      };
+      const status = fixture.status ?? 200;
+      if (status === 404) {
+        return json({ message: 'Not Found' }, 404);
+      }
+      if (status >= 400) {
+        return json({ message: `Contents error ${status}` }, status);
+      }
+      return json(fixture.body, status);
     }
 
     // --- Issue-comment routes (net-new, additive; NREG-01) ---
@@ -197,6 +302,50 @@ export function installGitHubFetchMock(fixtures: GitHubFetchMockFixtures) {
       );
     }
 
+    // POST /graphql (PROV-02). Two operations are surfaced: ListReviewThreads (query) and
+    // ResolveReviewThread (mutation). The handler chooses a scripted body per operation name
+    // (`ListReviewThreads` selects from `threadListResponses`; `ResolveReviewThread` uses
+    // `resolveReviewThreadResponse`). When `threadListNonRetriable` is set the response is a
+    // 5xx body so the real client's retry path surfaces a `GitHubError` rather than swallowing.
+    if (method === 'POST' && url.pathname === '/graphql') {
+      const payload = (init?.body ? JSON.parse(String(init.body)) : {}) as { query?: string; variables?: Record<string, unknown> };
+      const queryName = /query\s+(\w+)/.exec(payload.query ?? '')?.[1] ?? '';
+      const mutationName = /mutation\s+(\w+)/.exec(payload.query ?? '')?.[1] ?? '';
+
+      if (mutationName === 'ResolveReviewThread') {
+        const status = resolveReviewThreadFixture.status ?? 200;
+        if (status >= 400) {
+          return json({ message: 'GitHub resolve mutation failed' }, status);
+        }
+        const body = resolveReviewThreadFixture.errors
+          ? { errors: resolveReviewThreadFixture.errors }
+          : {
+              data: resolveReviewThreadFixture.data ?? {
+                resolveReviewThread: {
+                  thread: { id: payload.variables?.threadId ?? 'PRRT_unknown', isResolved: true },
+                },
+              },
+            };
+        return json(body, status);
+      }
+
+      if (queryName === 'ListReviewThreads') {
+        const idx = Math.min(threadListCallIndex, threadListResponses.length - 1);
+        threadListCallIndex += 1;
+        const scripted = threadListResponses[idx];
+        if (fixtures.threadListNonRetriable) {
+          return json({ message: 'GitHub thread list 502' }, 502);
+        }
+        if (scripted.errors) {
+          return json({ data: scripted.data ?? null, errors: scripted.errors }, 200);
+        }
+        return json({ data: scripted.data ?? {}, errors: scripted.errors }, 200);
+      }
+
+      // Unknown query/mutation: respond with a 200 + errors envelope so the caller can decide.
+      return json({ errors: [{ message: `Unhandled mock GraphQL operation: ${queryName || mutationName || '<anonymous>'}` }] }, 200);
+    }
+
     const labelLookup = new RegExp(`^${repoPrefix}/labels/([^/]+)$`).exec(url.pathname);
     if (method === 'GET' && labelLookup) {
       const name = decodeURIComponent(labelLookup[1]);
@@ -221,6 +370,12 @@ export function installGitHubFetchMock(fixtures: GitHubFetchMockFixtures) {
     if (method === 'DELETE' && labelRemoval) {
       issueLabels.delete(decodeURIComponent(labelRemoval[1]));
       return json([]);
+    }
+
+    // GET /users/{login} (CMD-07). Returns the bot identity used by resolveBotUserIdentity.
+    if (method === 'GET' && /^\/users\/[^/]+$/.test(url.pathname)) {
+      const login = decodeURIComponent(url.pathname.replace(/^\/users\//, ''));
+      return json({ id: botUserId, login });
     }
 
     return json({ message: `Unhandled mock GitHub route: ${method} ${url.pathname}` }, 404);
