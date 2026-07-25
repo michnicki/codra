@@ -250,7 +250,7 @@ export function nextOwner(owner: string) {
   });
 });
 
-describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
+describe('EVID-01/EVID-03 soft evidence gate (evidence_missing_summary aggregate)', () => {
   // mockFile hunk line 2 is the add line "new line" (position 2), so a finding at line 2 survives the
   // orphan check and becomes a persisted comment. Evidence is checked against the cleaned-hunk
   // haystack = "older\nnew line\nother".
@@ -291,7 +291,7 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     });
 
   const evidenceEvents = (r: ReturnType<typeof parseFileReviewResponse>) =>
-    r.severityAuditEvents.filter((e) => e.stage === 'evidence_missing');
+    r.severityAuditEvents.filter((e) => e.stage === 'evidence_missing_summary');
 
   it('exact substring match: no evidence_missing event, comment still posts', () => {
     const result = parseFileReviewResponse(rawWith('const Value = compute();'), evidenceFile);
@@ -311,49 +311,49 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     expect(evidenceEvents(result)).toHaveLength(0);
   });
 
-  it('non-substring evidence: one evidence_missing{not_in_hunk}, comment still posts', () => {
+  it('non-substring evidence: one evidence_missing_summary with not_in_hunk entry, comment still posts', () => {
     const result = parseFileReviewResponse(rawWith('someTotallyUnrelatedIdentifier()'), evidenceFile);
     expect(result.comments).toHaveLength(1);
     const events = evidenceEvents(result);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'not_in_hunk', path: 'src/evid.ts', line: 2 });
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing_summary', notInHunkCount: 1, file: 'src/evid.ts' });
   });
 
-  it('BLOCKER 1 (D-06): evidence_missing redacts title without changing parsed finding', () => {
+  it('BLOCKER 1 (D-06): evidence_missing_summary redacts sample title without changing parsed finding', () => {
     const result = parseFileReviewResponse(rawWith('someTotallyUnrelatedIdentifier()'), evidenceFile);
     expect(result.comments).toHaveLength(1);
     expect(result.comments[0].title).toBe('Uses computed value');
     const events = evidenceEvents(result);
     expect(events).toHaveLength(1);
-    expect(events[0].title).toBe('[title-redacted]');
-    expect(events[0].title).not.toBe(result.comments[0].title);
-    expect(events[0].title).not.toContain(result.comments[0].title);
+    expect(events[0].sample[0].title).toBe('[title-redacted]');
+    expect(events[0].sample[0].title).not.toBe(result.comments[0].title);
+    expect(events[0].sample[0].title).not.toContain(result.comments[0].title);
   });
 
-  it('omitted existing_code: one evidence_missing{absent}, comment still posts', () => {
+  it('omitted existing_code: one evidence_missing_summary with absent entry, comment still posts', () => {
     const result = parseFileReviewResponse(rawWith('__OMIT__'), evidenceFile);
     expect(result.comments).toHaveLength(1);
     const events = evidenceEvents(result);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'absent' });
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing_summary', absentCount: 1 });
   });
 
-  it('empty-string existing_code: one evidence_missing{absent}, comment still posts', () => {
+  it('empty-string existing_code: one evidence_missing_summary with absent entry, comment still posts', () => {
     const result = parseFileReviewResponse(rawWith('   '), evidenceFile);
     expect(result.comments).toHaveLength(1);
     expect(evidenceEvents(result)).toEqual([
-      expect.objectContaining({ stage: 'evidence_missing', reason: 'absent' }),
+      expect.objectContaining({ stage: 'evidence_missing_summary', absentCount: 1 }),
     ]);
   });
 
-  it('JSON null existing_code: no parse throw, comment still posts, one evidence_missing{absent}', () => {
+  it('JSON null existing_code: no parse throw, comment still posts, one evidence_missing_summary with absent entry', () => {
     // Codex 15-01 HIGH: existing_code is nullable().optional(), so a JSON null must NOT throw the
     // per-file parse before the evidence check runs.
     const result = parseFileReviewResponse(rawWith(null), evidenceFile);
     expect(result.comments).toHaveLength(1);
     const events = evidenceEvents(result);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'absent' });
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing_summary', absentCount: 1 });
   });
 
   it('array existing_code: no parse throw, joined + evidence-checked, comment still posts (CR-01, D-14)', () => {
@@ -378,7 +378,7 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     expect(result.comments).toHaveLength(1);
     const events = evidenceEvents(result);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'not_in_hunk' });
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing_summary', notInHunkCount: 1 });
   });
 
   it('number existing_code: no parse throw, degrades to absent, comment still posts (CR-01, D-14)', () => {
@@ -386,7 +386,7 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     expect(result.comments).toHaveLength(1);
     const events = evidenceEvents(result);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'absent' });
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing_summary', absentCount: 1 });
     // Non-string scalar coerced to undefined -> parsed comment existingCode is null (schema fail-open).
     expect(result.comments[0].existingCode == null).toBe(true);
   });
@@ -396,7 +396,7 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     expect(result.comments).toHaveLength(1);
     const events = evidenceEvents(result);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'absent' });
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing_summary', absentCount: 1 });
     expect(result.comments[0].existingCode == null).toBe(true);
   });
 
@@ -417,7 +417,7 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     expect(result.comments).toHaveLength(1);
     const events = evidenceEvents(result);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'not_in_hunk' });
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing_summary', notInHunkCount: 1 });
   });
 
   it('maps existing_code into the parsed comment existingCode field', () => {
@@ -425,7 +425,7 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     expect(result.comments[0].existingCode).toBe('const Value = compute();');
   });
 
-  it('the evidence_missing event carries NO body/diff/existingCode/codeSuggestion (privacy)', () => {
+  it('the evidence_missing_summary event carries NO body/diff/existingCode/codeSuggestion (privacy)', () => {
     const result = parseFileReviewResponse(rawWith('someTotallyUnrelatedIdentifier()'), evidenceFile);
     const event = evidenceEvents(result)[0];
     const keys = Object.keys(event);
@@ -433,7 +433,7 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     expect(keys).not.toContain('diff');
     expect(keys).not.toContain('existingCode');
     expect(keys).not.toContain('codeSuggestion');
-    expect(keys.sort()).toEqual(['line', 'path', 'reason', 'stage', 'timestamp', 'title']);
+    expect(keys.sort()).toEqual(['absentCount', 'file', 'notInHunkCount', 'pass', 'sample', 'stage', 'timestamp']);
   });
 
   it('off-diff finding contributes NO evidence_missing event (checked only after orphan survival)', () => {
@@ -454,6 +454,26 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     const result = parseFileReviewResponse(raw, evidenceFile);
     expect(result.comments).toHaveLength(0);
     expect(evidenceEvents(result)).toHaveLength(0);
+  });
+
+  it('multiple findings: both absent and not_in_hunk produce aggregate with correct counts and ordered sample', () => {
+    const multiRaw = JSON.stringify({
+      findings: [
+        { title: 'No evidence', body: 'x', priority: 2, code_location: { absolute_file_path: 'src/evid.ts', line: 2 }, existing_code: '   ' },
+        { title: 'Wrong evidence', body: 'y', priority: 3, code_location: { absolute_file_path: 'src/evid.ts', line: 5 }, existing_code: 'someTotallyUnrelatedIdentifier()' },
+      ],
+      overall_correctness: 'patch is incorrect',
+      overall_explanation: 'Issues found',
+      overall_confidence_score: 0.8,
+    });
+    const result = parseFileReviewResponse(multiRaw, evidenceFile);
+    expect(result.comments).toHaveLength(2);
+    const events = evidenceEvents(result);
+    expect(events).toHaveLength(1);
+    expect(events[0].absentCount).toBe(1);
+    expect(events[0].notInHunkCount).toBe(1);
+    expect(events[0].sample[0].reason).toBe('absent');
+    expect(events[0].sample[1].reason).toBe('not_in_hunk');
   });
 });
 
@@ -505,7 +525,7 @@ describe('EVID-01 async-path bounded reconstruction (Task 4, Codex 15-04 HIGH)',
   });
 
   const evidenceEvents = (r: ReturnType<typeof parseFileReviewResponse>) =>
-    r.severityAuditEvents.filter((e) => e.stage === 'evidence_missing');
+    r.severityAuditEvents.filter((e) => e.stage === 'evidence_missing_summary');
 
   it('FULL file: evidence in the tail falsely passes (no not_in_hunk)', () => {
     const result = parseFileReviewResponse(raw, bigFile);
@@ -519,7 +539,7 @@ describe('EVID-01 async-path bounded reconstruction (Task 4, Codex 15-04 HIGH)',
     expect(result.comments).toHaveLength(1);
     const events = evidenceEvents(result);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'not_in_hunk' });
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing_summary', notInHunkCount: 1 });
   });
 });
 
