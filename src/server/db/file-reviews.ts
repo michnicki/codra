@@ -125,6 +125,12 @@ export async function upsertFileReview(
     // 'pending'), cleared (null) once the batch completes and a terminal review is persisted.
     asyncRequestId?: string | null;
     asyncModel?: string | null;
+    // modelLineCap: set-once at submit time, preserved through subsequent upserts via COALESCE
+    // in the DO UPDATE SET clause. Unlike asyncRequestId/asyncModel (which persistCompletedReview
+    // explicitly nulls), modelLineCap is NEVER nulled after being set — the COALESCE ensures
+    // subsequent upserts that omit it (persistCompletedReview, persistFailedFileReview, inherited
+    // path) keep the original value.
+    modelLineCap?: number | null;
   },
 ) {
   await queryTransaction(env, async (tx) => {
@@ -149,9 +155,10 @@ export async function upsertFileReview(
           model_provider,
           async_request_id,
           async_model,
+          model_line_cap,
           pass
         )
-        VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+        VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
         ON CONFLICT (job_id, file_path, pass) DO UPDATE SET
           file_status = EXCLUDED.file_status,
           model_used = EXCLUDED.model_used,
@@ -169,6 +176,7 @@ export async function upsertFileReview(
           model_provider = EXCLUDED.model_provider,
           async_request_id = EXCLUDED.async_request_id,
           async_model = EXCLUDED.async_model,
+          model_line_cap = COALESCE(EXCLUDED.model_line_cap, file_reviews.model_line_cap),
           transient_error_count = 0
         RETURNING id
       `,
@@ -191,6 +199,7 @@ export async function upsertFileReview(
         input.modelProvider ?? null,
         input.asyncRequestId ?? null,
         input.asyncModel ?? null,
+        input.modelLineCap ?? null,
         input.pass ?? 'main',
       ],
     );
@@ -477,6 +486,7 @@ export async function getFileReviewsForJobs(env: Pick<AppBindings, 'HYPERDRIVE'>
     transient_error_count: number;
     async_request_id: string | null;
     async_model: string | null;
+    model_line_cap: number | null;
     // Phase 19 (PASS-02): per-file ensemble result (ensemble_resultSchema) — read alongside the
     // other columns so a downstream review-flow consumer can read the durable cursor in one
     // round-trip. Defaulted to null (parseJsonColumn degrades) for the runs:1 inert path.
