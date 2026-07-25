@@ -928,3 +928,114 @@ describe('JobDetailPage audit-trail viewer — Phase 20 ensemble + walkthrough',
     expect(screen.queryByText('groups')).not.toBeInTheDocument();
   });
 });
+
+// D-01 / D-02: the evidence_missing_summary aggregate audit event renders in the audit-trail
+// viewer's existing 'Evidence missing' group, with counts + bounded sample entries.
+describe('JobDetailPage audit-trail viewer — Phase 24 evidence_missing_summary', () => {
+  const okResponse = <T,>(data: T) => ({
+    status: 200 as const,
+    etag: null,
+    lastModified: null,
+    notModified: false as const,
+    data,
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('renders a populated evidence_missing_summary event with file, pass, counts, and sample entries in the Evidence missing group', async () => {
+    const user = userEvent.setup();
+    const audit: JobDetail['audit'] = [
+      {
+        stage: 'evidence_missing_summary',
+        file: 'src/test.ts',
+        pass: 'main',
+        absentCount: 17,
+        notInHunkCount: 42,
+        sample: [
+          { path: 'src/test.ts', line: 10, title: 'missing null check', reason: 'absent' },
+          { path: 'src/test.ts', line: 20, title: 'missing bounds check', reason: 'absent' },
+          { path: 'src/other.ts', line: 5, title: 'finding outside hunk', reason: 'not_in_hunk' },
+        ],
+        timestamp: new Date().toISOString(),
+      },
+    ];
+    vi.mocked(api.getJob).mockResolvedValue(okResponse({ job: { ...JOB, audit } }));
+
+    renderJobDetail();
+    const auditHeading = await screen.findByText('Audit trail');
+    await user.click(auditHeading);
+
+    // Group heading
+    expect(screen.getByText('Evidence missing')).toBeVisible();
+    // Metric lines for identifier and counts
+    expect(screen.getByText('src/test.ts')).toBeVisible();
+    expect(screen.getByText('main')).toBeVisible();
+    expect(screen.getByText('17')).toBeVisible();    // absentCount
+    expect(screen.getByText('42')).toBeVisible();    // notInHunkCount
+    // Sample entries with path:line, title, and reason
+    expect(screen.getByText(/missing null check/)).toBeVisible();
+    expect(screen.getByText(/missing bounds check/)).toBeVisible();
+    expect(screen.getByText(/finding outside hunk/)).toBeVisible();
+    // Reason text: 'absent' appears 3x (1 MetricLine label + 2 sample reasons)
+    expect(screen.getAllByText('absent').length).toBe(3);
+    // 'not_in_hunk' appears once (1 sample reason)
+    expect(screen.getByText('not_in_hunk')).toBeVisible();
+  });
+
+  it('renders an evidence_missing_summary event with counts but no sample when sample is empty', async () => {
+    const user = userEvent.setup();
+    const audit: JobDetail['audit'] = [
+      {
+        stage: 'evidence_missing_summary',
+        file: 'src/empty.ts',
+        pass: 'security',
+        absentCount: 0,
+        notInHunkCount: 0,
+        sample: [],
+        timestamp: new Date().toISOString(),
+      },
+    ];
+    vi.mocked(api.getJob).mockResolvedValue(okResponse({ job: { ...JOB, audit } }));
+
+    renderJobDetail();
+    const auditHeading = await screen.findByText('Audit trail');
+    await user.click(auditHeading);
+
+    // Group heading and identifier still visible
+    expect(screen.getByText('Evidence missing')).toBeVisible();
+    expect(screen.getByText('src/empty.ts')).toBeVisible();
+    // Counts render as zero (at least 2 MetricLine values = '0' across absentCount + notInHunkCount)
+    expect(screen.getAllByText('0').length).toBeGreaterThanOrEqual(2);
+    // No sample entries rendered
+    expect(screen.queryByText(/finding/)).not.toBeInTheDocument();
+  });
+
+  it('renders a not_in_hunk reason entry in the sample list', async () => {
+    const user = userEvent.setup();
+    const audit: JobDetail['audit'] = [
+      {
+        stage: 'evidence_missing_summary',
+        file: 'src/hunk.ts',
+        pass: 'main',
+        absentCount: 0,
+        notInHunkCount: 2,
+        sample: [
+          { path: 'src/hunk.ts', line: 30, title: 'finding outside hunk 1', reason: 'not_in_hunk' },
+          { path: 'src/hunk.ts', line: 45, title: 'finding outside hunk 2', reason: 'not_in_hunk' },
+        ],
+        timestamp: new Date().toISOString(),
+      },
+    ];
+    vi.mocked(api.getJob).mockResolvedValue(okResponse({ job: { ...JOB, audit } }));
+
+    renderJobDetail();
+    const auditHeading = await screen.findByText('Audit trail');
+    await user.click(auditHeading);
+
+    // Reason badge rendered per sample entry (appears 2x — one per sample entry)
+    expect(screen.getAllByText('not_in_hunk').length).toBe(2);
+    expect(screen.getByText(/finding outside hunk 1/)).toBeVisible();
+  });
+});
