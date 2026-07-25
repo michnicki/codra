@@ -918,6 +918,39 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
       timestamp: dateStringSchema,
     })
     .passthrough(),
+  // Phase 21 (EVID-03 / D-01..D-04): AGGREGATE replacement for per-finding `evidence_missing` events.
+  // One `evidence_missing_summary` event per (file, pass) unit replaces N per-finding `evidence_missing`
+  // events, preventing a non-compliant model's flood of evidence-missing findings from evicting other
+  // telemetry from the 500-event ring buffer.
+  //
+  // The legacy `evidence_missing` per-finding variant (lines 907-920 above) is kept forever — old
+  // persisted events still parse; the two `stage` literals are distinct and coexist in the union.
+  //
+  // Counts are camelCase per D-03 (absentCount, notInHunkCount).
+  // Sample entry line is nullable and carries the post-orphan-remap line (current behavior) per D-02.
+  //   Phase 22 (EVID-04) will swap to the pre-remap original line.
+  // Sample preserves model emission order per D-07, NOT grouped by reason.
+  // Sample entries carry `reason` per D-04 for EVID-02 consumption.
+  // Privacy-bounded: titles route through redactFindingTitle (max 100 char marker); never
+  //   body/diff/existingCode/codeSuggestion.
+  z
+    .object({
+      stage: z.literal('evidence_missing_summary'),
+      file: z.string(),
+      pass: fileReviewPassSchema,
+      absentCount: z.number().int().min(0),
+      notInHunkCount: z.number().int().min(0),
+      sample: z.array(
+        z.object({
+          path: z.string(),
+          line: z.number().nullable().optional(),
+          title: z.string().max(100),
+          reason: z.enum(['absent', 'not_in_hunk']),
+        }),
+      ).max(20),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
   // Phase 18 round/anchor audit events (RND-01 / RND-02 / RND-03 / RND-05). All five variants share
   // the `rounds.` stage prefix; the client-side AuditDisplayStage normalization (see audit-grouping.ts)
   // collapses them to the single `rounds` display group while preserving the original event stage
