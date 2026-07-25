@@ -4535,3 +4535,101 @@ dbDescribe('Review Flow Lifecycle', () => {
     }, REVIEW_FLOW_TIMEOUT_MS);
   });
 });
+
+/**
+ * modelLineCap persistence integration test — verifies the full submit-poll roundtrip
+ * persists model_line_cap and that it survives persistCompletedReview despite a change
+ * in transient_error_count between submit and poll.
+ */
+dbDescribe('modelLineCap persistence across submit-poll roundtrip', () => {
+  const env = createTestEnv();
+
+  it('uses persisted model_line_cap in poll path even when transient_error_count changes between submit and poll', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const { ModelService } = await import('@server/services/model');
+
+    const repo = `mlc-persistence-${Date.now()}`;
+    const headSha = sha('m');
+
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+    );
+
+    // Spy on submitReviewBatch to return a defined modelLineCap
+    const submitSpy = vi
+      .spyOn(ModelService.prototype as any, 'submitReviewBatch')
+      .mockResolvedValue({ requestId: 'req-mlc', model: '@cf/moonshotai/kimi-k2.6', modelLineCap: 800 });
+
+    // pollReviewBatch: first call returns pending, second call returns done
+    let pollCallCount = 0;
+    const pollSpy = vi
+      .spyOn(ModelService.prototype as any, 'pollReviewBatch')
+      .mockImplementation(async () => {
+        pollCallCount += 1;
+        if (pollCallCount < 2) return { status: 'pending' as const };
+        return {
+          status: 'done' as const,
+          response: {
+            modelUsed: '@cf/moonshotai/kimi-k2.6',
+            provider: 'Cloudflare',
+            inputTokens: 10,
+            outputTokens: 5,
+            rawText: '{"findings":[]}',
+            userPrompt: '',
+            parsed: { comments: [], verdict: 'approve' as const, fileSummary: 'ok', overallCorrectness: 'patch is correct', confidenceScore: 0.9 },
+          },
+        };
+      });
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 1,
+      prTitle: 'MLC persistence test',
+      prAuthor: 'author',
+      commitSha: headSha,
+      baseSha: sha('n'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: defaultRepoConfig,
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+
+    // (1) Run the review phase — submits async batch, creates 'pending' file_review row
+    await runWithDb(env, async () => {
+      const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-mlc-1', phase: 'review' });
+      expect(res).toBeDefined();
+    });
+
+    // (2) Manually mutate transient_error_count on the pending row to simulate compact-mode activation
+    await queryRows(
+      env,
+      `UPDATE file_reviews SET transient_error_count = 1 WHERE async_request_id = $1`,
+      ['req-mlc'],
+    );
+
+    // (3) Run the review phase again — polls the async batch, completes via persistCompletedReview
+    await runWithDb(env, async () => {
+      const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-mlc-2', phase: 'review' });
+      expect(res).toBeDefined();
+    });
+
+    // (4) Assert model_line_cap survived persistCompletedReview at 800 (NOT null, NOT clobbered)
+    await runWithDb(env, async () => {
+      const rows = await queryRows<{ model_line_cap: number | null }>(
+        env,
+        `SELECT model_line_cap FROM file_reviews WHERE async_request_id = $1`,
+        ['req-mlc'],
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0].model_line_cap).toBe(800);
+    });
+
+    submitSpy.mockRestore();
+    pollSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
+});
