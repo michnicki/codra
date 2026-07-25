@@ -11,7 +11,7 @@ import { WALKTHROUGH_DIAGRAM_SYSTEM_PROMPT, buildWalkthroughDiagramPrompt } from
 import { WALKTHROUGH_ENRICHMENT_SYSTEM_PROMPT, buildWalkthroughEnrichmentPrompt, type EnrichmentFileEntry } from '../prompts/walkthrough-enrichment';
 import { parseFileReviewResponse, parseAnswerResponse } from '../core/model-output';
 import { truncateFileDiff, chunkFileDiff, type FileDiff } from '../core/diff';
-import type { RepoConfig } from '@shared/schema';
+import type { JobAuditEvent, RepoConfig } from '@shared/schema';
 import type { TokenTracker } from '../core/token-tracker';
 import { UnparseableModelResponseError, type ModelRequestInput, type ModelResponse } from '../models/types';
 import { logger } from '../core/logger';
@@ -22,6 +22,7 @@ import { decryptLlmApiKey } from '@server/core/llm-crypto';
 import { ModelCallGate, adaptiveModelTimeoutMs, MODEL_FALLBACK_CHAIN_BUDGET_MS } from '../models/limits';
 import { admitEnsembleUnit, type EnsembleRun, type EnsembleAdmissionShape } from '../core/ensemble';
 import { redactErrorMessage } from '../core/audit-redact';
+import { EVIDENCE_MISSING_SAMPLE_CAP, type EvidenceMissingSummaryAuditEvent } from '../core/audit';
 
 const PROVIDER_UNAVAILABLE_TTL_SECONDS = 24 * 60 * 60;
 const COMPACT_REVIEW_PROMPT_LINE_CAP = 400;
@@ -371,7 +372,48 @@ export class ModelService {
     const combinedFindings = results.flatMap(r => r.parsed.comments);
     // Merge every chunk's severity audit events (same .flatMap pattern as combinedFindings) so a
     // multi-chunk file surfaces adjustments from all chunks, not just the primary chunk's.
-    const combinedSeverityAuditEvents = results.flatMap(r => r.parsed.severityAuditEvents);
+    let combinedSeverityAuditEvents = results.flatMap(r => r.parsed.severityAuditEvents);
+    // Phase 21 (EVID-03 / REVIEWS.md HIGH — Codex): coalesce per-chunk evidence_missing_summary
+    // events into ONE aggregate per (file, pass) unit. reviewFileChunk is called once per chunk
+    // and each chunk runs parseFileReviewResponse which calls buildEvidenceMissingSummary. Without
+    // coalescing, an N-chunk file would emit N separate summaries with identical (file, pass),
+    // directly violating EVID-03's "one aggregate per (file, pass) unit" contract.
+    // Non-summary audit events (drafted, severity_adjusted, etc.) pass through unmodified.
+    const nonSummaryEvents = combinedSeverityAuditEvents.filter(
+      (e: JobAuditEvent) => e.stage !== 'evidence_missing_summary',
+    );
+    const summaryEvents = combinedSeverityAuditEvents.filter(
+      (e: JobAuditEvent) => e.stage === 'evidence_missing_summary',
+    ) as EvidenceMissingSummaryAuditEvent[];
+    if (summaryEvents.length > 1) {
+      const groups = new Map<string, EvidenceMissingSummaryAuditEvent[]>();
+      for (const evt of summaryEvents) {
+        const key = `${evt.file}|${evt.pass}`;
+        const group = groups.get(key) ?? [];
+        group.push(evt);
+        groups.set(key, group);
+      }
+      const coalescedSummaries: EvidenceMissingSummaryAuditEvent[] = [];
+      for (const [, group] of groups) {
+        if (group.length === 1) {
+          coalescedSummaries.push(group[0]);
+        } else {
+          const totalAbsent = group.reduce((s, e) => s + e.absentCount, 0);
+          const totalNotInHunk = group.reduce((s, e) => s + e.notInHunkCount, 0);
+          const mergedSample = group.flatMap((e) => e.sample).slice(0, EVIDENCE_MISSING_SAMPLE_CAP);
+          coalescedSummaries.push({
+            stage: 'evidence_missing_summary' as const,
+            file: group[0].file,
+            pass: group[0].pass,
+            absentCount: totalAbsent,
+            notInHunkCount: totalNotInHunk,
+            sample: mergedSample,
+            timestamp: group[group.length - 1].timestamp,
+          } satisfies JobAuditEvent);
+        }
+      }
+      combinedSeverityAuditEvents = [...nonSummaryEvents, ...coalescedSummaries];
+    }
     // Report the file with the most serious chunk's verdict/summary/correctness, not just the last
     // chunk's: taking `results[results.length - 1]` would let a clean final chunk mask real findings
     // from an earlier chunk of the same file (reporting verdict 'approve' while carrying its comments).
