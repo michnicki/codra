@@ -445,6 +445,10 @@ export function parseFileReviewResponse(
     .map((finding) => {
       // Codex style findings use start/end or line
       let line = finding.code_location.line || finding.code_location.line_range?.start;
+      // EVID-04: capture the original model-cited line BEFORE the orphan-comment line remap below
+      // (lines 451-460). The evidence_missing_summary sample records the pre-remap line so EVID-02
+      // analysis sees the model's cited line, not the remapped position-lookup line.
+      const originalLine = finding.code_location.line || finding.code_location.line_range?.start;
       let position: number | undefined;
 
       // Try to find position for the line
@@ -526,10 +530,10 @@ export function parseFileReviewResponse(
         // EVID-03: accumulate as EvidenceMissingEntry (raw title, not redacted — the builder applies
         // redactFindingTitle internally per D-06). `line` normalized via ?? null for the
         // EvidenceMissingEntry type (number | undefined -> number | null).
-        evidenceMissingEntries.push({ path: file.path, line: line ?? null, title, reason: 'absent' });
+        evidenceMissingEntries.push({ path: file.path, line: originalLine ?? null, title, reason: 'absent' });
       } else if (!evidenceHaystack.includes(needle)) {
-        // EVID-03: same accumulation for not_in_hunk; line ?? null type normalization.
-        evidenceMissingEntries.push({ path: file.path, line: line ?? null, title, reason: 'not_in_hunk' });
+        // EVID-03: same accumulation for not_in_hunk; originalLine ?? null type normalization.
+        evidenceMissingEntries.push({ path: file.path, line: originalLine ?? null, title, reason: 'not_in_hunk' });
       }
 
       return parsedReviewCommentSchema.parse({
