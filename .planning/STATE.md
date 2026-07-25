@@ -5,8 +5,8 @@ milestone_name: Bounded Evidence Audit Telemetry
 current_phase: 24
 current_phase_name: Dashboard surface for new audit events
 status: executing
-stopped_at: Phase 23 context gathered
-last_updated: "2026-07-25T21:13:45.153Z"
+stopped_at: Phase 24 context gathered
+last_updated: "2026-07-25T21:35:33.977Z"
 last_activity: 2026-07-25
 last_activity_desc: Phase 23 complete, transitioned to Phase 24
 progress:
@@ -14,7 +14,6 @@ progress:
   completed_phases: 3
   total_plans: 4
   completed_plans: 4
-  percent: 60
 ---
 
 # Project State
@@ -254,9 +253,9 @@ Items acknowledged and carried forward:
 
 ## Session Continuity
 
-Last session: 2026-07-25T20:22:57.825Z
-Stopped at: Phase 23 context gathered
-Resume file: .planning/phases/23-in-01-modellinecap-persistence-at-submit-time/23-CONTEXT.md
+Last session: 2026-07-25T21:35:33.964Z
+Stopped at: Phase 24 context gathered
+Resume file: .planning/phases/24-dashboard-surface-for-new-audit-events/24-CONTEXT.md
 
 ## Operator Next Steps
 
