@@ -1320,9 +1320,13 @@ async function runReviewPhase(
           // thread config so the async-batch parse path resolves the severity_engine.enabled escape
           // hatch from this repo's config, matching the sync path (13-04)
           config,
+          // D-04, D-05: use persisted submit-time value when available. Retain compactPrompt
+          // alongside for legacy rows where model_line_cap is NULL (consensus #1).
+          modelLineCap: awaitingReview.model_line_cap ?? undefined,
           // EVID-01 (Codex 15-04 HIGH): the same compact-prompt derivation submitReviewBatch used, so
           // pollReviewBatch reconstructs the EXACT bounded (truncated) file the model saw before the
           // evidence gate builds its haystack — truncated-away evidence correctly emits not_in_hunk.
+          // RETAINED alongside modelLineCap for legacy rows with NULL model_line_cap.
           compactPrompt: (awaitingReview.transient_error_count ?? existingReview?.transient_error_count ?? 0) > 0,
         });
         if (poll.status === 'pending') {
@@ -1377,6 +1381,7 @@ async function runReviewPhase(
               errorMessage: null,
               asyncRequestId: submitted.requestId,
               asyncModel: submitted.model,
+              modelLineCap: submitted.modelLineCap,
             });
             awaitingAsync += 1;
             return;
