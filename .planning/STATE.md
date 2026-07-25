@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Bounded Evidence Audit Telemetry
-current_phase: 23
-current_phase_name: IN-01 modelLineCap Persistence at Submit Time
-status: complete
-stopped_at: Phase 23 plan 01 complete — all 3 tasks, AUD-03 checked off
-last_updated: "2026-07-25T23:22:00.000Z"
+current_phase: 24
+current_phase_name: Dashboard surface for new audit events
+status: executing
+stopped_at: Phase 23 context gathered
+last_updated: "2026-07-25T21:13:45.153Z"
 last_activity: 2026-07-25
-last_activity_desc: Phase 23 plan 01 complete — modelLineCap persistence at submit time
+last_activity_desc: Phase 23 complete, transitioned to Phase 24
 progress:
   total_phases: 5
   completed_phases: 3
@@ -28,10 +28,10 @@ See: .planning/PROJECT.md (updated 2026-07-25 for v1.2 closure)
 
 ## Current Position
 
-Phase: 23 (IN-01 modelLineCap Persistence at Submit Time) — EXECUTING
-Plan: 1 of 1
+Phase: 24 — Dashboard surface for new audit events
+Plan: Not started
 Status: Executing Phase 23
-Last activity: 2026-07-25 — Phase 23 execution started
+Last activity: 2026-07-25 — Phase 23 complete, transitioned to Phase 24
 
 ## Performance Metrics
 

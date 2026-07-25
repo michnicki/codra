@@ -37,7 +37,7 @@ Plans:
 **Goal:** Persist the `modelLineCap` value used at async submit time so `pollReviewBatch` uses the exact haystack boundary the model saw for evidence reconstruction, fixing a race condition where a mutable `transient_error_count` between submit and poll causes incorrect `not_in_hunk` evidence classification.
 **Requirements**: AUD-03
 **Depends on:** Phase 22
-**Plans:** 1 plan
+**Plans:** 1/1 plans complete
 
 Plans:
 
