@@ -16,7 +16,6 @@ import {
 import { z } from 'zod';
 import { logger } from './logger';
 import { applySeverityRules } from './severity';
-import { redactFindingTitle } from './audit-redact';
 import { buildEvidenceMissingSummary } from './audit';
 import type { EvidenceMissingEntry } from './audit';
 import { findClosestValidLine, findPositionForLine, getValidNewLines, getValidPositions } from './diff';
