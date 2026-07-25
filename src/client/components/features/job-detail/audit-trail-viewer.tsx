@@ -169,6 +169,28 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
           <SampleIdentifier path={event.path} line={event.line} title={event.title} />
         </li>
       );
+    // Phase 24: evidence_missing_summary aggregate event — the operator sees file+pass as identifier,
+    // absentCount+notInHunkCount as metric lines, and up to 20 sample entries with path:line, title,
+    // and reason. No model_line_cap data is surfaced per D-03.
+    case 'evidence_missing_summary':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="file" value={event.file} />
+          <MetricLine label="pass" value={event.pass} />
+          <MetricLine label="absent" value={String(event.absentCount)} />
+          <MetricLine label="not in hunk" value={String(event.notInHunkCount)} />
+          {event.sample.length > 0 && (
+            <ul className="mt-2 flex flex-col gap-1.5 border-t border-border/30 pt-2">
+              {event.sample.map((s, i) => (
+                <li key={i}>
+                  <SampleIdentifier path={s.path} line={s.line} title={s.title} />
+                  <div className="text-[10px] text-muted-foreground/70 font-mono">{s.reason}</div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </li>
+      );
     // Phase 18 RND-01..05: every `rounds.*` sub-variant lands inside the normalized `Rounds`
     // DecisionGroup via the audit-grouping normalizer. The original event.stage distinguishes
     // each sub-variant for the per-row renderer below; .passthrough() keeps every known field
