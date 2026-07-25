@@ -11,9 +11,10 @@
 //       silent no-op for resolution; the model-call failure path is also a silent no-op for
 //       resolution (D-02).
 //
-// The tests exercise the pure orchestration seam (processVerifyFixesBatch) with synthetic
-// dependencies so they stay under the normal vitest runner without spinning up Cloudflare
-// bindings. The high-level runVerifyFixesPhase is integration-tested by review-flow.spec.ts.
+// The tests use a local `processOneBatch` simulation defined inline in the multi-invocation
+// describe block to exercise the multi-invocation exactly-once semantics without spinning up
+// Cloudflare bindings. The high-level runVerifyFixesPhase is integration-tested by
+// review-flow.spec.ts.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { TokenTracker } from '@server/core/token-tracker';
@@ -489,13 +490,21 @@ describe('verify-fixes windowing', () => {
   });
 
   it('builds merged 50-line windows that preserve ordering and stamp safe boundaries', () => {
-    const lines = Array.from({ length: 175 }, (_, i) => `line ${i + 1}`);
+    // Phase 19 Plan 10 (THR-01): the locked boundary is "<=500 lines full content; larger files
+    // windowed into 50-line slices". Build FULL_CONTENT_LINE_CAP + 75 lines so the fixture sits
+    // strictly above the cap and exercises the windowing math (12 windows: 50 x 11 + 25 = 575).
+    // The constant import keeps the fixture in sync if FULL_CONTENT_LINE_CAP ever changes again.
+    const lines = Array.from({ length: FULL_CONTENT_LINE_CAP + 75 }, (_, i) => `line ${i + 1}`);
     const windows = windowFileContent('src/example.ts', lines.join('\n')) ?? [];
-    expect(windows.length).toBe(4);
+    expect(windows.length).toBe(12);
     const totalLines = windows.reduce((sum, w) => sum + w.lineCount, 0);
-    expect(totalLines).toBe(175);
+    expect(totalLines).toBe(FULL_CONTENT_LINE_CAP + 75);
     expect(windows[0]).toMatchObject({ mergedStart: 1, mergedEnd: 50, lineCount: 50 });
-    expect(windows[windows.length - 1]).toMatchObject({ mergedStart: 151, mergedEnd: 175, lineCount: 25 });
+    expect(windows[windows.length - 1]).toMatchObject({
+      mergedStart: FULL_CONTENT_LINE_CAP + 51,
+      mergedEnd: FULL_CONTENT_LINE_CAP + 75,
+      lineCount: 25,
+    });
   });
 });
 
