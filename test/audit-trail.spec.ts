@@ -1,10 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
 import { insertJob, getJobDetail, appendJobAuditEvents } from '@server/db/jobs';
 import * as jobsModule from '@server/db/jobs';
-import { buildFileSkipEvents, recordFileSkips, recordUnitAudit } from '@server/core/audit';
+import { buildFileSkipEvents, recordFileSkips, recordUnitAudit, buildEvidenceMissingSummary } from '@server/core/audit';
 import type { FileDiff } from '@server/core/diff';
 import { queryRows } from '@server/db/client';
 import { defaultRepoConfig, type JobAuditEvent } from '@shared/schema';
+import { jobAuditEventSchema } from '@shared/schema';
 import { logger } from '@server/core/logger';
 import { createTestEnv, hasConfiguredTestDatabaseUrl } from './helpers';
 
@@ -291,6 +292,100 @@ describe('buildFileSkipEvents pure drop-event builder (PRIO-03, D-11/D-12)', () 
         expect(entry).not.toHaveProperty('codeSuggestion');
       }
     }
+  });
+});
+
+describe('buildEvidenceMissingSummary (EVID-03, D-05/D-06/D-07)', () => {
+  it('empty input returns null (D-05)', () => {
+    expect(buildEvidenceMissingSummary('a.ts', 'main', [])).toBeNull();
+  });
+
+  it('single entry still produces one aggregate (D-06)', () => {
+    const event = buildEvidenceMissingSummary('a.ts', 'main', [
+      { path: 'src/x.ts', line: 10, title: 'finding one', reason: 'absent' },
+    ])!;
+
+    expect(event.stage).toBe('evidence_missing_summary');
+    expect(event.absentCount).toBe(1);
+    expect(event.notInHunkCount).toBe(0);
+    expect(event.sample).toHaveLength(1);
+  });
+
+  it('mixed reasons produce correct counts', () => {
+    const event = buildEvidenceMissingSummary('a.ts', 'main', [
+      { path: 'src/x.ts', line: 10, title: 'finding one', reason: 'absent' },
+      { path: 'src/y.ts', line: 20, title: 'finding two', reason: 'not_in_hunk' },
+    ])!;
+
+    expect(event.absentCount).toBe(1);
+    expect(event.notInHunkCount).toBe(1);
+  });
+
+  it('sample capped at 20, counts reflect full total', () => {
+    const entries = Array.from({ length: 25 }, (_, i) => ({
+      path: `src/x/${i}.ts`,
+      line: i,
+      title: `finding ${i}`,
+      reason: (i < 15 ? 'absent' : 'not_in_hunk') as 'absent' | 'not_in_hunk',
+    }));
+
+    const event = buildEvidenceMissingSummary('a.ts', 'main', entries)!;
+
+    expect(event.sample).toHaveLength(20);
+    expect(event.absentCount).toBe(15);
+    expect(event.notInHunkCount).toBe(10);
+  });
+
+  it('model emission order preserved (D-07)', () => {
+    const event = buildEvidenceMissingSummary('a.ts', 'main', [
+      { path: 'src/a.ts', line: 1, title: 'first', reason: 'absent' },
+      { path: 'src/b.ts', line: 2, title: 'second', reason: 'not_in_hunk' },
+      { path: 'src/c.ts', line: 3, title: 'third', reason: 'absent' },
+    ])!;
+
+    expect(event.sample).toHaveLength(3);
+    expect(event.sample[0].reason).toBe('absent');
+    expect(event.sample[1].reason).toBe('not_in_hunk');
+    expect(event.sample[2].reason).toBe('absent');
+  });
+
+  it('title redacted via redactFindingTitle', () => {
+    const event = buildEvidenceMissingSummary('a.ts', 'main', [
+      { path: 'src/x.ts', line: 10, title: 'secret-finding', reason: 'absent' },
+    ])!;
+
+    expect(event.sample[0].title).toBe('[title-redacted]');
+  });
+
+  it('file+pass identity correct', () => {
+    const event = buildEvidenceMissingSummary('src/test.ts', 'main', [
+      { path: 'src/x.ts', line: 10, title: 'finding', reason: 'absent' },
+    ])!;
+
+    expect(event.file).toBe('src/test.ts');
+    expect(event.pass).toBe('main');
+  });
+
+  it('both main and security passes accepted', () => {
+    const mainEvent = buildEvidenceMissingSummary('a.ts', 'main', [
+      { path: 'src/x.ts', line: 10, title: 'finding', reason: 'absent' },
+    ])!;
+    const secEvent = buildEvidenceMissingSummary('a.ts', 'security', [
+      { path: 'src/x.ts', line: 10, title: 'finding', reason: 'absent' },
+    ])!;
+
+    expect(mainEvent.pass).toBe('main');
+    expect(secEvent.pass).toBe('security');
+  });
+
+  it('builder output round-trips through jobAuditEventSchema', () => {
+    const event = buildEvidenceMissingSummary('src/test.ts', 'main', [
+      { path: 'src/a.ts', line: 10, title: 'first', reason: 'absent' },
+      { path: 'src/b.ts', line: null, title: 'second', reason: 'not_in_hunk' },
+    ])!;
+
+    const result = jobAuditEventSchema.safeParse(event);
+    expect(result.success).toBe(true);
   });
 });
 
