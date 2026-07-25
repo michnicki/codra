@@ -349,7 +349,7 @@ const ENSEMBLE_DROPPED_SAMPLE_CAP = 20;
 const ENSEMBLE_FAILED_RUN_REASONS_CAP = 4;
 
 // Phase 21 (EVID-03): evidence_missing_summary bounded sample cap (schema .max(20) constant for the builder).
-const EVIDENCE_MISSING_SAMPLE_CAP = 20;
+export const EVIDENCE_MISSING_SAMPLE_CAP = 20;
 
 export type EvidenceMissingSummaryAuditEvent = Extract<JobAuditEvent, { stage: 'evidence_missing_summary' }>;
 
