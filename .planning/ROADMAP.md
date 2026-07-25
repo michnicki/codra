@@ -45,14 +45,14 @@ Plans:
 
 ### Phase 24: Dashboard surface for new audit events
 
-**Goal:** [To be planned]
-**Requirements**: TBD
+**Goal:** Surface `evidence_missing_summary` audit events in the dashboard's job-detail audit trail viewer
+**Requirements**: EVID-03, EVID-04, AUD-03 (dashboard catch-up)
 **Depends on:** Phase 23
-**Plans:** 0 plans
+**Plans:** 1 plan
 
 Plans:
 
-- [ ] TBD (run /gsd-plan-phase 24 to break down)
+- [ ] 24-01-PLAN.md — Add normalizer mapping + renderer + tests for evidence_missing_summary
 
 ### Phase 25: Milestone closeout (audit, verification, sign-off)
 
