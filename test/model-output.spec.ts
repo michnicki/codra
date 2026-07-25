@@ -475,6 +475,36 @@ describe('EVID-01/EVID-03 soft evidence gate (evidence_missing_summary aggregate
     expect(events[0].sample[0].reason).toBe('absent');
     expect(events[0].sample[1].reason).toBe('not_in_hunk');
   });
+
+  it('evidence_missing_summary sample entry carries the original model-cited line, not the orphan-remap line (EVID-04)', () => {
+    // Model cites line 5, which is outside valid diff lines {1,2,3}. The orphan remap moves it to the
+    // closest valid line (3), so the finding survives the orphan check. The evidence_missing_summary
+    // sample must carry the ORIGINAL line (5), NOT the remapped line (3), while the comment itself
+    // uses the remapped line (proving remap logic is untouched).
+    const raw = JSON.stringify({
+      findings: [
+        {
+          title: 'Off-diff evidence',
+          body: 'This finding cites a line just outside the diff.',
+          priority: 2,
+          code_location: { absolute_file_path: 'src/evid.ts', line: 5 },
+          existing_code: '   ',
+        },
+      ],
+      overall_correctness: 'patch is incorrect',
+      overall_explanation: 'Found an issue',
+    });
+    const result = parseFileReviewResponse(raw, evidenceFile);
+    expect(result.comments).toHaveLength(1);
+    // Comment line is remapped (orphan remap is untouched per D-01)
+    expect(result.comments[0].line).toBe(3);
+    const events = evidenceEvents(result);
+    expect(events).toHaveLength(1);
+    expect(events[0].sample).toHaveLength(1);
+    // Sample entry carries the original model-cited line (5), not the remapped line (3)
+    expect(events[0].sample[0].line).toBe(5);
+    expect(events[0].sample[0].reason).toBe('absent');
+  });
 });
 
 describe('normalizeForEvidence (D-16)', () => {
