@@ -24,14 +24,6 @@ export default defineConfig({
   },
   test: {
     globals: true,
-    // Phase 20.1 WARNING 1 closure: build the production Vite/Tailwind bundle once (in node
-    // context) before any test runs so the browser harness can fetch the production CSS from a
-    // real origin. The globalSetup at `test/support/visual-backstop-global-setup.ts` invokes
-    // `vite build` + `cleanProductionBuild`; the served-asset behavior is provided by the
-    // `visualBackstopPlugin` Vite plugin (above) which exposes `dist/client/` at
-    // `${window.__VISUAL_BACKSTOP_BASE__}/*` on the vitest server origin. The browser test
-    // reads the injected base path and fetches the bundled CSS via fetch().
-    globalSetup: ['./test/support/visual-backstop-global-setup.ts'],
     projects: [
       {
         extends: true,
@@ -85,6 +77,18 @@ export default defineConfig({
           name: 'browser',
           include: ['test/browser/**/*.spec.tsx'],
           setupFiles: ['./test/browser/setup.ts'],
+          // Phase 20.1 WARNING 1 closure: build the production Vite/Tailwind bundle once (in node
+          // context) before any browser test runs so the browser harness can fetch the production
+          // CSS from a real origin. The globalSetup at
+          // `test/support/visual-backstop-global-setup.ts` invokes `vite build` +
+          // `cleanProductionBuild`; the served-asset behavior is provided by the
+          // `visualBackstopPlugin` Vite plugin (above) which exposes `dist/client/` at
+          // `${window.__VISUAL_BACKSTOP_BASE__}/*` on the vitest server origin. The browser test
+          // reads the injected base path and fetches the bundled CSS via fetch().
+          //
+          // This globalSetup is scoped to the browser project so unrelated node-only test runs
+          // do not build or mutate `dist/client`.
+          globalSetup: ['./test/support/visual-backstop-global-setup.ts'],
           browser: {
             enabled: true,
             headless: true,

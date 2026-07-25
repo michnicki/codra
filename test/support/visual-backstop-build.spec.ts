@@ -25,13 +25,7 @@ import {
   serveProductionBundle,
 } from './visual-backstop-build';
 
-let serveHandle: { url: string; close: () => Promise<void> } | null = null;
-
-afterAll(async () => {
-  if (serveHandle) {
-    await serveHandle.close();
-    serveHandle = null;
-  }
+afterAll(() => {
   cleanProductionBuild();
 });
 
@@ -59,32 +53,44 @@ describe('visual-backstop-build helper', () => {
 
   it('Test 13: serveProductionBundle returns a handle with a URL', async () => {
     buildProductionBundle();
-    serveHandle = await serveProductionBundle();
-    expect(serveHandle.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
-    expect(typeof serveHandle.close).toBe('function');
+    const handle = await serveProductionBundle();
+    try {
+      expect(handle.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+      expect(typeof handle.close).toBe('function');
+    } finally {
+      await handle.close();
+    }
   }, 180_000);
 
   it('Test 14: GET on the served URL returns 200', async () => {
     buildProductionBundle();
-    serveHandle = await serveProductionBundle();
-    const status = await fetchStatus(serveHandle.url + '/');
-    expect(status).toBe(200);
+    const handle = await serveProductionBundle();
+    try {
+      const status = await fetchStatus(handle.url + '/');
+      expect(status).toBe(200);
+    } finally {
+      await handle.close();
+    }
   }, 180_000);
 
   it('Test 15: GET on the bundled CSS URL returns 200 with a non-empty body', async () => {
     buildProductionBundle();
-    serveHandle = await serveProductionBundle();
-    const cssPath = findBundledCssPath();
-    const cssFileName = path.basename(cssPath);
-    const cssUrl = serveHandle.url + '/assets/' + cssFileName;
-    const { status, body } = await fetchBody(cssUrl);
-    expect(status).toBe(200);
-    expect(body.length).toBeGreaterThan(0);
-    // Sanity-check: the production CSS must contain at least one Tailwind utility we depend on.
-    // `.line-clamp-2` is the load-bearing class asserted in visual-backstops.spec.tsx for the
-    // two-line title geometry test. If Tailwind drops it from the production build, the visual
-    // backstop must fail — this test pins that contract.
-    expect(body).toMatch(/line-clamp-2/);
+    const handle = await serveProductionBundle();
+    try {
+      const cssPath = findBundledCssPath();
+      const cssFileName = path.basename(cssPath);
+      const cssUrl = handle.url + '/assets/' + cssFileName;
+      const { status, body } = await fetchBody(cssUrl);
+      expect(status).toBe(200);
+      expect(body.length).toBeGreaterThan(0);
+      // Sanity-check: the production CSS must contain at least one Tailwind utility we depend on.
+      // `.line-clamp-2` is the load-bearing class asserted in visual-backstops.spec.tsx for the
+      // two-line title geometry test. If Tailwind drops it from the production build, the visual
+      // backstop must fail — this test pins that contract.
+      expect(body).toMatch(/line-clamp-2/);
+    } finally {
+      await handle.close();
+    }
   }, 180_000);
 
   it('Test 16: cleanProductionBuild removes dist/client/', () => {
