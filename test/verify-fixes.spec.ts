@@ -75,6 +75,15 @@ describe('verify-fixes windowing', () => {
     expect(windowFileContent(heading, lines.join('\n'))).toBeNull();
   });
 
+  it('returns null when total line count is one below the full-content cap (locked <cap boundary)', () => {
+    // Phase 19 Plan 10 (THR-01): the locked requirement is "files at or below 500 lines use full
+    // content". This pin captures the strict less-than-cap branch: even at FULL_CONTENT_LINE_CAP - 1
+    // lines the verifier sees a single null slice (one full-content pass), not a windowed array.
+    const heading = 'src/example.ts';
+    const lines = Array.from({ length: FULL_CONTENT_LINE_CAP - 1 }, (_, i) => `line ${i + 1}`);
+    expect(windowFileContent(heading, lines.join('\n'))).toBeNull();
+  });
+
   it('returns the rendered full content when file fits within the cap', () => {
     const content = ['line 1', 'line 2', 'line 3'].join('\n');
     expect(windowFileContent('src/example.ts', content)).toBeNull();
@@ -82,12 +91,15 @@ describe('verify-fixes windowing', () => {
 
   it('builds merged 50-line windows that preserve ordering and stamp safe boundaries', () => {
     const heading = 'src/example.ts';
-    const lines = Array.from({ length: 175 }, (_, i) => `line ${i + 1}`);
+    // Phase 19 Plan 10 (THR-01): the locked boundary is "<=500 lines full content; larger files
+    // windowed into 50-line slices". Build exactly FULL_CONTENT_LINE_CAP + 1 lines so the fixture
+    // stays in sync with the constant if it ever changes again; under the locked 500 boundary this
+    // yields 11 windows of 50/50/50/50/50/50/50/50/50/50/1 (501 lines total).
+    const lines = Array.from({ length: FULL_CONTENT_LINE_CAP + 1 }, (_, i) => `line ${i + 1}`);
     const windows = windowFileContent(heading, lines.join('\n')) ?? [];
-    // 175 lines -> 4 windows (50 + 50 + 50 + 25)
-    expect(windows.length).toBe(4);
+    expect(windows.length).toBe(11);
     const totalLines = windows.reduce((sum, window) => sum + window.lineCount, 0);
-    expect(totalLines).toBe(175);
+    expect(totalLines).toBe(FULL_CONTENT_LINE_CAP + 1);
     for (const window of windows) {
       expect(window.lineCount).toBeLessThanOrEqual(WINDOW_LINE_COUNT);
       expect(window.mergedStart).toBeLessThanOrEqual(window.mergedEnd);
@@ -98,9 +110,9 @@ describe('verify-fixes windowing', () => {
       lineCount: 50,
     });
     expect(windows[windows.length - 1]).toMatchObject({
-      mergedStart: 151,
-      mergedEnd: 175,
-      lineCount: 25,
+      mergedStart: FULL_CONTENT_LINE_CAP + 1,
+      mergedEnd: FULL_CONTENT_LINE_CAP + 1,
+      lineCount: 1,
     });
   });
 

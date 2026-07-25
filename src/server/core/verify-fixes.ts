@@ -19,12 +19,13 @@ import { sanitizeUntrusted } from '../prompts/file-review';
 // single hunk block -- pinned to WINDOW_LINE_COUNT today (one window per hunk); kept as its own
 // named constant so a future increase does not require re-deriving the windowing math.
 //
-// The cap is small (< 175) by design: the verifier is the SECOND LLM call against the same file
-// (review → verify), and a small cap keeps the second call's prompt well inside a single model's
-// context window even for files that are reasonably sized in the human-readable sense. Files
-// beyond the cap are windowed into WINDOW_LINE_COUNT-sized slices so the verifier can still grade
-// each thread's line range precisely.
-export const FULL_CONTENT_LINE_CAP = 100;
+// Phase 19 Plan 10 (THR-01): the cap is locked at 500 lines (Phase 19 success criterion + REQUIREMENTS
+// THR-01). The verifier is the SECOND LLM call against the same file (review → verify), so the
+// prompt must still fit inside a single model's context window; 500 lines of typical source code
+// (≈10-15k tokens) is well within the 100k+ token context of every supported provider adapter
+// (Anthropic, OpenAI, Google, Cloudflare). Files beyond the cap are windowed into
+// WINDOW_LINE_COUNT-sized slices so the verifier can still grade each thread's line range precisely.
+export const FULL_CONTENT_LINE_CAP = 500;
 export const WINDOW_LINE_COUNT = 50;
 export const SAFE_HUNK_LINE_LIMIT = WINDOW_LINE_COUNT;
 
@@ -391,25 +392,6 @@ type VerifyFixesAuditEvent = NonNullable<
   ? never
   : { threadRef: string; path: string; line: number | null; reason: string };
 
-export type VerifyFixesBatchDeps = {
-  fetchFileContent: (path: string) => Promise<string | null>;
-  callVerifier: (input: { systemPrompt: string; userPrompt: string; temperature?: number }) => Promise<{
-    rawText: string;
-    modelUsed: string;
-    inputTokens: number;
-    outputTokens: number;
-  }>;
-  resolveThread: (threadRef: string) => Promise<boolean>;
-  tracker: TokenTracker;
-  autoResolveEnabled: boolean;
-  auditAppend?: (events: Array<{ stage: string; [key: string]: unknown; timestamp: string }>) => Promise<void>;
-};
-
-export type VerifyFixesBatchResult =
-  | { kind: 'completed'; state: ThreadVerifications }
-  | { kind: 'yielded'; state: ThreadVerifications; reason: string }
-  | { kind: 'failed-open'; state: ThreadVerifications; reason: string };
-
 /**
  * Public phase entry point. Loads the durable cursor, dispatches a batched loop that admits against
  * the safe budget before each external call, persists the cursor after every bounded batch, and
@@ -740,34 +722,6 @@ export async function runVerifyFixesPhase(
   // (NREG-01 default).
   const handOff = nextPhaseAfterVerifyFixes(config);
   throw new NextPhaseError(handOff, VERIFY_FIXES_FRESH_INVOCATION_YIELD_SECONDS);
-}
-
-/**
- * Resume-friendly: process at most one bounded batch and return the new state + a yield signal.
- * The single-batch return shape lets tests force continuation at the content-fetch, model-batch,
- * and resolution boundaries independently. The high-level phase wrapper (`runVerifyFixesPhase`)
- * invokes this in a loop until the phase reaches a terminal status.
- */
-export async function processVerifyFixesBatch(
-  state: ThreadVerifications,
-  deps: VerifyFixesBatchDeps,
-  job: { id: string; owner: string; repo: string; commitSha: string },
-): Promise<VerifyFixesBatchResult> {
-  // Idempotent re-entry guard.
-  if (state.status === 'completed' || state.status === 'fail_open') {
-    return { kind: 'completed', state };
-  }
-
-  // ... batch processing implementation ...
-  // (This is the test-friendly lower-level entry point used by verify-fixes-orchestration.spec.ts)
-  //
-  // NOTE: The high-level runVerifyFixesPhase implements the full phase; tests can either drive
-  // the low-level processVerifyFixesBatch with synthetic deps OR call the high-level wrapper with
-  // mocked vcs/model services. This function is the test seam.
-
-  // For the initial implementation we keep the orchestration single-batched in the high-level
-  // function and expose this lower-level seam for future expansion.
-  return { kind: 'completed', state };
 }
 
 // ============================================================================
