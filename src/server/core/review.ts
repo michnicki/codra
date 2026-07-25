@@ -657,32 +657,45 @@ async function continueOrFailWedgedJob(
       const configFromJob = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
       return { action: 'next_phase', phase: nextPhaseAfterReview(configFromJob), delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
     } else if (phase === 'critic') {
-      // FAIL-OPEN ceiling (MP-03): a wedged critic (repeated subrequest-budget exhaustion on its
-      // fresh-instance retries) must NEVER terminal-fail the job. Reset the continuation counter and
-      // hand finalize its own fresh instance/budget; finalize's null-critic_result branch (10-07)
-      // reconstructs the deduped candidate set, so no finding is lost by skipping the critic.
-      logger.error(`Critic phase exceeded the continuation ceiling; failing OPEN to finalize (no critique applied): ${job.owner}/${job.repo} PR #${job.prNumber}`, {
+      // FAIL-OPEN ceiling (Phase 20.1 GAP-02): a wedged critic (repeated subrequest-budget exhaustion
+      // on its fresh-instance retries) must NEVER terminal-fail the job. Reset the continuation counter
+      // and route through the same `nextPhaseAfterCritic` selector the healthy/no-skip paths use, so
+      // a configured walkthrough_enrichment hop still runs after the critic fails open (chain order
+      // verify_fixes -> critic -> walkthrough_enrichment -> finalize is preserved under both healthy
+      // and degraded completion). The verify_fixes hop is intentionally ABSENT: it is the FIRST hop
+      // after review, never a hop after critic — re-entering verify_fixes would recreate the
+      // critic -> verify_fixes loop Plan 20.1-02 / commit caf2eef fixed. finalize's null-critic_result
+      // branch (10-07) reconstructs the deduped candidate set, so no finding is lost by skipping the
+      // critic.
+      const configFromCritic = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
+      logger.error(`Critic phase exceeded the continuation ceiling; failing OPEN to configured post-critic successor (no critique applied): ${job.owner}/${job.repo} PR #${job.prNumber}`, {
         phase,
         continuationCount,
         reason,
+        successor: nextPhaseAfterCritic(configFromCritic),
       });
       await resetJobContinuationCount(env, job.id);
       await releaseJobLease(env, job.id, leaseOwner);
-      return { action: 'next_phase', phase: 'finalize', delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
+      return { action: 'next_phase', phase: nextPhaseAfterCritic(configFromCritic), delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
     } else if (phase === 'verify_fixes') {
-      // FAIL-OPEN ceiling (D-03): a wedged verify_fixes (repeated subrequest-budget exhaustion on its
-      // fresh-instance retries) must NEVER terminal-fail the job. Reset the continuation counter and
-      // hand finalize its own fresh instance/budget; finalize reads the persisted
+      // FAIL-OPEN ceiling (Phase 20.1 GAP-02): a wedged verify_fixes (repeated subrequest-budget
+      // exhaustion on its fresh-instance retries) must NEVER terminal-fail the job. Reset the
+      // continuation counter and route through the same `nextPhaseAfterVerifyFixes` selector the
+      // successful completion path uses, so a configured critic hop (and walkthrough when critic is
+      // off) still runs after verify_fixes fails open. finalize reads the persisted
       // thread_verifications JSONB idempotently so a fail-open verify_fixes still surfaces whatever
-      // entries the cursor had persisted before exhaustion.
-      logger.error(`verify_fixes phase exceeded the continuation ceiling; failing OPEN to finalize (verification halted at cursor): ${job.owner}/${job.repo} PR #${job.prNumber}`, {
+      // entries the cursor had persisted before exhaustion. Verification is halted at the cursor;
+      // the chain continues through the configured successor.
+      const configFromVerifyFixes = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
+      logger.error(`verify_fixes phase exceeded the continuation ceiling; failing OPEN to configured post-verify-fixes successor (verification halted at cursor): ${job.owner}/${job.repo} PR #${job.prNumber}`, {
         phase,
         continuationCount,
         reason,
+        successor: nextPhaseAfterVerifyFixes(configFromVerifyFixes),
       });
       await resetJobContinuationCount(env, job.id);
       await releaseJobLease(env, job.id, leaseOwner);
-      return { action: 'next_phase', phase: 'finalize', delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
+      return { action: 'next_phase', phase: nextPhaseAfterVerifyFixes(configFromVerifyFixes), delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
     } else {
       const message = `Review could not make progress after ${continuationCount} continuation attempts (${reason}). Failing the job to avoid an endless retry loop; re-run it once the underlying provider issue clears.`;
       logger.error(`Review job exceeded the continuation ceiling; failing terminally: ${job.owner}/${job.repo} PR #${job.prNumber}`, {
@@ -2718,10 +2731,13 @@ async function runCriticPhase(
     await enqueueJobPhase(
       env,
       job.id,
-      // Post-critic routing: verify_fixes (when enabled) → walkthrough_enrichment (when enabled) →
-      // finalize. The walkthrough enrichment runs on its own fresh budget regardless of the
-      // preceding verify_fixes presence so the durable chain stays correct in either toggle config.
-      config.review.threads?.verify_fixes ? 'verify_fixes' : nextPhaseAfterCritic(config),
+      // Phase 20.1 (BLOCKER 3 chain correctness): post-critic hand-off is walkthrough_enrichment
+      // (when enabled) → finalize. The verify_fixes is the FIRST hop after review (not a hop after
+      // critic) — chaining critic → verify_fixes would create a loop (review → verify_fixes →
+      // critic → verify_fixes → ...). The walkthrough_enrichment runs on its own fresh budget
+      // regardless of the preceding verify_fixes presence so the durable chain stays correct in
+      // either toggle config.
+      nextPhaseAfterCritic(config),
       FRESH_INVOCATION_YIELD_SECONDS,
     );
     return;
@@ -2729,18 +2745,18 @@ async function runCriticPhase(
 
   // (2) TOGGLE-OFF fail-open: a critic phase reached with passes.critic off (config drift / a stale
   // in-flight message after the toggle was turned off) must NOT run — fail open to the next phase
-  // (verify_fixes if enabled, else finalize) so behavior is byte-identical to the critic-off engine
-  // (NREG-01, Pitfall 5).
+  // (walkthrough_enrichment if enabled, else finalize) so behavior is byte-identical to the
+  // critic-off engine (NREG-01, Pitfall 5).
   if (!config.review.passes?.critic?.enabled) {
     logger.info(`Critic phase reached for job ${job.id} but passes.critic is off; failing open.`);
     await enqueueJobPhase(
       env,
       job.id,
-      // Same routing as the idempotency branch above — verify_fixes (when enabled) →
-      // walkthrough_enrichment (when enabled) → finalize. The walkthrough enrichment runs on its
-      // own fresh budget regardless of the preceding verify_fixes presence so the durable chain
-      // stays correct in either toggle config.
-      config.review.threads?.verify_fixes ? 'verify_fixes' : nextPhaseAfterCritic(config),
+      // Same routing as the idempotency branch above — walkthrough_enrichment (when enabled) →
+      // finalize. The critic-to-verify_fixes branch is intentionally absent (the verify_fixes
+      // is the FIRST hop after review, not a hop after critic; routing back to verify_fixes
+      // would create a loop — see the (1) comment above).
+      nextPhaseAfterCritic(config),
       FRESH_INVOCATION_YIELD_SECONDS,
     );
     return;
@@ -2821,7 +2837,33 @@ async function runCriticPhase(
       reason,
       decisions: skippedDecisions,
     });
-    await enqueueJobPhase(env, job.id, 'finalize', FRESH_INVOCATION_YIELD_SECONDS);
+
+    // Phase 20.1 (BLOCKER 5): skipped-ledger cases still emit the critic.decisions audit event so
+    // the audit viewer sees the skip terminal. The audit-event schema already accepts
+    // status='skipped' via criticRunStatusSchema at schema.ts:485; the builder at audit.ts:454-491
+    // returns null for an empty decisions array, so this branch hand-crafts the event (the
+    // sample really is empty — there are no candidates — and the D-05 audit ought to reflect
+    // that truthfully). The recorder is best-effort (never rethrows) so a broken audit write
+    // never wrecks the review (D-13-03-04 posture).
+    const skippedAuditEvent = {
+      stage: 'critic.decisions' as const,
+      status: 'skipped' as const,
+      count: 0,
+      sample: [],
+      reason,
+      timestamp: new Date().toISOString(),
+    };
+    await recordCriticAudit(env, job.id, [skippedAuditEvent]);
+
+    // Phase 20.1 (BLOCKER 5 chain correctness): the skip path MUST use the same hand-off as
+    // the no-skip path at line 2951 (`nextPhaseAfterCritic(config)`) — UNCONDITIONALLY. The
+    // verify_fixes hop has ALREADY happened before this phase (it is the FIRST hop after review,
+    // not a hop after critic). Re-entering verify_fixes from the critic terminal would recreate
+    // the critic → verify_fixes → critic → verify_fixes loop that Plan 20.1-02 / commit caf2eef
+    // explicitly fixed. The skip path is therefore byte-equivalent to the no-skip path's hand-off
+    // selector: walkthrough_enrichment (when enabled) → finalize. No verify_fixes branch.
+    const handOff = nextPhaseAfterCritic(config);
+    await enqueueJobPhase(env, job.id, handOff, FRESH_INVOCATION_YIELD_SECONDS);
     return;
   }
 
@@ -2939,10 +2981,13 @@ async function runCriticPhase(
   await enqueueJobPhase(
     env,
     job.id,
-    // Post-critic hand-off: verify_fixes (when enabled) → walkthrough_enrichment (when enabled) →
-    // finalize. The walkthrough enrichment runs on its own fresh budget regardless of the
-    // preceding verify_fixes presence so the durable chain stays correct in either toggle config.
-    config.review.threads?.verify_fixes ? 'verify_fixes' : nextPhaseAfterCritic(config),
+    // Phase 20.1 (BLOCKER 3 chain correctness): post-critic hand-off is walkthrough_enrichment
+    // (when enabled) → finalize. The verify_fixes is the FIRST hop after review (not a hop after
+    // critic) — chaining critic → verify_fixes would create a loop (review → verify_fixes →
+    // critic → verify_fixes → ...). The walkthrough_enrichment runs on its own fresh budget
+    // regardless of the preceding verify_fixes presence so the durable chain stays correct in
+    // either toggle config.
+    nextPhaseAfterCritic(config),
     FRESH_INVOCATION_YIELD_SECONDS,
   );
 }
@@ -2957,56 +3002,15 @@ async function heartbeatAndCheckSuperseded(env: AppBindings, jobId: string, leas
 
 export { NextPhaseError } from './next-phase-error';
 
-/**
- * Single source of truth for where the review phase hands off (D-07 / MP-03). When the critic pass is
- * enabled the critic runs as its OWN fresh-budget phase BETWEEN review and finalize; otherwise the
- * review goes straight to finalize exactly as it did pre-critic. EVERY review-exit path — normal
- * completion, async-batch exhaustion, and the continuation-ceiling degrade in continueOrFailWedgedJob
- * — routes through this selector, so a degraded review can NEVER bypass the critic when it is enabled.
- * With passes.critic off this returns 'finalize' unconditionally, so routing is byte-identical to the
- * pre-critic engine (NREG-01).
- *
- * Phase 19 (THR-01/THR-02, D-03): when verify_fixes is enabled AND the job is not a review-rest
- * job (reviewScope !== 'rest'), verify_fixes runs as its own fresh-budget phase BEFORE the critic.
- * The verify_fixes phase is itself idempotent on re-entry (persisted thread_verifications
- * cursor), so re-routing the same chain is safe and a failed-over verify_fixes still surfaces
- * whatever entries the cursor had persisted.
- */
-function nextPhaseAfterReview(config: RepoConfig): 'critic' | 'finalize' | 'verify_fixes' {
-  if (config.review.threads?.verify_fixes) {
-    return 'verify_fixes';
-  }
-  return config.review.passes?.critic?.enabled ? 'critic' : 'finalize';
-}
-
-/**
- * Phase 19 (THR-01/THR-02): post-verify_fixes hand-off. Routes to the critic when enabled
- * (so verify_fixes runs BEFORE the critic in the durable chain), otherwise straight to finalize.
- * The verify_fixes phase ends with this selector so a hand-off never bypasses the critic
- * when it is enabled.
- */
-function nextPhaseAfterVerifyFixes(config: RepoConfig): 'critic' | 'finalize' {
-  return config.review.passes?.critic?.enabled ? 'critic' : 'finalize';
-}
-
-/**
- * Phase 19 Plan 19-08 (PASS-03, D-13): the durable walkthrough enrichment sits between the
- * last LLM phase (critic or verify_fixes) and finalize. Walkthrough enrichment runs ONLY when
- * `review.walkthrough.enabled` is on — otherwise the chain skips it and goes straight to finalize
- * (NREG-01). This selector is shared by both `nextPhaseAfterCritic` and `nextPhaseAfterVerifyFixes`
- * so the durable chain always inserts the enrichment phase exactly once.
- */
-function maybeRouteToWalkthroughEnrichment(config: RepoConfig): 'walkthrough_enrichment' | 'finalize' {
-  return config.review.walkthrough?.enabled ? 'walkthrough_enrichment' : 'finalize';
-}
-
-/**
- * Phase 19 Plan 19-08 (PASS-03): post-critic hand-off. Routes through the walkthrough enrichment
- * phase when the walkthrough is enabled, otherwise straight to finalize.
- */
-function nextPhaseAfterCritic(config: RepoConfig): 'walkthrough_enrichment' | 'finalize' {
-  return maybeRouteToWalkthroughEnrichment(config);
-}
+// Phase 20.1 (BLOCKER 2 + BLOCKER 3): the four phase selectors live in `./phase-routing` so
+// `verify-fixes.ts` can import `nextPhaseAfterVerifyFixes` without creating an import cycle
+// (review.ts → verify-fixes.ts already exists, so the cycle is broken by hoisting the selectors).
+import {
+  maybeRouteToWalkthroughEnrichment,
+  nextPhaseAfterCritic,
+  nextPhaseAfterReview,
+  nextPhaseAfterVerifyFixes,
+} from './phase-routing';
 
 async function enqueueJobPhase(
   env: AppBindings,

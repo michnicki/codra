@@ -349,8 +349,13 @@ import {
   mapJob,
   setJobThreadVerifications,
   appendJobAuditEvents,
+  markJobContinuationQueued,
 } from '../db/jobs';
 import { NextPhaseError } from './next-phase-error';
+// Phase 20.1 (BLOCKER 3): import the post-verify_fixes selector from the shared module so the
+// combined verify_fixes + critic config chains verify_fixes INTO the critic instead of bypassing
+// it. The selector lives in `phase-routing.ts` to avoid the review.ts ↔ verify-fixes.ts cycle.
+import { nextPhaseAfterVerifyFixes } from './phase-routing';
 import { logger } from './logger';
 
 // Subrequest cost model for verify-fixes. Conservative on purpose: the worst case is roughly
@@ -434,17 +439,40 @@ export async function runVerifyFixesPhase(
 
   // D-03: review-rest stays scoped to its selected paths and causes NO unrelated thread side
   // effects. The verify_fixes phase is skipped entirely on review-rest jobs.
+  //
+  // Phase 20.1 (BLOCKER 4): even on review-rest jobs the verify_fixes phase must still schedule a
+  // successor so the durable queue chain reaches finalize. The previous `return` left the queue
+  // message acked with no next-phase message and the job non-terminal forever. The canonical
+  // successor scheduler is `enqueueJobPhase` (review.ts:2976-2984): markJobContinuationQueued +
+  // NextPhaseError(phase, delaySeconds). We reuse the same two primitives inline so this file
+  // does not grow a new helper.
   if (job.reviewScope === 'rest') {
-    return;
+    await markJobContinuationQueued(env, job.id, VERIFY_FIXES_FRESH_INVOCATION_YIELD_SECONDS);
+    throw new NextPhaseError(
+      nextPhaseAfterVerifyFixes(config),
+      VERIFY_FIXES_FRESH_INVOCATION_YIELD_SECONDS,
+    );
   }
 
   // Resume from durable state if available; the orchestrator records progress after every batch so
   // a hibernated retry never re-grades a thread or re-fetches a path it already covered.
   const initialState = job.threadVerification ?? createPendingState();
 
-  // Idempotent re-entry (D-04): a previous invocation reached a terminal state. Skip to finalize.
+  // Idempotent re-entry (D-04): a previous invocation reached a terminal state.
+  //
+  // Phase 20.1 (BLOCKER 4): even when the durable state is already terminal, the verify_fixes
+  // phase must still schedule a successor. A crash between the terminal write and the throw left
+  // the job non-terminal forever under the previous `return` -- the queue message was acked with
+  // no next-phase message and finalize never ran. The successor scheduler here mirrors
+  // enqueueJobPhase (review.ts:2976-2984): markJobContinuationQueued increments continuation_count
+  // (D-17 idempotent counter) + stamps last_queue_message_at, then NextPhaseError(phase,
+  // delaySeconds) signals runReviewJob's catch to produce { action: 'next_phase' }.
   if (initialState.status === 'completed' || initialState.status === 'fail_open') {
-    return;
+    await markJobContinuationQueued(env, job.id, VERIFY_FIXES_FRESH_INVOCATION_YIELD_SECONDS);
+    throw new NextPhaseError(
+      nextPhaseAfterVerifyFixes(config),
+      VERIFY_FIXES_FRESH_INVOCATION_YIELD_SECONDS,
+    );
   }
 
   const autoResolveEnabled = Boolean(config.review.threads?.auto_resolve ?? false);
@@ -706,12 +734,11 @@ export async function runVerifyFixesPhase(
 
   await emitCompletionAudit(env, job.id, finalTotals, allProcessed);
 
-  // Phase 19 (D-03 / D-04): verify_fixes always hands off to its successor on its own fresh-budget
-  // step. The successor is the walkthrough enrichment phase (when the walkthrough is enabled) so
-  // the durable chain can do PASS-03 work BEFORE finalize, otherwise finalize directly. Throw
-  // NextPhaseError so runReviewJob's catch translates it into a {action:'next_phase'} result.
-  // (See nextPhaseAfterVerifyFixes in core/review.ts.)
-  const handOff = config.review.walkthrough?.enabled ? 'walkthrough_enrichment' : 'finalize';
+  // Phase 20.1 (BLOCKER 3): verify_fixes hands off through the shared selector so the combined
+  // verify_fixes + critic config chains verify_fixes INTO the critic instead of bypassing it.
+  // The selector routes to critic (when enabled) → walkthrough_enrichment (when enabled) → finalize
+  // (NREG-01 default).
+  const handOff = nextPhaseAfterVerifyFixes(config);
   throw new NextPhaseError(handOff, VERIFY_FIXES_FRESH_INVOCATION_YIELD_SECONDS);
 }
 

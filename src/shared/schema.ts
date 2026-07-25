@@ -426,6 +426,13 @@ export const reviewJobMessageSchema = z.object({
 // provider responses, thread bodies, prompts, or model output (T-19-01-02).
 export const phase19MachineReasonSchema = z.string().trim().min(1).max(200);
 
+// Phase 20.1 BLOCKER 1 (D-07): the re-exported `machineErrorReasonSchema` and
+// `redactedErrorReasonSchema` are defined in @shared/transient-errors (the source of truth for
+// the MACHINE_ERROR_REASONS enum). They are re-exported here so callers that already depend on
+// @shared/schema can resolve the audit-event reason schema without a second import. The schemas
+// are identical to the source-of-truth schemas (same Zod instance via re-export).
+export { machineErrorReasonSchema, redactedErrorReasonSchema } from './transient-errors';
+
 export const threadVerificationVerdicts = ['fixed', 'unfixed', 'unverifiable'] as const;
 export const threadVerificationVerdictSchema = z.enum(threadVerificationVerdicts);
 
@@ -836,7 +843,11 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
         z.object({
           path: z.string(),
           line: z.number().nullable().optional(),
-          title: z.string(),
+          // Phase 20.1 BLOCKER 1 (D-06): the redactor (core/audit-redact.ts redactFindingTitle)
+          // caps the title to 100 chars via a length-bounded head-clamp marker. The schema cap
+          // matches the redactor's ceiling so a redacted marker shape is accepted; the redactor
+          // is the producer-side enforcement, not the schema parser.
+          title: z.string().max(100),
           // Non-sensitive decision metrics explaining WHY each sampled finding fell below the rule
           // (review finding #4) — optional; never body/diff/existingCode/codeSuggestion.
           severity: z.enum(reviewSeverities).optional(),
@@ -851,8 +862,10 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
     .object({
       stage: z.literal('deduped'),
       rule: z.enum(['rule1', 'rule2', 'rule3', 'rule4']),
-      survivor: z.object({ path: z.string(), line: z.number().nullable().optional(), title: z.string() }),
-      suppressed: z.object({ path: z.string(), line: z.number().nullable().optional(), title: z.string() }),
+      // Phase 20.1 BLOCKER 1 (D-06): see filtered.sample.title above — the redactor's ceiling is
+      // the schema cap.
+      survivor: z.object({ path: z.string(), line: z.number().nullable().optional(), title: z.string().max(100) }),
+      suppressed: z.object({ path: z.string(), line: z.number().nullable().optional(), title: z.string().max(100) }),
       // The word-Jaccard scores that caused the merge (review finding #4) — nullable because rule1
       // has no title check and only rule4 uses a body measure.
       titleSimilarity: z.number().nullable().optional(),
@@ -881,7 +894,11 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
         z.object({
           path: z.string(),
           line: z.number().nullable().optional(),
-          title: z.string().optional(),
+          // Phase 20.1 BLOCKER 1 (D-06): see filtered.sample.title above — the redactor's ceiling is
+          // the schema cap. `file_skipped` sample rows are path-only in practice (a skipped file has
+          // no finding title), but the optional field keeps the variant shape consistent with the
+          // other filtered/deduped audit variants.
+          title: z.string().max(100).optional(),
         }),
       ),
       timestamp: dateStringSchema,
@@ -890,13 +907,14 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
   // `evidence_missing` (D-17, EVID-01): a PER-FINDING event — the soft evidence gate could not confirm
   // a finding's model-emitted `existing_code` against the cleaned hunk. `reason` discriminates `absent`
   // (no/empty evidence string emitted) from `not_in_hunk` (evidence present but not found in the diff).
+  // Phase 20.1 BLOCKER 1 (D-06): the title is redacted via redactFindingTitle (max 100 chars).
   z
     .object({
       stage: z.literal('evidence_missing'),
       reason: z.enum(['absent', 'not_in_hunk']),
       path: z.string(),
       line: z.number().nullable().optional(),
-      title: z.string(),
+      title: z.string().max(100),
       timestamp: dateStringSchema,
     })
     .passthrough(),
@@ -980,7 +998,9 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
       stage: z.literal('rounds.suppressed'),
       path: z.string(),
       line: z.number().nullable().optional(),
-      title: z.string(),
+      // Phase 20.1 BLOCKER 1 (D-06): see filtered.sample.title above — the redactor's ceiling is
+      // the schema cap.
+      title: z.string().max(100),
       threadPath: z.string(),
       timestamp: dateStringSchema,
     })
@@ -1041,6 +1061,10 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
   // One aggregate Critic-v2 event per persisted ledger. The canonical result remains jobs JSONB;
   // audit receives only a privacy-bounded sample so a large candidate set cannot flood the 500-event
   // ring buffer or duplicate full finding bodies.
+  // Phase 20.1 BLOCKER 1 (D-06): the sample title is redacted via redactFindingTitle (max 100 chars).
+  // The prior `.min(1).max(200)` shape is relaxed to `.max(100)` so the redactor's defensive marker
+  // (always non-empty, length-bounded) accepts the schema; the redactor is the producer-side
+  // enforcement that ensures no raw title > 100 chars reaches audit.
   z
     .object({
       stage: z.literal('critic.decisions'),
@@ -1052,7 +1076,7 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
           id: z.number().int().nonnegative(),
           path: z.string().min(1).max(1_024),
           line: z.number().int().positive().nullable().optional(),
-          title: z.string().min(1).max(200),
+          title: z.string().max(100),
           verdict: criticVerdictSchema.nullable(),
           outcome: z.enum(['kept', 'dropped']),
           reason: phase19MachineReasonSchema,
@@ -1064,6 +1088,9 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
   // PASS-02 vote telemetry is one bounded aggregate per ensemble-enabled file. Successful/failed
   // denominator totals and both winner/drop samples are independent; failed reasons are capped by
   // the configured maximum of four extra runs and never carry provider response bodies.
+  // Phase 20.1 BLOCKER 1 (D-06): winningSample and droppedSample titles are redacted via
+  // redactFindingTitle (max 100 chars). failedRunReasons are already machine-enum-shaped and
+  // bounded to 4.
   z
     .object({
       stage: z.literal('ensemble.voted'),
@@ -1079,7 +1106,7 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
           votes: z.number().int().positive(),
           path: z.string().min(1).max(1_024),
           line: z.number().int().positive().nullable().optional(),
-          title: z.string().min(1).max(200),
+          title: z.string().max(100),
         }),
       ).max(20),
       droppedSample: z.array(
@@ -1088,7 +1115,7 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
           votes: z.number().int().nonnegative(),
           path: z.string().min(1).max(1_024),
           line: z.number().int().positive().nullable().optional(),
-          title: z.string().min(1).max(200),
+          title: z.string().max(100),
         }),
       ).max(20),
       failedRunReasons: z.array(phase19MachineReasonSchema).max(4).optional(),

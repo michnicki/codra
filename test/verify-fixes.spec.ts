@@ -3,24 +3,34 @@
 // all helpers are pure, no DB, no fetch, so this file stays under the normal test runner and pins
 // every D-01..D-04 edge the cross-AI review surfaced.
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { defaultRepoConfig, type RepoConfig } from '@shared/schema';
+import { nextPhaseAfterVerifyFixes } from '@server/core/phase-routing';
 import type {
   ThreadVerificationEntry,
   ThreadVerificationSnapshot,
   ThreadVerifications,
 } from '@shared/schema';
 import type { VcsReviewThread } from '@server/vcs/types';
+import { NextPhaseError } from '@server/core/next-phase-error';
 import {
   buildVerifyFixesUserPrompt,
   classifyVerifyFixesVerdict,
   collectUnverifiableThreads,
   FULL_CONTENT_LINE_CAP,
+  runVerifyFixesPhase,
   SAFE_HUNK_LINE_LIMIT,
   shouldAttemptResolution,
   VERIFY_FIXES_UNVERIFIABLE_REASONS,
   WINDOW_LINE_COUNT,
   windowFileContent,
 } from '@server/core/verify-fixes';
+
+// The verify-fixes phase's fresh-invocation yield constant (60s) is intentionally not exported
+// from core/verify-fixes.ts (it is a private module-level constant). The tests below pin the
+// exact value to mirror the runtime behavior -- if the constant is ever retuned, these
+// assertions must be updated in lockstep with the constant.
+const VERIFY_FIXES_FRESH_INVOCATION_YIELD_SECONDS = 60;
 
 function makeThread(overrides: Partial<VcsReviewThread> = {}): VcsReviewThread {
   return {
@@ -294,3 +304,262 @@ describe('verify-fixes cursor shape', () => {
     expect(cursor.totals).toEqual({ fixed: 0, unfixed: 0, unverifiable: 0, resolved: 0 });
   });
 });
+
+// Phase 20.1 (BLOCKER 3): the verify-fixes phase terminal hand-off now routes through the
+// `nextPhaseAfterVerifyFixes` selector in `core/phase-routing.ts`. The pure selector is fully
+// covered by `test/phase-routing.spec.ts`; this describe block is the smoke evidence that the
+// import in `core/verify-fixes.ts` is wired correctly and the four toggle combinations reach
+// the expected terminal phase.
+describe('verify-fixes terminal hand-off (BLOCKER 3 chain)', () => {
+  // Inline copy of the minimal-withToggle helper used in phase-routing.spec.ts — kept here so
+  // this file stays self-contained and the review can read each describe block independently.
+  const withT = <K extends keyof RepoConfig['review']>(
+    config: RepoConfig,
+    key: K,
+    value: NonNullable<RepoConfig['review'][K]>,
+  ): RepoConfig => ({
+    ...config,
+    review: { ...config.review, [key]: value },
+  });
+  const verifyFixesOn = (c: RepoConfig) =>
+    withT(c, 'threads', { verify_fixes: true, auto_resolve: false });
+  const criticOn = (c: RepoConfig) =>
+    withT(c, 'passes', { ...c.review.passes, critic: { enabled: true } });
+  const walkthroughOn = (c: RepoConfig) =>
+    withT(c, 'walkthrough', { enabled: true, sequence_diagram: { enabled: true } });
+
+  it('chains verify_fixes → critic when verify_fixes + critic are on (BLOCKER 3 primary)', () => {
+    const config = verifyFixesOn(criticOn(defaultRepoConfig));
+    expect(nextPhaseAfterVerifyFixes(config)).toBe('critic');
+  });
+
+  it('chains verify_fixes → walkthrough_enrichment when verify_fixes + walkthrough are on (critic off)', () => {
+    const config = verifyFixesOn(walkthroughOn(defaultRepoConfig));
+    expect(nextPhaseAfterVerifyFixes(config)).toBe('walkthrough_enrichment');
+  });
+
+  it('chains verify_fixes → finalize when verify_fixes is on but critic + walkthrough are off', () => {
+    const config = verifyFixesOn(defaultRepoConfig);
+    expect(nextPhaseAfterVerifyFixes(config)).toBe('finalize');
+  });
+
+  it('chains verify_fixes → critic when all three toggles are on (chain order: critic first)', () => {
+    const config = verifyFixesOn(criticOn(walkthroughOn(defaultRepoConfig)));
+    expect(nextPhaseAfterVerifyFixes(config)).toBe('critic');
+  });
+});
+
+// Phase 20.1 (BLOCKER 4): the verify-fixes idempotency guard AND the review-rest guard used to
+// `return` without scheduling a successor. A crash between the terminal write and the throw left
+// the job non-terminal indefinitely. The fix: both guards now schedule a successor via
+// markJobContinuationQueued + NextPhaseError, mirroring the canonical successor scheduler at
+// core/review.ts:2976-2984 (`enqueueJobPhase`). These tests pin the guard wiring at the
+// runVerifyFixesPhase level: they mock markJobContinuationQueued + drive the guard with the
+// minimum inputs needed to trigger it, then assert the mark was called + the throw carries the
+// expected phase.
+//
+// The guards fire BEFORE any other DB call, so mocking only markJobContinuationQueued is enough
+// to isolate the guard behavior. The other DB writers (setJobThreadVerifications,
+// appendJobAuditEvents) are NEVER reached on either guard path -- if a future refactor moves a
+// guard after one of those calls, these tests will start failing and the refactor will be
+// required to preserve the guard semantics.
+const block4Mock = vi.hoisted(() => ({
+  markJobContinuationQueued: vi.fn(async () => 1),
+}));
+vi.mock('@server/db/jobs', async (importOriginal) => {
+  const mod = await importOriginal<typeof import('@server/db/jobs')>();
+  return {
+    ...mod,
+    markJobContinuationQueued: block4Mock.markJobContinuationQueued,
+  };
+});
+
+describe('verify-fixes terminal guards schedule successor (BLOCKER 4)', () => {
+  // Inline withToggle helpers (mirror the BLOCKER 3 block above) so this describe stays self-
+  // contained. The combined config builders are reused below.
+  const withT = <K extends keyof RepoConfig['review']>(
+    config: RepoConfig,
+    key: K,
+    value: NonNullable<RepoConfig['review'][K]>,
+  ): RepoConfig => ({
+    ...config,
+    review: { ...config.review, [key]: value },
+  });
+  const verifyFixesOn = (c: RepoConfig) =>
+    withT(c, 'threads', { verify_fixes: true, auto_resolve: false });
+  const criticOn = (c: RepoConfig) =>
+    withT(c, 'passes', { ...c.review.passes, critic: { enabled: true } });
+  const walkthroughOn = (c: RepoConfig) =>
+    withT(c, 'walkthrough', { enabled: true, sequence_diagram: { enabled: true } });
+
+  // Minimal env stub: only HYPERDRIVE is read by markJobContinuationQueued (and we mock that).
+  // The other bindings (REVIEW_QUEUE / APP_KV / etc.) are never touched on a guard path.
+  const envStub = { HYPERDRIVE: { connectionString: 'postgres://test' } } as any;
+
+  // Lightweight VcsProvider stub: the guards fire before any vcs call, so the methods below are
+  // NEVER invoked. If a future refactor moves a guard past the vcs boundary, the vcs stubs would
+  // surface a clear failure rather than silently passing.
+  const vcsStub = {
+    capabilities: { supportsThreadResolution: false },
+    async getUnresolvedBotThreads() { return []; },
+    async getFileContent() { return null; },
+    async resolveThread() { return false; },
+  } as any;
+
+  // Lightweight ModelService stub: never invoked on a guard path.
+  const modelStub = {
+    async callVerifierRaw() {
+      throw new Error('verify-fixes guards must not reach the model adapter');
+    },
+  } as any;
+
+  // Lightweight TokenTracker stub: never invoked on a guard path.
+  const trackerStub = {
+    remainingSafeBudget() { return 100; },
+    incrementSubrequests() { /* no-op */ },
+  } as any;
+
+  const makeTerminalJob = (config: RepoConfig, status: 'completed' | 'fail_open'): any => ({
+    id: 'job-blocker4-test',
+    owner: 'test-owner',
+    repo: 'test-repo',
+    prNumber: 1,
+    commitSha: 'a'.repeat(40),
+    configSnapshot: config,
+    reviewScope: 'all' as const,
+    threadVerification: {
+      version: 1,
+      status,
+      entries: [],
+      totals: { fixed: 0, unfixed: 0, unverifiable: 0, resolved: 0 },
+    },
+  });
+
+  const makeReviewRestJob = (config: RepoConfig): any => ({
+    id: 'job-blocker4-test',
+    owner: 'test-owner',
+    repo: 'test-repo',
+    prNumber: 1,
+    commitSha: 'a'.repeat(40),
+    configSnapshot: config,
+    reviewScope: 'rest' as const,
+    threadVerification: null,
+  });
+
+  beforeEach(() => {
+    block4Mock.markJobContinuationQueued.mockClear();
+  });
+
+  it('idempotency guard (status=completed, no critic, no walkthrough) schedules successor=finalize', async () => {
+    const config = verifyFixesOn(defaultRepoConfig);
+    const job = makeTerminalJob(config, 'completed');
+
+    await expect(
+      runVerifyFixesPhase(envStub, job, 'lease-owner', vcsStub, modelStub, trackerStub),
+    ).rejects.toBeInstanceOf(NextPhaseError);
+
+    expect(block4Mock.markJobContinuationQueued).toHaveBeenCalledTimes(1);
+    expect(block4Mock.markJobContinuationQueued).toHaveBeenCalledWith(
+      envStub,
+      'job-blocker4-test',
+      VERIFY_FIXES_FRESH_INVOCATION_YIELD_SECONDS,
+    );
+
+    // The throw's phase must match nextPhaseAfterVerifyFixes(config): with no critic and no
+    // walkthrough, the successor is 'finalize'.
+    let thrownPhase: string | undefined;
+    try {
+      await runVerifyFixesPhase(envStub, makeTerminalJob(config, 'completed'), 'lease-owner', vcsStub, modelStub, trackerStub);
+    } catch (error) {
+      if (error instanceof NextPhaseError) thrownPhase = error.phase;
+    }
+    expect(thrownPhase).toBe('finalize');
+  });
+
+  it('idempotency guard (status=fail_open, critic on) schedules successor=critic', async () => {
+    const config = verifyFixesOn(criticOn(defaultRepoConfig));
+    const job = makeTerminalJob(config, 'fail_open');
+
+    let thrownPhase: string | undefined;
+    try {
+      await runVerifyFixesPhase(envStub, job, 'lease-owner', vcsStub, modelStub, trackerStub);
+    } catch (error) {
+      if (error instanceof NextPhaseError) thrownPhase = error.phase;
+    }
+
+    expect(thrownPhase).toBe('critic');
+    expect(block4Mock.markJobContinuationQueued).toHaveBeenCalledTimes(1);
+  });
+
+  it('idempotency guard (status=completed, critic + walkthrough on) schedules successor=critic (chain order)', async () => {
+    const config = verifyFixesOn(criticOn(walkthroughOn(defaultRepoConfig)));
+    const job = makeTerminalJob(config, 'completed');
+
+    let thrownPhase: string | undefined;
+    try {
+      await runVerifyFixesPhase(envStub, job, 'lease-owner', vcsStub, modelStub, trackerStub);
+    } catch (error) {
+      if (error instanceof NextPhaseError) thrownPhase = error.phase;
+    }
+
+    // Chain order: critic runs BEFORE walkthrough, so the successor is critic (not walkthrough).
+    expect(thrownPhase).toBe('critic');
+    expect(block4Mock.markJobContinuationQueued).toHaveBeenCalledTimes(1);
+  });
+
+  it('review-rest guard (verify_fixes on, reviewScope=rest) schedules successor via nextPhaseAfterVerifyFixes', async () => {
+    const config = verifyFixesOn(defaultRepoConfig);
+    const job = makeReviewRestJob(config);
+
+    let thrownPhase: string | undefined;
+    try {
+      await runVerifyFixesPhase(envStub, job, 'lease-owner', vcsStub, modelStub, trackerStub);
+    } catch (error) {
+      if (error instanceof NextPhaseError) thrownPhase = error.phase;
+    }
+
+    expect(thrownPhase).toBe('finalize');
+    expect(block4Mock.markJobContinuationQueued).toHaveBeenCalledTimes(1);
+    expect(block4Mock.markJobContinuationQueued).toHaveBeenCalledWith(
+      envStub,
+      'job-blocker4-test',
+      VERIFY_FIXES_FRESH_INVOCATION_YIELD_SECONDS,
+    );
+  });
+
+  it('default config (verify_fixes off) returns early without scheduling a successor', async () => {
+    // NREG-01 byte-identity: at the v1.2 default config the verify_fixes toggle is OFF, so the
+    // verifyEnabled guard at the top of runVerifyFixesPhase returns early. The BLOCKER 4 fix is
+    // never exercised -- markJobContinuationQueued is never called and no throw happens.
+    const job = makeTerminalJob(defaultRepoConfig, 'completed');
+
+    await expect(
+      runVerifyFixesPhase(envStub, job, 'lease-owner', vcsStub, modelStub, trackerStub),
+    ).resolves.toBeUndefined();
+
+    expect(block4Mock.markJobContinuationQueued).not.toHaveBeenCalled();
+  });
+
+  it('idempotency guard calls markJobContinuationQueued BEFORE throwing NextPhaseError (call order)', async () => {
+    // Pin the ordering: the canonical successor scheduler at review.ts:2976-2984 calls
+    // markJobContinuationQueued FIRST, then throws NextPhaseError. A future refactor that
+    // throws first would risk an unscheduled successor -- this test catches that.
+    const config = verifyFixesOn(defaultRepoConfig);
+    const callOrder: string[] = [];
+
+    block4Mock.markJobContinuationQueued.mockImplementationOnce(async () => {
+      callOrder.push('markJobContinuationQueued');
+      return 1;
+    });
+
+    const throwingJob = makeTerminalJob(config, 'completed');
+    try {
+      await runVerifyFixesPhase(envStub, throwingJob, 'lease-owner', vcsStub, modelStub, trackerStub);
+    } catch (error) {
+      if (error instanceof NextPhaseError) callOrder.push('NextPhaseError');
+    }
+
+    expect(callOrder).toEqual(['markJobContinuationQueued', 'NextPhaseError']);
+  });
+});
+

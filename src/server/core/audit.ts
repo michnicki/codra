@@ -5,6 +5,7 @@ import type { FileSelectionResult } from './diff';
 import type { DropRecord, NoiseFilterResult } from './noise-filter';
 import type { EnsembleReconciliation } from './ensemble';
 import { logger } from './logger';
+import { redactFindingTitle } from './audit-redact';
 
 /**
  * AUD-01 audit-trail recorder. A SINGLE best-effort recorder for one completed (file, pass) review
@@ -59,25 +60,30 @@ export async function recordUnitAudit(
 }
 
 /**
- * Clamp an audit title to at most 100 chars at the WRITE boundary (Codex LOW / T-14-02-01):
- * `parsedReviewCommentSchema.title` is unbounded (`min(1)` only), so nothing upstream guarantees a
- * length cap. Do NOT rely on an upstream 100-cap — every persisted audit identifier passes through here.
+ * @deprecated Phase 20.1 BLOCKER 1 (D-06): the legacy `clampAuditTitle` is no longer the privacy
+ * boundary. It permitted arbitrary titles to leak through to the audit trail up to 100 chars. The
+ * producer-side enforcement is now `redactFindingTitle` (./audit-redact), which not only caps the
+ * length but also wraps over-length titles in a fixed-shape marker so the persisted audit trail is
+ * bounded to a recognizable clamp shape. This deprecation shim is retained for any external caller
+ * that still imports the symbol; it delegates to the new redactor so the two helpers always agree
+ * on the shape. New code MUST use `redactFindingTitle` directly.
  */
 export function clampAuditTitle(title: string): string {
-  return title.slice(0, 100);
+  return redactFindingTitle(title);
 }
 
 /**
  * Project any finding-shaped record to the privacy-bounded audit identifier { path, line, title }
- * (T-14-02-01) — the ONLY finding fields that ever reach persisted audit events. Titles are clamped
- * to <=100 chars via `clampAuditTitle`. NEVER carries body/diff/existingCode/codeSuggestion.
+ * (T-14-02-01) — the ONLY finding fields that ever reach persisted audit events. Titles are passed
+ * through `redactFindingTitle` (D-06) which caps at 100 chars and wraps over-length input in a
+ * fixed-shape marker. NEVER carries body/diff/existingCode/codeSuggestion.
  */
 export function toAuditIdentifier(record: {
   path: string;
   line?: number | null;
   title: string;
 }): { path: string; line: number | null; title: string } {
-  return { path: record.path, line: record.line ?? null, title: clampAuditTitle(record.title) };
+  return { path: record.path, line: record.line ?? null, title: redactFindingTitle(record.title) };
 }
 
 /**
@@ -370,7 +376,10 @@ export function buildEnsembleVoteAuditEvent(
       votes: cluster.voters.length,
       path: finding.path,
       line: finding.line ?? null,
-      title: finding.title.slice(0, 200),
+      // Phase 20.1 BLOCKER 1 (D-06): the redactor caps the title to 100 chars with a length-bounded
+      // head-clamp marker for over-length input. The prior `.slice(0, 200)` only truncated; the
+      // redactor is the producer-side enforcement of the audit-event privacy boundary.
+      title: redactFindingTitle(finding.title),
     }));
 
   const droppedSample = reconciliation.droppedClusters
@@ -383,7 +392,8 @@ export function buildEnsembleVoteAuditEvent(
         votes: cluster.voters.length,
         path: sample?.path ?? '',
         line: sample?.line ?? null,
-        title: (sample?.title ?? '').slice(0, 200),
+        // Phase 20.1 BLOCKER 1 (D-06): see winningSample.title above.
+        title: redactFindingTitle(sample?.title ?? ''),
       };
     });
 
@@ -462,7 +472,10 @@ export function buildCriticDecisionsAuditEvent(
     id: d.id,
     path: d.path,
     line: d.line ?? null,
-    title: d.title,
+    // Phase 20.1 BLOCKER 1 (D-06): the redactor caps the title to 100 chars with a length-bounded
+    // head-clamp marker for over-length input. The prior pass-through `d.title` accepted arbitrary
+    // length; the redactor is the producer-side enforcement of the audit-event privacy boundary.
+    title: redactFindingTitle(d.title),
     verdict: d.verdict,
     outcome: d.outcome,
     reason: d.reason,

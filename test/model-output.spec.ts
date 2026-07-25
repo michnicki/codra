@@ -319,6 +319,17 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'not_in_hunk', path: 'src/evid.ts', line: 2 });
   });
 
+  it('BLOCKER 1 (D-06): evidence_missing redacts title without changing parsed finding', () => {
+    const result = parseFileReviewResponse(rawWith('someTotallyUnrelatedIdentifier()'), evidenceFile);
+    expect(result.comments).toHaveLength(1);
+    expect(result.comments[0].title).toBe('Uses computed value');
+    const events = evidenceEvents(result);
+    expect(events).toHaveLength(1);
+    expect(events[0].title).toBe('[title-redacted]');
+    expect(events[0].title).not.toBe(result.comments[0].title);
+    expect(events[0].title).not.toContain(result.comments[0].title);
+  });
+
   it('omitted existing_code: one evidence_missing{absent}, comment still posts', () => {
     const result = parseFileReviewResponse(rawWith('__OMIT__'), evidenceFile);
     expect(result.comments).toHaveLength(1);
@@ -735,5 +746,27 @@ describe('parseWalkthroughEnrichmentResponse — Phase 20 D-05 malformedFields p
       kind: 'fail_open',
       reason: 'json_not_object',
     });
+  });
+
+  // Phase 20.1 (D-13 verification): when the model returns a partial result with 1 valid group,
+  // a malformed confidence object, and a valid effort object, the parser attributes the
+  // `malformedFields` to the ACTUALLY malformed field (confidence) and keeps the valid fields
+  // (groups + effort). This pins the contract that the parser does NOT conflate per-field
+  // validation with whole-group classification — the audit's "groups malformed when zero items
+  // survive" claim is the correct narrow check, not a blanket "all groups failed" gate.
+  it('attributes malformedFields to the actually-invalid field in a mixed valid + invalid case', () => {
+    const result = parseWalkthroughEnrichmentResponse(JSON.stringify({
+      groups: [{ label: 'API', paths: ['src/a.ts'] }],
+      // confidence object with wrong shape (level is required, missing here) — invalid
+      confidence: { label: 'unsure' },
+      effort: { level: 2, label: 'Small', minutes: 30 },
+    }));
+    expect(result.kind).toBe('parsed');
+    if (result.kind === 'parsed') {
+      expect(result.malformedFields).toEqual(['confidence']);
+      expect(result.groups).toHaveLength(1);
+      expect(result.confidence).toBeNull();
+      expect(result.effort).not.toBeNull();
+    }
   });
 });
