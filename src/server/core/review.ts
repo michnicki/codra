@@ -657,32 +657,45 @@ async function continueOrFailWedgedJob(
       const configFromJob = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
       return { action: 'next_phase', phase: nextPhaseAfterReview(configFromJob), delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
     } else if (phase === 'critic') {
-      // FAIL-OPEN ceiling (MP-03): a wedged critic (repeated subrequest-budget exhaustion on its
-      // fresh-instance retries) must NEVER terminal-fail the job. Reset the continuation counter and
-      // hand finalize its own fresh instance/budget; finalize's null-critic_result branch (10-07)
-      // reconstructs the deduped candidate set, so no finding is lost by skipping the critic.
-      logger.error(`Critic phase exceeded the continuation ceiling; failing OPEN to finalize (no critique applied): ${job.owner}/${job.repo} PR #${job.prNumber}`, {
+      // FAIL-OPEN ceiling (Phase 20.1 GAP-02): a wedged critic (repeated subrequest-budget exhaustion
+      // on its fresh-instance retries) must NEVER terminal-fail the job. Reset the continuation counter
+      // and route through the same `nextPhaseAfterCritic` selector the healthy/no-skip paths use, so
+      // a configured walkthrough_enrichment hop still runs after the critic fails open (chain order
+      // verify_fixes -> critic -> walkthrough_enrichment -> finalize is preserved under both healthy
+      // and degraded completion). The verify_fixes hop is intentionally ABSENT: it is the FIRST hop
+      // after review, never a hop after critic — re-entering verify_fixes would recreate the
+      // critic -> verify_fixes loop Plan 20.1-02 / commit caf2eef fixed. finalize's null-critic_result
+      // branch (10-07) reconstructs the deduped candidate set, so no finding is lost by skipping the
+      // critic.
+      const configFromCritic = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
+      logger.error(`Critic phase exceeded the continuation ceiling; failing OPEN to configured post-critic successor (no critique applied): ${job.owner}/${job.repo} PR #${job.prNumber}`, {
         phase,
         continuationCount,
         reason,
+        successor: nextPhaseAfterCritic(configFromCritic),
       });
       await resetJobContinuationCount(env, job.id);
       await releaseJobLease(env, job.id, leaseOwner);
-      return { action: 'next_phase', phase: 'finalize', delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
+      return { action: 'next_phase', phase: nextPhaseAfterCritic(configFromCritic), delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
     } else if (phase === 'verify_fixes') {
-      // FAIL-OPEN ceiling (D-03): a wedged verify_fixes (repeated subrequest-budget exhaustion on its
-      // fresh-instance retries) must NEVER terminal-fail the job. Reset the continuation counter and
-      // hand finalize its own fresh instance/budget; finalize reads the persisted
+      // FAIL-OPEN ceiling (Phase 20.1 GAP-02): a wedged verify_fixes (repeated subrequest-budget
+      // exhaustion on its fresh-instance retries) must NEVER terminal-fail the job. Reset the
+      // continuation counter and route through the same `nextPhaseAfterVerifyFixes` selector the
+      // successful completion path uses, so a configured critic hop (and walkthrough when critic is
+      // off) still runs after verify_fixes fails open. finalize reads the persisted
       // thread_verifications JSONB idempotently so a fail-open verify_fixes still surfaces whatever
-      // entries the cursor had persisted before exhaustion.
-      logger.error(`verify_fixes phase exceeded the continuation ceiling; failing OPEN to finalize (verification halted at cursor): ${job.owner}/${job.repo} PR #${job.prNumber}`, {
+      // entries the cursor had persisted before exhaustion. Verification is halted at the cursor;
+      // the chain continues through the configured successor.
+      const configFromVerifyFixes = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
+      logger.error(`verify_fixes phase exceeded the continuation ceiling; failing OPEN to configured post-verify-fixes successor (verification halted at cursor): ${job.owner}/${job.repo} PR #${job.prNumber}`, {
         phase,
         continuationCount,
         reason,
+        successor: nextPhaseAfterVerifyFixes(configFromVerifyFixes),
       });
       await resetJobContinuationCount(env, job.id);
       await releaseJobLease(env, job.id, leaseOwner);
-      return { action: 'next_phase', phase: 'finalize', delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
+      return { action: 'next_phase', phase: nextPhaseAfterVerifyFixes(configFromVerifyFixes), delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
     } else {
       const message = `Review could not make progress after ${continuationCount} continuation attempts (${reason}). Failing the job to avoid an endless retry loop; re-run it once the underlying provider issue clears.`;
       logger.error(`Review job exceeded the continuation ceiling; failing terminally: ${job.owner}/${job.repo} PR #${job.prNumber}`, {

@@ -2140,6 +2140,428 @@ dbDescribe('Review Flow Lifecycle', () => {
       reviewSpy.mockRestore();
       getDiffSpy.mockRestore();
     }, REVIEW_FLOW_TIMEOUT_MS);
+
+    // Phase 20.1 (GAP-02 / BLOCKER 2 + 3 ceiling routing): the critic and verify_fixes
+    // continuation-ceiling branches at review.ts:659-696 used to hardcode 'finalize' as the
+    // successor, silently bypassing configured downstream passes. The fix replaces them with
+    // the canonical selectors so the chain stays symmetric under healthy and degraded
+    // completion. These tests force every tested toggle combination with continuation_count
+    // already at the ceiling and assert the configured successor.
+    //
+    // Plan 20.1-08 Task 1: critic ceiling handoff uses nextPhaseAfterCritic.
+    it('BLOCKER 2 + 3 ceiling: wedged critic with walkthrough ON routes to walkthrough_enrichment (not raw finalize)', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { ModelService } = await import('@server/services/model');
+      const repo = `test-repo-${Date.now()}-critic-ceiling-walk`;
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/one.ts', content: 'console.log(1);' }]),
+      );
+      // Force a subrequest-budget error inside the critic so continueOrFailWedgedJob runs.
+      const critiqueSpy = vi.spyOn(ModelService.prototype as any, 'critiqueFindings').mockRejectedValue(
+        new Error('Too many subrequests'),
+      );
+
+      // critic + walkthrough ON. The ceiling handoff must reach walkthrough_enrichment via
+      // nextPhaseAfterCritic — NOT bypass it straight to finalize.
+      const config: RepoConfig = {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          passes: {
+            ...defaultRepoConfig.review.passes,
+            critic: { enabled: true },
+          },
+          walkthrough: { enabled: true, sequence_diagram: { enabled: true } },
+        },
+      };
+
+      const job = await insertCriticJob(repo, config, 'ce');
+      await updateJobFileCount(env, job.id, 1);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+      // Insert a 'done' file_review with non-empty parsed_comments so the critic phase has
+      // candidates to grade (the skip branch at review.ts:2803 fires on empty candidates and
+      // does NOT call critiqueFindings — its hand-off is via enqueueJobPhase + NextPhaseError,
+      // which never reaches the ceiling branch).
+      await upsertFileReview(env, job.id, {
+        filePath: 'src/one.ts',
+        fileStatus: 'done',
+        modelUsed: 'test-model',
+        modelProvider: 'test-provider',
+        diffLineCount: 1,
+        diffInput: 'diff',
+        rawAiOutput: '{}',
+        parsedComments: [{
+          path: 'src/one.ts',
+          line: 1,
+          position: 1,
+          severity: 'P2',
+          category: 'quality',
+          title: 'Test finding for ceiling',
+          body: 'Body for ceiling test',
+        }],
+        inputTokens: 1,
+        outputTokens: 1,
+        durationMs: 1,
+        verdict: 'comment',
+        fileSummary: 'ok',
+        errorMessage: null,
+      });
+      // Pre-set the continuation counter to MAX_FINALIZE_CONTINUATIONS so the next bump (via
+      // markJobContinuationQueued) trips the ceiling branch.
+      await queryRows(env, `UPDATE jobs SET continuation_count = 3 WHERE id = $1`, [job.id]);
+
+      await runWithDb(env, async () => {
+        const result = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-critic-ceiling-walk', phase: 'critic' });
+        expect(result.action).toBe('next_phase');
+        if (result.action === 'next_phase') {
+          expect(result.phase).toBe('walkthrough_enrichment');
+          expect(result.freshInstance).toBe(true);
+          expect(result.delaySeconds).toEqual(expect.any(Number));
+          expect(result.jobId).toBe(job.id);
+        }
+      });
+
+      // Continuation count was reset to 0 by the ceiling branch (release-once fresh budget).
+      const updated = await queryRows<{ continuation_count: number }>(env, `SELECT continuation_count FROM jobs WHERE id = $1`, [job.id]);
+      expect(updated[0].continuation_count).toBe(0);
+
+      // The job is NOT failed; the lease is released; the runReviewJob returned a next_phase.
+      const finalJob = await findExistingJobForHead(env, { owner: 'test-owner', repo, prNumber: 8, commitSha: sha('ce'), trigger: 'auto' });
+      expect(finalJob?.status).not.toBe('failed');
+
+      critiqueSpy.mockRestore();
+      getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('BLOCKER 2 + 3 ceiling: wedged critic with walkthrough OFF routes to finalize (selector default)', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { ModelService } = await import('@server/services/model');
+      const repo = `test-repo-${Date.now()}-critic-ceiling-no-walk`;
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/one.ts', content: 'console.log(1);' }]),
+      );
+      const critiqueSpy = vi.spyOn(ModelService.prototype as any, 'critiqueFindings').mockRejectedValue(
+        new Error('Too many subrequests'),
+      );
+
+      // critic ON, walkthrough OFF. The ceiling handoff must reach finalize directly via
+      // nextPhaseAfterCritic.
+      const config: RepoConfig = {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          passes: {
+            ...defaultRepoConfig.review.passes,
+            critic: { enabled: true },
+          },
+        },
+      };
+
+      const job = await insertCriticJob(repo, config, 'cf');
+      await updateJobFileCount(env, job.id, 1);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+      await upsertFileReview(env, job.id, {
+        filePath: 'src/one.ts',
+        fileStatus: 'done',
+        modelUsed: 'test-model',
+        modelProvider: 'test-provider',
+        diffLineCount: 1,
+        diffInput: 'diff',
+        rawAiOutput: '{}',
+        parsedComments: [{
+          path: 'src/one.ts',
+          line: 1,
+          position: 1,
+          severity: 'P2',
+          category: 'quality',
+          title: 'Test finding for ceiling',
+          body: 'Body for ceiling test',
+        }],
+        inputTokens: 1,
+        outputTokens: 1,
+        durationMs: 1,
+        verdict: 'comment',
+        fileSummary: 'ok',
+        errorMessage: null,
+      });
+      await queryRows(env, `UPDATE jobs SET continuation_count = 3 WHERE id = $1`, [job.id]);
+
+      await runWithDb(env, async () => {
+        const result = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-critic-ceiling-no-walk', phase: 'critic' });
+        expect(result.action).toBe('next_phase');
+        if (result.action === 'next_phase') {
+          expect(result.phase).toBe('finalize');
+          expect(result.freshInstance).toBe(true);
+        }
+      });
+
+      const updated = await queryRows<{ continuation_count: number }>(env, `SELECT continuation_count FROM jobs WHERE id = $1`, [job.id]);
+      expect(updated[0].continuation_count).toBe(0);
+
+      critiqueSpy.mockRestore();
+      getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    // Loop-prevention invariant: the critic ceiling handoff uses nextPhaseAfterCritic, which
+    // never returns 'verify_fixes'. Even when verify_fixes is enabled, the post-critic ceiling
+    // handoff must skip past it (verify_fixes is the FIRST hop after review, not a hop after
+    // critic — re-entering verify_fixes would recreate the loop Plan 20.1-02 fixed).
+    it('BLOCKER 2 + 3 ceiling: wedged critic never routes to verify_fixes (loop-prevention invariant)', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { ModelService } = await import('@server/services/model');
+      const repo = `test-repo-${Date.now()}-critic-ceiling-noverify`;
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/one.ts', content: 'console.log(1);' }]),
+      );
+      const critiqueSpy = vi.spyOn(ModelService.prototype as any, 'critiqueFindings').mockRejectedValue(
+        new Error('Too many subrequests'),
+      );
+
+      // All v1.2 toggles ON: verify_fixes + critic + walkthrough.
+      const config: RepoConfig = {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          threads: { verify_fixes: true, auto_resolve: false },
+          passes: {
+            ...defaultRepoConfig.review.passes,
+            critic: { enabled: true },
+          },
+          walkthrough: { enabled: true, sequence_diagram: { enabled: true } },
+        },
+      };
+
+      const job = await insertCriticJob(repo, config, 'cl');
+      await updateJobFileCount(env, job.id, 1);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+      await upsertFileReview(env, job.id, {
+        filePath: 'src/one.ts',
+        fileStatus: 'done',
+        modelUsed: 'test-model',
+        modelProvider: 'test-provider',
+        diffLineCount: 1,
+        diffInput: 'diff',
+        rawAiOutput: '{}',
+        parsedComments: [{
+          path: 'src/one.ts',
+          line: 1,
+          position: 1,
+          severity: 'P2',
+          category: 'quality',
+          title: 'Test finding for ceiling',
+          body: 'Body for ceiling test',
+        }],
+        inputTokens: 1,
+        outputTokens: 1,
+        durationMs: 1,
+        verdict: 'comment',
+        fileSummary: 'ok',
+        errorMessage: null,
+      });
+      await queryRows(env, `UPDATE jobs SET continuation_count = 3 WHERE id = $1`, [job.id]);
+
+      await runWithDb(env, async () => {
+        const result = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-critic-ceiling-noverify', phase: 'critic' });
+        expect(result.action).toBe('next_phase');
+        if (result.action === 'next_phase') {
+          // MUST route to walkthrough_enrichment (nextPhaseAfterCritic), NOT verify_fixes.
+          expect(result.phase).toBe('walkthrough_enrichment');
+          expect(result.phase).not.toBe('verify_fixes');
+          expect(result.phase).not.toBe('finalize');
+        }
+      });
+
+      critiqueSpy.mockRestore();
+      getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    // Plan 20.1-08 Task 2: verify_fixes ceiling handoff uses nextPhaseAfterVerifyFixes.
+    it('BLOCKER 2 + 3 ceiling: wedged verify_fixes with critic + walkthrough ON routes to critic', async () => {
+      const repo = `test-repo-${Date.now()}-verifyfixes-ceiling-critic`;
+
+      // All v1.2 toggles ON: verify_fixes + critic + walkthrough. The verify_fixes ceiling must
+      // route to critic (nextPhaseAfterVerifyFixes) — NOT raw finalize.
+      const config: RepoConfig = {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          threads: { verify_fixes: true, auto_resolve: false },
+          passes: {
+            ...defaultRepoConfig.review.passes,
+            critic: { enabled: true },
+          },
+          walkthrough: { enabled: true, sequence_diagram: { enabled: true } },
+        },
+      };
+
+      const job = await insertJob(env, {
+        installationId: '123',
+        owner: 'test-owner',
+        repo,
+        prNumber: 8,
+        prTitle: 'verify_fixes ceiling critic test',
+        prAuthor: 'author',
+        commitSha: sha('ve'),
+        baseSha: sha('0'),
+        trigger: 'auto',
+        headRef: 'feature',
+        baseRef: 'main',
+        configSnapshot: config,
+      });
+      await updateJobFileCount(env, job.id, 1);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+      await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+      await queryRows(env, `UPDATE jobs SET continuation_count = 3 WHERE id = $1`, [job.id]);
+
+      // The verify_fixes phase reads vcs.getUnresolvedBotThreads(...) which delegates to
+      // GitHubService.getReviewThreads inside an adapter try/catch. The adapter's silent-degradation
+      // catch (D-02 in vcs/github.ts:166-170) swallows the error so the phase never reaches
+      // continueOrFailWedgedJob. To force a propagating subrequest-budget path, spy on the ADAPTER's
+      // getUnresolvedBotThreads directly: the spy replaces the whole method (including the catch),
+      // so the rejection surfaces to runReviewJob's catch.
+      const { GithubAdapter } = await import('@server/vcs/github');
+      const getThreadsSpy = vi.spyOn(GithubAdapter.prototype, 'getUnresolvedBotThreads').mockRejectedValue(
+        new Error('Too many subrequests'),
+      );
+
+      try {
+        await runWithDb(env, async () => {
+          const result = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-verifyfixes-ceiling-critic', phase: 'verify_fixes' });
+          expect(result.action).toBe('next_phase');
+          if (result.action === 'next_phase') {
+            expect(result.phase).toBe('critic');
+            expect(result.freshInstance).toBe(true);
+            expect(result.delaySeconds).toEqual(expect.any(Number));
+            expect(result.jobId).toBe(job.id);
+          }
+        });
+
+        // Continuation count was reset to 0 by the ceiling branch.
+        const updated = await queryRows<{ continuation_count: number }>(env, `SELECT continuation_count FROM jobs WHERE id = $1`, [job.id]);
+        expect(updated[0].continuation_count).toBe(0);
+
+        // The job is NOT failed.
+        const finalJob = await findExistingJobForHead(env, { owner: 'test-owner', repo, prNumber: 8, commitSha: sha('ve'), trigger: 'auto' });
+        expect(finalJob?.status).not.toBe('failed');
+      } finally {
+        getThreadsSpy.mockRestore();
+      }
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('BLOCKER 2 + 3 ceiling: wedged verify_fixes with critic OFF + walkthrough ON routes to walkthrough_enrichment', async () => {
+      const repo = `test-repo-${Date.now()}-verifyfixes-ceiling-walk`;
+
+      // verify_fixes + walkthrough ON, critic OFF. The verify_fixes ceiling must route to
+      // walkthrough_enrichment, proving the caller uses nextPhaseAfterVerifyFixes (not raw finalize).
+      const config: RepoConfig = {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          threads: { verify_fixes: true, auto_resolve: false },
+          walkthrough: { enabled: true, sequence_diagram: { enabled: true } },
+        },
+      };
+
+      const job = await insertJob(env, {
+        installationId: '123',
+        owner: 'test-owner',
+        repo,
+        prNumber: 8,
+        prTitle: 'verify_fixes ceiling walkthrough test',
+        prAuthor: 'author',
+        commitSha: sha('vw'),
+        baseSha: sha('0'),
+        trigger: 'auto',
+        headRef: 'feature',
+        baseRef: 'main',
+        configSnapshot: config,
+      });
+      await updateJobFileCount(env, job.id, 1);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+      await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+      await queryRows(env, `UPDATE jobs SET continuation_count = 3 WHERE id = $1`, [job.id]);
+
+      const { GithubAdapter } = await import('@server/vcs/github');
+      const getThreadsSpy = vi.spyOn(GithubAdapter.prototype, 'getUnresolvedBotThreads').mockRejectedValue(
+        new Error('Too many subrequests'),
+      );
+
+      try {
+        await runWithDb(env, async () => {
+          const result = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-verifyfixes-ceiling-walk', phase: 'verify_fixes' });
+          expect(result.action).toBe('next_phase');
+          if (result.action === 'next_phase') {
+            expect(result.phase).toBe('walkthrough_enrichment');
+            expect(result.freshInstance).toBe(true);
+          }
+        });
+
+        const updated = await queryRows<{ continuation_count: number }>(env, `SELECT continuation_count FROM jobs WHERE id = $1`, [job.id]);
+        expect(updated[0].continuation_count).toBe(0);
+      } finally {
+        getThreadsSpy.mockRestore();
+      }
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    // Loop-prevention invariant: the verify_fixes ceiling handoff uses nextPhaseAfterVerifyFixes,
+    // which returns 'critic' when critic is enabled. The chain order is already proven by the
+    // healthy-drain tests (BLOCKER 3 chain integration at line 1302). This ceiling test pins
+    // that the DEGRADED path preserves the same order — verify_fixes -> critic, not verify_fixes
+    // -> walkthrough -> finalize.
+    it('BLOCKER 2 + 3 ceiling: wedged verify_fixes preserves the chain order verify_fixes -> critic', async () => {
+      const repo = `test-repo-${Date.now()}-verifyfixes-ceiling-order`;
+
+      const config: RepoConfig = {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          threads: { verify_fixes: true, auto_resolve: false },
+          passes: {
+            ...defaultRepoConfig.review.passes,
+            critic: { enabled: true },
+          },
+        },
+      };
+
+      const job = await insertJob(env, {
+        installationId: '123',
+        owner: 'test-owner',
+        repo,
+        prNumber: 8,
+        prTitle: 'verify_fixes ceiling chain-order test',
+        prAuthor: 'author',
+        commitSha: sha('vo'),
+        baseSha: sha('0'),
+        trigger: 'auto',
+        headRef: 'feature',
+        baseRef: 'main',
+        configSnapshot: config,
+      });
+      await updateJobFileCount(env, job.id, 1);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+      await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+      await queryRows(env, `UPDATE jobs SET continuation_count = 3 WHERE id = $1`, [job.id]);
+
+      const { GithubAdapter } = await import('@server/vcs/github');
+      const getThreadsSpy = vi.spyOn(GithubAdapter.prototype, 'getUnresolvedBotThreads').mockRejectedValue(
+        new Error('Too many subrequests'),
+      );
+
+      try {
+        await runWithDb(env, async () => {
+          const result = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-verifyfixes-ceiling-order', phase: 'verify_fixes' });
+          expect(result.action).toBe('next_phase');
+          if (result.action === 'next_phase') {
+            // Chain order: verify_fixes -> critic (not walkthrough, not finalize).
+            expect(result.phase).toBe('critic');
+            expect(result.phase).not.toBe('walkthrough_enrichment');
+            expect(result.phase).not.toBe('finalize');
+          }
+        });
+      } finally {
+        getThreadsSpy.mockRestore();
+      }
+    }, REVIEW_FLOW_TIMEOUT_MS);
   });
 
   it('marks completed jobs with skipped files as partial reviews', async () => {
