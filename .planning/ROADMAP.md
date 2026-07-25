@@ -41,7 +41,7 @@ Plans:
 
 Plans:
 
-- [ ] 23-01-PLAN.md — modelLineCap persistence: migration 014 + upsertFileReview COALESCE + COMPACT_REVIEW_PROMPT_LINE_CAP export + submitReviewBatch return extension + pollReviewBatch optional param + dual-param poll call site (modelLineCap + compactPrompt retained for legacy row fallback) + bulk mock updates + dedicated unit test file (model-line-cap.spec.ts) + integration test + migration idempotency test
+- [x] 23-01-PLAN.md — modelLineCap persistence: migration 014 + upsertFileReview COALESCE + COMPACT_REVIEW_PROMPT_LINE_CAP export + submitReviewBatch return extension + pollReviewBatch optional param + dual-param poll call site (modelLineCap + compactPrompt retained for legacy row fallback) + bulk mock updates + dedicated unit test file (model-line-cap.spec.ts) + integration test + migration idempotency test
 
 ### Phase 24: Dashboard surface for new audit events
 
