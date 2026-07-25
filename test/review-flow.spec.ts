@@ -4263,14 +4263,14 @@ dbDescribe('Review Flow Lifecycle', () => {
       const floorThresholds = confFloor.map((e: any) => e.threshold).sort();
       expect(floorThresholds).toEqual([0.7, 0.85]);
       const secFloorEvent = confFloor.find((e: any) => e.threshold === 0.85);
-      expect(secFloorEvent.sample.some((s: any) => s.title === 'Auth bypass sec' && s.category === 'security')).toBe(true);
+      expect(secFloorEvent.sample.some((s: any) => s.title === '[title-redacted]' && s.category === 'security')).toBe(true);
       const globalFloorEvent = confFloor.find((e: any) => e.threshold === 0.7);
-      expect(globalFloorEvent.sample.some((s: any) => s.title === 'Low conf bug')).toBe(true);
+      expect(globalFloorEvent.sample.some((s: any) => s.title === '[title-redacted]')).toBe(true);
 
       // one severity_floor event (nit below min_severity P3) + one cap event (1 P3 over max_comments 2).
       expect(sevFloor).toHaveLength(1);
       expect(sevFloor[0].threshold).toBe('P3');
-      expect(sevFloor[0].sample.some((s: any) => s.title === 'Rename var nit' && s.severity === 'nit')).toBe(true);
+      expect(sevFloor[0].sample.some((s: any) => s.title === '[title-redacted]' && s.severity === 'nit')).toBe(true);
       expect(cap).toHaveLength(1);
       expect(cap[0].threshold).toBe(2);
       expect(cap[0].sample.every((s: any) => s.severity === 'P3')).toBe(true);

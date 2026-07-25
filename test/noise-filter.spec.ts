@@ -288,7 +288,7 @@ describe('buildFinalizeDropEvents (FILT-04, D-07)', () => {
     expect(at85?.count).toBe(2);
     expect(at70?.count).toBe(1);
     // Sample entries carry the finding's own category/confidence (review finding #4).
-    expect(at85?.sample[0]).toMatchObject({ title: 'sec1', category: 'security', confidence: 0.8 });
+    expect(at85?.sample[0]).toMatchObject({ title: '[title-redacted]', category: 'security', confidence: 0.8 });
   });
 
   it('emits one severity_floor and one cap event with the passed thresholds and per-entry severity', () => {
@@ -300,7 +300,7 @@ describe('buildFinalizeDropEvents (FILT-04, D-07)', () => {
     const sev = filteredEvents(events).find((e) => e.rule === 'severity_floor');
     expect(sev?.threshold).toBe('P2');
     expect(sev?.count).toBe(1);
-    expect(sev?.sample[0]).toMatchObject({ title: 'sev1', severity: 'P3' });
+    expect(sev?.sample[0]).toMatchObject({ title: '[title-redacted]', severity: 'P3' });
 
     const cap = filteredEvents(events).find((e) => e.rule === 'cap');
     expect(cap?.threshold).toBe(5);
@@ -317,12 +317,20 @@ describe('buildFinalizeDropEvents (FILT-04, D-07)', () => {
     expect(cap?.sample).toHaveLength(20); // sample is bounded to 20
   });
 
-  it('clamps sample titles to <=100 chars (Codex LOW — parsedReviewComment.title is unbounded)', () => {
+  it('redacts non-empty titles to fixed marker and nullish titles to empty marker (Phase 20.1 BLOCKER 1)', () => {
     const dropped = emptyDropped();
-    dropped.severityFloor = [dropRecord({ title: 'x'.repeat(250) })];
+    // Producer-side redaction (audit-redact.ts:53-56): every non-empty title becomes
+    // `[title-redacted]` regardless of length, and nullish input becomes `[clamped:empty]`.
+    dropped.severityFloor = [
+      dropRecord({ title: 'x'.repeat(250) }),
+      dropRecord({ title: '' }),
+    ];
     const events = buildFinalizeDropEvents(dropped, { severityFloor: 'nit', cap: 3 });
     const sev = filteredEvents(events).find((e) => e.rule === 'severity_floor');
-    expect(sev?.sample[0].title).toHaveLength(100);
+    // Both sample entries carry the fixed privacy marker — over-length input does NOT leak
+    // through as a length-bounded head-clamp, and empty input does NOT collapse to ''.
+    expect(sev?.sample[0].title).toBe('[title-redacted]');
+    expect(sev?.sample[1].title).toBe('[clamped:empty]');
   });
 
   it('emits one deduped event per merge carrying titleSimilarity/bodySimilarity (review finding #4)', () => {
@@ -341,8 +349,8 @@ describe('buildFinalizeDropEvents (FILT-04, D-07)', () => {
     expect(dedup).toHaveLength(1);
     expect(dedup[0]).toMatchObject({
       rule: 'rule3',
-      survivor: { path: 'src/x.ts', line: 3, title: 'keep' },
-      suppressed: { path: 'src/x.ts', line: 4, title: 'drop' },
+      survivor: { path: 'src/x.ts', line: 3, title: '[title-redacted]' },
+      suppressed: { path: 'src/x.ts', line: 4, title: '[title-redacted]' },
       titleSimilarity: 0.7,
       bodySimilarity: null,
     });
