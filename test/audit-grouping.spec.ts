@@ -164,3 +164,35 @@ describe('groupAuditByStage — Phase 18 rounds display group', () => {
     expect(roundsGroup.events.map((e) => e.stage)).toEqual(['rounds.detected', 'rounds.escalated']);
   });
 });
+
+describe('normalizeAuditDisplayStage — Phase 24 D-01', () => {
+  it('maps evidence_missing_summary to the synthetic `evidence_missing` display stage', () => {
+    expect(normalizeAuditDisplayStage('evidence_missing_summary')).toBe('evidence_missing');
+  });
+
+  it('leaves existing non-prefixed stages unchanged — including evidence_missing itself', () => {
+    expect(normalizeAuditDisplayStage('evidence_missing')).toBe('evidence_missing');
+    expect(normalizeAuditDisplayStage('file_skipped')).toBe('file_skipped');
+  });
+});
+
+describe('groupAuditByStage — Phase 24 D-01 / D-02', () => {
+  it('produces an evidence_missing group for an evidence_missing_summary event and preserves its original stage', () => {
+    const event = ev('evidence_missing_summary', '2026-01-01T00:00:01Z');
+    const groups = groupAuditByStage([event]);
+    const group = groups.find((g) => g.stage === 'evidence_missing');
+    expect(group).toBeDefined();
+    expect(group!.count).toBe(1);
+    expect(group!.events.map((e) => e.stage)).toEqual(['evidence_missing_summary']);
+  });
+
+  it('groups legacy evidence_missing and evidence_missing_summary events together in one evidence_missing group', () => {
+    const legacy = ev('evidence_missing', '2026-01-01T00:00:01Z');
+    const summary = ev('evidence_missing_summary', '2026-01-01T00:00:02Z');
+    const groups = groupAuditByStage([legacy, summary]);
+    const group = groups.find((g) => g.stage === 'evidence_missing');
+    expect(group).toBeDefined();
+    expect(group!.count).toBe(2);
+    expect(group!.events.map((e) => e.stage)).toEqual(['evidence_missing', 'evidence_missing_summary']);
+  });
+});
