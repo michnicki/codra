@@ -17,6 +17,8 @@ import { z } from 'zod';
 import { logger } from './logger';
 import { applySeverityRules } from './severity';
 import { redactFindingTitle } from './audit-redact';
+import { buildEvidenceMissingSummary } from './audit';
+import type { EvidenceMissingEntry } from './audit';
 import { findClosestValidLine, findPositionForLine, getValidNewLines, getValidPositions } from './diff';
 import type { FileDiff } from './diff';
 import { jsonrepair } from 'jsonrepair';
@@ -428,6 +430,8 @@ export function parseFileReviewResponse(
   // findings that survive the orphan check (i.e. become a persisted comment) contribute events, so
   // the trail never references a dropped, off-diff finding.
   const severityAuditEvents: JobAuditEvent[] = [];
+  // EVID-03: accumulate evidence-missing entries per (file, pass); builder call after .filter(Boolean).
+  const evidenceMissingEntries: EvidenceMissingEntry[] = [];
 
   // EVID-01 soft evidence gate (D-16). Build the cleaned-hunk haystack ONCE for this file: concat of
   // ALL hunk lines (context + add + del) content — hunk `content` is already diff-prefix-stripped
@@ -520,27 +524,13 @@ export function parseFileReviewResponse(
       if (evidence == null || needle.length === 0) {
         // null / undefined / whitespace-only -> `absent`. A JSON `null` reaches here (never a parse
         // failure) because fileReviewModelOutputSchema.existing_code is nullable().optional() (15-01).
-        // Phase 20.1 BLOCKER 1 (D-06): the title is redacted via redactFindingTitle (max 100 chars
-        // with a length-bounded head-clamp marker for over-length input). The prior clampAuditTitle
-        // only truncated; the redactor is the producer-side enforcement of the audit-event privacy
-        // boundary (AUD-01 sign-off text).
-        severityAuditEvents.push({
-          stage: 'evidence_missing',
-          reason: 'absent',
-          path: file.path,
-          line,
-          title: redactFindingTitle(title),
-          timestamp: new Date().toISOString(),
-        });
+        // EVID-03: accumulate as EvidenceMissingEntry (raw title, not redacted — the builder applies
+        // redactFindingTitle internally per D-06). `line` normalized via ?? null for the
+        // EvidenceMissingEntry type (number | undefined -> number | null).
+        evidenceMissingEntries.push({ path: file.path, line: line ?? null, title, reason: 'absent' });
       } else if (!evidenceHaystack.includes(needle)) {
-        severityAuditEvents.push({
-          stage: 'evidence_missing',
-          reason: 'not_in_hunk',
-          path: file.path,
-          line,
-          title: redactFindingTitle(title),
-          timestamp: new Date().toISOString(),
-        });
+        // EVID-03: same accumulation for not_in_hunk; line ?? null type normalization.
+        evidenceMissingEntries.push({ path: file.path, line: line ?? null, title, reason: 'not_in_hunk' });
       }
 
       return parsedReviewCommentSchema.parse({
@@ -561,6 +551,15 @@ export function parseFileReviewResponse(
       });
     })
     .filter((comment): comment is ParsedReviewComment => Boolean(comment));
+
+  // EVID-03 / D-05/D-06/D-08: single builder call per (file, pass) returning
+  // EvidenceMissingSummaryAuditEvent | null. Returns null when entries.length === 0
+  // (D-05 — no zero-count event). The result flows through the existing
+  // severityAuditEvents channel into recordUnitAudit (unchanged).
+  const evidenceSummary = buildEvidenceMissingSummary(file.path, opts.pass ?? 'main', evidenceMissingEntries);
+  if (evidenceSummary) {
+    severityAuditEvents.push(evidenceSummary);
+  }
 
   const verdict = parsed.overall_correctness.toLowerCase().includes('patch is correct') ? 'approve' : 'comment';
   let fileSummary = parsed.overall_explanation;
