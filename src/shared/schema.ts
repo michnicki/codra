@@ -927,8 +927,8 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
   // persisted events still parse; the two `stage` literals are distinct and coexist in the union.
   //
   // Counts are camelCase per D-03 (absentCount, notInHunkCount).
-  // Sample entry line is nullable and carries the post-orphan-remap line (current behavior) per D-02.
-  //   Phase 22 (EVID-04) will swap to the pre-remap original line.
+  // Sample entry line is nullable and carries the pre-orphan-remap original line the model cited per D-02.
+  //   Implemented by Phase 22 (EVID-04).
   // Sample preserves model emission order per D-07, NOT grouped by reason.
   // Sample entries carry `reason` per D-04 for EVID-02 consumption.
   // Privacy-bounded: titles route through redactFindingTitle (max 100 char marker); never
