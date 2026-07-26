@@ -191,6 +191,27 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
           )}
         </li>
       );
+    // Phase 26 (EVID-02): evidence_hard_dropped aggregate event — the operator sees file+pass as
+    // identifier, droppedCount as metric line, and up to 20 sample entries with path:line, title,
+    // and reason tag. Follows the evidence_missing_summary pattern exactly.
+    case 'evidence_hard_dropped':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="file" value={event.file} />
+          <MetricLine label="pass" value={event.pass} />
+          <MetricLine label="dropped" value={String(event.droppedCount)} />
+          {event.sample.length > 0 && (
+            <ul className="mt-2 flex flex-col gap-1.5 border-t border-border/30 pt-2">
+              {event.sample.map((s, i) => (
+                <li key={i}>
+                  <SampleIdentifier path={s.path} line={s.line} title={s.title} />
+                  <div className="text-[10px] text-muted-foreground/70 font-mono">{s.reason}</div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </li>
+      );
     // Phase 18 RND-01..05: every `rounds.*` sub-variant lands inside the normalized `Rounds`
     // DecisionGroup via the audit-grouping normalizer. The original event.stage distinguishes
     // each sub-variant for the per-row renderer below; .passthrough() keeps every known field

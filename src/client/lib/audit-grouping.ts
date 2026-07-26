@@ -71,6 +71,7 @@ export function normalizeAuditDisplayStage(stage: JobAuditEvent['stage']): Audit
   // Phase 24: evidence_missing_summary maps to the existing evidence_missing display stage
   // so the aggregate event lands in the same Evidence missing group as legacy per-finding events.
   if (stage === 'evidence_missing_summary') return 'evidence_missing';
+  if (stage === 'evidence_hard_dropped') return 'evidence_missing';
   return stage as AuditDisplayStage;
 }
 
