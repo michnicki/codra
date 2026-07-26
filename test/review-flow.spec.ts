@@ -4662,8 +4662,9 @@ dbDescribe('evidence hard-drop', () => {
     );
 
     let captured: any[] = [];
+    let createReviewArgs: any[] = [];
     const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
-      async (_o: any, _r: any, _p: any, input: any) => { captured = input.comments; return { id: 456 }; },
+      async (...args: any[]) => { createReviewArgs = args; captured = args[3]?.comments ?? []; return { id: 456 }; },
     );
 
     const job = await insertJob(env, {
@@ -4782,19 +4783,21 @@ dbDescribe('evidence hard-drop', () => {
     // Finding A: quality category with hallucinated evidence -> dropped (not exempt)
     // Finding B: security category with hallucinated evidence -> kept (exempt)
     // Finding C: security category with genuine evidence -> kept
+    // Each finding uses a different line so dedup does not collapse them (rule1 fires on same-path +
+    // same-line + same-category, which would suppress the second security finding).
     await upsertFileReview(env, job.id, {
       filePath: 'src/app.ts',
       pass: 'main',
       fileStatus: 'done',
       modelUsed: 'test-model',
       modelProvider: 'test-provider',
-      diffLineCount: 1,
+      diffLineCount: 3,
       diffInput: 'diff',
       rawAiOutput: '{}',
       parsedComments: [
-        comment({ category: 'quality', title: 'Quality bad evidence', existingCode: 'fake.code' }),
-        comment({ category: 'security', title: 'Security bad evidence', existingCode: 'fake.code' }),
-        comment({ category: 'security', title: 'Security good evidence', existingCode: 'console.log(1);' }),
+        comment({ category: 'quality', title: 'Quality bad evidence', existingCode: 'fake.code', line: 1, position: 1 }),
+        comment({ category: 'security', title: 'Security bad evidence', existingCode: 'fake.code', line: 2, position: 2 }),
+        comment({ category: 'security', title: 'Security good evidence', existingCode: 'console.log(1);', line: 3, position: 3 }),
       ],
       inputTokens: 10,
       outputTokens: 5,
@@ -4813,9 +4816,10 @@ dbDescribe('evidence hard-drop', () => {
 
     // Both security findings should survive (exempt + genuine); quality finding dropped
     expect(captured).toHaveLength(2);
-    expect(captured[0].body).toContain('Security bad evidence');
-    expect(captured[0].body).toContain('Security good evidence');
-    expect(captured[0].body).not.toContain('Quality bad evidence');
+    const capturedBodies = captured.map((c: any) => c.body).join(' ');
+    expect(capturedBodies).toContain('Security bad evidence');
+    expect(capturedBodies).toContain('Security good evidence');
+    expect(capturedBodies).not.toContain('Quality bad evidence');
 
     // Verify audit trail: only 1 dropped (the quality finding)
     const detail = await getJobDetail(env, job.id);
@@ -4861,20 +4865,22 @@ dbDescribe('evidence hard-drop', () => {
     await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
     await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
 
-    // All three findings have bad evidence, but hard_drop is false so ALL should post
+    // All three findings have bad evidence, but hard_drop is false so ALL should post.
+    // Each finding uses a different line so dedup does not collapse them (rule1 fires on same-path +
+    // same-line + same-category).
     await upsertFileReview(env, job.id, {
       filePath: 'src/app.ts',
       pass: 'main',
       fileStatus: 'done',
       modelUsed: 'test-model',
       modelProvider: 'test-provider',
-      diffLineCount: 1,
+      diffLineCount: 3,
       diffInput: 'diff',
       rawAiOutput: '{}',
       parsedComments: [
-        comment({ title: 'Finding A', existingCode: 'fake.code' }),
-        comment({ title: 'Finding B', existingCode: 'another.fake' }),
-        comment({ title: 'Finding C', existingCode: null }),
+        comment({ title: 'Finding A', existingCode: 'fake.code', line: 1, position: 1 }),
+        comment({ title: 'Finding B', existingCode: 'another.fake', line: 2, position: 2 }),
+        comment({ title: 'Finding C', existingCode: null, line: 3, position: 3 }),
       ],
       inputTokens: 10,
       outputTokens: 5,

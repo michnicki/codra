@@ -84,15 +84,16 @@ export async function insertFileReview(
       const bodies = input.parsedComments.map(c => c.body);
       const codeSuggestions = input.parsedComments.map(c => c.codeSuggestion ?? null);
       const confidences = input.parsedComments.map(c => c.confidence ?? null);
+      const existingCodes = input.parsedComments.map(c => c.existingCode ?? null);
 
       await tx.query(
         `
           INSERT INTO review_comments (
-            file_review_id, path, line, position, severity, category, title, body, code_suggestion, confidence
+            file_review_id, path, line, position, severity, category, title, body, code_suggestion, confidence, existing_code
           )
-          SELECT $1::uuid, * FROM UNNEST($2::text[], $3::int[], $4::int[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], $10::real[])
+          SELECT $1::uuid, * FROM UNNEST($2::text[], $3::int[], $4::int[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], $10::real[], $11::text[])
         `,
-        [review.id, paths, lines, positions, severities, categories, titles, bodies, codeSuggestions, confidences]
+        [review.id, paths, lines, positions, severities, categories, titles, bodies, codeSuggestions, confidences, existingCodes]
       );
     }
   });
@@ -210,9 +211,9 @@ export async function upsertFileReview(
       await tx.query(
         `
           INSERT INTO review_comments (
-            file_review_id, path, line, position, severity, category, title, body, code_suggestion, confidence
+            file_review_id, path, line, position, severity, category, title, body, code_suggestion, confidence, existing_code
           )
-          SELECT $1::uuid, * FROM UNNEST($2::text[], $3::int[], $4::int[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], $10::real[])
+          SELECT $1::uuid, * FROM UNNEST($2::text[], $3::int[], $4::int[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], $10::real[], $11::text[])
         `,
         [
           review.id,
@@ -225,6 +226,7 @@ export async function upsertFileReview(
           input.parsedComments.map(c => c.body),
           input.parsedComments.map(c => c.codeSuggestion ?? null),
           input.parsedComments.map(c => c.confidence ?? null),
+          input.parsedComments.map(c => c.existingCode ?? null),
         ],
       );
     }
@@ -508,7 +510,8 @@ export async function getFileReviewsForJobs(env: Pick<AppBindings, 'HYPERDRIVE'>
                 'title', rc.title,
                 'body', rc.body,
                 'codeSuggestion', rc.code_suggestion,
-                'confidence', rc.confidence
+                'confidence', rc.confidence,
+                'existingCode', rc.existing_code
               )
             ORDER BY rc.id ASC
             ) FROM review_comments rc WHERE rc.file_review_id = fr.id
