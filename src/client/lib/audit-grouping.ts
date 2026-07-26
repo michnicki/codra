@@ -18,6 +18,7 @@ export const STAGE_ORDER = [
   'filtered',
   'deduped',
   'evidence_missing',
+  'learned_rule_suppressed',
   'rounds',
   'threads',
   'critic',
@@ -72,6 +73,9 @@ export function normalizeAuditDisplayStage(stage: JobAuditEvent['stage']): Audit
   // so the aggregate event lands in the same Evidence missing group as legacy per-finding events.
   if (stage === 'evidence_missing_summary') return 'evidence_missing';
   if (stage === 'evidence_hard_dropped') return 'evidence_missing';
+  // Phase 28 (LRN-01): learned_rule_suppressed maps to the evidence_missing display
+  // group so suppression events land alongside evidence hard-drop events.
+  if (stage === 'learned_rule_suppressed') return 'evidence_missing';
   return stage as AuditDisplayStage;
 }
 
