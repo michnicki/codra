@@ -27,6 +27,14 @@ export type RejectFeedbackRow = {
   rejected_by: string;
   source_comment_ref: string;
   created_at: string;
+  // Phase 28 (LRN-01): denormalized finding metadata for learned-rule clustering.
+  // All nullable — existing rows get NULLs; edge cases where metadata can't be resolved
+  // (deleted comment, provider error, orphan ref) also get NULLs. Clustering only considers
+  // rows with non-null finding_category and finding_file_path (D-02).
+  finding_title: string | null;
+  finding_category: string | null;
+  finding_file_path: string | null;
+  finding_severity: string | null;
 };
 
 /**
@@ -50,6 +58,13 @@ export async function insertRejectFeedback(
     reason: string | null;
     rejectedBy: string;
     sourceCommentRef: string;
+    // Phase 28 (LRN-01): optional denormalized finding metadata for learned-rule clustering.
+    // All nullable — populated from provider API + review_comments join at reject time.
+    // NULLs are safe: clustering skips rows with null finding_category or finding_file_path (D-02).
+    findingTitle?: string | null;
+    findingCategory?: string | null;
+    findingFilePath?: string | null;
+    findingSeverity?: string | null;
   },
 ): Promise<RejectFeedbackRow | null> {
   // CMD-05 edge: a reject with no resolvable finding_ref (no parent comment) -- or no source comment
@@ -62,8 +77,9 @@ export async function insertRejectFeedback(
     env,
     `
       INSERT INTO reject_feedback
-        (vcs_provider, workspace, repo_slug, pr_number, finding_ref, reason, rejected_by, source_comment_ref)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        (vcs_provider, workspace, repo_slug, pr_number, finding_ref, reason, rejected_by, source_comment_ref,
+         finding_title, finding_category, finding_file_path, finding_severity)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
       ON CONFLICT (vcs_provider, source_comment_ref) DO NOTHING
       RETURNING *
     `,
@@ -76,6 +92,71 @@ export async function insertRejectFeedback(
       input.reason,
       input.rejectedBy,
       input.sourceCommentRef,
+      input.findingTitle ?? null,
+      input.findingCategory ?? null,
+      input.findingFilePath ?? null,
+      input.findingSeverity ?? null,
+    ],
+  );
+
+  return rows[0] ?? null;
+}
+
+/**
+ * Phase 28 (LRN-01): Look up a review_comment by (path, line) for the most recent completed job
+ * matching the given PR identity. Returns the finding's title, category, and severity, or null if
+ * no matching review_comment is found. Used by the reject handler to denormalize finding metadata
+ * onto reject_feedback rows (D-01).
+ *
+ * Joins review_comments → file_reviews → jobs → repositories. The (path, line) match is unambiguous
+ * for most PRs; if multiple Codra comments exist on the same (path, line), the most recent completed
+ * job's comment is returned (ORDER BY jobs.created_at DESC, LIMIT 1).
+ *
+ * The vcs_provider filter ensures we don't cross-match between GitHub and Bitbucket repos that
+ * share the same owner/workspace + repo slug.
+ */
+export async function findReviewCommentByPathLine(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  input: {
+    workspace: string;
+    repoSlug: string;
+    vcsProvider: VcsProvider;
+    prNumber: number;
+    path: string;
+    line: number | null;
+  },
+): Promise<{ title: string; category: string; severity: string } | null> {
+  // Line must be non-null to match — a comment with null line is a general PR comment, not an
+  // inline finding, so there's no meaningful review_comment to join against.
+  if (input.line == null) {
+    return null;
+  }
+
+  const rows = await queryRows<{ title: string; category: string; severity: string }>(
+    env,
+    `
+      SELECT rc.title, rc.category, rc.severity
+      FROM review_comments rc
+      JOIN file_reviews fr ON fr.id = rc.file_review_id
+      JOIN jobs j ON j.id = fr.job_id
+      JOIN repositories r ON r.id = j.repository_id
+      WHERE r.vcs_provider = $1
+        AND (r.owner = $2 OR r.workspace = $2)
+        AND r.repo = $3
+        AND j.pr_number = $4
+        AND j.status = 'done'
+        AND rc.path = $5
+        AND rc.line = $6
+      ORDER BY j.created_at DESC
+      LIMIT 1
+    `,
+    [
+      input.vcsProvider,
+      input.workspace,
+      input.repoSlug,
+      input.prNumber,
+      input.path,
+      input.line,
     ],
   );
 

@@ -86,6 +86,13 @@ export class GitHubService {
     return this.client.updateIssueComment(owner, repo, commentId, body);
   }
 
+  // Phase 28 (LRN-01): fetch a single pull request review comment by id. Pass-through to the
+  // client's getReviewComment. REQUIRED here so the vi.mock('@server/services/github') seam
+  // intercepts (same pattern as the other comment-primitive pass-throughs above).
+  async getReviewComment(owner: string, repo: string, commentId: number) {
+    return this.client.getReviewComment(owner, repo, commentId);
+  }
+
   // Command-authorization pass-through (Phase 11, CMD-08): the adapter re-verifies the returned
   // immutable id against the authorId before trusting the permission. REQUIRED here so the
   // vi.mock('@server/services/github') seam intercepts.

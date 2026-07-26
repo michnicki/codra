@@ -287,6 +287,31 @@ export interface VcsProvider {
     authorLogin?: string,
   ): Promise<'admin' | 'write' | 'read' | 'none' | null>;
 
+  /**
+   * Fetch the details of an inline PR review comment by its provider-opaque ref (LRN-01, D-01).
+   * Returns the comment's file path, line number, and body text, or null if the comment doesn't
+   * exist (404), was deleted, or is not an inline comment (no `inline` object on Bitbucket, no
+   * `path` on GitHub issue comments).
+   *
+   * Used by the reject handler to resolve finding metadata at reject time: the `finding_ref` in
+   * `reject_feedback` is the provider's comment id, and this method translates it to the
+   * (path, line, body) triple needed to join against `review_comments`.
+   *
+   * `commentRef` is PROVIDER-OPAQUE — the adapter alone interprets it. GitHub uses the bare
+   * numeric `pull_request_review_comment.id`; Bitbucket uses the comment id from the PR comments
+   * endpoint.
+   *
+   * Error handling: returns null on 404/deleted/comment-not-found (never throws for missing
+   * comments). Throws on auth errors, 5xx, or network failures so the caller can distinguish
+   * "comment doesn't exist" from "provider is down".
+   */
+  getInlineCommentDetails(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    commentRef: string,
+  ): Promise<{ path: string; line: number | null; body: string } | null>;
+
   labels?: {
     ensure(owner: string, repo: string, name: string, color: string): Promise<void>;
     add(owner: string, repo: string, prNumber: number, labels: string[]): Promise<void>;

@@ -943,6 +943,35 @@ export class GitHubClient {
     });
   }
 
+  // Phase 28 (LRN-01): fetch a single pull request review comment by its id. Returns the
+  // comment's path, line, and body, or null on 404 (deleted comment). Uses this.request (NOT
+  // requestAndCheck) so 404 returns null instead of throwing — same pattern as updateIssueComment
+  // and getRepoFileOrNull. Any OTHER non-2xx still throws a GitHubError.
+  async getReviewComment(owner: string, repo: string, commentId: number) {
+    return withRetry(`getReviewComment ${owner}/${repo} comment#${commentId}`, async () => {
+      const commentPath = `${repoApiPath(owner, repo)}/pulls/comments/${commentId}`;
+      const response = await this.request(commentPath);
+      if (response.status === 404) {
+        return null;
+      }
+      if (!response.ok) {
+        let errText: string;
+        try {
+          errText = await response.text();
+        } catch {
+          errText = String(response.status);
+        }
+        throw new GitHubError(
+          response.status,
+          errText,
+          commentPath,
+          `GitHub review comment fetch failed with ${response.status}: ${errText}`,
+        );
+      }
+      return (await response.json()) as { path: string; line: number | null; body: string };
+    });
+  }
+
   // --- Command-authorization + bot-identity primitives (Phase 11, CMD-07/CMD-08) ---
 
   /**
