@@ -17,7 +17,17 @@
 **Goal:** Promote EVID-01 from soft/audit-only to hard-drop — findings with hallucinated `existingCode` evidence are dropped from posted comments (not just recorded in audit). Config-gated (`evidence.hard_drop`, default off). Per-category opt-out.
 **Requirements**: EVID-02
 **Depends on:** v1.3 (Phase 21 EVID-03 bounded telemetry)
-**Plans:** TBD
+**Plans:** 2 plans
+
+Plans:
+
+**Wave 1**
+
+- [ ] 26-01-PLAN.md — Schema definitions + evidence check extraction + audit builder + unit tests
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 26-02-PLAN.md — Finalize wiring + integration tests + dashboard config UI + audit viewer renderer
 
 ### Phase 27: SEC-XDIFF-01 Whole-diff cross-file security reasoning
 
