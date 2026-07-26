@@ -23,11 +23,11 @@ Plans:
 
 **Wave 1**
 
-- [ ] 26-01-PLAN.md — Schema definitions + evidence check extraction + audit builder + unit tests
+- [ ] 26-01-PLAN.md — Schema + evidence block (bounded at 20) + checkEvidence extraction + audit builder + config.ts default injection + 17 unit tests
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 26-02-PLAN.md — Finalize wiring + integration tests + dashboard config UI + audit viewer renderer
+- [ ] 26-02-PLAN.md — Finalize wiring (persisted finalizeRetriedPastPost gate) + API shallow-merge fix + integration tests + dashboard config UI + audit viewer renderer
 
 ### Phase 27: SEC-XDIFF-01 Whole-diff cross-file security reasoning
 
