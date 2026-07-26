@@ -48,19 +48,21 @@ Plans:
 **Goal:** Surface `evidence_missing_summary` audit events in the dashboard's job-detail audit trail viewer
 **Requirements**: EVID-03, EVID-04, AUD-03 (dashboard catch-up)
 **Depends on:** Phase 23
-**Plans:** 1 plan
+**Plans:** 1/1 plans complete
 
 Plans:
 
-- [ ] 24-01-PLAN.md — Add normalizer mapping + renderer + tests for evidence_missing_summary
+- [x] 24-01-PLAN.md — Add normalizer mapping + renderer + tests for evidence_missing_summary
 
 ### Phase 25: Milestone closeout (audit, verification, sign-off)
 
-**Goal:** [To be planned]
-**Requirements**: TBD
+**Goal:** Close out the v1.3 "Bounded Evidence Audit Telemetry" milestone: Nyquist-validate all 4 deliverable phases, run a formal scored milestone audit (matching v1.2 depth), obtain human sign-off, archive v1.3, and prepare v1.4.
+**Requirements**: Process phase (no new requirements — validates EVID-03, EVID-04, AUD-03)
 **Depends on:** Phase 24
-**Plans:** 0 plans
+**Plans:** 1/1 plans complete (process phase)
 
 Plans:
 
-- [ ] TBD (run /gsd-plan-phase 25 to break down)
+**Wave 1**
+
+- [ ] 25-01-PLAN.md — Full closeout sequence: Nyquist validation (4 phases), formal milestone audit, human sign-off checkpoint, archive v1.3, prepare v1.4
