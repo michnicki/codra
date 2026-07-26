@@ -2,9 +2,17 @@
 
 ## Milestones
 
+- ✅ **v1.3 Bounded Evidence Audit Telemetry** — Phases 21-25 (shipped 2026-07-26): [milestones/v1.3-ROADMAP.md](milestones/v1.3-ROADMAP.md)
 - ✅ **v1.2 Review Engine Quality & Re-review Lifecycle** — shipped 2026-07-25: 9 phases (13-20 + 20.1), 49 plans including 19-10, 31/31 requirements satisfied, milestone audit `passed`. Full history: [milestones/v1.2-ROADMAP.md](milestones/v1.2-ROADMAP.md)
 
-### Phase 21: Evidence-missing aggregate summary event (schema + audit writer)
+### v1.4 — Next Milestone (preparation)
+
+**Initiated:** 2026-07-26
+**Candidates:** EVID-02, SEC-XDIFF-01, LRN-01, QA-IDX-01, ANNO-01, WS-01 (promoted from deferred)
+**Status:** Ready for `/gsd-new-milestone` scoping
+
+<details>
+<summary>✅ v1.3 Bounded Evidence Audit Telemetry (Phases 21-25) — SHIPPED 2026-07-26</summary>
 
 **Goal:** Replace per-finding `evidence_missing` audit events with one bounded aggregate `evidence_missing_summary` event per `(file, pass)` unit, preventing a non-compliant model's flood of per-finding events from evicting other telemetry from the ring buffer.
 **Requirements**: EVID-03
@@ -65,4 +73,6 @@ Plans:
 
 **Wave 1**
 
-- [ ] 25-01-PLAN.md — Full closeout sequence: Nyquist validation (4 phases), formal milestone audit, human sign-off checkpoint, archive v1.3, prepare v1.4
+- [x] 25-01-PLAN.md — Full closeout sequence: Nyquist validation (4 phases), formal milestone audit, human sign-off checkpoint, archive v1.3, prepare v1.4
+
+</details>
