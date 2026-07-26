@@ -8,7 +8,8 @@ export type PhaseName =
   | 'finalize'
   | 'critic'
   | 'verify_fixes'
-  | 'walkthrough_enrichment';
+  | 'walkthrough_enrichment'
+  | 'cross_file_security';
 
 export class NextPhaseError extends Error {
   constructor(public phase: PhaseName, public delaySeconds: number) {

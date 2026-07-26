@@ -540,7 +540,7 @@ describe('ModelService', () => {
               command: 'npm run lint',
             },
             walkthrough: { enabled: false, sequence_diagram: { enabled: true } },
-            passes: { security: { enabled: false }, critic: { enabled: false }, ensemble: { runs: 1, temperature: 0.7 } },
+            passes: { security: { enabled: false, cross_file: false }, critic: { enabled: false }, ensemble: { runs: 1, temperature: 0.7 } },
             interactive: {
               commands: { enabled: false, bitbucket_allowed_account_ids: [], bitbucket_bot_account_id: null },
               qa: { enabled: false, rate_limit_per_hour: 10 },

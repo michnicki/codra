@@ -888,3 +888,99 @@ export function parseWalkthroughEnrichmentResponse(raw: string): ParsedWalkthrou
   return { kind: 'parsed', groups, confidence, effort, malformedFields: Object.freeze(malformedFields) };
 }
 
+// SEC-XDIFF-01: schema for the cross-file security model's JSON response. The model returns
+// `{ "findings": [...] }` where each finding has title, body, severity, path, line, confidence,
+// and optional cross_references. Severity is mapped to the Codra severity enum (P0..P3/nit) by
+// the prompt template; the parser validates the mapping but falls back to 'P2' for unexpected
+// values so a single malformed severity never drops a valid finding.
+const crossFileSecurityFindingSchema = z.object({
+  title: z.string().min(1),
+  body: z.string().min(1),
+  severity: z.enum(reviewSeverities).catch('P2'),
+  path: z.string().min(1),
+  line: z.number().int().positive().optional(),
+  confidence: z.number().min(0).max(1).optional(),
+  cross_references: z.array(z.object({
+    path: z.string().min(1),
+    line: z.number().int().positive().optional(),
+    relationship: z.string().min(1),
+  })).optional(),
+});
+
+const crossFileSecurityResponseSchema = z.object({
+  findings: z.array(crossFileSecurityFindingSchema),
+});
+
+export type CrossFileSecurityFinding = z.infer<typeof crossFileSecurityFindingSchema>;
+
+export type ParsedCrossFileSecurityResponse =
+  | { kind: 'parsed'; findings: CrossFileSecurityFinding[] }
+  | { kind: 'fail_open'; reason: string };
+
+/**
+ * SEC-XDIFF-01: tolerant parse of the cross-file security model's JSON response. Follows the
+ * same extract → repair → parse → validate pattern as parseWalkthroughEnrichmentResponse.
+ * Returns {kind: 'parsed', findings} on success, or {kind: 'fail_open', reason} on whole-call
+ * parse failure. Individual findings that fail schema validation are silently dropped (same
+ * tolerance posture as walkthrough enrichment's per-item filtering).
+ */
+export function parseCrossFileSecurityResponse(raw: string): ParsedCrossFileSecurityResponse {
+  if (typeof raw !== 'string' || raw.trim().length === 0) {
+    return { kind: 'fail_open', reason: 'empty_response' };
+  }
+
+  // Strip <think>...</think> reasoning before extraction — same tolerance as walkthrough enrichment.
+  const stripped = raw
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<think>[\s\S]*$/i, '');
+
+  let extracted: string;
+  try {
+    extracted = extractJson(stripped);
+  } catch {
+    return { kind: 'fail_open', reason: 'json_extract_failed' };
+  }
+
+  let repaired = extracted;
+  try {
+    repaired = jsonrepair(preprocessJson(extracted));
+  } catch {
+    // Fall back to the raw extracted text; the JSON.parse below is the final gate.
+  }
+
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(repaired);
+  } catch {
+    return { kind: 'fail_open', reason: 'json_parse_failed' };
+  }
+
+  if (!parsedJson || typeof parsedJson !== 'object' || Array.isArray(parsedJson)) {
+    return { kind: 'fail_open', reason: 'json_not_object' };
+  }
+
+  const obj = parsedJson as Record<string, unknown>;
+
+  if (!('findings' in obj) || !Array.isArray(obj.findings)) {
+    return { kind: 'fail_open', reason: 'findings_missing_or_not_array' };
+  }
+
+  // Per-item tolerant filtering: drop items that fail schema validation rather than failing the
+  // whole call. Matches walkthrough enrichment's group-validation posture.
+  const findings: CrossFileSecurityFinding[] = [];
+  for (const item of obj.findings) {
+    if (item && typeof item === 'object') {
+      const parsed = crossFileSecurityFindingSchema.safeParse(item);
+      if (parsed.success) {
+        findings.push(parsed.data);
+      }
+    }
+  }
+
+  if (findings.length === 0) {
+    return { kind: 'fail_open', reason: 'all_findings_invalid' };
+  }
+
+  return { kind: 'parsed', findings };
+}
+
