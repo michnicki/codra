@@ -1,19 +1,19 @@
 ---
 gsd_state_version: 1.0
 milestone: v1.4
-milestone_name: TBD (v1.4 candidates: EVID-02, SEC-XDIFF-01, LRN-01, QA-IDX-01, ANNO-01, WS-01)
-current_phase: 25
-current_phase_name: milestone-closeout-audit-verification-sign-off
-status: transition — v1.3 closed 2026-07-26, v1.4 preparation pending
-stopped_at: Phase 25 execution completed — awaiting /gsd-complete-milestone and /gsd-new-milestone
+milestone_name: TBD — candidates: EVID-02, SEC-XDIFF-01, LRN-01, QA-IDX-01, ANNO-01, WS-01
+current_phase: 0
+current_phase_name: none (v1.4 preparation — ready for /gsd-discuss-phase)
+status: ready — v1.3 closed and archived 2026-07-26, v1.4 requirements seeded
+stopped_at: Phase 25 complete, v1.3 archived, v1.4 candidates promoted
 last_updated: "2026-07-26"
 last_activity: 2026-07-26
-last_activity_desc: Phase 25 closeout completed (Nyquist, audit, sign-off, doc updates)
+last_activity_desc: Phase 25 closeout + v1.3 archive + v1.4 preparation complete
 progress:
-  total_phases: 5
-  completed_phases: 5
-  total_plans: 6
-  completed_plans: 6
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
 ---
 
 # Project State
@@ -23,14 +23,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-25 for v1.2 closure)
 
 **Core value:** A Bitbucket Cloud PR gets the same AI review a GitHub PR gets, from one instance, without breaking GitHub — held end-to-end since v1.0, extended by v1.1 (every interactive/multi-pass capability shipped on both providers), extended by v1.2 (deterministic severity + real categories, audit-backed noise filter, priority file selection, incremental rounds, verify-fixes, critic v2, ensemble, walkthrough enrichment — all on both providers, every drop explainable from `jobs.audit`).
-**Current focus:** v1.3 closed 2026-07-26 — Nyquist, audit, sign-off complete. Transitioning to v1.4 preparation.
+**Current focus:** v1.4 preparation — EVID-02, SEC-XDIFF-01, LRN-01, QA-IDX-01, ANNO-01, WS-01 promoted from deferred. Ready for /gsd-discuss-phase.
 
 ## Current Position
 
-Phase: 25 (milestone-closeout-audit-verification-sign-off) — COMPLETE
-Plan: 1 of 1
-Status: v1.3 closed, v1.4 preparation pending
-Last activity: 2026-07-26 -- Phase 25 executed: Nyquist validated 4/4 phases, v1.3-MILESTONE-AUDIT.md produced, human sign-off recorded, docs updated
+Phase: none — v1.4 milestone preparation complete
+Plan: none
+Status: Ready — v1.3 closed and archived 2026-07-26, v1.4 requirements seeded
+Last activity: 2026-07-26 -- Phase 25 closeout + v1.3 archive + v1.4 preparation
 
 ## Performance Metrics
 
