@@ -1,4 +1,5 @@
-import { normalizeForEvidence, parseCriticPruneResponse, parseFileReviewResponse, parseWalkthroughDiagram, parseWalkthroughEnrichmentResponse } from '@server/core/model-output';
+import { parseCriticPruneResponse, parseFileReviewResponse, parseWalkthroughDiagram, parseWalkthroughEnrichmentResponse } from '@server/core/model-output';
+import { normalizeForEvidence } from '@server/core/evidence';
 import { truncateFileDiff, type FileDiff } from '@server/core/diff';
 
 describe('Model Output Parsing Deep Dive', () => {

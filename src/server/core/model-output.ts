@@ -18,6 +18,7 @@ import { logger } from './logger';
 import { applySeverityRules } from './severity';
 import { buildEvidenceMissingSummary } from './audit';
 import type { EvidenceMissingEntry } from './audit';
+import { checkEvidence, normalizeForEvidence, stripLeadingDiffMarkers } from './evidence';
 import { findClosestValidLine, findPositionForLine, getValidNewLines, getValidPositions } from './diff';
 import type { FileDiff } from './diff';
 import { jsonrepair } from 'jsonrepair';
@@ -278,34 +279,6 @@ function preprocessJson(json: string): string {
   return result;
 }
 
-/**
- * Normalizer for the soft evidence gate (EVID-01, D-16). Collapses every whitespace run to a single
- * space, trims, AND lower-cases — the substring match is therefore whitespace- AND case-INSENSITIVE,
- * so trivial `Const` vs `const` / indentation differences do NOT inflate the `not_in_hunk` count and
- * pollute the EVID-02 go/no-go signal (OpenCode C4 / Antigravity). No Unicode normalization.
- *
- * This is DELIBERATELY NOT `cleanText` (D-16 Anti-Pattern): cleanText strips leading tag/emoji
- * prefixes (SECURITY/BUG/P0/…), which are meaningless for diff-line evidence and would corrupt the
- * haystack/needle comparison. Never reuse cleanText here.
- */
-export function normalizeForEvidence(s: string): string {
-  return s.replace(/\s+/g, ' ').trim().toLowerCase();
-}
-
-/**
- * WR-02: The evidence haystack is built from hunk `content`, which is already diff-prefix-stripped
- * (diff.ts strips the leading +/-/space marker). The needle (`existing_code`) is only produced by the
- * model, which is merely ASKED not to prepend a `+`/`-` marker. When it disobeys (common), the needle
- * keeps that leading char and fails the `includes()` test, producing a FALSE `not_in_hunk` that
- * inflates the exact count EVID-02 reads as a go/no-go signal. Strip a single leading `+`/`-` from EACH
- * line (evidence may be multi-line) so the needle is normalized the same way the haystack already is.
- * Whitespace markers need no handling — normalizeForEvidence collapses/trims them anyway. Audit-only:
- * no posting behavior changes.
- */
-function stripLeadingDiffMarkers(s: string): string {
-  return s.split('\n').map((line) => line.replace(/^[+-]/, '')).join('\n');
-}
-
 function withSuggestion(body: string, codeSuggestion?: string) {
   if (!codeSuggestion) return body;
 
@@ -432,15 +405,6 @@ export function parseFileReviewResponse(
   // EVID-03: accumulate evidence-missing entries per (file, pass); builder call after .filter(Boolean).
   const evidenceMissingEntries: EvidenceMissingEntry[] = [];
 
-  // EVID-01 soft evidence gate (D-16). Build the cleaned-hunk haystack ONCE for this file: concat of
-  // ALL hunk lines (context + add + del) content — hunk `content` is already diff-prefix-stripped
-  // (diff.ts) — then normalizeForEvidence. Per surviving finding, we test whether its normalized
-  // existing_code is a substring of this haystack. This is audit-only (D-14): a miss NEVER drops or
-  // penalizes the finding, it only emits an `evidence_missing` telemetry event.
-  const evidenceHaystack = normalizeForEvidence(
-    file.hunks.flatMap((h) => h.lines).map((l) => l.content).join('\n'),
-  );
-
   const comments = (parsed.findings || [])
     .map((finding) => {
       // Codex style findings use start/end or line
@@ -519,19 +483,31 @@ export function parseFileReviewResponse(
       // The finding ALWAYS still posts below regardless of the evidence outcome — this block only pushes
       // telemetry into the SAME severityAuditEvents accumulator (D-18), never a new returned field, and
       // NEVER carries body/diff/existingCode/codeSuggestion (privacy posture; T-15-04-01).
+
+      // EVID-01 soft evidence gate (D-14/D-16/D-17/D-18): only findings that SURVIVED the orphan check
+      // (they become a persisted comment) reach here, so the trail never references an off-diff finding.
+      // The finding ALWAYS still posts below regardless of the evidence outcome — this block only pushes
+      // telemetry into the SAME severityAuditEvents accumulator (D-18), never a new returned field, and
+      // NEVER carries body/diff/existingCode/codeSuggestion (privacy posture; T-15-04-01).
       const evidence = finding.existing_code;
-      // WR-02: strip a leading +/- diff marker from each needle line BEFORE normalizeForEvidence, the
-      // same way the haystack is already diff-prefix-stripped. Computed once and used for both the
-      // absent/whitespace check and the includes() check so the needle is normalized identically.
+      // Use shared normalize helpers from evidence.ts (extracted from this file). The needle is
+      // computed once and used for both the absent/whitespace check and the includes() test.
       const needle = evidence == null ? '' : normalizeForEvidence(stripLeadingDiffMarkers(evidence));
       if (evidence == null || needle.length === 0) {
         // null / undefined / whitespace-only -> `absent`. A JSON `null` reaches here (never a parse
         // failure) because fileReviewModelOutputSchema.existing_code is nullable().optional() (15-01).
         // EVID-03: accumulate as EvidenceMissingEntry (raw title, not redacted — the builder applies
-        // redactFindingTitle internally per D-06). `line` normalized via ?? null for the
-        // EvidenceMissingEntry type (number | undefined -> number | null).
+        // redactFindingTitle internally per D-06). `line` uses the pre-remap original model-cited
+        // line (EVID-04) for the evidence_missing_summary sample, not the orphan-remapped line.
         evidenceMissingEntries.push({ path: file.path, line: originalLine ?? null, title, reason: 'absent' });
-      } else if (!evidenceHaystack.includes(needle)) {
+      } else if (
+        // Haystack: build from file hunks same as checkEvidence() in core/evidence.ts.
+        // Using checkEvidence directly here would lose the originalLine pre-remap distinction
+        // (EVID-04), so we keep the inline check for EVID-01 audit parity.
+        !normalizeForEvidence(
+          file.hunks.flatMap((h) => h.lines).map((l) => l.content).join('\n'),
+        ).includes(needle)
+      ) {
         // EVID-03: same accumulation for not_in_hunk; originalLine ?? null type normalization.
         evidenceMissingEntries.push({ path: file.path, line: originalLine ?? null, title, reason: 'not_in_hunk' });
       }
