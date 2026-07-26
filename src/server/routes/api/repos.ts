@@ -163,6 +163,13 @@ export function createReposRouter() {
     const updatedParsedJson = {
       ...existing.parsedJson,
       ...configPatch,
+      // CRITICAL PATH FIX #3 (Plan 26-02): deep-merge the `review` sub-object so patching specific
+      // review fields (e.g., `evidence`) does not destroy other review settings like `dedup`, `passes`,
+      // `rounds`. If configPatch.review is undefined the spread of undefined is a no-op.
+      review: {
+        ...existing.parsedJson.review,
+        ...configPatch.review,
+      },
     };
     const parsedConfig = repoConfigSchema.safeParse(updatedParsedJson);
 
