@@ -250,6 +250,16 @@ export const reviewConfigSchema = z.object({
       escalate_floors: z.boolean().default(true),
     })
     .default({ incremental: false, escalate_floors: true }),
+  // Phase 26 (EVID-02): evidence quality gate config. `hard_drop` defaults off (soft gate only);
+  // `hard_drop_exempt_categories` defaults to ['security'] so security findings always post
+  // regardless of evidence quality. Array bound .max(20) mirrors the custom_rules .max(50) precedent
+  // (line 130) and prevents unbounded config accumulation (defense-in-depth, Antigravity MEDIUM).
+  evidence: z
+    .object({
+      hard_drop: z.boolean().default(false),
+      hard_drop_exempt_categories: z.array(z.string()).max(20).default(['security']),
+    })
+    .default({ hard_drop: false, hard_drop_exempt_categories: ['security'] }),
 });
 
 export const repoConfigSchema = z.object({
@@ -294,6 +304,7 @@ export const repoConfigSchema = z.object({
     category_confidence: {},
     threads: { verify_fixes: false, auto_resolve: false },
     rounds: { incremental: false, escalate_floors: true },
+    evidence: { hard_drop: false, hard_drop_exempt_categories: ['security'] },
   }),
   model: z
     .object({
@@ -951,6 +962,30 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
       timestamp: dateStringSchema,
     })
     .passthrough(),
+  // Phase 26 (EVID-02): evidence_hard_dropped audit event. AGGREGATE — one event per (file, pass)
+  // when EVID-02 hard-drop removed >=1 finding from the finalize pass output. Follows the
+  // `evidence_missing_summary` precedent (lines 921-963) for the per-(file, pass) aggregate shape.
+  // droppedCount reflects the FULL total, NOT the capped sample length. Sample bounded to 20 entries.
+  // Design: each sample entry carries a `reason` ('absent' | 'not_in_hunk') per D-06; titles route
+  // through redactFindingTitle at production time (AUD-01); never body/diff/existingCode/codeSuggestion.
+  // Privacy bounded: same evidence_missing_summary posture.
+  z
+    .object({
+      stage: z.literal('evidence_hard_dropped'),
+      file: z.string(),
+      pass: fileReviewPassSchema,
+      droppedCount: z.number().int().min(0),
+      sample: z.array(
+        z.object({
+          path: z.string(),
+          line: z.number().nullable().optional(),
+          title: z.string().max(100),
+          reason: z.enum(['absent', 'not_in_hunk']),
+        }),
+      ).max(20),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
   // Phase 18 round/anchor audit events (RND-01 / RND-02 / RND-03 / RND-05). All five variants share
   // the `rounds.` stage prefix; the client-side AuditDisplayStage normalization (see audit-grouping.ts)
   // collapses them to the single `rounds` display group while preserving the original event stage
@@ -1315,6 +1350,9 @@ export function normalizeRepoModelConfig(model: RepoConfig['model']): RepoConfig
 }
 
 export function normalizeRepoConfig(config: RepoConfig): RepoConfig {
+  // NOTE: This function does NOT inject Zod defaults for evidence or any other nested config keys.
+  // That responsibility is in config.ts's loadRepoConfig (which calls repoConfigSchema.parse() after
+  // model override) to ensure DB-loaded configs always get defaults for keys added post-storage.
   return {
     ...config,
     model: normalizeRepoModelConfig(config.model),
