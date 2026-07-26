@@ -19,6 +19,7 @@ const STAGE_LABELS: Record<AuditStageGroup['stage'], string> = {
   filtered: 'Filtered',
   deduped: 'Deduped',
   evidence_missing: 'Evidence missing',
+  learned_rule_suppressed: 'Learned rule suppressed',
   rounds: 'Rounds',
   threads: 'Threads',
   critic: 'Critic',

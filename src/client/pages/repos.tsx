@@ -38,6 +38,7 @@ import {
   type ProviderOption,
 } from '@client/components/features/models/model-chain';
 import { ReviewSettingsPanel } from '@client/components/features/repos/review-settings-panel';
+import { LearnedRulesPanel } from '@client/components/features/repos/learned-rules-panel';
 import { mergeReviewPatch, type ReviewSettingsDraft } from '@client/lib/review-config-draft';
 
 const EMPTY_MODEL_ROUTE: ModelRouteConfig = {
@@ -447,6 +448,8 @@ interface RepoModelModalProps {
   onModelApplied: (repo: RepoConfigRecord, route: ModelRouteConfig) => void;
   onModelReset: (repo: RepoConfigRecord) => void;
   onReviewSaved: (repo: RepoConfigRecord, review: RepoConfig['review']) => void;
+  /** Re-fetches the repo config from the server (used by LearnedRulesPanel after synthesis/rule changes). */
+  onRepoRefreshed: (repo: RepoConfigRecord) => void;
 }
 
 function RepoModelModal({
@@ -459,6 +462,7 @@ function RepoModelModal({
   onModelApplied,
   onModelReset,
   onReviewSaved,
+  onRepoRefreshed,
 }: RepoModelModalProps) {
   const selectedRepoId = repo ? repoId(repo) : null;
   const globalRouteKey = useMemo(
@@ -471,6 +475,7 @@ function RepoModelModal({
   const [error, setError] = useState<string | null>(null);
   const [interactiveDraft, setInteractiveDraft] = useState<InteractiveDraft | null>(null);
   const [reviewSettingsDraft, setReviewSettingsDraft] = useState<ReviewSettingsDraft | null>(null);
+  const [learningDraft, setLearningDraft] = useState<RepoConfig['review']['learning'] | null>(null);
 
   useEffect(() => {
     if (!repo) return;
@@ -481,6 +486,7 @@ function RepoModelModal({
     setError(null);
     setInteractiveDraft(null);
     setReviewSettingsDraft(null);
+    setLearningDraft(null);
   }, [selectedRepoId, globalRouteKey]);
 
   const modelDirty = useMemo(() => !routesEqual(route, initialRoute), [initialRoute, route]);
@@ -488,7 +494,8 @@ function RepoModelModal({
   const interactiveValid = interactiveDraft?.valid ?? true;
   const reviewSettingsDirty = reviewSettingsDraft?.dirty ?? false;
   const reviewSettingsValid = reviewSettingsDraft?.valid ?? true;
-  const dirty = modelDirty || interactiveDirty || reviewSettingsDirty;
+  const learningDirty = learningDraft !== null;
+  const dirty = modelDirty || interactiveDirty || reviewSettingsDirty || learningDirty;
   const canApply = !!repo && dirty && interactiveValid && reviewSettingsValid && saving === null;
   const hasStoredStrategy = repo ? hasStoredModelStrategy(repo) : false;
 
@@ -505,12 +512,21 @@ function RepoModelModal({
       // the full current review first, overlays the settings draft, then applies the fresh
       // interactive draft LAST so a simultaneous Interactive edit wins over the settings draft's
       // own (stale) interactive block (REVIEW #4). Null when neither sub-editor is dirty.
+      // LRN-01: learning toggle changes are merged into settingsFields so they flow through
+      // the same PATCH path as other review settings.
+      const settingsFields =
+        reviewSettingsDirty || learningDirty
+          ? {
+              ...(reviewSettingsDirty && reviewSettingsDraft ? reviewSettingsDraft.review : {}),
+              ...(learningDirty && learningDraft ? { learning: learningDraft } : {}),
+            }
+          : null;
       const nextReview =
-        interactiveDirty || reviewSettingsDirty
+        interactiveDirty || settingsFields
           ? mergeReviewPatch(
               repo.parsedJson.review,
               interactiveDirty && interactiveDraft ? interactiveDraft.interactive : null,
-              reviewSettingsDirty && reviewSettingsDraft ? reviewSettingsDraft.review : null,
+              settingsFields,
             )
           : null;
       const patch: Parameters<typeof api.updateRepoConfig>[2] = {};
@@ -613,6 +629,27 @@ function RepoModelModal({
                 <InteractivePanel key={selectedRepoId} repo={repo} onChange={setInteractiveDraft} />
                 <div className="my-6 border-t border-border" />
                 <ReviewSettingsPanel key={`${selectedRepoId}-review`} repo={repo} onChange={setReviewSettingsDraft} />
+                <div className="my-6 border-t border-border" />
+                <LearnedRulesPanel
+                  key={`${selectedRepoId}-learning`}
+                  config={learningDraft ?? repo.parsedJson.review.learning}
+                  onLearningChange={setLearningDraft}
+                  onSynthesized={async () => {
+                    // C7: re-fetch config from server to get fresh rules after synthesis/rule change
+                    try {
+                      const fresh = await api.getRepo(repo.owner, repo.repo, repo.vcsProvider);
+                      if (fresh?.repo) {
+                        onRepoRefreshed(fresh.repo);
+                      }
+                    } catch {
+                      // best-effort — stale data is acceptable until next modal open
+                    }
+                  }}
+                  repoId={selectedRepoId ?? ''}
+                  owner={repo.owner}
+                  repo={repo.repo}
+                  vcsProvider={repo.vcsProvider}
+                />
               </>
             )}
           </div>
@@ -738,6 +775,9 @@ export function ReposPage() {
 
   const handleReviewSaved = (repo: RepoConfigRecord, review: RepoConfig['review']) =>
     mergeRepo(repoId(repo), { parsedJson: { ...repo.parsedJson, review } });
+
+  const handleRepoRefreshed = (repo: RepoConfigRecord) =>
+    mergeRepo(repoId(repo), { parsedJson: repo.parsedJson });
 
   const handleSync = async () => {
     if (syncing) return;
@@ -869,6 +909,7 @@ export function ReposPage() {
         onModelApplied={handleModelApplied}
         onModelReset={handleModelReset}
         onReviewSaved={handleReviewSaved}
+        onRepoRefreshed={handleRepoRefreshed}
       />
     </section>
   );
