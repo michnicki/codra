@@ -362,6 +362,20 @@ export class GithubAdapter implements VcsProvider {
     return results;
   }
 
+  async getInlineCommentDetails(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    commentRef: string,
+  ): Promise<{ path: string; line: number | null; body: string } | null> {
+    void prNumber; // GitHub's GET /pulls/comments/{id} doesn't need the PR number.
+    const commentId = Number(commentRef);
+    if (!Number.isFinite(commentId) || commentId <= 0) {
+      return null;
+    }
+    return this.gh.getReviewComment(owner, repo, commentId);
+  }
+
   async getUserRepoPermission(
     owner: string,
     repo: string,

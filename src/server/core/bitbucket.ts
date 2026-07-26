@@ -451,6 +451,28 @@ export class BitbucketClient {
     }
   }
 
+  // Phase 28 (LRN-01): fetch a single pull request comment by id. Returns the comment record
+  // including inline path/line and content, or null on 404 (deleted comment). Uses the same
+  // error-handling pattern as editPullRequestComment: catches BitbucketError 404/410 → null,
+  // rethrows any other error.
+  async getPullRequestComment(
+    workspace: string,
+    repoSlug: string,
+    prNumber: number,
+    commentId: number,
+  ): Promise<BitbucketCommentRecord | null> {
+    const path = `${repositoryPath(workspace, repoSlug)}/pullrequests/${prNumber}/comments/${commentId}`;
+    try {
+      const response = await this.request('GET', path);
+      return (await response.json()) as BitbucketCommentRecord;
+    } catch (e) {
+      if (e instanceof BitbucketError && (e.status === 404 || e.status === 410)) {
+        return null;
+      }
+      throw e;
+    }
+  }
+
   async approvePullRequest(workspace: string, repoSlug: string, prNumber: number): Promise<void> {
     const path = `${repositoryPath(workspace, repoSlug)}/pullrequests/${prNumber}/approve`;
     await this.request('POST', path);

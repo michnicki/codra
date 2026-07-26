@@ -572,6 +572,32 @@ export class BitbucketAdapter implements VcsProvider {
     return this.client.resolveBotUserIdentity();
   }
 
+  async getInlineCommentDetails(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    commentRef: string,
+  ): Promise<{ path: string; line: number | null; body: string } | null> {
+    void owner; // Bitbucket's workspace is canonical (this.job.repositoryWorkspace).
+    const commentId = Number(commentRef);
+    if (!Number.isFinite(commentId) || commentId <= 0) {
+      return null;
+    }
+    const comment = await this.client.getPullRequestComment(this.job.repositoryWorkspace, repo, prNumber, commentId);
+    if (!comment) {
+      return null;
+    }
+    // Not an inline comment — no path/line to resolve.
+    if (!comment.inline) {
+      return null;
+    }
+    return {
+      path: comment.inline.path,
+      line: comment.inline.to ?? comment.inline.from ?? null,
+      body: comment.content?.raw ?? '',
+    };
+  }
+
   /**
    * Loads the cached diff for this job from KV and parses it once. Mirrors the diff-cache shape
    * that core/review.ts uses (key `diff:<jobId>`). Falls back to a freshly-fetched diff if no

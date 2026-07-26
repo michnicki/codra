@@ -1,9 +1,10 @@
 import type { AppBindings } from '@server/env';
+import { logger } from '@server/core/logger';
 import type { VcsProvider } from '@server/vcs/types';
 import type { RepoConfig } from '@shared/schema';
 import { getBotIdentity, type BotIdentityResolver } from '@server/core/bot-identity';
 import { markPrPaused, markPrResumed, type PrReviewStateKey } from '@server/db/pr-review-state';
-import { insertRejectFeedback } from '@server/db/reject-feedback';
+import { insertRejectFeedback, findReviewCommentByPathLine } from '@server/db/reject-feedback';
 
 /**
  * Phase 11 Plan 03 — core/commands.ts: the webhook-layer command parser + dispatcher that is the
@@ -391,6 +392,41 @@ export async function executeCommand(
       if (!(await authorizeActor(env, provider, ctx.owner, ctx.repo, ctx.authorId, ctx.authorLogin, config))) {
         return; // D-07 silent ignore.
       }
+
+      // Phase 28 (LRN-01): resolve finding metadata from the provider API + review_comments join
+      // at reject time. Best-effort — a failure to resolve metadata must NEVER fail the reject
+      // command (same posture as the rest of the reject handler). All 4 fields are nullable;
+      // NULLs mean the rejection is excluded from clustering (D-02).
+      let findingTitle: string | null = null;
+      let findingCategory: string | null = null;
+      let findingFilePath: string | null = null;
+      let findingSeverity: string | null = null;
+
+      try {
+        if (cmd.findingRef) {
+          const commentDetails = await provider.getInlineCommentDetails(ctx.owner, ctx.repo, ctx.prNumber, cmd.findingRef);
+          if (commentDetails && commentDetails.path && commentDetails.line != null) {
+            findingFilePath = commentDetails.path;
+            const reviewComment = await findReviewCommentByPathLine(env, {
+              workspace: ctx.workspace,
+              repoSlug: ctx.repo,
+              vcsProvider: provider.name,
+              prNumber: ctx.prNumber,
+              path: commentDetails.path,
+              line: commentDetails.line,
+            });
+            if (reviewComment) {
+              findingTitle = reviewComment.title;
+              findingCategory = reviewComment.category;
+              findingSeverity = reviewComment.severity;
+            }
+          }
+        }
+      } catch (error) {
+        // Best-effort: metadata resolution failure must NOT fail the reject command.
+        logger.warn('Failed to resolve finding metadata for reject feedback', error);
+      }
+
       // Capture-only (D-09). reason is the FULL reply body, never the parsed args. A missing
       // findingRef / commentRef is a capture-skip inside insertRejectFeedback (returns null).
       await insertRejectFeedback(env, {
@@ -402,6 +438,10 @@ export async function executeCommand(
         reason: ctx.body,
         rejectedBy: ctx.authorId,
         sourceCommentRef: ctx.commentRef ?? '',
+        findingTitle,
+        findingCategory,
+        findingFilePath,
+        findingSeverity,
       });
       return;
     }
