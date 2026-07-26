@@ -5208,3 +5208,299 @@ dbDescribe('evidence hard-drop', () => {
     getDiffSpy.mockRestore();
   }, REVIEW_FLOW_TIMEOUT_MS);
 });
+
+// --- Phase 28 (LRN-01) learned-rule suppression in finalize ----------------------------------
+dbDescribe('learned rule suppression', () => {
+  const env = createTestEnv();
+
+  const comment = (over: Partial<ParsedReviewComment>): ParsedReviewComment => ({
+    path: 'src/app.ts',
+    line: 1,
+    position: 1,
+    severity: 'P3',
+    category: 'quality',
+    title: 'Test finding',
+    body: 'test body',
+    confidence: 0.9,
+    ...over,
+  });
+
+  it('active learned rule suppresses matching finding in finalize', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const repo = `test-repo-${Date.now()}-lrn-suppress`;
+    const headSha = sha('l');
+
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+    );
+
+    let captured: any[] = [];
+    const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+      async (...args: any[]) => { captured = args[3]?.comments ?? []; return { id: 789 }; },
+    );
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 1,
+      prTitle: 'Learned rule suppression test',
+      prAuthor: 'author',
+      commitSha: headSha,
+      baseSha: sha('0'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          learning: {
+            enabled: true,
+            learned_rules: [
+              {
+                id: 'rule-quality-app',
+                category: 'quality',
+                file_pattern: 'src/app.ts',
+                status: 'active',
+                source_rejection_ids: ['rej-1', 'rej-2'],
+                created_at: '2026-01-01T00:00:00.000Z',
+              },
+            ],
+          },
+        },
+      },
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+    await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+
+    // Finding A: matches active rule (quality + src/app.ts) -> should be suppressed
+    // Finding B: different category (security) -> should be kept
+    await upsertFileReview(env, job.id, {
+      filePath: 'src/app.ts',
+      pass: 'main',
+      fileStatus: 'done',
+      modelUsed: 'test-model',
+      modelProvider: 'test-provider',
+      diffLineCount: 1,
+      diffInput: 'diff',
+      rawAiOutput: '{}',
+      parsedComments: [
+        comment({ title: 'Quality finding', category: 'quality', line: 1, position: 1 }),
+        comment({ title: 'Security finding', category: 'security', severity: 'P1', line: 2, position: 2 }),
+      ],
+      inputTokens: 10,
+      outputTokens: 5,
+      durationMs: 1,
+      verdict: 'comment',
+      fileSummary: 'summary',
+      overallCorrectness: 'issues found',
+      confidenceScore: 0.9,
+      errorMessage: null,
+    });
+
+    await runWithDb(env, async () => {
+      const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-lrn-1', phase: 'finalize' });
+      expect(res).toEqual({ action: 'ack' });
+    });
+
+    // Only the security finding should have been posted (quality was suppressed)
+    expect(captured).toHaveLength(1);
+    expect(captured[0].body).toContain('Security finding');
+    expect(captured[0].body).not.toContain('Quality finding');
+
+    // Verify audit trail contains learned_rule_suppressed event
+    const detail = await getJobDetail(env, job.id);
+    const audit: any[] = detail!.audit;
+    const suppressedEvents = audit.filter((e: any) => e.stage === 'learned_rule_suppressed');
+    expect(suppressedEvents.length).toBeGreaterThanOrEqual(1);
+    expect(suppressedEvents[0].droppedCount).toBe(1);
+    expect(suppressedEvents[0].sample[0].matched_rule).toBe('rule-quality-app');
+
+    createSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
+
+  it('learning.enabled=false does not suppress findings', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const repo = `test-repo-${Date.now()}-lrn-disabled`;
+    const headSha = sha('m');
+
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+    );
+
+    let captured: any[] = [];
+    const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+      async (...args: any[]) => { captured = args[3]?.comments ?? []; return { id: 790 }; },
+    );
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 2,
+      prTitle: 'Learning disabled test',
+      prAuthor: 'author',
+      commitSha: headSha,
+      baseSha: sha('0'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          learning: {
+            enabled: false, // disabled
+            learned_rules: [
+              {
+                id: 'rule-quality-app',
+                category: 'quality',
+                file_pattern: 'src/app.ts',
+                status: 'active',
+                source_rejection_ids: ['rej-1', 'rej-2'],
+                created_at: '2026-01-01T00:00:00.000Z',
+              },
+            ],
+          },
+        },
+      },
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+    await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+
+    await upsertFileReview(env, job.id, {
+      filePath: 'src/app.ts',
+      pass: 'main',
+      fileStatus: 'done',
+      modelUsed: 'test-model',
+      modelProvider: 'test-provider',
+      diffLineCount: 1,
+      diffInput: 'diff',
+      rawAiOutput: '{}',
+      parsedComments: [
+        comment({ title: 'Quality finding', category: 'quality', line: 1, position: 1 }),
+      ],
+      inputTokens: 10,
+      outputTokens: 5,
+      durationMs: 1,
+      verdict: 'comment',
+      fileSummary: 'summary',
+      overallCorrectness: 'issues found',
+      confidenceScore: 0.9,
+      errorMessage: null,
+    });
+
+    await runWithDb(env, async () => {
+      const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-lrn-2', phase: 'finalize' });
+      expect(res).toEqual({ action: 'ack' });
+    });
+
+    // All findings should post — learning is disabled
+    expect(captured).toHaveLength(1);
+    expect(captured[0].body).toContain('Quality finding');
+
+    // No learned_rule_suppressed audit events
+    const detail = await getJobDetail(env, job.id);
+    const audit: any[] = detail!.audit;
+    const suppressedEvents = audit.filter((e: any) => e.stage === 'learned_rule_suppressed');
+    expect(suppressedEvents).toHaveLength(0);
+
+    createSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
+
+  it('no active rules (all pending/disabled) does not suppress', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const repo = `test-repo-${Date.now()}-lrn-pending`;
+    const headSha = sha('n');
+
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+    );
+
+    let captured: any[] = [];
+    const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+      async (...args: any[]) => { captured = args[3]?.comments ?? []; return { id: 791 }; },
+    );
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 3,
+      prTitle: 'Pending rules test',
+      prAuthor: 'author',
+      commitSha: headSha,
+      baseSha: sha('0'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          learning: {
+            enabled: true,
+            learned_rules: [
+              {
+                id: 'rule-pending',
+                category: 'quality',
+                file_pattern: 'src/app.ts',
+                status: 'pending', // pending, not active
+                source_rejection_ids: ['rej-1'],
+                created_at: '2026-01-01T00:00:00.000Z',
+              },
+            ],
+          },
+        },
+      },
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+    await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+
+    await upsertFileReview(env, job.id, {
+      filePath: 'src/app.ts',
+      pass: 'main',
+      fileStatus: 'done',
+      modelUsed: 'test-model',
+      modelProvider: 'test-provider',
+      diffLineCount: 1,
+      diffInput: 'diff',
+      rawAiOutput: '{}',
+      parsedComments: [
+        comment({ title: 'Quality finding', category: 'quality', line: 1, position: 1 }),
+      ],
+      inputTokens: 10,
+      outputTokens: 5,
+      durationMs: 1,
+      verdict: 'comment',
+      fileSummary: 'summary',
+      overallCorrectness: 'issues found',
+      confidenceScore: 0.9,
+      errorMessage: null,
+    });
+
+    await runWithDb(env, async () => {
+      const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-lrn-3', phase: 'finalize' });
+      expect(res).toEqual({ action: 'ack' });
+    });
+
+    // Finding should post — rule is pending, not active
+    expect(captured).toHaveLength(1);
+    expect(captured[0].body).toContain('Quality finding');
+
+    // No learned_rule_suppressed audit events
+    const detail = await getJobDetail(env, job.id);
+    const audit: any[] = detail!.audit;
+    const suppressedEvents = audit.filter((e: any) => e.stage === 'learned_rule_suppressed');
+    expect(suppressedEvents).toHaveLength(0);
+
+    createSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
+});
