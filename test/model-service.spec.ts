@@ -551,6 +551,7 @@ describe('ModelService', () => {
             category_confidence: {},
             threads: { verify_fixes: false, auto_resolve: false },
             rounds: { incremental: false, escalate_floors: true },
+            evidence: { hard_drop: false, hard_drop_exempt_categories: ['security'] },
           },
           model: {
             main: '@cf/zai-org/glm-4.7-flash',
