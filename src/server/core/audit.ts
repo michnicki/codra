@@ -718,3 +718,67 @@ export async function recordWalkthroughAudit(
     logger.warn(`Failed to record walkthrough audit events for job ${jobId}`, error);
   }
 }
+
+// ---------------------------------------------------------------------------
+// SEC-XDIFF-01 — cross-file security reasoning audit builder + best-effort recorder.
+//
+// One `cross_file_security` event per enabled run. Status is 'completed' when the model
+// returned findings, 'skipped' when cross_file is disabled or the model call failed open,
+// 'failed' when a hard error occurred. finding_count and files_included are set only on
+// completed runs.
+// ---------------------------------------------------------------------------
+
+export type CrossFileSecurityAuditEvent = Extract<JobAuditEvent, { stage: 'cross_file_security' }>;
+
+/**
+ * PURE cross-file security audit builder (SEC-XDIFF-01). Derives ONE `cross_file_security`
+ * event from the run status, optional finding count, and file count. Returns a typed event
+ * that validates against the schema-authoritative `cross_file_security` arm of
+ * `jobAuditEventSchema`.
+ *
+ * Status semantics:
+ *   - `completed` — the model returned valid findings (may be 0 findings — still completed).
+ *   - `skipped`   — cross_file is disabled, or the model call failed open (fail-open pattern).
+ *   - `failed`    — a hard error occurred that prevented the pass from running.
+ *
+ * `finding_count` and `files_included` are set only on completed runs (the most useful
+ * operator-telemetry fields).
+ */
+export function buildCrossFileSecurityAuditEvent(
+  status: 'completed' | 'skipped' | 'failed',
+  opts?: { reason?: string; findingCount?: number; filesIncluded?: number },
+): CrossFileSecurityAuditEvent {
+  const event: CrossFileSecurityAuditEvent = {
+    stage: 'cross_file_security',
+    status,
+    timestamp: new Date().toISOString(),
+  };
+  if (opts?.reason != null) event.reason = opts.reason;
+  if (status === 'completed') {
+    if (opts?.findingCount != null) event.finding_count = opts.findingCount;
+    if (opts?.filesIncluded != null) event.files_included = opts.filesIncluded;
+  }
+  return event;
+}
+
+/**
+ * Best-effort recorder for the `cross_file_security` audit variant. Mirrors
+ * `recordWalkthroughAudit` EXACTLY: try/catch, defensive timestamp stamping, logs and NEVER
+ * rethrows. A broken cross-file security audit write must never fail the caller's review
+ * (D-13-03-04 carry-over posture).
+ */
+export async function recordCrossFileSecurityAudit(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  events: JobAuditEvent[],
+): Promise<void> {
+  try {
+    if (events.length === 0) return;
+    const stamped = events.map((event) =>
+      event.timestamp ? event : { ...event, timestamp: new Date().toISOString() },
+    );
+    await appendJobAuditEvents(env, jobId, stamped);
+  } catch (error) {
+    logger.warn(`Failed to record cross-file security audit events for job ${jobId}`, error);
+  }
+}

@@ -494,3 +494,77 @@ export function chunkFileDiff(file: FileDiff, maxLinesPerChunk: number): FileDif
 
   return chunks;
 }
+
+// ---------------------------------------------------------------------------
+// SEC-XDIFF-01: cross-file security diff construction
+// ---------------------------------------------------------------------------
+
+/**
+ * Maximum total lines for the cross-file security diff context. Beyond this, the diff is
+ * truncated by priority-sorted file ordering so the highest-signal security files (auth,
+ * middleware, routes, session, crypto, etc.) are retained. ~3000 lines approximates ~12K tokens
+ * which comfortably fits a single model call alongside the cross-file security system prompt.
+ */
+export const CROSS_FILE_DIFF_MAX_LINES = 3000;
+
+/**
+ * Sentinel file path used to persist cross-file security review results as a synthetic
+ * file_review row. The sentinel is not a real file path, so it cannot collide with any
+ * actual file in the PR diff. Used with pass 'cross_file_security'.
+ */
+export const CROSS_FILE_SENTINEL = '__cross_file__';
+
+/**
+ * Build a concatenated cross-file diff from the full PR file set, prioritized by security
+ * sensitivity (scoreFile from priority.ts). When the total line count exceeds `maxLines`,
+ * files are included in descending priority order until the budget is exhausted. Each file
+ * is formatted with a unified diff header (`--- a/` / `+++ b/`) followed by its hunks with
+ * `+`/`-`/` ` line prefixes and 3 context lines per hunk.
+ *
+ * Pure, deterministic, I/O-free. Never throws — returns whatever it can fit within the budget.
+ */
+export function buildCrossFileDiff(files: FileDiff[], maxLines: number = CROSS_FILE_DIFF_MAX_LINES): string {
+  // Sort files by descending priority so security-sensitive files are retained first.
+  const sorted = [...files].sort((a, b) => scoreFile(b) - scoreFile(a));
+
+  const parts: string[] = [];
+  let totalLines = 0;
+
+  for (const file of sorted) {
+    // Skip binary files — they have no meaningful diff content for security analysis.
+    if (file.isBinary) continue;
+
+    // Estimate lines for this file: 2 header lines + sum of (1 hunk header + N content lines) per hunk.
+    const fileLines = 2 + file.hunks.reduce((sum, h) => sum + 1 + h.lines.length, 0);
+    if (totalLines + fileLines > maxLines && parts.length > 0) {
+      // Budget exhausted — skip this and all remaining lower-priority files.
+      break;
+    }
+
+    const filePart: string[] = [];
+    filePart.push(`--- a/${file.path}`);
+    filePart.push(`+++ b/${file.path}`);
+
+    for (const hunk of file.hunks) {
+      // Hunk header: use the original header from the parsed diff if available, otherwise
+      // reconstruct from line counts. The DiffHunk type stores `header` as a raw string.
+      const oldCount = hunk.lines.filter((l) => l.kind === 'context' || l.kind === 'del').length;
+      const newCount = hunk.lines.filter((l) => l.kind === 'context' || l.kind === 'add').length;
+      // Parse start lines from the header if it matches the @@ format; fall back to 1.
+      const headerMatch = hunk.header.match(/@@ -(\d+),?\d* \+(\d+),?\d* @@/);
+      const oldStart = headerMatch ? parseInt(headerMatch[1], 10) : 1;
+      const newStart = headerMatch ? parseInt(headerMatch[2], 10) : 1;
+      filePart.push(`@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`);
+
+      for (const line of hunk.lines) {
+        const prefix = line.kind === 'add' ? '+' : line.kind === 'del' ? '-' : ' ';
+        filePart.push(`${prefix}${line.content}`);
+      }
+    }
+
+    parts.push(filePart.join('\n'));
+    totalLines += fileLines;
+  }
+
+  return parts.join('\n');
+}

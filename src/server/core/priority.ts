@@ -22,6 +22,12 @@ export const SENSITIVE_KEYWORDS = [
   'deploy',
   'infra',
   'terraform',
+  // SEC-XDIFF-01 (D-14): additional security-adjacent paths for cross-file diff prioritization.
+  // These keywords catch middleware, route definitions, and session handling files that are
+  // high-signal for cross-file security reasoning (auth boundaries, access control, session lifecycle).
+  'middleware',
+  'routes',
+  'session',
 ] as const;
 
 // LOW_PRIORITY (-5): tests/docs/generated-adjacent paths that can cede a slot. Hardcoded, NOT

@@ -32,13 +32,13 @@ import {
   appendJobAuditEvents,
 } from '@server/db/jobs';
 import { getPrReviewState, setLastReviewedSha, type PrReviewStateKey } from '@server/db/pr-review-state';
-import { filterReviewableFiles, parseUnifiedDiff, partitionReviewableFiles, selectReviewableFiles, type FileDiff, type FileSelectionResult } from './diff';
+import { buildCrossFileDiff, CROSS_FILE_DIFF_MAX_LINES, CROSS_FILE_SENTINEL, filterReviewableFiles, parseUnifiedDiff, partitionReviewableFiles, selectReviewableFiles, type FileDiff, type FileSelectionResult } from './diff';
 import { insertSkippedFiles, listSkippedFilesForHead, type SkippedFilesHeadKey } from '@server/db/skipped-files';
 import { dedupeComposite, dedupeFindings } from './dedup';
 import { checkEvidence, type EvidenceDropEntry } from './evidence';
 import { applyNoiseFilter, type NoiseFilterOptions } from './noise-filter';
-import { parseSummaryResponse, parseWalkthroughDiagram } from './model-output';
-import { buildCriticDecisionsAuditEvent, buildEvidenceHardDroppedEvent, recordCriticAudit } from './audit';
+import { parseCrossFileSecurityResponse, parseSummaryResponse, parseWalkthroughDiagram } from './model-output';
+import { buildCriticDecisionsAuditEvent, buildCrossFileSecurityAuditEvent, buildEvidenceHardDroppedEvent, recordCrossFileSecurityAudit, recordCriticAudit } from './audit';
 import {
   CRITIC_REASON_BELOW_SKIP_THRESHOLD,
   CRITIC_REASON_OVER_CHAR_BUDGET,
@@ -112,7 +112,7 @@ export type ReviewJobRunResult =
   // hand off exactly like every other phase. The verify_fixes phase runs as its OWN fresh-budget
   // step between critic and finalize (or review and finalize when critic is off) — see
   // nextPhaseAfterCritic / nextPhaseAfterVerifyFixes below.
-  | { action: 'next_phase'; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment'; delaySeconds: number; jobId?: string; freshInstance?: boolean };
+  | { action: 'next_phase'; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' | 'cross_file_security'; delaySeconds: number; jobId?: string; freshInstance?: boolean };
 
 const REVIEW_CHUNK_WALL_CLOCK_MS = 12 * 60 * 1000;
 const JOB_LEASE_SECONDS = 15 * 60;
@@ -524,6 +524,12 @@ export async function runReviewJob(env: AppBindings, message: ReviewJobMessage):
         config: configForEnrichment,
         model,
       });
+    } else if (phase === 'cross_file_security') {
+      // SEC-XDIFF-01: the cross-file security reasoning phase. Runs a whole-diff security model
+      // call on its own fresh-budget step. Fail-open: model errors persist a skipped row + audit
+      // event and hand off to the next phase.
+      const configForCrossFile = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
+      await runCrossFileSecurityPhase(env, job, configForCrossFile, model);
     } else {
       await runReviewPhase(env, job, leaseOwner, vcs, model, tracker);
     }
@@ -540,16 +546,13 @@ export async function runReviewJob(env: AppBindings, message: ReviewJobMessage):
 
     if (error instanceof NextPhaseError) {
       await releaseJobLease(env, job.id, leaseOwner);
-      // Finalize AND critic AND verify_fixes AND walkthrough_enrichment each need a fresh instance
-      // for a clean subrequest budget: finalize posts the review (~20 subrequests at once), critic
-      // makes its single whole-set model call on its OWN budget (D-07 — the critic must never share
-      // finalize's budget), verify_fixes runs an unbounded number of file-content fetches + model
-      // calls + resolution calls on its OWN budget (D-01/D-02 — never share the prior phase's
-      // spent budget), and walkthrough_enrichment makes its single whole-set enrichment call on
-      // its OWN budget (D-13 — never share the prior phase's spent budget). Other phase transitions
-      // (e.g. the per-chunk review yield) stay in this instance and rely on the normal step.sleep
-      // hibernation to reset the budget.
-      const freshInstance = error.phase === 'finalize' || error.phase === 'critic' || error.phase === 'verify_fixes' || error.phase === 'walkthrough_enrichment';
+      // Finalize AND critic AND verify_fixes AND walkthrough_enrichment AND cross_file_security each
+      // need a fresh instance for a clean subrequest budget: finalize posts the review (~20
+      // subrequests at once), critic makes its single whole-set model call on its OWN budget (D-07),
+      // verify_fixes runs an unbounded number of file-content fetches + model calls on its OWN budget,
+      // walkthrough_enrichment makes its single whole-set enrichment call on its OWN budget (D-13),
+      // and cross_file_security makes its single whole-diff model call on its OWN budget (SEC-XDIFF-01).
+      const freshInstance = error.phase === 'finalize' || error.phase === 'critic' || error.phase === 'verify_fixes' || error.phase === 'walkthrough_enrichment' || error.phase === 'cross_file_security';
       return { action: 'next_phase', phase: error.phase, delaySeconds: error.delaySeconds, jobId: job.id, freshInstance };
     }
 
@@ -601,7 +604,7 @@ async function continueOrFailWedgedJob(
   job: PersistedReviewJob,
   vcs: VcsProvider,
   leaseOwner: string,
-  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment',
+  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' | 'cross_file_security',
   delaySeconds: number,
   reason: string,
 ): Promise<ReviewJobRunResult> {
@@ -613,7 +616,7 @@ async function continueOrFailWedgedJob(
   // review keeps the generous ceiling because it makes real per-file progress. (Critic and
   // verify_fixes never terminal-fail on exceed — they fail OPEN to finalize in the branches
   // below — but they still use the low ceiling to bound their fresh-instance retries.)
-  const ceiling = phase === 'finalize' || phase === 'critic' || phase === 'verify_fixes' || phase === 'walkthrough_enrichment'
+  const ceiling = phase === 'finalize' || phase === 'critic' || phase === 'verify_fixes' || phase === 'walkthrough_enrichment' || phase === 'cross_file_security'
     ? MAX_FINALIZE_CONTINUATIONS
     : MAX_JOB_CONTINUATIONS;
 
@@ -698,6 +701,21 @@ async function continueOrFailWedgedJob(
       await resetJobContinuationCount(env, job.id);
       await releaseJobLease(env, job.id, leaseOwner);
       return { action: 'next_phase', phase: nextPhaseAfterVerifyFixes(configFromVerifyFixes), delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
+    } else if (phase === 'cross_file_security') {
+      // SEC-XDIFF-01 FAIL-OPEN: a wedged cross_file_security phase must NEVER terminal-fail the job.
+      // Reset the continuation counter and route through nextPhaseAfterCrossFileSecurity so the
+      // chain continues to verify_fixes / critic / walkthrough_enrichment / finalize. The cross-file
+      // security pass is advisory — its findings enrich the review but are never required.
+      const configFromCrossFile = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
+      logger.error(`cross_file_security phase exceeded the continuation ceiling; failing OPEN to configured post-cross-file successor (no cross-file findings applied): ${job.owner}/${job.repo} PR #${job.prNumber}`, {
+        phase,
+        continuationCount,
+        reason,
+        successor: nextPhaseAfterCrossFileSecurity(configFromCrossFile),
+      });
+      await resetJobContinuationCount(env, job.id);
+      await releaseJobLease(env, job.id, leaseOwner);
+      return { action: 'next_phase', phase: nextPhaseAfterCrossFileSecurity(configFromCrossFile), delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
     } else {
       const message = `Review could not make progress after ${continuationCount} continuation attempts (${reason}). Failing the job to avoid an endless retry loop; re-run it once the underlying provider issue clears.`;
       logger.error(`Review job exceeded the continuation ceiling; failing terminally: ${job.owner}/${job.repo} PR #${job.prNumber}`, {
@@ -722,7 +740,7 @@ async function continueOrFailWedgedJob(
 async function resolveQueuedJob(
   env: AppBindings,
   message: ReviewJobMessage,
-): Promise<{ job: PersistedReviewJob; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' } | null> {
+): Promise<{ job: PersistedReviewJob; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' | 'cross_file_security' } | null> {
   // The WIRE contract (reviewJobMessageSchema.phase) includes 'critic' (D-07). Phase 10 DISPATCHES it
   // — but ONLY for a jobId-bearing message. A critic phase is only ever reached AFTER a job exists
   // (review→critic hands off keyed on the resolved jobId), so a phase:'critic' message WITHOUT a jobId
@@ -749,6 +767,13 @@ async function resolveQueuedJob(
     // spoof / premature delivery — REJECT it here so a stray queue message can never resolve a
     // job by webhook payload and run against it.
     logger.warn('Queue message ignored: phase "walkthrough_enrichment" requires a jobId (a jobId-less enrichment message is treated as a spoof).');
+    return null;
+  }
+  if (requestedPhase === 'cross_file_security' && !message.jobId) {
+    // SEC-XDIFF-01: cross_file_security is a jobId-only phase, same posture as critic /
+    // verify_fixes / walkthrough_enrichment. A phase:'cross_file_security' message WITHOUT a
+    // jobId is a spoof / premature delivery — REJECT it here.
+    logger.warn('Queue message ignored: phase "cross_file_security" requires a jobId (a jobId-less cross_file_security message is treated as a spoof).');
     return null;
   }
 
@@ -1236,7 +1261,9 @@ async function runReviewPhase(
   // model call. With security off the list is main-only and every downstream path (scheduling,
   // skip, inherit, completion) is byte-identical to v1.0 (NREG-01).
   const securityPassEnabled = config.review.passes?.security?.enabled ?? false;
-  const units: Array<{ file: (typeof files)[number]; pass: FileReviewPass }> = [];
+  // The per-file review loop only runs 'main' and 'security' passes. 'cross_file_security' is a
+  // whole-diff phase that runs separately in runCrossFileSecurityPhase (never here).
+  const units: Array<{ file: (typeof files)[number]; pass: 'main' | 'security' }> = [];
   for (const file of files) {
     units.push({ file, pass: 'main' });
     if (securityPassEnabled) units.push({ file, pass: 'security' });
@@ -1678,8 +1705,9 @@ async function reviewAndPersistFile(
   // Which review PASS this call persists. Defaults to 'main' (NREG-01: existing behavior). 'security'
   // routes the SAME resolved model through the security prompt (10-04) and persists a row keyed on
   // (job_id, file_path, 'security'); all failure bookkeeping below is threaded with this pass so a
-  // security-unit failure never touches the main row.
-  pass: FileReviewPass = 'main',
+  // security-unit failure never touches the main row. Note: 'cross_file_security' is NOT valid here
+  // — that pass uses callVerifierRaw directly in runCrossFileSecurityPhase.
+  pass: 'main' | 'security' = 'main',
 ) {
   const startedAt = Date.now();
   const compactPrompt = (previousReview?.transient_error_count ?? 0) > 0;
@@ -3046,6 +3074,242 @@ async function heartbeatAndCheckSuperseded(env: AppBindings, jobId: string, leas
   }
 }
 
+// SEC-XDIFF-01: the cross-file security reasoning phase. Runs a single whole-diff security model
+// call on its own fresh-budget invocation. Fail-open: model errors persist a skipped row + audit
+// event and hand off to the next phase.
+//
+// Phase routing: review → cross_file_security → (verify_fixes | critic | walkthrough_enrichment | finalize).
+// The nextPhaseAfterCrossFileSecurity selector unconditionally hands off to the existing chain
+// without re-checking the cross_file toggle (Pitfall 1: re-checking would skip downstream phases
+// when cross_file is toggled off mid-job, breaking the in-flight chain).
+//
+// Idempotent on re-entry: a persisted `__cross_file__` / `cross_file_security` row means a prior
+// invocation already ran (or was skipped). Skip the model call and hand off directly.
+//
+// NREG-01: disabled default emits no new call / write / event. A drift (the toggle off but the
+// phase somehow reached) degrades to a silent hand-off.
+async function runCrossFileSecurityPhase(
+  env: AppBindings,
+  job: PersistedReviewJob,
+  config: RepoConfig,
+  model: ModelService,
+): Promise<void> {
+  // NREG-01: disabled toggle — fail open silently.
+  if (!config.review.passes?.security?.cross_file) {
+    logger.info(`Cross-file security phase reached for job ${job.id} but passes.security.cross_file is off; failing open.`);
+    throw new NextPhaseError(nextPhaseAfterCrossFileSecurity(config), FRESH_INVOCATION_YIELD_SECONDS);
+  }
+
+  // Idempotent re-entry: a persisted `__cross_file__` row means a prior invocation already ran.
+  const existingReviews = await getFileReviewsForJobs(env, [job.id]);
+  const existingCrossFile = existingReviews.find(
+    (r) => r.file_path === CROSS_FILE_SENTINEL && r.pass === 'cross_file_security',
+  );
+  if (existingCrossFile) {
+    logger.info(`Cross-file security already persisted for job ${job.id}; skipping the model call and transitioning onward.`);
+    throw new NextPhaseError(nextPhaseAfterCrossFileSecurity(config), FRESH_INVOCATION_YIELD_SECONDS);
+  }
+
+  // Read the main-pass reviews to build the whole-diff input. Only completed (done) reviews
+  // contribute to the cross-file diff — failed/skipped files have no meaningful diff content.
+  const mainReviews = existingReviews.filter(
+    (r) => r.pass === 'main' && r.file_status === 'done' && r.diff_input,
+  );
+
+  if (mainReviews.length === 0) {
+    logger.info(`No completed main-pass reviews with diff input for job ${job.id}; skipping cross-file security.`);
+    // Persist a skipped row so the idempotency guard short-circuits on re-entry.
+    await upsertFileReview(env, job.id, {
+      filePath: CROSS_FILE_SENTINEL,
+      pass: 'cross_file_security',
+      fileStatus: 'skipped',
+      modelUsed: 'none',
+      diffLineCount: 0,
+      diffInput: null,
+      rawAiOutput: null,
+      parsedComments: [],
+      inputTokens: null,
+      outputTokens: null,
+      durationMs: null,
+      verdict: null,
+      fileSummary: 'No completed file reviews with diff input',
+      errorMessage: null,
+    });
+    const auditEvent = buildCrossFileSecurityAuditEvent('skipped', {
+      reason: 'no_diff_input',
+      findingCount: 0,
+      filesIncluded: 0,
+    });
+    await recordCrossFileSecurityAudit(env, job.id, [auditEvent]);
+    throw new NextPhaseError(nextPhaseAfterCrossFileSecurity(config), FRESH_INVOCATION_YIELD_SECONDS);
+  }
+
+  // Build the cross-file diff from the main-pass diff inputs. Re-parse each file's stored diff
+  // into FileDiff objects so buildCrossFileDiff can sort by security priority and truncate by line
+  // budget when the concatenated diff exceeds CROSS_FILE_DIFF_MAX_LINES.
+  const fileDiffs: FileDiff[] = [];
+  for (const review of mainReviews) {
+    try {
+      const parsed = parseUnifiedDiff(review.diff_input!);
+      fileDiffs.push(...parsed);
+    } catch {
+      // A malformed diff for a single file is silently excluded rather than failing the phase.
+      logger.warn(`Failed to parse diff for ${review.file_path} in cross-file security phase; skipping file.`);
+    }
+  }
+
+  if (fileDiffs.length === 0) {
+    logger.info(`All file diffs failed to parse for job ${job.id}; skipping cross-file security.`);
+    await upsertFileReview(env, job.id, {
+      filePath: CROSS_FILE_SENTINEL,
+      pass: 'cross_file_security',
+      fileStatus: 'skipped',
+      modelUsed: 'none',
+      diffLineCount: 0,
+      diffInput: null,
+      rawAiOutput: null,
+      parsedComments: [],
+      inputTokens: null,
+      outputTokens: null,
+      durationMs: null,
+      verdict: null,
+      fileSummary: 'All file diffs failed to parse',
+      errorMessage: null,
+    });
+    const auditEvent = buildCrossFileSecurityAuditEvent('skipped', {
+      reason: 'all_diffs_unparseable',
+      findingCount: 0,
+      filesIncluded: 0,
+    });
+    await recordCrossFileSecurityAudit(env, job.id, [auditEvent]);
+    throw new NextPhaseError(nextPhaseAfterCrossFileSecurity(config), FRESH_INVOCATION_YIELD_SECONDS);
+  }
+
+  // Build the priority-sorted, truncated cross-file diff.
+  const crossFileDiff = buildCrossFileDiff(fileDiffs, CROSS_FILE_DIFF_MAX_LINES);
+  const filesIncluded = new Set(
+    crossFileDiff.split('\n')
+      .filter((line) => line.startsWith('+++ b/'))
+      .map((line) => line.slice(6)),
+  ).size;
+
+  // Build prompts.
+  const { buildCrossFileSecuritySystemPrompt, buildCrossFileSecurityUserPrompt } = await import('@server/prompts/cross-file-security-review');
+  const systemPrompt = buildCrossFileSecuritySystemPrompt();
+  const userPrompt = buildCrossFileSecurityUserPrompt({
+    prTitle: job.prTitle ?? null,
+    concatenatedDiff: crossFileDiff,
+    fileCount: fileDiffs.length,
+  });
+
+  // Make the model call. This is the single outbound call for the phase — stays inside the
+  // per-invocation subrequest budget.
+  let response: { rawText: string; modelUsed: string; inputTokens: number; outputTokens: number };
+  try {
+    response = await model.callVerifierRaw({
+      systemPrompt,
+      userPrompt,
+      config,
+    });
+  } catch (error) {
+    // Whole-call LLM failure: persist a skipped row + audit event and fail open. The downstream
+    // chain (verify_fixes → critic → walkthrough → finalize) must still run.
+    logger.warn(
+      `Cross-file security model call failed for job ${job.id}; failing open`,
+      error instanceof Error ? error : new Error(String(error)),
+    );
+    await upsertFileReview(env, job.id, {
+      filePath: CROSS_FILE_SENTINEL,
+      pass: 'cross_file_security',
+      fileStatus: 'failed',
+      modelUsed: 'none',
+      diffLineCount: crossFileDiff.split('\n').length,
+      diffInput: crossFileDiff,
+      rawAiOutput: null,
+      parsedComments: [],
+      inputTokens: null,
+      outputTokens: null,
+      durationMs: null,
+      verdict: null,
+      fileSummary: 'Model call failed',
+      errorMessage: error instanceof Error ? error.message : String(error),
+    });
+    const auditEvent = buildCrossFileSecurityAuditEvent('failed', {
+      reason: 'model_call_failed',
+      findingCount: 0,
+      filesIncluded,
+    });
+    await recordCrossFileSecurityAudit(env, job.id, [auditEvent]);
+    throw new NextPhaseError(nextPhaseAfterCrossFileSecurity(config), FRESH_INVOCATION_YIELD_SECONDS);
+  }
+
+  // Parse the response. Tolerant: individual findings that fail schema validation are silently
+  // dropped; a whole-call parse failure persists as 'skipped' (fail-open).
+  const parsed = parseCrossFileSecurityResponse(response.rawText);
+
+  let findings: ParsedReviewComment[];
+  let auditStatus: 'completed' | 'skipped';
+  let auditReason: string | undefined;
+
+  if (parsed.kind === 'fail_open') {
+    findings = [];
+    auditStatus = 'skipped';
+    auditReason = parsed.reason;
+  } else {
+    // Map model findings to ParsedReviewComment shape. The model returns title/body/severity/path/
+    // line/confidence/cross_references; the schema's existingCode/codeSuggestion/category fields
+    // are not populated by the cross-file pass (they're per-file concepts).
+    findings = parsed.findings.map((f) => ({
+      path: f.path,
+      line: f.line ?? null,
+      position: null,
+      severity: f.severity,
+      category: 'security' as const,
+      title: f.title,
+      body: f.body,
+      codeSuggestion: null,
+      existingCode: null,
+      confidence: f.confidence ?? null,
+      cross_references: f.cross_references,
+    }));
+    auditStatus = 'completed';
+  }
+
+  // Persist the synthetic file_review row. The `__cross_file__` sentinel path + `cross_file_security`
+  // pass uniquely identifies this row (ON CONFLICT (job_id, file_path, pass) arbiter).
+  await upsertFileReview(env, job.id, {
+    filePath: CROSS_FILE_SENTINEL,
+    pass: 'cross_file_security',
+    fileStatus: parsed.kind === 'fail_open' ? 'skipped' : 'done',
+    modelUsed: response.modelUsed,
+    diffLineCount: crossFileDiff.split('\n').length,
+    diffInput: crossFileDiff,
+    rawAiOutput: response.rawText,
+    parsedComments: findings,
+    inputTokens: response.inputTokens,
+    outputTokens: response.outputTokens,
+    durationMs: null,
+    verdict: findings.length > 0 ? 'comment' : 'approve',
+    fileSummary: parsed.kind === 'fail_open'
+      ? `Cross-file security: ${parsed.reason}`
+      : `Cross-file security: ${findings.length} finding(s)`,
+    errorMessage: parsed.kind === 'fail_open' ? parsed.reason : null,
+  });
+
+  // Record audit event (best-effort, never rethrows).
+  const auditEvent = buildCrossFileSecurityAuditEvent(auditStatus, {
+    reason: auditReason,
+    findingCount: findings.length,
+    filesIncluded,
+  });
+  await recordCrossFileSecurityAudit(env, job.id, [auditEvent]);
+
+  logger.info(`Cross-file security phase completed for job ${job.id}: ${findings.length} finding(s), ${filesIncluded} file(s) included.`);
+
+  // Hand off to the next phase unconditionally (Pitfall 1: do NOT re-check the cross_file toggle).
+  throw new NextPhaseError(nextPhaseAfterCrossFileSecurity(config), FRESH_INVOCATION_YIELD_SECONDS);
+}
+
 export { NextPhaseError } from './next-phase-error';
 
 // Phase 20.1 (BLOCKER 2 + BLOCKER 3): the four phase selectors live in `./phase-routing` so
@@ -3054,6 +3318,7 @@ export { NextPhaseError } from './next-phase-error';
 import {
   maybeRouteToWalkthroughEnrichment,
   nextPhaseAfterCritic,
+  nextPhaseAfterCrossFileSecurity,
   nextPhaseAfterReview,
   nextPhaseAfterVerifyFixes,
 } from './phase-routing';
@@ -3061,7 +3326,7 @@ import {
 async function enqueueJobPhase(
   env: AppBindings,
   jobId: string,
-  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment',
+  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' | 'cross_file_security',
   delaySeconds = 0,
 ) {
   await markJobContinuationQueued(env, jobId, delaySeconds);

@@ -225,7 +225,7 @@ dbDescribe('Severity + audit trail through a REAL job run (engine + DB round tri
     ...defaultRepoConfig,
     review: {
       ...defaultRepoConfig.review,
-      passes: { ...defaultRepoConfig.review.passes, security: { enabled: true } },
+      passes: { ...defaultRepoConfig.review.passes, security: { enabled: true, cross_file: false } },
     },
   });
 

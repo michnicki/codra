@@ -815,7 +815,7 @@ dbDescribe('Review Flow Lifecycle', () => {
         ...defaultRepoConfig.review,
         passes: {
           ...defaultRepoConfig.review.passes,
-          security: { enabled: true },
+          security: { enabled: true, cross_file: false },
         },
       },
     });
@@ -1012,7 +1012,7 @@ dbDescribe('Review Flow Lifecycle', () => {
         ...defaultRepoConfig.review,
         passes: {
           ...defaultRepoConfig.review.passes,
-          security: { enabled: overrides?.security ?? false },
+          security: { enabled: overrides?.security ?? false, cross_file: false },
           critic: {
             enabled: true,
             ...(overrides?.skip_threshold !== undefined ? { skip_threshold: overrides.skip_threshold } : {}),
@@ -3646,7 +3646,7 @@ dbDescribe('Review Flow Lifecycle', () => {
       ...defaultRepoConfig,
       review: {
         ...defaultRepoConfig.review,
-        passes: { ...defaultRepoConfig.review.passes, security: { enabled: true }, critic: { enabled: false } },
+        passes: { ...defaultRepoConfig.review.passes, security: { enabled: true, cross_file: false }, critic: { enabled: false } },
       },
     });
 
@@ -3655,7 +3655,7 @@ dbDescribe('Review Flow Lifecycle', () => {
       ...defaultRepoConfig,
       review: {
         ...defaultRepoConfig.review,
-        passes: { ...defaultRepoConfig.review.passes, security: { enabled: security }, critic: { enabled: true } },
+        passes: { ...defaultRepoConfig.review.passes, security: { enabled: security, cross_file: false }, critic: { enabled: true } },
       },
     });
 
@@ -3665,7 +3665,7 @@ dbDescribe('Review Flow Lifecycle', () => {
       review: {
         ...defaultRepoConfig.review,
         walkthrough: { enabled: true, sequence_diagram: { enabled: false } },
-        passes: { ...defaultRepoConfig.review.passes, security: { enabled: security }, critic: { enabled: false } },
+        passes: { ...defaultRepoConfig.review.passes, security: { enabled: security, cross_file: false }, critic: { enabled: false } },
       },
     });
 
@@ -4073,7 +4073,7 @@ dbDescribe('Review Flow Lifecycle', () => {
       review: {
         ...defaultRepoConfig.review,
         dedup: { enabled: dedupEnabled },
-        passes: { ...defaultRepoConfig.review.passes, security: { enabled: false }, critic: { enabled: false } },
+        passes: { ...defaultRepoConfig.review.passes, security: { enabled: false, cross_file: false }, critic: { enabled: false } },
         ...over,
       },
     });
@@ -4222,7 +4222,7 @@ dbDescribe('Review Flow Lifecycle', () => {
           max_comments: 2,
           category_confidence: { security: 0.85 },
           dedup: { enabled: true },
-          passes: { ...defaultRepoConfig.review.passes, security: { enabled: true }, critic: { enabled: false } },
+          passes: { ...defaultRepoConfig.review.passes, security: { enabled: true, cross_file: false }, critic: { enabled: false } },
         },
       };
       const secDrop = finding({ category: 'security', severity: 'P1', confidence: 0.8, title: 'Auth bypass sec', line: 10, position: 10, body: 'auth check missing' });

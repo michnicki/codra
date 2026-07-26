@@ -79,9 +79,10 @@ export type WalkthroughReviewRow = {
   // NULLABLE in the DB (001_initial.sql:83) even though getFileReviewsForJobs types it `number`;
   // the sort tiebreak uses `?? 0` (cross-AI LOW).
   diff_line_count: number | null;
-  // file_reviews is unique on (job_id, file_path, pass); Phase 10 adds security-pass rows, so the
-  // walkthrough filters pass === 'main' to keep exactly one row per file_path (D-02, forward-compat).
-  pass: 'main' | 'security';
+  // file_reviews is unique on (job_id, file_path, pass); Phase 10 adds security-pass rows, Phase 27
+  // adds cross_file_security rows, so the walkthrough filters pass === 'main' to keep exactly one
+  // row per file_path (D-02, forward-compat).
+  pass: 'main' | 'security' | 'cross_file_security';
 };
 
 /** Durable thread-verification data projected into the PR walkthrough. */

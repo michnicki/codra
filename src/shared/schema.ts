@@ -55,6 +55,14 @@ export const parsedReviewCommentSchema = z.object({
   // Per-finding model confidence (0..1). Threaded parse -> persist -> reconstruct -> finalize.
   // nullable + optional so a provider that omits it is representable and treated fail-open.
   confidence: z.number().min(0).max(1).nullable().optional(),
+  // SEC-XDIFF-01: cross-references to other files in the PR that share a security relationship
+  // with this finding (e.g. "auth middleware missing check" references "route handler no auth").
+  // Optional so existing providers/findings without cross-file context parse unchanged (NREG-01).
+  cross_references: z.array(z.object({
+    path: z.string().min(1),
+    line: z.number().int().positive().optional(),
+    relationship: z.string().min(1),
+  })).optional(),
 });
 
 export const fileReviewModelOutputSchema = z.object({
@@ -162,7 +170,13 @@ export const reviewConfigSchema = z.object({
     .default({ enabled: false, sequence_diagram: { enabled: true } }),
   passes: z
     .object({
-      security: z.object({ enabled: z.boolean().default(false) }).default({ enabled: false }),
+      security: z.object({
+        enabled: z.boolean().default(false),
+        // SEC-XDIFF-01: enable the cross-file security reasoning pass. Default-off so existing
+        // behavior is byte-identical (NREG-01). When enabled, a whole-diff security pass runs
+        // after the per-file review phase and before verify_fixes.
+        cross_file: z.boolean().default(false),
+      }).default({ enabled: false, cross_file: false }),
       // `skip_threshold` / `input_char_budget` are OPTIONAL critic tuning knobs (review suggestion):
       // when unset, 10-06 falls back to its in-code constants, so absence is behavior-identical.
       // Additive optional fields keep `passes.critic` all-off by default (NREG-01 inertness).
@@ -183,7 +197,7 @@ export const reviewConfigSchema = z.object({
         })
         .default({ runs: 1, temperature: 0.7 }),
     })
-    .default({ security: { enabled: false }, critic: { enabled: false }, ensemble: { runs: 1, temperature: 0.7 } }),
+    .default({ security: { enabled: false, cross_file: false }, critic: { enabled: false }, ensemble: { runs: 1, temperature: 0.7 } }),
   interactive: z
     .object({
       commands: z
@@ -293,7 +307,7 @@ export const repoConfigSchema = z.object({
     // two documented always-on v1.2 exceptions — `severity_engine.enabled` and `dedup.enabled` —
     // deliberately default `true` (D-01/D-02, FILT-03), so this is no longer an "all-off" literal.
     walkthrough: { enabled: false, sequence_diagram: { enabled: true } },
-    passes: { security: { enabled: false }, critic: { enabled: false }, ensemble: { runs: 1, temperature: 0.7 } },
+    passes: { security: { enabled: false, cross_file: false }, critic: { enabled: false }, ensemble: { runs: 1, temperature: 0.7 } },
     interactive: {
       commands: { enabled: false, bitbucket_allowed_account_ids: [], bitbucket_bot_account_id: null },
       qa: { enabled: false, rate_limit_per_hour: 10 },
@@ -344,7 +358,7 @@ export const reviewJobMessageSchema = z.object({
   // WIRE contract widened with durable auxiliary phases. The INTERNAL ReviewJobRunResult.phase union
   // and dispatch switch are widened only when each phase's worker lands; accepting the values here
   // lets fresh Workflow handoffs carry their persisted cursor without another contract edit.
-  phase: z.enum(['prepare', 'review', 'finalize', 'critic', 'verify_fixes', 'walkthrough_enrichment']).optional(),
+  phase: z.enum(['prepare', 'review', 'finalize', 'critic', 'verify_fixes', 'walkthrough_enrichment', 'cross_file_security']).optional(),
   // Optional multi-pass routing fields (D-07). Kept `.optional()` (no default) so every
   // pre-widening producer/fixture — and ReviewJobMessage = z.input<...> — keeps compiling.
   kind: z.enum(['review', 'qa', 'command']).optional(),
@@ -756,7 +770,7 @@ export type JobStep = z.infer<typeof jobStepSchema>;
 // D-07 pass value-set, locked contract-first (closes the file_reviews.pass gap so Phase 10 needs
 // no cross-layer contract edit). 'main' is today's single review pass; 'security' is Phase 10's
 // dedicated pass. Widen this enum when a new pass is introduced.
-export const fileReviewPassSchema = z.enum(['main', 'security']);
+export const fileReviewPassSchema = z.enum(['main', 'security', 'cross_file_security']);
 export type FileReviewPass = z.infer<typeof fileReviewPassSchema>;
 
 // Canonical (file_path, pass) tuple identity for the multi-pass engine. The review-consensus HIGH
@@ -1198,6 +1212,18 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
       status: z.enum(['completed', 'partial', 'failed']),
       reason: phase19MachineReasonSchema.optional(),
       groupCount: z.number().int().nonnegative().optional(),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // SEC-XDIFF-01: cross-file security reasoning pass audit event. Tracks completion status,
+  // finding count, and how many files were included in the whole-diff context.
+  z
+    .object({
+      stage: z.literal('cross_file_security'),
+      status: z.enum(['completed', 'skipped', 'failed']),
+      reason: z.string().optional(),
+      finding_count: z.number().int().nonnegative().optional(),
+      files_included: z.number().int().nonnegative().optional(),
       timestamp: dateStringSchema,
     })
     .passthrough(),
