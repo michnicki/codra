@@ -17,7 +17,7 @@
 **Goal:** Promote EVID-01 from soft/audit-only to hard-drop — findings with hallucinated `existingCode` evidence are dropped from posted comments (not just recorded in audit). Config-gated (`evidence.hard_drop`, default off). Per-category opt-out.
 **Requirements**: EVID-02
 **Depends on:** v1.3 (Phase 21 EVID-03 bounded telemetry)
-**Plans:** 2 plans
+**Plans:** 0/2 plans complete
 
 Plans:
 
@@ -34,14 +34,38 @@ Plans:
 **Goal:** New LLM pass that sees the entire PR diff and reasons about security implications across file boundaries — e.g., auth middleware change + new unprotected route. Findings enter dedup → critic → post pipeline. Subject to subrequest budget.
 **Requirements**: SEC-XDIFF-01
 **Depends on:** Phase 26 (benefits from EVID-02 hard-drop being in place, structurally independent)
-**Plans:** TBD
+**Plans:** 2/2 plans complete
+
+Plans:
+
+**Wave 1**
+
+- [x] 27-01-PLAN.md — Schema additions (7 changes) + PhaseName union + new prompt template + buildCrossFileDiff helper + audit builders + runCrossFileSecurityPhase handler + model output parser + unit tests (committed aa0c434)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [x] 27-02-PLAN.md — Finalize candidate set merge (__cross_file__ findings) + walkthrough cross-file section + formatter cross-reference rendering + integration tests + NREG-01 byte-identical assertion
 
 ### Phase 28: LRN-01 Learned-rule synthesis from reject feedback
 
 **Goal:** Cluster `reject` feedback (CMD-05 already captures) by similarity, synthesize suppression rules stored in repo config, dashboard-reviewable before activation. Config-gated (`learning.enabled`, default off).
 **Requirements**: LRN-01
 **Depends on:** Phase 26 (independent of SEC-XDIFF-01, benefits from EVID-02 signal)
-**Plans:** TBD
+**Plans:** 0/3 plans complete
+
+Plans:
+
+**Wave 1**
+
+- [ ] 28-01-PLAN.md — Schema additions (learning config block, audit event, RejectFeedbackRow) + migration 016 + VCS getInlineCommentDetails + reject handler enrichment
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 28-02-PLAN.md — Core learned-rules.ts (clustering + synthesis + suppression) + finalize wiring + audit event builder + API routes (POST synthesize, PATCH rule status)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 28-03-PLAN.md — Dashboard UI (LearnedRulesPanel + RuleCard) + repo config page integration + audit stage normalization
 
 ### Phase 29: QA-IDX-01 Codebase-index-backed Q&A
 
