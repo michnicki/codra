@@ -36,9 +36,10 @@ import { buildCrossFileDiff, CROSS_FILE_DIFF_MAX_LINES, CROSS_FILE_SENTINEL, fil
 import { insertSkippedFiles, listSkippedFilesForHead, type SkippedFilesHeadKey } from '@server/db/skipped-files';
 import { dedupeComposite, dedupeFindings } from './dedup';
 import { checkEvidence, type EvidenceDropEntry } from './evidence';
+import { suppressByLearnedRules } from './learned-rules';
 import { applyNoiseFilter, type NoiseFilterOptions } from './noise-filter';
 import { parseCrossFileSecurityResponse, parseSummaryResponse, parseWalkthroughDiagram } from './model-output';
-import { buildCriticDecisionsAuditEvent, buildCrossFileSecurityAuditEvent, buildEvidenceHardDroppedEvent, recordCrossFileSecurityAudit, recordCriticAudit } from './audit';
+import { buildCriticDecisionsAuditEvent, buildCrossFileSecurityAuditEvent, buildEvidenceHardDroppedEvent, buildLearnedRuleSuppressedEvent, recordCrossFileSecurityAudit, recordCriticAudit } from './audit';
 import {
   CRITIC_REASON_BELOW_SKIP_THRESHOLD,
   CRITIC_REASON_OVER_CHAR_BUDGET,
@@ -2261,6 +2262,39 @@ async function runFinalizePhase(
       } catch (error) {
         // Best-effort: log and continue (same posture as recordUnitAudit).
         logger.warn(`Failed to record evidence_hard_dropped events for job ${job.id}`, error);
+      }
+    }
+  }
+
+  // LRN-01: learned-rule suppression gate (Plan 28-02). Runs AFTER EVID-02 hard-drop (D-14)
+  // so a finding that fails evidence is dropped by the stricter gate first. Only active when
+  // config.review.learning.enabled is true (NREG-01 — default off, byte-identical when disabled).
+  // Matching is category (case-insensitive) + file_pattern (picomatch glob). Active rules only —
+  // pending and disabled rules have no effect.
+  if (config.review.learning?.enabled ?? false) {
+    const activeRules = (config.review.learning?.learned_rules ?? []).filter(
+      (r) => r.status === 'active',
+    );
+    if (activeRules.length > 0) {
+      const lrResult = suppressByLearnedRules(reviewedComments, activeRules);
+      reviewedComments = lrResult.kept;
+
+      // At-most-once audit emission: gated on !finalizeRetriedPastPost so a retry that already
+      // reached 'Completing' does not re-append learned_rule_suppressed events (same gate as
+      // EVID-02 above).
+      if (lrResult.entries.length > 0 && !finalizeRetriedPastPost) {
+        const lrEvents: JobAuditEvent[] = [];
+        for (const review of reviews) {
+          const reviewEntries = lrResult.entries.filter((e) => e.path === review.file_path);
+          if (reviewEntries.length === 0) continue;
+          const event = buildLearnedRuleSuppressedEvent(review.file_path, review.pass, reviewEntries);
+          if (event) lrEvents.push(event);
+        }
+        try {
+          await appendJobAuditEvents(env, job.id, lrEvents);
+        } catch (error) {
+          logger.warn(`Failed to record learned_rule_suppressed events for job ${job.id}`, error);
+        }
       }
     }
   }

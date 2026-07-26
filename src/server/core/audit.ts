@@ -5,6 +5,7 @@ import type { FileSelectionResult } from './diff';
 import type { DropRecord, NoiseFilterResult } from './noise-filter';
 import type { EnsembleReconciliation } from './ensemble';
 import type { EvidenceDropEntry } from './evidence';
+import type { LearnedRuleSuppressionEntry } from './learned-rules';
 import { logger } from './logger';
 import { redactFindingTitle } from './audit-redact';
 
@@ -687,6 +688,57 @@ export function buildEvidenceHardDroppedEvent(
   // `satisfies` is a compile-time check — if the literal ever diverges from
   // the `JobAuditEvent` union member, TypeScript rejects at compile time
   // rather than silently widening (Codex REVIEWS finding). NEVER cast `as`.
+  return event satisfies JobAuditEvent;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 28 (LRN-01) — bounded learned_rule_suppressed audit builder.
+//
+// One aggregate event per (file, pass) when learned-rule suppression removed >=1
+// finding from the finalize pass output. Follows the evidence_hard_dropped
+// precedent (lines 642-691) for the per-(file, pass) aggregate shape.
+// ---------------------------------------------------------------------------
+
+/** Sample cap for learned_rule_suppressed events — matches evidence_hard_dropped precedent. */
+const LEARNED_RULE_SUPPRESS_SAMPLE_CAP = 20;
+
+/**
+ * PURE learned-rule-suppressed audit builder (LRN-01 / D-13).
+ * Derives ONE `learned_rule_suppressed` event from an array of `LearnedRuleSuppressionEntry`
+ * objects. Returns null when entries is empty (no zero-count event for empty input).
+ *
+ * droppedCount reflects the FULL total passed in, NOT the capped sample length.
+ * The sample array is bounded to at most `LEARNED_RULE_SUPPRESS_SAMPLE_CAP` (20) entries.
+ *
+ * Privacy boundary: every sample entry's title passes through `redactFindingTitle` before
+ * storage. The builder never includes body/diff/existingCode/codeSuggestion in the event payload.
+ *
+ * Precedent: follows `buildEvidenceHardDroppedEvent` pattern — pure function, no I/O, never
+ * throws, returns typed event via `satisfies`.
+ */
+export function buildLearnedRuleSuppressedEvent(
+  file: string,
+  pass: FileReviewPass,
+  entries: LearnedRuleSuppressionEntry[],
+): JobAuditEvent | null {
+  if (entries.length === 0) return null;
+
+  const sample = entries.slice(0, LEARNED_RULE_SUPPRESS_SAMPLE_CAP).map((e) => ({
+    path: e.path,
+    line: e.line,
+    title: redactFindingTitle(e.title),
+    matched_rule: e.matched_rule,
+  }));
+
+  const event = {
+    stage: 'learned_rule_suppressed' as const,
+    file,
+    pass,
+    droppedCount: entries.length,
+    sample,
+    timestamp: new Date().toISOString(),
+  };
+
   return event satisfies JobAuditEvent;
 }
 
