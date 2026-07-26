@@ -274,6 +274,30 @@ export const reviewConfigSchema = z.object({
       hard_drop_exempt_categories: z.array(z.string()).max(20).default(['security']),
     })
     .default({ hard_drop: false, hard_drop_exempt_categories: ['security'] }),
+  // Phase 28 (LRN-01): learned-rule synthesis from reject feedback. `learning.enabled` is the
+  // master toggle gating both synthesis (on-demand clustering of reject_feedback rows) and
+  // suppression (dropping findings in finalize that match active rules). `learned_rules` is the
+  // in-config rule store — each rule is synthesized from a cluster of 2+ rejections sharing the
+  // same (category, file_path). Rules lifecycle: pending → active → disabled. Default-off for
+  // NREG-01 inertness: `repoConfigSchema.parse({})` yields `learning.enabled === false` and
+  // `learning.learned_rules === []`.
+  learning: z
+    .object({
+      enabled: z.boolean().default(false),
+      learned_rules: z
+        .array(
+          z.object({
+            id: z.uuid(),
+            category: z.string(),
+            file_pattern: z.string(),
+            status: z.enum(['pending', 'active', 'disabled']),
+            source_rejection_ids: z.array(z.string()),
+            created_at: z.string(),
+          }),
+        )
+        .default([]),
+    })
+    .default({ enabled: false, learned_rules: [] }),
 });
 
 export const repoConfigSchema = z.object({
@@ -319,6 +343,7 @@ export const repoConfigSchema = z.object({
     threads: { verify_fixes: false, auto_resolve: false },
     rounds: { incremental: false, escalate_floors: true },
     evidence: { hard_drop: false, hard_drop_exempt_categories: ['security'] },
+    learning: { enabled: false, learned_rules: [] },
   }),
   model: z
     .object({
@@ -995,6 +1020,30 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
           line: z.number().nullable().optional(),
           title: z.string().max(100),
           reason: z.enum(['absent', 'not_in_hunk']),
+        }),
+      ).max(20),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // Phase 28 (LRN-01): learned_rule_suppressed audit event. AGGREGATE — one event per (file, pass)
+  // when learned-rule suppression removed >=1 finding from the finalize pass output. Follows the
+  // `evidence_hard_dropped` precedent (lines 1004-1027) for the per-(file, pass) aggregate shape.
+  // droppedCount reflects the FULL total, NOT the capped sample length. Sample bounded to 20 entries.
+  // Each sample entry carries `matched_rule` (the rule ID, string) per D-13; titles route through
+  // redactFindingTitle at production time (AUD-01); never body/diff/existingCode/codeSuggestion.
+  // Privacy bounded: same evidence_hard_dropped posture.
+  z
+    .object({
+      stage: z.literal('learned_rule_suppressed'),
+      file: z.string(),
+      pass: fileReviewPassSchema,
+      droppedCount: z.number().int().min(0),
+      sample: z.array(
+        z.object({
+          path: z.string(),
+          line: z.number().nullable().optional(),
+          title: z.string().max(100),
+          matched_rule: z.string(),
         }),
       ).max(20),
       timestamp: dateStringSchema,
