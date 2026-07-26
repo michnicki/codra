@@ -286,4 +286,19 @@ export const api = {
       { method: 'DELETE' },
     );
   },
+  // Phase 28 (LRN-01): learned-rule synthesis and status transitions.
+  synthesizeLearnedRules(owner: string, repo: string, vcsProvider?: VcsProvider) {
+    const query = vcsProvider ? `?provider=${vcsProvider}` : '';
+    return request<{ ok: boolean; rules: unknown[]; message?: string }>(
+      `/api/repos/${pathSegment(owner)}/${pathSegment(repo)}/learned-rules/synthesize${query}`,
+      { method: 'POST' },
+    );
+  },
+  updateLearnedRule(owner: string, repo: string, ruleId: string, status: 'pending' | 'active' | 'disabled', vcsProvider?: VcsProvider) {
+    const query = vcsProvider ? `?provider=${vcsProvider}` : '';
+    return request<{ ok: boolean }>(
+      `/api/repos/${pathSegment(owner)}/${pathSegment(repo)}/learned-rules/${pathSegment(ruleId)}${query}`,
+      { method: 'PATCH', body: JSON.stringify({ status }) },
+    );
+  },
 };
