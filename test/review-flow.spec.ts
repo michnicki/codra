@@ -4534,6 +4534,303 @@ dbDescribe('Review Flow Lifecycle', () => {
       getDiffSpy.mockRestore();
     }, REVIEW_FLOW_TIMEOUT_MS);
   });
+
+  // --- Phase 27 SEC-XDIFF-01: cross-file security integration tests ----------------------------
+  describe('cross-file security integration', () => {
+    const crossFileConfig = (): RepoConfig => ({
+      ...defaultRepoConfig,
+      review: {
+        ...defaultRepoConfig.review,
+        passes: {
+          ...defaultRepoConfig.review.passes,
+          security: { enabled: true, cross_file: true },
+        },
+      },
+    });
+
+    const insertCrossFileJob = (repo: string, config: RepoConfig, commitChar: string) =>
+      insertJob(env, {
+        installationId: '123',
+        owner: 'test-owner',
+        repo,
+        prNumber: 10,
+        prTitle: 'Cross-file Security Test',
+        prAuthor: 'author',
+        commitSha: sha(commitChar),
+        baseSha: sha('0'),
+        trigger: 'auto',
+        headRef: 'feature',
+        baseRef: 'main',
+        configSnapshot: config,
+      });
+
+    it('cross_file: true on multi-file PR produces cross-file findings in posted review', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { ModelService } = await import('@server/services/model');
+      const repo = `test-repo-${Date.now()}-xf-e2e`;
+      const config = crossFileConfig();
+
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([
+          { path: 'src/auth/middleware.ts', content: 'export function auth() {}' },
+          { path: 'src/routes/api.ts', content: 'router.get("/data", handler)' },
+        ]),
+      );
+
+      // Mock reviewFile to return per-file findings
+      const reviewSpy = vi.spyOn(ModelService.prototype as any, 'reviewFile').mockImplementation(async (params: any) => ({
+        parsed: {
+          comments: [{
+            path: params.file.path,
+            line: 1,
+            position: 1,
+            severity: 'P2',
+            category: 'security',
+            title: `Finding in ${params.file.path}`,
+            body: `Security issue in ${params.file.path}`,
+          }],
+          verdict: 'comment' as const,
+            fileSummary: `Reviewed ${params.file.path}`,
+            overallCorrectness: 'issues found',
+            confidenceScore: 0.8,
+          },
+          modelUsed: 'test-model',
+          provider: 'test-provider',
+          inputTokens: 10,
+          outputTokens: 5,
+          rawText: '{}',
+          userPrompt: '',
+        }));
+
+      // Mock callVerifierRaw to return cross-file findings with cross_references
+      const verifierSpy = vi.spyOn(ModelService.prototype as any, 'callVerifierRaw').mockResolvedValue({
+        rawText: JSON.stringify({
+          findings: [{
+            title: 'Auth bypass via middleware gap',
+            body: 'The auth middleware does not protect the API route.',
+            severity: 'P0',
+            category: 'security',
+            confidence_score: 0.95,
+            cross_references: [
+              { path: 'src/routes/api.ts', line: 1, relationship: 'missing_auth_guard' },
+              { path: 'src/auth/middleware.ts', line: 1, relationship: 'weak_auth_check' },
+            ],
+          }],
+        }),
+        modelUsed: 'cross-file-model',
+        inputTokens: 100,
+        outputTokens: 50,
+      });
+
+      const job = await insertCrossFileJob(repo, config, 'x');
+      await updateJobFileCount(env, job.id, 2);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+
+      await runAndDrain({ jobId: job.id, deliveryId: 'delivery-xf-e2e', phase: 'review' });
+
+      // Verify the __cross_file__ file_review row exists
+      const reviews = await getFileReviewsForJobs(env, [job.id]);
+      const crossFileRow = reviews.find((r) => r.file_path === '__cross_file__' && r.pass === 'cross_file_security');
+      expect(crossFileRow).toBeDefined();
+      expect(crossFileRow!.file_status).toBe('done');
+      expect(crossFileRow!.parsed_comments).toHaveLength(1);
+
+      // Verify audit events include cross_file_security completed
+      const detail = await getJobDetail(env, job.id);
+      const audit: any[] = detail!.audit;
+      const xfEvents = audit.filter((e: any) => e.stage === 'cross_file_security');
+      expect(xfEvents.length).toBeGreaterThan(0);
+      expect(xfEvents.some((e: any) => e.status === 'completed')).toBe(true);
+
+      reviewSpy.mockRestore();
+      getDiffSpy.mockRestore();
+      verifierSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('cross_file: true on single-file PR skips cross-file pass', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { ModelService } = await import('@server/services/model');
+      const repo = `test-repo-${Date.now()}-xf-skip`;
+      const config = crossFileConfig();
+
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+      );
+
+      const reviewSpy = vi.spyOn(ModelService.prototype as any, 'reviewFile').mockImplementation(async (params: any) => ({
+        parsed: {
+          comments: [],
+          verdict: 'approve' as const,
+          fileSummary: 'Looks good',
+          overallCorrectness: 'no issues',
+          confidenceScore: 0.9,
+        },
+        modelUsed: 'test-model',
+        provider: 'test-provider',
+        inputTokens: 10,
+        outputTokens: 5,
+        rawText: '{}',
+        userPrompt: '',
+      }));
+
+      const job = await insertCrossFileJob(repo, config, 'y');
+      await updateJobFileCount(env, job.id, 1);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+
+      await runAndDrain({ jobId: job.id, deliveryId: 'delivery-xf-skip', phase: 'review' });
+
+      // Verify the __cross_file__ row exists with skipped status
+      const reviews = await getFileReviewsForJobs(env, [job.id]);
+      const crossFileRow = reviews.find((r) => r.file_path === '__cross_file__' && r.pass === 'cross_file_security');
+      expect(crossFileRow).toBeDefined();
+      expect(crossFileRow!.file_status).toBe('skipped');
+
+      // Verify skip audit event
+      const detail = await getJobDetail(env, job.id);
+      const audit: any[] = detail!.audit;
+      const xfEvents = audit.filter((e: any) => e.stage === 'cross_file_security');
+      expect(xfEvents.some((e: any) => e.status === 'skipped')).toBe(true);
+
+      // Verify finalize still completes (no cross-file findings in output)
+      expect(detail!.status).toBe('done');
+
+      reviewSpy.mockRestore();
+      getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('cross_file: true + model error fails open (per-file findings still posted)', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { ModelService } = await import('@server/services/model');
+      const repo = `test-repo-${Date.now()}-xf-fail`;
+      const config = crossFileConfig();
+
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([
+          { path: 'src/auth.ts', content: 'export function auth() {}' },
+          { path: 'src/routes.ts', content: 'router.get("/data", handler)' },
+        ]),
+      );
+
+      // Per-file reviews succeed
+      const reviewSpy = vi.spyOn(ModelService.prototype as any, 'reviewFile').mockImplementation(async (params: any) => ({
+        parsed: {
+          comments: [{
+            path: params.file.path,
+            line: 1,
+            position: 1,
+            severity: 'P2',
+            category: 'quality',
+            title: `Issue in ${params.file.path}`,
+            body: `Found issue in ${params.file.path}`,
+          }],
+          verdict: 'comment' as const,
+          fileSummary: `Reviewed ${params.file.path}`,
+          overallCorrectness: 'issues found',
+          confidenceScore: 0.8,
+        },
+        modelUsed: 'test-model',
+        provider: 'test-provider',
+        inputTokens: 10,
+        outputTokens: 5,
+        rawText: '{}',
+        userPrompt: '',
+      }));
+
+      // Cross-file model call throws
+      const verifierSpy = vi.spyOn(ModelService.prototype as any, 'callVerifierRaw').mockRejectedValue(
+        new Error('Model rate limited'),
+      );
+
+      const job = await insertCrossFileJob(repo, config, 'z');
+      await updateJobFileCount(env, job.id, 2);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+
+      await runAndDrain({ jobId: job.id, deliveryId: 'delivery-xf-fail', phase: 'review' });
+
+      // Verify __cross_file__ row exists with failed/skipped status
+      const reviews = await getFileReviewsForJobs(env, [job.id]);
+      const crossFileRow = reviews.find((r) => r.file_path === '__cross_file__' && r.pass === 'cross_file_security');
+      expect(crossFileRow).toBeDefined();
+      expect(crossFileRow!.file_status).toBe('failed');
+
+      // Verify failed audit event
+      const detail = await getJobDetail(env, job.id);
+      const audit: any[] = detail!.audit;
+      const xfEvents = audit.filter((e: any) => e.stage === 'cross_file_security');
+      expect(xfEvents.some((e: any) => e.status === 'failed')).toBe(true);
+
+      // Verify finalize still completes with per-file findings
+      expect(detail!.status).toBe('done');
+
+      reviewSpy.mockRestore();
+      getDiffSpy.mockRestore();
+      verifierSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('cross_file: false (default) produces no __cross_file__ row or audit events (NREG-01)', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { ModelService } = await import('@server/services/model');
+      const repo = `test-repo-${Date.now()}-xf-nreg`;
+      // Default config — cross_file is false
+      const config: RepoConfig = {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          passes: {
+            ...defaultRepoConfig.review.passes,
+            security: { enabled: true, cross_file: false },
+          },
+        },
+      };
+
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([
+          { path: 'src/auth.ts', content: 'export function auth() {}' },
+          { path: 'src/routes.ts', content: 'router.get("/data", handler)' },
+        ]),
+      );
+
+      const reviewSpy = vi.spyOn(ModelService.prototype as any, 'reviewFile').mockImplementation(async (params: any) => ({
+        parsed: {
+          comments: [],
+          verdict: 'approve' as const,
+          fileSummary: 'Looks good',
+          overallCorrectness: 'no issues',
+          confidenceScore: 0.9,
+        },
+        modelUsed: 'test-model',
+        provider: 'test-provider',
+        inputTokens: 10,
+        outputTokens: 5,
+        rawText: '{}',
+        userPrompt: '',
+      }));
+
+      const job = await insertCrossFileJob(repo, config, 'n');
+      await updateJobFileCount(env, job.id, 2);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+
+      await runAndDrain({ jobId: job.id, deliveryId: 'delivery-xf-nreg', phase: 'review' });
+
+      // Verify NO __cross_file__ row exists
+      const reviews = await getFileReviewsForJobs(env, [job.id]);
+      const crossFileRow = reviews.find((r) => r.file_path === '__cross_file__');
+      expect(crossFileRow).toBeUndefined();
+
+      // Verify NO cross_file_security audit events
+      const detail = await getJobDetail(env, job.id);
+      const audit: any[] = detail!.audit;
+      const xfEvents = audit.filter((e: any) => e.stage === 'cross_file_security');
+      expect(xfEvents).toHaveLength(0);
+
+      // Verify job completes normally
+      expect(detail!.status).toBe('done');
+
+      reviewSpy.mockRestore();
+      getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+  });
+
 });
 
 /**

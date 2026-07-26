@@ -6,6 +6,9 @@
 // - CROSS_FILE_SENTINEL / CROSS_FILE_DIFF_MAX_LINES constants
 // - Prompt template functions
 // - Audit event builders
+// - Walkthrough cross-file section (buildWalkthroughData)
+// - Formatter cross-reference rendering (formatInlineComment)
+// - No-duplication / NREG-01 byte-identical assertions
 
 import { describe, it, expect } from 'vitest';
 import {
@@ -23,6 +26,9 @@ import {
 import {
   buildCrossFileSecurityAuditEvent,
 } from '@server/core/audit';
+import { buildWalkthroughData, type WalkthroughReviewRow } from '@server/core/walkthrough';
+import { FormatterService } from '@server/services/formatter';
+import type { ParsedReviewComment } from '@shared/schema';
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -397,5 +403,250 @@ describe('buildCrossFileSecurityAuditEvent', () => {
   it('includes a timestamp', () => {
     const event = buildCrossFileSecurityAuditEvent('completed');
     expect(event.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+});
+
+// ── Walkthrough cross-file section ───────────────────────────────────────────
+
+describe('buildWalkthroughData — cross-file section', () => {
+  function makeReview(overrides: Partial<WalkthroughReviewRow> = {}): WalkthroughReviewRow {
+    return {
+      file_path: 'src/auth.ts',
+      file_summary: 'Auth module reviewed',
+      file_status: 'done',
+      error_msg: null,
+      verdict: 'comment',
+      diff_line_count: 50,
+      pass: 'main',
+      ...overrides,
+    };
+  }
+
+  function makeComment(overrides: Partial<ParsedReviewComment> = {}): ParsedReviewComment {
+    return {
+      path: 'src/auth.ts',
+      line: 10,
+      severity: 'P1',
+      category: 'security',
+      title: 'Missing auth check',
+      body: 'The middleware does not verify the token.',
+      ...overrides,
+    };
+  }
+
+  it('omits crossFileSection when no crossFileComments provided (NREG-01)', () => {
+    const data = buildWalkthroughData({
+      reviews: [makeReview()],
+      finalComments: [makeComment()],
+    });
+    expect(data.crossFileSection).toBeUndefined();
+  });
+
+  it('omits crossFileSection when crossFileComments is empty (NREG-01)', () => {
+    const data = buildWalkthroughData({
+      reviews: [makeReview()],
+      finalComments: [makeComment()],
+      crossFileComments: [],
+    });
+    expect(data.crossFileSection).toBeUndefined();
+  });
+
+  it('builds cross-file section with severity counts and findings', () => {
+    const crossFileComments = [
+      makeComment({
+        path: 'src/auth.ts',
+        severity: 'P0',
+        title: 'Auth bypass via middleware gap',
+        cross_references: [
+          { path: 'src/routes/api.ts', line: 42, relationship: 'missing_auth_guard' },
+          { path: 'src/middleware/session.ts', relationship: 'session_not_checked' },
+        ],
+      }),
+      makeComment({
+        path: 'src/routes/api.ts',
+        severity: 'P1',
+        title: 'Unprotected endpoint',
+        cross_references: [
+          { path: 'src/auth.ts', line: 10, relationship: 'auth_not_called' },
+        ],
+      }),
+    ];
+    const data = buildWalkthroughData({
+      reviews: [makeReview()],
+      finalComments: [makeComment()],
+      crossFileComments,
+    });
+    expect(data.crossFileSection).toBeDefined();
+    expect(data.crossFileSection!.severityCounts.P0).toBe(1);
+    expect(data.crossFileSection!.severityCounts.P1).toBe(1);
+    expect(data.crossFileSection!.severityCounts.P2).toBe(0);
+    expect(data.crossFileSection!.findings).toHaveLength(2);
+    expect(data.crossFileSection!.findings[0].title).toBe('Auth bypass via middleware gap');
+    expect(data.crossFileSection!.findings[0].crossReferences).toHaveLength(2);
+    expect(data.crossFileSection!.findings[0].crossReferences[0].path).toBe('src/routes/api.ts');
+    expect(data.crossFileSection!.findings[0].crossReferences[0].line).toBe(42);
+    expect(data.crossFileSection!.findings[0].crossReferences[1].path).toBe('src/middleware/session.ts');
+  });
+
+  it('counts unique files across primary paths and cross-references', () => {
+    const crossFileComments = [
+      makeComment({
+        path: 'src/auth.ts',
+        cross_references: [
+          { path: 'src/routes/api.ts', relationship: 'missing_auth_guard' },
+          { path: 'src/middleware/session.ts', relationship: 'session_not_checked' },
+        ],
+      }),
+    ];
+    const data = buildWalkthroughData({
+      reviews: [makeReview()],
+      finalComments: [makeComment()],
+      crossFileComments,
+    });
+    // Unique paths: src/auth.ts, src/routes/api.ts, src/middleware/session.ts = 3
+    expect(data.crossFileSection!.filesAnalyzed).toBe(3);
+  });
+
+  it('severityCounts on main walkthrough data are unaffected by cross-file section', () => {
+    const crossFileComments = [
+      makeComment({
+        path: 'src/auth.ts',
+        severity: 'P0',
+        title: 'Critical cross-file vuln',
+        cross_references: [{ path: 'src/routes/api.ts', relationship: 'test' }],
+      }),
+    ];
+    const data = buildWalkthroughData({
+      reviews: [makeReview()],
+      finalComments: [makeComment({ severity: 'P2' })],
+      crossFileComments,
+    });
+    // Main severity counts come from finalComments (P2 only)
+    expect(data.severityCounts.P0).toBe(0);
+    expect(data.severityCounts.P2).toBe(1);
+    // Cross-file section has its own P0 count
+    expect(data.crossFileSection!.severityCounts.P0).toBe(1);
+  });
+});
+
+// ── Formatter cross-reference rendering ──────────────────────────────────────
+
+describe('FormatterService.formatInlineComment — cross-references', () => {
+  const formatter = new FormatterService('https://example.com');
+
+  it('renders "Also affects" line for findings with cross_references', () => {
+    const comment: ParsedReviewComment = {
+      path: 'src/auth.ts',
+      line: 10,
+      severity: 'P1',
+      category: 'security',
+      title: 'Missing auth check',
+      body: 'The middleware does not verify the token.',
+      cross_references: [
+        { path: 'src/routes/api.ts', line: 42, relationship: 'missing_auth_guard' },
+        { path: 'src/middleware/session.ts', relationship: 'session_not_checked' },
+      ],
+    };
+    const result = formatter.formatInlineComment(comment);
+    expect(result).toContain('Also affects:');
+    expect(result).toContain('`src/routes/api.ts` (line 42)');
+    expect(result).toContain('`src/middleware/session.ts`');
+  });
+
+  it('does not render "Also affects" for findings without cross_references (NREG-01)', () => {
+    const comment: ParsedReviewComment = {
+      path: 'src/auth.ts',
+      line: 10,
+      severity: 'P1',
+      category: 'security',
+      title: 'Missing auth check',
+      body: 'The middleware does not verify the token.',
+    };
+    const result = formatter.formatInlineComment(comment);
+    expect(result).not.toContain('Also affects');
+  });
+
+  it('does not render "Also affects" for empty cross_references array (NREG-01)', () => {
+    const comment: ParsedReviewComment = {
+      path: 'src/auth.ts',
+      line: 10,
+      severity: 'P1',
+      category: 'security',
+      title: 'Missing auth check',
+      body: 'The middleware does not verify the token.',
+      cross_references: [],
+    };
+    const result = formatter.formatInlineComment(comment);
+    expect(result).not.toContain('Also affects');
+  });
+
+  it('renders cross-references without line numbers', () => {
+    const comment: ParsedReviewComment = {
+      path: 'src/auth.ts',
+      line: 10,
+      severity: 'P2',
+      category: 'security',
+      title: 'Session fixation',
+      body: 'Session ID not rotated after login.',
+      cross_references: [
+        { path: 'src/middleware/session.ts', relationship: 'session_not_rotated' },
+      ],
+    };
+    const result = formatter.formatInlineComment(comment);
+    expect(result).toContain('Also affects: `src/middleware/session.ts`');
+    expect(result).not.toContain('line');
+  });
+});
+
+// ── Formatter walkthrough cross-file section ────────────────────────────────
+
+describe('FormatterService.formatWalkthrough — cross-file section', () => {
+  const formatter = new FormatterService('https://example.com');
+
+  it('renders cross-file section when crossFileSection is provided', () => {
+    const result = formatter.formatWalkthrough({
+      files: [{ path: 'src/auth.ts', summary: 'Auth reviewed', counts: { P0: 0, P1: 0, P2: 1, P3: 0, nit: 0 } }],
+      severityCounts: { P0: 0, P1: 0, P2: 1, P3: 0, nit: 0 },
+      filesReviewed: 1,
+      crossFileSection: {
+        severityCounts: { P0: 1, P1: 0, P2: 0, P3: 0, nit: 0 },
+        filesAnalyzed: 3,
+        findings: [{
+          path: 'src/auth.ts',
+          title: 'Auth bypass via middleware gap',
+          severity: 'P0',
+          crossReferences: [
+            { path: 'src/routes/api.ts', line: 42, relationship: 'missing_auth_guard' },
+          ],
+        }],
+      },
+    });
+    expect(result).toContain('Cross-file Security');
+    expect(result).toContain('3 files analyzed');
+    expect(result).toContain('Auth bypass via middleware gap');
+    expect(result).toContain('`src/routes/api.ts` (line 42)');
+  });
+
+  it('does not render cross-file section when crossFileSection is absent (NREG-01)', () => {
+    const result = formatter.formatWalkthrough({
+      files: [{ path: 'src/auth.ts', summary: 'Auth reviewed', counts: { P0: 0, P1: 0, P2: 1, P3: 0, nit: 0 } }],
+      severityCounts: { P0: 0, P1: 0, P2: 1, P3: 0, nit: 0 },
+      filesReviewed: 1,
+    });
+    expect(result).not.toContain('Cross-file Security');
+  });
+
+  it('does not render cross-file section when findings is empty (NREG-01)', () => {
+    const result = formatter.formatWalkthrough({
+      files: [{ path: 'src/auth.ts', summary: 'Auth reviewed', counts: { P0: 0, P1: 0, P2: 1, P3: 0, nit: 0 } }],
+      severityCounts: { P0: 0, P1: 0, P2: 1, P3: 0, nit: 0 },
+      filesReviewed: 1,
+      crossFileSection: {
+        severityCounts: { P0: 0, P1: 0, P2: 0, P3: 0, nit: 0 },
+        filesAnalyzed: 0,
+        findings: [],
+      },
+    });
+    expect(result).not.toContain('Cross-file Security');
   });
 });
