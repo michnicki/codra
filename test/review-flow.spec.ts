@@ -4633,3 +4633,281 @@ dbDescribe('modelLineCap persistence across submit-poll roundtrip', () => {
     getDiffSpy.mockRestore();
   }, REVIEW_FLOW_TIMEOUT_MS);
 });
+
+// --- Phase 26 (EVID-02) evidence hard-drop gate ------------------------------------------------
+dbDescribe('evidence hard-drop', () => {
+  const env = createTestEnv();
+
+  // Helper to create a ParsedReviewComment with optional existingCode.
+  const comment = (over: Partial<ParsedReviewComment>): ParsedReviewComment => ({
+    path: 'src/app.ts',
+    line: 1,
+    position: 1,
+    severity: 'P3',
+    category: 'quality',
+    title: 'Test finding',
+    body: 'test body',
+    confidence: 0.9,
+    ...over,
+  });
+
+  it('drops findings with hallucinated existing_code when hard_drop=true', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const repo = `test-repo-${Date.now()}-evid02-drop`;
+    const headSha = sha('d');
+
+    // Diff contains 'console.log(1);' — findings that reference this text should be kept.
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+    );
+
+    let captured: any[] = [];
+    let createReviewArgs: any[] = [];
+    const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+      async (...args: any[]) => { createReviewArgs = args; captured = args[3]?.comments ?? []; return { id: 456 }; },
+    );
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 1,
+      prTitle: 'Evidence hard-drop test',
+      prAuthor: 'author',
+      commitSha: headSha,
+      baseSha: sha('0'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          evidence: { hard_drop: true, hard_drop_exempt_categories: [] },
+        },
+      },
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+    await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+
+    // Finding A: genuine existingCode matching diff content -> should survive
+    // Finding B: hallucinated existingCode not in diff -> should be dropped
+    // Finding C: null existingCode -> should be dropped (absent)
+    await upsertFileReview(env, job.id, {
+      filePath: 'src/app.ts',
+      pass: 'main',
+      fileStatus: 'done',
+      modelUsed: 'test-model',
+      modelProvider: 'test-provider',
+      diffLineCount: 1,
+      diffInput: 'diff',
+      rawAiOutput: '{}',
+      parsedComments: [
+        comment({ title: 'Genuine finding', existingCode: 'console.log(1);' }),
+        comment({ title: 'Hallucinated finding', existingCode: 'nonexistent.code.here' }),
+        comment({ title: 'Null evidence', existingCode: null }),
+      ],
+      inputTokens: 10,
+      outputTokens: 5,
+      durationMs: 1,
+      verdict: 'comment',
+      fileSummary: 'summary',
+      overallCorrectness: 'issues found',
+      confidenceScore: 0.9,
+      errorMessage: null,
+    });
+
+    await runWithDb(env, async () => {
+      const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-evid02-1', phase: 'finalize' });
+      expect(res).toEqual({ action: 'ack' });
+    });
+
+    // Only the genuine finding should have been posted
+    expect(captured).toHaveLength(1);
+    expect(captured[0].body).toContain('Genuine finding');
+    expect(captured[0].body).not.toContain('Hallucinated finding');
+    expect(captured[0].body).not.toContain('Null evidence');
+
+    // Verify audit trail contains evidence_hard_dropped event
+    const detail = await getJobDetail(env, job.id);
+    const audit: any[] = detail!.audit;
+    const hardDropEvents = audit.filter((e: any) => e.stage === 'evidence_hard_dropped');
+    expect(hardDropEvents).toHaveLength(1);
+    expect(hardDropEvents[0].droppedCount).toBe(2);
+    expect(hardDropEvents[0].file).toBe('src/app.ts');
+
+    createSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
+
+  it('exempt categories bypass hard-drop', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const repo = `test-repo-${Date.now()}-evid02-exempt`;
+    const headSha = sha('e');
+
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+    );
+
+    let captured: any[] = [];
+    const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+      async (_o: any, _r: any, _p: any, input: any) => { captured = input.comments; return { id: 456 }; },
+    );
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 2,
+      prTitle: 'Evidence exempt test',
+      prAuthor: 'author',
+      commitSha: headSha,
+      baseSha: sha('0'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          // 'security' is the default exempt category; 'quality' is NOT exempt
+          evidence: { hard_drop: true, hard_drop_exempt_categories: ['security'] },
+        },
+      },
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+    await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+
+    // Finding A: quality category with hallucinated evidence -> dropped (not exempt)
+    // Finding B: security category with hallucinated evidence -> kept (exempt)
+    // Finding C: security category with genuine evidence -> kept
+    // Each finding uses a different line so dedup does not collapse them (rule1 fires on same-path +
+    // same-line + same-category, which would suppress the second security finding).
+    await upsertFileReview(env, job.id, {
+      filePath: 'src/app.ts',
+      pass: 'main',
+      fileStatus: 'done',
+      modelUsed: 'test-model',
+      modelProvider: 'test-provider',
+      diffLineCount: 3,
+      diffInput: 'diff',
+      rawAiOutput: '{}',
+      parsedComments: [
+        comment({ category: 'quality', title: 'Quality bad evidence', existingCode: 'fake.code', line: 1, position: 1 }),
+        comment({ category: 'security', title: 'Security bad evidence', existingCode: 'fake.code', line: 2, position: 2 }),
+        comment({ category: 'security', title: 'Security good evidence', existingCode: 'console.log(1);', line: 3, position: 3 }),
+      ],
+      inputTokens: 10,
+      outputTokens: 5,
+      durationMs: 1,
+      verdict: 'comment',
+      fileSummary: 'summary',
+      overallCorrectness: 'issues found',
+      confidenceScore: 0.9,
+      errorMessage: null,
+    });
+
+    await runWithDb(env, async () => {
+      const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-evid02-2', phase: 'finalize' });
+      expect(res).toEqual({ action: 'ack' });
+    });
+
+    // Both security findings should survive (exempt + genuine); quality finding dropped
+    expect(captured).toHaveLength(2);
+    const capturedBodies = captured.map((c: any) => c.body).join(' ');
+    expect(capturedBodies).toContain('Security bad evidence');
+    expect(capturedBodies).toContain('Security good evidence');
+    expect(capturedBodies).not.toContain('Quality bad evidence');
+
+    // Verify audit trail: only 1 dropped (the quality finding)
+    const detail = await getJobDetail(env, job.id);
+    const audit: any[] = detail!.audit;
+    const hardDropEvents = audit.filter((e: any) => e.stage === 'evidence_hard_dropped');
+    expect(hardDropEvents).toHaveLength(1);
+    expect(hardDropEvents[0].droppedCount).toBe(1);
+
+    createSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
+
+  it('byte-identical output when hard_drop=false (NREG-01)', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const repo = `test-repo-${Date.now()}-evid02-nreg`;
+    const headSha = sha('f');
+
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+    );
+
+    let captured: any[] = [];
+    const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+      async (_o: any, _r: any, _p: any, input: any) => { captured = input.comments; return { id: 456 }; },
+    );
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 3,
+      prTitle: 'Evidence NREG-01 test',
+      prAuthor: 'author',
+      commitSha: headSha,
+      baseSha: sha('0'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      // Use default config — hard_drop defaults to false, evidence key may not even be present
+      configSnapshot: defaultRepoConfig,
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+    await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+
+    // All three findings have bad evidence, but hard_drop is false so ALL should post.
+    // Each finding uses a different line so dedup does not collapse them (rule1 fires on same-path +
+    // same-line + same-category).
+    await upsertFileReview(env, job.id, {
+      filePath: 'src/app.ts',
+      pass: 'main',
+      fileStatus: 'done',
+      modelUsed: 'test-model',
+      modelProvider: 'test-provider',
+      diffLineCount: 3,
+      diffInput: 'diff',
+      rawAiOutput: '{}',
+      parsedComments: [
+        comment({ title: 'Finding A', existingCode: 'fake.code', line: 1, position: 1 }),
+        comment({ title: 'Finding B', existingCode: 'another.fake', line: 2, position: 2 }),
+        comment({ title: 'Finding C', existingCode: null, line: 3, position: 3 }),
+      ],
+      inputTokens: 10,
+      outputTokens: 5,
+      durationMs: 1,
+      verdict: 'comment',
+      fileSummary: 'summary',
+      overallCorrectness: 'issues found',
+      confidenceScore: 0.9,
+      errorMessage: null,
+    });
+
+    await runWithDb(env, async () => {
+      const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-evid02-3', phase: 'finalize' });
+      expect(res).toEqual({ action: 'ack' });
+    });
+
+    // All three findings still post (hard_drop is false)
+    expect(captured).toHaveLength(3);
+    expect(captured[0].body).toContain('Finding');
+
+    // Verify NO evidence_hard_dropped audit events
+    const detail = await getJobDetail(env, job.id);
+    const audit: any[] = detail!.audit;
+    const hardDropEvents = audit.filter((e: any) => e.stage === 'evidence_hard_dropped');
+    expect(hardDropEvents).toHaveLength(0);
+
+    createSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
+});
