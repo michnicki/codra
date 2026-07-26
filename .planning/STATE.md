@@ -1,16 +1,16 @@
 ---
 gsd_state_version: 1.0
 milestone: v1.4
-milestone_name: TBD — candidates: EVID-02, SEC-XDIFF-01, LRN-01, QA-IDX-01, ANNO-01, WS-01
-current_phase: 0
-current_phase_name: none (v1.4 preparation — ready for /gsd-discuss-phase)
-status: ready — v1.3 closed and archived 2026-07-26, v1.4 requirements seeded
-stopped_at: Phase 25 complete, v1.3 archived, v1.4 candidates promoted
+milestone_name: Deferred Candidates — Hard-Drop Evidence + Review Quality + Bitbucket Differentiators
+current_phase: 26
+current_phase_name: evid-02-hard-drop-evidence-gate (next to discuss)
+status: ready — v1.4 scoped 2026-07-26, 6 requirements across 6 phases (26-31)
+stopped_at: v1.4 scoping complete — ready for /gsd-discuss-phase 26
 last_updated: "2026-07-26"
 last_activity: 2026-07-26
-last_activity_desc: Phase 25 closeout + v1.3 archive + v1.4 preparation complete
+last_activity_desc: v1.4 milestone scoped — all 6 deferred candidates promoted, dependency-ordered phases 26-31
 progress:
-  total_phases: 0
+  total_phases: 6
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -23,14 +23,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-25 for v1.2 closure)
 
 **Core value:** A Bitbucket Cloud PR gets the same AI review a GitHub PR gets, from one instance, without breaking GitHub — held end-to-end since v1.0, extended by v1.1 (every interactive/multi-pass capability shipped on both providers), extended by v1.2 (deterministic severity + real categories, audit-backed noise filter, priority file selection, incremental rounds, verify-fixes, critic v2, ensemble, walkthrough enrichment — all on both providers, every drop explainable from `jobs.audit`).
-**Current focus:** v1.4 preparation — EVID-02, SEC-XDIFF-01, LRN-01, QA-IDX-01, ANNO-01, WS-01 promoted from deferred. Ready for /gsd-discuss-phase.
+**Current focus:** v1.4 scoped — 6 phases (26-31), dependency-ordered: EVID-02 → SEC-XDIFF-01 → LRN-01 → QA-IDX-01 → ANNO-01 ∥ WS-01. Next: /gsd-discuss-phase 26.
 
 ## Current Position
 
-Phase: none — v1.4 milestone preparation complete
-Plan: none
-Status: Ready — v1.3 closed and archived 2026-07-26, v1.4 requirements seeded
-Last activity: 2026-07-26 -- Phase 25 closeout + v1.3 archive + v1.4 preparation
+Phase: 26 (evid-02-hard-drop-evidence-gate) — next to discuss
+Plan: none yet
+Status: Ready — v1.4 scoped, 6 requirements across 6 phases
+Last activity: 2026-07-26 -- v1.4 scoped with all 6 deferred candidates
 
 ## Performance Metrics
 

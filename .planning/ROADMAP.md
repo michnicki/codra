@@ -2,14 +2,57 @@
 
 ## Milestones
 
+- 🚧 **v1.4 Deferred Candidates** — Phases 26-31 (scoped 2026-07-26) — 6 requirements: EVID-02, SEC-XDIFF-01, LRN-01, QA-IDX-01, ANNO-01, WS-01
 - ✅ **v1.3 Bounded Evidence Audit Telemetry** — Phases 21-25 (shipped 2026-07-26): [milestones/v1.3-ROADMAP.md](milestones/v1.3-ROADMAP.md)
 - ✅ **v1.2 Review Engine Quality & Re-review Lifecycle** — shipped 2026-07-25: 9 phases (13-20 + 20.1), 49 plans including 19-10, 31/31 requirements satisfied, milestone audit `passed`. Full history: [milestones/v1.2-ROADMAP.md](milestones/v1.2-ROADMAP.md)
 
-### v1.4 — Next Milestone (preparation)
+### 🚧 v1.4 (Planned)
 
 **Initiated:** 2026-07-26
-**Candidates:** EVID-02, SEC-XDIFF-01, LRN-01, QA-IDX-01, ANNO-01, WS-01 (promoted from deferred)
-**Status:** Ready for `/gsd-new-milestone` scoping
+**Scope:** 6 requirements (EVID-02, SEC-XDIFF-01, LRN-01, QA-IDX-01, ANNO-01, WS-01) — all 6 deferred candidates promoted
+**Dependency order:** EVID-02 → SEC-XDIFF-01 → LRN-01 → QA-IDX-01 → ANNO-01 ∥ WS-01
+
+### Phase 26: EVID-02 Hard-drop evidence gate
+
+**Goal:** Promote EVID-01 from soft/audit-only to hard-drop — findings with hallucinated `existingCode` evidence are dropped from posted comments (not just recorded in audit). Config-gated (`evidence.hard_drop`, default off). Per-category opt-out.
+**Requirements**: EVID-02
+**Depends on:** v1.3 (Phase 21 EVID-03 bounded telemetry)
+**Plans:** TBD
+
+### Phase 27: SEC-XDIFF-01 Whole-diff cross-file security reasoning
+
+**Goal:** New LLM pass that sees the entire PR diff and reasons about security implications across file boundaries — e.g., auth middleware change + new unprotected route. Findings enter dedup → critic → post pipeline. Subject to subrequest budget.
+**Requirements**: SEC-XDIFF-01
+**Depends on:** Phase 26 (benefits from EVID-02 hard-drop being in place, structurally independent)
+**Plans:** TBD
+
+### Phase 28: LRN-01 Learned-rule synthesis from reject feedback
+
+**Goal:** Cluster `reject` feedback (CMD-05 already captures) by similarity, synthesize suppression rules stored in repo config, dashboard-reviewable before activation. Config-gated (`learning.enabled`, default off).
+**Requirements**: LRN-01
+**Depends on:** Phase 26 (independent of SEC-XDIFF-01, benefits from EVID-02 signal)
+**Plans:** TBD
+
+### Phase 29: QA-IDX-01 Codebase-index-backed Q&A
+
+**Goal:** Index default-branch tree into embeddings/keyword index (KV or Postgres) on repo install. Q&A queries index for relevant code beyond PR diff. Index freshness via webhook push events. Config-gated (`qa.index_enabled`, default off).
+**Requirements**: QA-IDX-01
+**Depends on:** Phase 26 (independent, heaviest lift)
+**Plans:** TBD
+
+### Phase 30: ANNO-01 Bitbucket Code Insights annotations
+
+**Goal:** Per-line Code Insights `ANNOTATION` reports on Bitbucket Cloud PRs — gutter-level severity markers mirroring inline comments. Separate from existing summary report. Bitbucket-only. Config-gated (`bitbucket.annotations_enabled`, default off).
+**Requirements**: ANNO-01
+**Depends on:** v1.0 Bitbucket adapter (independent of all review-quality phases)
+**Plans:** TBD
+
+### Phase 31: WS-01 Workspace-level token/webhook
+
+**Goal:** Workspace Access Token + workspace-level webhook auto-discovers repos in a Bitbucket workspace. Reduces per-repo onboarding friction to "add workspace, select repos." Dashboard workspace management UI. Bitbucket-only.
+**Requirements**: WS-01
+**Depends on:** v1.0 Bitbucket adapter (can run parallel with Phase 30)
+**Plans:** TBD
 
 <details>
 <summary>✅ v1.3 Bounded Evidence Audit Telemetry (Phases 21-25) — SHIPPED 2026-07-26</summary>
