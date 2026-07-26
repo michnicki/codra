@@ -3,17 +3,17 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Bounded Evidence Audit Telemetry
 current_phase: 24
-current_phase_name: Dashboard surface for new audit events
-status: executing
-stopped_at: Phase 24 context gathered
-last_updated: "2026-07-25T21:35:33.977Z"
-last_activity: 2026-07-25
-last_activity_desc: Phase 23 complete, transitioned to Phase 24
+current_phase_name: dashboard-surface-for-new-audit-events
+status: verifying
+stopped_at: Phase 25 context gathered
+last_updated: "2026-07-26T07:22:03.051Z"
+last_activity: 2026-07-26
+last_activity_desc: Phase 24 execution completed
 progress:
   total_phases: 5
-  completed_phases: 3
-  total_plans: 4
-  completed_plans: 4
+  completed_phases: 4
+  total_plans: 5
+  completed_plans: 5
 ---
 
 # Project State
@@ -23,14 +23,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-25 for v1.2 closure)
 
 **Core value:** A Bitbucket Cloud PR gets the same AI review a GitHub PR gets, from one instance, without breaking GitHub — held end-to-end since v1.0, extended by v1.1 (every interactive/multi-pass capability shipped on both providers), extended by v1.2 (deterministic severity + real categories, audit-backed noise filter, priority file selection, incremental rounds, verify-fixes, critic v2, ensemble, walkthrough enrichment — all on both providers, every drop explainable from `jobs.audit`).
-**Current focus:** Phase 23 — IN-01 modelLineCap Persistence at Submit Time
+**Current focus:** Phase 24 complete -- ready for verification
 
 ## Current Position
 
-Phase: 24 — Dashboard surface for new audit events
-Plan: Not started
-Status: Executing Phase 23
-Last activity: 2026-07-25 — Phase 23 complete, transitioned to Phase 24
+Phase: 24 (dashboard-surface-for-new-audit-events) — COMPLETE
+Plan: 1 of 1
+Status: Phase complete — ready for verification
+Last activity: 2026-07-26 -- Phase 24 execution completed
 
 ## Performance Metrics
 
@@ -105,6 +105,7 @@ Last activity: 2026-07-25 — Phase 23 complete, transitioned to Phase 24
 | Phase 20 P03 | 10min | 1 task | 1 file |
 | Phase 21 P01 | 7min | 2 tasks | 3 files |
 | Phase 21 P02 | 12min | 3 tasks | 5 files |
+| Phase 24 P01 | 4min | 4 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -253,9 +254,9 @@ Items acknowledged and carried forward:
 
 ## Session Continuity
 
-Last session: 2026-07-25T21:35:33.964Z
-Stopped at: Phase 24 context gathered
-Resume file: .planning/phases/24-dashboard-surface-for-new-audit-events/24-CONTEXT.md
+Last session: 2026-07-26T07:22:03.044Z
+Stopped at: Phase 25 context gathered
+Resume file: .planning/phases/25-milestone-closeout-audit-verification-sign-off/25-CONTEXT.md
 
 ## Operator Next Steps
 
