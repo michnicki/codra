@@ -2130,6 +2130,10 @@ async function runFinalizePhase(
       return units;
     },
   );
+  // __cross_file__ is NOT in expectedUnits — it's a synthetic aggregate row from
+  // cross_file_security (Phase 27), not a real file from getJobDiffFiles. A missing sentinel
+  // won't trigger the "missing units" backfill. This is correct: the cross-file pass writes its
+  // own row via upsertFileReview and is checked idempotently by runCrossFileSecurityPhase.
 
   if (reviews.length < expectedUnits.length) {
     const presentUnitKeys = new Set(reviews.map((review) => reviewUnitKey(review.file_path, review.pass)));
@@ -2218,6 +2222,10 @@ async function runFinalizePhase(
   } else {
     reviewedComments = reviews.flatMap((review) => review.parsed_comments as ParsedReviewComment[]);
   }
+  // __cross_file__ findings (Phase 27) are included automatically — they flow via
+  // reviews.flatMap / criticResult.kept like any other file_review row. No manual append needed.
+  // The sentinel row is loaded by getFileReviewsForJobs alongside real file rows, and its
+  // parsed_comments participate in the candidate set / critic grading / dedup identically.
 
   // EVID-02: evidence hard-drop gate (Plan 26-02). Runs BEFORE dedup (D-01) so a hallucinated-evidence
   // finding never participates in merging. Only active when config.evidence.hard_drop is true (NREG-01).
@@ -2666,11 +2674,17 @@ async function runFinalizePhase(
             effort: job.walkthroughEnrichment.effort ?? null,
           }
         : null;
+      // Phase 27 (SEC-XDIFF-01): identify cross-file findings by cross_references presence
+      // (NOT by path === '__cross_file__'). These get a dedicated "Cross-file Security" section
+      // in the walkthrough. When cross_file is off, no findings carry cross_references, so
+      // crossFileComments is empty and the section is omitted — NREG-01.
+      const crossFileComments = finalComments.filter((c) => Boolean(c.cross_references?.length));
       const data = buildWalkthroughData({
         reviews: mainReviews,
         finalComments: mainFinalComments,
         threadVerification: job.threadVerification,
         enrichment,
+        ...(crossFileComments.length > 0 ? { crossFileComments } : {}),
       });
       // (d) single in-place edit (delete-recovery + bounded transient retry live in the helper). The
       // mermaid fence is added GitHub-only by formatWalkthrough (Plan 01), filling the Plan 02 seam.
