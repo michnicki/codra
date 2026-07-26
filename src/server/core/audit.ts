@@ -4,6 +4,7 @@ import type { CriticDecision, FileReviewPass, JobAuditEvent, ReviewSeverity } fr
 import type { FileSelectionResult } from './diff';
 import type { DropRecord, NoiseFilterResult } from './noise-filter';
 import type { EnsembleReconciliation } from './ensemble';
+import type { EvidenceDropEntry } from './evidence';
 import { logger } from './logger';
 import { redactFindingTitle } from './audit-redact';
 
@@ -351,6 +352,9 @@ const ENSEMBLE_FAILED_RUN_REASONS_CAP = 4;
 // Phase 21 (EVID-03): evidence_missing_summary bounded sample cap (schema .max(20) constant for the builder).
 export const EVIDENCE_MISSING_SAMPLE_CAP = 20;
 
+// Phase 26 (EVID-02): evidence_hard_dropped bounded sample cap (schema .max(20) constant for the builder).
+export const EVIDENCE_HARD_DROP_SAMPLE_CAP = 20;
+
 export type EvidenceMissingSummaryAuditEvent = Extract<JobAuditEvent, { stage: 'evidence_missing_summary' }>;
 
 export interface EvidenceMissingEntry {
@@ -625,6 +629,57 @@ export function buildEvidenceMissingSummary(
     pass,
     absentCount,
     notInHunkCount,
+    sample,
+    timestamp: new Date().toISOString(),
+  };
+
+  // `satisfies` is a compile-time check — if the literal ever diverges from
+  // the `JobAuditEvent` union member, TypeScript rejects at compile time
+  // rather than silently widening (Codex REVIEWS finding). NEVER cast `as`.
+  return event satisfies JobAuditEvent;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 26 (EVID-02) — bounded evidence_hard_dropped audit builder.
+//
+// One aggregate event per (file, pass) when EVID-02 hard-drop removed >=1 finding
+// from the finalize pass output. Follows the buildEvidenceMissingSummary pattern.
+// ---------------------------------------------------------------------------
+
+/**
+ * PURE evidence-hard-dropped audit builder (EVID-02 / D-05 / D-06).
+ * Derives ONE `evidence_hard_dropped` event from an array of `EvidenceDropEntry`
+ * objects. Returns null when entries is empty (no zero-count event for empty input).
+ *
+ * droppedCount reflects the FULL total passed in, NOT the capped sample length.
+ * The sample array is bounded to at most `EVIDENCE_HARD_DROP_SAMPLE_CAP` (20) entries.
+ *
+ * Privacy boundary (T-26-02): every sample entry's title passes through
+ * `redactFindingTitle` before storage. The builder never includes
+ * body/diff/existingCode/codeSuggestion in the event payload.
+ *
+ * Precedent: follows `buildEvidenceMissingSummary` (lines 605-640) pattern — pure
+ * function, no I/O, never throws, returns typed event via `satisfies`.
+ */
+export function buildEvidenceHardDroppedEvent(
+  file: string,
+  pass: FileReviewPass,
+  entries: EvidenceDropEntry[],
+): JobAuditEvent | null {
+  if (entries.length === 0) return null;
+
+  const sample = entries.slice(0, EVIDENCE_HARD_DROP_SAMPLE_CAP).map((e) => ({
+    path: e.path,
+    line: e.line,
+    title: redactFindingTitle(e.title),
+    reason: e.reason,
+  }));
+
+  const event = {
+    stage: 'evidence_hard_dropped' as const,
+    file,
+    pass,
+    droppedCount: entries.length,
     sample,
     timestamp: new Date().toISOString(),
   };
