@@ -14,9 +14,22 @@ Codra is self-hosted AI code review for pull requests, running entirely on Cloud
 
 See `.planning/milestones/` for full phase-by-phase detail and closeout audits (`v1.0-*`, `v1.1-*`, `v1.2-*`).
 
-## Current Milestone: v1.4 (preparation)
+## Current Milestone: v1.4 — Deferred Candidates (Hard-Drop Evidence + Review Quality + Bitbucket Differentiators)
 
-v1.4 preparation initiated 2026-07-26. Scope: promote EVID-02, SEC-XDIFF-01, LRN-01, QA-IDX-01, ANNO-01, WS-01 from deferred to active. Full scoping via `/gsd-new-milestone`.
+**Scoped:** 2026-07-26
+**Scope:** All 6 deferred candidates promoted — 6 phases (26-31) ordered by dependency.
+**Status:** Scoped, ready for `/gsd-discuss-phase 26`
+
+**Dependency-ordered phases:**
+
+| Phase | Requirement | Description |
+|-------|-------------|-------------|
+| 26 | EVID-02 | Hard-drop evidence gate — promote EVID-01 from audit-only to hard-drop |
+| 27 | SEC-XDIFF-01 | Whole-diff cross-file security reasoning pass |
+| 28 | LRN-01 | Learned-rule synthesis from clustered reject feedback |
+| 29 | QA-IDX-01 | Codebase-index-backed Q&A (indexing subsystem) |
+| 30 | ANNO-01 | Bitbucket Code Insights per-line annotations |
+| 31 | WS-01 | Workspace-level token/webhook for multi-repo onboarding |
 
 ### v1.3 Bounded Evidence Audit Telemetry — CLOSED 2026-07-26
 
