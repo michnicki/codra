@@ -162,3 +162,31 @@ export async function findReviewCommentByPathLine(
 
   return rows[0] ?? null;
 }
+
+/**
+ * Phase 28 (LRN-01): Query all reject_feedback rows for a repository, identified by
+ * (vcs_provider, workspace, repo_slug). Used by the POST /api/repos/:id/learned-rules/synthesize
+ * endpoint to feed the clustering algorithm.
+ *
+ * Returns rows ordered by created_at DESC (most recent first). The caller filters to
+ * non-null finding_category + finding_file_path in clusterRejectFeedback.
+ */
+export async function getRejectFeedbackForRepo(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  input: {
+    vcsProvider: VcsProvider;
+    workspace: string;
+    repoSlug: string;
+  },
+): Promise<RejectFeedbackRow[]> {
+  return queryRows<RejectFeedbackRow>(
+    env,
+    `
+      SELECT *
+      FROM reject_feedback
+      WHERE vcs_provider = $1 AND workspace = $2 AND repo_slug = $3
+      ORDER BY created_at DESC
+    `,
+    [input.vcsProvider, input.workspace, input.repoSlug],
+  );
+}

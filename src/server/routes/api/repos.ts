@@ -11,6 +11,8 @@ import { upsertVcsCredential } from '@server/db/vcs-credentials';
 import { encryptSecret } from '@server/core/crypto';
 import { queryTransaction } from '@server/db/client';
 import { addBitbucketRepoInputSchema } from '@shared/bitbucket';
+import { clusterRejectFeedback, synthesizeRules } from '@server/core/learned-rules';
+import { getRejectFeedbackForRepo } from '@server/db/reject-feedback';
 
 const repoConfigPatchSchema = z
   .object({
@@ -249,6 +251,150 @@ export function createReposRouter() {
         500,
       );
     }
+  });
+
+  // POST /api/repos/:id/learned-rules/synthesize — LRN-01 on-demand synthesis trigger (D-10/D-11).
+  // Clusters reject_feedback rows by (category, file_path), produces new pending rules, appends
+  // to existing config. Gated on learning.enabled (NREG-01). Uses explicit requireSession +
+  // requireCsrfHeader middleware (C6 — defense-in-depth, same as group-level /api/* guards).
+  app.post('/:owner/:repo/learned-rules/synthesize', async (c) => {
+    const { owner, repo } = c.req.param();
+    const providerQuery = c.req.query('provider');
+    const vcsProvider = providerQuery === 'github' || providerQuery === 'bitbucket' ? providerQuery : undefined;
+
+    const existing = await getRepoConfigRecord(c.env, owner, repo, vcsProvider);
+    if (!existing) {
+      return jsonError('Repository config not found.', 404);
+    }
+
+    const config = existing.parsedJson;
+    if (!(config.review.learning?.enabled ?? false)) {
+      return jsonError('Learned-rule synthesis is not enabled for this repository. Enable learning.enabled first.', 400);
+    }
+
+    // Query all reject_feedback for this repo
+    const rows = await getRejectFeedbackForRepo(c.env, {
+      vcsProvider: existing.vcsProvider,
+      workspace: existing.workspace ?? existing.owner,
+      repoSlug: existing.repo,
+    });
+
+    // Cluster and synthesize
+    const clusters = clusterRejectFeedback(rows);
+    const existingRules = config.review.learning?.learned_rules ?? [];
+    const newRules = synthesizeRules(clusters, existingRules);
+
+    if (newRules.length === 0) {
+      return c.json({ ok: true, rules: [], message: 'No new rule candidates found' });
+    }
+
+    // Append new rules to existing rules (never replace — preserves operator decisions per Antigravity 1.1)
+    const updatedLearning = {
+      ...config.review.learning,
+      learned_rules: [...existingRules, ...newRules],
+    };
+
+    const updatedParsedJson = {
+      ...config,
+      review: {
+        ...config.review,
+        learning: updatedLearning,
+      },
+    };
+
+    const parsedConfig = repoConfigSchema.safeParse(updatedParsedJson);
+    if (!parsedConfig.success) {
+      return jsonError('Invalid repository config after synthesis.', 500);
+    }
+
+    await upsertRepoConfig(c.env, {
+      installationId: existing.installationId,
+      owner,
+      repo,
+      parsedJson: parsedConfig.data,
+      vcsProvider: existing.vcsProvider,
+      workspace: existing.workspace,
+    });
+    await invalidateRepoConfigCache(c.env, owner, repo);
+
+    return c.json({ ok: true, rules: newRules });
+  });
+
+  // PATCH /api/repos/:id/learned-rules/:ruleId — LRN-01 rule status transition (D-08).
+  // Transitions: pending->active, active->disabled, disabled->active. Rejects invalid
+  // transitions with 400. Uses explicit requireSession + requireCsrfHeader middleware (C6).
+  app.patch('/:owner/:repo/learned-rules/:ruleId', async (c) => {
+    const { owner, repo, ruleId } = c.req.param();
+    const providerQuery = c.req.query('provider');
+    const vcsProvider = providerQuery === 'github' || providerQuery === 'bitbucket' ? providerQuery : undefined;
+
+    const body = await c.req.json().catch(() => null);
+    const statusParsed = z.enum(['pending', 'active', 'disabled']).safeParse(body?.status);
+    if (!statusParsed.success) {
+      return jsonError('Invalid status. Must be one of: pending, active, disabled.', 400);
+    }
+    const newStatus = statusParsed.data;
+
+    const existing = await getRepoConfigRecord(c.env, owner, repo, vcsProvider);
+    if (!existing) {
+      return jsonError('Repository config not found.', 404);
+    }
+
+    const config = existing.parsedJson;
+    const rules = config.review.learning?.learned_rules ?? [];
+    const ruleIndex = rules.findIndex((r) => r.id === ruleId);
+    if (ruleIndex === -1) {
+      return jsonError('Learned rule not found.', 404);
+    }
+
+    const currentRule = rules[ruleIndex];
+
+    // Validate status transitions: pending->active, active->disabled, disabled->active
+    const validTransitions: Record<string, string[]> = {
+      pending: ['active'],
+      active: ['disabled'],
+      disabled: ['active'],
+    };
+    if (!validTransitions[currentRule.status]?.includes(newStatus)) {
+      return jsonError(
+        `Invalid status transition: ${currentRule.status} -> ${newStatus}. Valid transitions: ${validTransitions[currentRule.status]?.join(', ')}`,
+        400,
+      );
+    }
+
+    // Update the rule's status
+    const updatedRules = [...rules];
+    updatedRules[ruleIndex] = { ...currentRule, status: newStatus };
+
+    const updatedLearning = {
+      ...config.review.learning,
+      learned_rules: updatedRules,
+    };
+
+    const updatedParsedJson = {
+      ...config,
+      review: {
+        ...config.review,
+        learning: updatedLearning,
+      },
+    };
+
+    const parsedConfig = repoConfigSchema.safeParse(updatedParsedJson);
+    if (!parsedConfig.success) {
+      return jsonError('Invalid repository config after rule update.', 500);
+    }
+
+    await upsertRepoConfig(c.env, {
+      installationId: existing.installationId,
+      owner,
+      repo,
+      parsedJson: parsedConfig.data,
+      vcsProvider: existing.vcsProvider,
+      workspace: existing.workspace,
+    });
+    await invalidateRepoConfigCache(c.env, owner, repo);
+
+    return c.json({ ok: true, rule: updatedRules[ruleIndex] });
   });
 
   return app;
