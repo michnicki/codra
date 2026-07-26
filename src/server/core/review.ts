@@ -29,14 +29,16 @@ import {
   updateJobCriticResult,
   updateJobStatusCheckRef,
   updateJobStep,
+  appendJobAuditEvents,
 } from '@server/db/jobs';
 import { getPrReviewState, setLastReviewedSha, type PrReviewStateKey } from '@server/db/pr-review-state';
 import { filterReviewableFiles, parseUnifiedDiff, partitionReviewableFiles, selectReviewableFiles, type FileDiff, type FileSelectionResult } from './diff';
 import { insertSkippedFiles, listSkippedFilesForHead, type SkippedFilesHeadKey } from '@server/db/skipped-files';
 import { dedupeComposite, dedupeFindings } from './dedup';
+import { checkEvidence, type EvidenceDropEntry } from './evidence';
 import { applyNoiseFilter, type NoiseFilterOptions } from './noise-filter';
 import { parseSummaryResponse, parseWalkthroughDiagram } from './model-output';
-import { buildCriticDecisionsAuditEvent, recordCriticAudit } from './audit';
+import { buildCriticDecisionsAuditEvent, buildEvidenceHardDroppedEvent, recordCriticAudit } from './audit';
 import {
   CRITIC_REASON_BELOW_SKIP_THRESHOLD,
   CRITIC_REASON_OVER_CHAR_BUDGET,
@@ -2140,6 +2142,13 @@ async function runFinalizePhase(
   // no-ops the timestamp when the review phase already marked it done.
   await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
 
+  // REVIEWS CRITICAL FIX #2: moved from line 2410 so the EVID-02 evidence block (inserted below)
+  // can use the persisted finalizeRetriedPastPost gate for at-most-once audit emission. Computing this
+  // early is safe because job.steps is immutable after job creation — the Workflow steps are set once.
+  const finalizeRetriedPastPost = job.steps.some(
+    (step) => step.name === 'Completing' && (step.status === 'running' || step.status === 'done'),
+  );
+
   // D-09 / MP-04: resolve the finalize candidate set that feeds the (untouched) deterministic floor
   // block below. Precedence:
   //   (i)   a persisted critic result  -> reviewedComments = criticResult.kept. This is READ-ONLY:
@@ -2181,6 +2190,45 @@ async function runFinalizePhase(
   } else {
     reviewedComments = reviews.flatMap((review) => review.parsed_comments as ParsedReviewComment[]);
   }
+
+  // EVID-02: evidence hard-drop gate (Plan 26-02). Runs BEFORE dedup (D-01) so a hallucinated-evidence
+  // finding never participates in merging. Only active when config.evidence.hard_drop is true (NREG-01).
+  // Uses the shared checkEvidence function (same EVID-01 haystack algorithm) to re-check existingCode
+  // against the diff.
+  if (config.review.evidence?.hard_drop ?? false) {
+    const exemptCategories = config.review.evidence?.hard_drop_exempt_categories ?? ['security'];
+    const evidenceResult = checkEvidence(files, reviewedComments, exemptCategories);
+    reviewedComments = evidenceResult.kept;
+
+    // At-most-once audit emission: gated on !finalizeRetriedPastPost so a retry that already reached
+    // 'Completing' does not re-append evidence_hard_dropped events (same pattern as recordFinalizeDrops
+    // at the later gate). The gate is the persisted job.steps check, NOT an in-memory variable (REVIEWS
+    // CRITICAL FIX #2 — an in-memory guard resets on workflow retry).
+    if (evidenceResult.entries.length > 0 && !finalizeRetriedPastPost) {
+      const evidenceEvents: JobAuditEvent[] = [];
+      // Group entries by (file, pass). Pass association comes from the `review.pass` field on the
+      // FileReview DB row (the FileReview record carries review.pass, not ParsedReviewComment — the
+      // comment object has no `.pass` property). The grouping uses `review.file_path` to match
+      // entries to their originating review unit.
+      for (const review of reviews) {
+        const reviewEntries = evidenceResult.entries.filter(
+          (e) => e.path === review.file_path,
+        );
+        if (reviewEntries.length === 0) continue;
+        const event = buildEvidenceHardDroppedEvent(review.file_path, review.pass, reviewEntries);
+        if (event) evidenceEvents.push(event);
+      }
+      // REVIEWS FINDING #13 (Antigravity Suggestion): batch ALL evidence events into a single
+      // appendJobAuditEvents call to preserve subrequest budget. Never emit per-(file, pass).
+      try {
+        await appendJobAuditEvents(env, job.id, evidenceEvents);
+      } catch (error) {
+        // Best-effort: log and continue (same posture as recordUnitAudit).
+        logger.warn(`Failed to record evidence_hard_dropped events for job ${job.id}`, error);
+      }
+    }
+  }
+
   // Pitfall 3 (NREG): split the reviews into the main pass for every Phase-9 surface. mainReviews
   // feeds fileSummaries, the verdict aggregation, successfulReviews/confidence/correctness, and the
   // walkthrough — so toggling passes.security/critic never changes the summary narrative inputs, the
@@ -2403,13 +2451,6 @@ async function runFinalizePhase(
     { provider: vcs.name },
   );
 
-  // If a prior finalize attempt already reached the posting stage (the 'Completing' step was
-  // started) and then died before completeJob recorded the review id, the review may already be on
-  // GitHub. Re-posting would duplicate it, so reuse the existing one. This GitHub read is only paid
-  // on an actual finalize re-run, never on the common first pass.
-  const finalizeRetriedPastPost = job.steps.some(
-    (step) => step.name === 'Completing' && (step.status === 'running' || step.status === 'done'),
-  );
   await updateJobStep(env, job.id, 'Completing', { status: 'running' });
 
   // FILT-04 / review finding #7: emit finalize drop audit events on the POSTING path ONLY and
