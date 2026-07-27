@@ -419,6 +419,9 @@ export async function executeCommand(
               path: commentDetails.path,
               line: commentDetails.line,
               position: commentDetails.position,
+              // In-memory tiebreak only when two findings share one coordinate — never persisted,
+              // never logged, never bound into SQL.
+              commentBody: commentDetails.body,
             });
             if (reviewComment) {
               findingTitle = reviewComment.title;

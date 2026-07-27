@@ -115,6 +115,97 @@ const COORDINATE_PREDICATE_BY_PROVIDER: Record<VcsProvider, string> = {
 };
 
 /**
+ * Row cap for the candidate fetch behind the coordinate lookup. A bounded fetch keeps an
+ * unexpectedly hot coordinate (a pathological PR, or a crafted one) from reading unbounded rows
+ * while still covering every realistic collision — live PR#9 had two candidates at one coordinate.
+ * The tiebreak scan below is therefore O(20) in memory (threat T-28-09).
+ */
+const COORDINATE_CANDIDATE_LIMIT = 20;
+
+/** The five entities `services/formatter.ts escapeHtml` can emit, for un-escaping a posted body. */
+const HTML_ENTITY_REPLACEMENTS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/&lt;/g, '<'],
+  [/&gt;/g, '>'],
+  [/&quot;/g, '"'],
+  [/&#39;/g, "'"],
+  // `&amp;` LAST so `&amp;lt;` decodes to the literal `&lt;` rather than to `<`.
+  [/&amp;/g, '&'],
+];
+
+/** Collapse whitespace runs, trim, lowercase — the part both sides share. */
+function collapse(value: string): string {
+  return value.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/**
+ * Normalize a POSTED COMMENT BODY for title matching: strip the markup the formatter wrapped the
+ * title in (`<img ... />`, `<strong>`), then decode the five entities `escapeHtml` emits, so the
+ * result holds the title as raw text again.
+ */
+function normalizeBodyForTitleMatch(value: string): string {
+  let out = value.replace(/<[^>]*>/g, ' ');
+  for (const [pattern, replacement] of HTML_ENTITY_REPLACEMENTS) {
+    out = out.replace(pattern, replacement);
+  }
+  return collapse(out);
+}
+
+/**
+ * Normalize a STORED FINDING TITLE for matching. Deliberately ASYMMETRIC with the body normalizer:
+ * the title is raw plain text straight out of `review_comments`, so it must NOT be tag-stripped or
+ * entity-decoded. A title like `Guard <input> & "quoted"` would otherwise lose `<input>` to the
+ * tag-stripping regex and stop matching the very body the formatter rendered it into. Only the
+ * whitespace/case normalization is shared.
+ */
+function normalizeTitleForMatch(value: string): string {
+  return collapse(value);
+}
+
+/**
+ * Phase 28 (LRN-01) / G-28-3: resolve an ambiguous coordinate match using the rejected comment's own
+ * body. Pure and I/O-free so it is unit-testable without a database.
+ *
+ * WHY THE BODY IS THE TIEBREAK: the inline comment Codra posted was rendered from the finding by
+ * `services/formatter.ts formatInlineComment`, which writes the finding's title verbatim into
+ * `<strong>{escaped title}</strong>`. So when two findings share a coordinate (live PR#9 had two at
+ * position 32), the body of the comment the user actually replied `reject` to identifies WHICH of
+ * them was rejected. Recency (the caller's `ORDER BY`) is only the last resort.
+ *
+ * Returns `candidates[0] ?? null` when there is at most one candidate or no usable body. Otherwise
+ * returns the FIRST candidate (in the caller's already-deterministic order) whose normalized title
+ * is a substring of the normalized body, falling back to `candidates[0]` when none matches — so the
+ * result is total and order-stable for identical inputs.
+ *
+ * The body is IN-MEMORY TIEBREAK INPUT ONLY: it is never bound into a WHERE clause, never persisted,
+ * and never logged (threats T-28-07 / T-28-10).
+ */
+export function pickReviewCommentByCommentBody<T extends { title: string }>(
+  candidates: readonly T[],
+  commentBody: string | null | undefined,
+): T | null {
+  if (candidates.length === 0) {
+    return null;
+  }
+  if (candidates.length === 1 || !commentBody) {
+    return candidates[0];
+  }
+
+  const normalizedBody = normalizeBodyForTitleMatch(commentBody);
+  if (!normalizedBody) {
+    return candidates[0];
+  }
+
+  for (const candidate of candidates) {
+    const normalizedTitle = normalizeTitleForMatch(candidate.title);
+    if (normalizedTitle && normalizedBody.includes(normalizedTitle)) {
+      return candidate;
+    }
+  }
+
+  return candidates[0];
+}
+
+/**
  * Phase 28 (LRN-01): Look up a review_comment by (path, provider-appropriate coordinate) for the
  * most recent completed job matching the given PR identity. Returns the finding's title, category
  * and severity, or null when nothing matches. Used by the reject handler to denormalize finding
@@ -137,7 +228,10 @@ const COORDINATE_PREDICATE_BY_PROVIDER: Record<VcsProvider, string> = {
  *
  * Joins review_comments → file_reviews → jobs → repositories. `ORDER BY j.created_at DESC, rc.id
  * ASC` makes the ordering TOTAL: the colliding rows observed on PR#9 belong to the SAME job, so
- * `created_at` alone leaves a tie the database may break arbitrarily.
+ * `created_at` alone leaves a tie the database may break arbitrarily. Up to
+ * `COORDINATE_CANDIDATE_LIMIT` candidates are fetched and resolved by
+ * `pickReviewCommentByCommentBody`, so two findings on one coordinate attribute the rejection to the
+ * finding named in the rejected comment's body rather than to whichever row sorted first.
  *
  * The vcs_provider filter ensures we don't cross-match between GitHub and Bitbucket repos that
  * share the same owner/workspace + repo slug.
@@ -152,6 +246,9 @@ export async function findReviewCommentByCoordinate(
     path: string;
     line: number | null;
     position: number | null;
+    // The rejected comment's body, used ONLY in memory to disambiguate a coordinate collision.
+    // Never bound into SQL, never persisted, never logged (T-28-07 / T-28-10).
+    commentBody?: string | null;
   },
 ): Promise<{ title: string; category: string; severity: string } | null> {
   // Pick the coordinate the provider anchors by — GitHub the diff offset, Bitbucket the line.
@@ -182,7 +279,7 @@ export async function findReviewCommentByCoordinate(
         AND rc.path = $5
         AND ${coordinatePredicate}
       ORDER BY j.created_at DESC, rc.id ASC
-      LIMIT 1
+      LIMIT $7
     `,
     [
       input.vcsProvider,
@@ -191,12 +288,11 @@ export async function findReviewCommentByCoordinate(
       input.prNumber,
       input.path,
       coordinate,
+      COORDINATE_CANDIDATE_LIMIT,
     ],
   );
 
-  // Task 2 replaces this LIMIT 1 with a bounded candidate fetch plus a body-based tiebreak so an
-  // ambiguous coordinate resolves to the finding the user actually rejected.
-  return rows[0] ?? null;
+  return pickReviewCommentByCommentBody(rows, input.commentBody);
 }
 
 /**
