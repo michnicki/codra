@@ -12,13 +12,49 @@
 // without error but nothing persisted" — and under D-15's fail-open retrieval policy that defect is
 // completely SILENT in production.
 //
+// THE THREE MEASURED POSTGRES FACTS THE RETRIEVAL CASES GUARD. Each was measured on the live test
+// database during phase 29 research, and each failure mode is silent:
+//
+//   1. A raw slash path tokenizes to ONE unsearchable lexeme. to_tsvector('english',
+//      'src/server/core/code-index.ts') produces exactly the single lexeme
+//      'src/server/core/code-index.ts', so a question about "code index" never matches it. The path
+//      half of the vector must therefore be fed PRE-SPLIT tokens from buildIndexTokens. (Postgres's
+//      own path tokenization is also unpredictable: 'a_b/c-d/e.f' silently DROPS the leading 'a_'.)
+//      The path-tokenization case below is the regression guard — if raw paths are ever fed to the
+//      vector again, it is the only thing that fails.
+//   2. The 'A' and 'D' weight labels produce the path-over-body ordering with NO post-processing.
+//      ts_rank_cd's weight array is ordered {D, C, B, A}, so the defaults {0.1, 0.2, 0.4, 1.0} make a
+//      path-token hit outrank a body-only hit by 10x (2.0 vs 0.2) for the same query.
+//   3. to_tsvector RAISES above roughly 1 MB of RESULTING vector, and the vector is LARGER than its
+//      input (a 1 088 889-byte input produced a 1 477 980-byte vector against the 1 048 575-byte
+//      ceiling). That is why CODE_INDEX_MAX_CHUNK_BYTES is enforced in JS BEFORE the insert rather
+//      than by a generated column — the pathological-input case asserts the insert RESOLVES.
+//
 // Gated on hasConfiguredTestDatabaseUrl() the way the migration specs are. Migration 018 is applied to
 // TEST_DATABASE_URL by `npm test` (scripts/test.mjs sets DATABASE_URL = TEST_DATABASE_URL and runs
 // scripts/migrate.mjs), so a "relation does not exist" failure here is an un-migrated database rather
 // than a code defect.
+//
+// ENVIRONMENT HAZARDS — recorded so a future reader does not misdiagnose one as a code defect:
+//   - The live local test Postgres does NOT answer on the port written in `.env.test` (5432). It has
+//     been observed on 5433 and on 5455 depending on the local data directory, so an ECONNREFUSED
+//     here is an ENVIRONMENT problem: point TEST_DATABASE_URL at the running instance. Do not
+//     "fix" it by changing production code or by hardcoding a port anywhere.
+//   - The test database is NEVER reset, so it accumulates rows across runs and any LIMIT-bounded
+//     query can start flaking. The fix is TRUNCATE ... CASCADE on the offending table, never a
+//     production code change. This spec removes its own rows in beforeEach and afterAll for exactly
+//     that reason.
+//   - A bare `npx vitest run` skips the env files entirely, so createTestEnv() throws on a missing
+//     BITBUCKET_CLIENT_ID before any case runs. Use `npm test`, or load the env files first.
 
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { buildIndexTokens } from '@server/core/code-index';
+import {
+  CODE_INDEX_MAX_CHUNK_BYTES,
+  buildIndexTokens,
+  buildQueryExpression,
+  buildQueryTerms,
+  chunkLines,
+} from '@server/core/code-index';
 import {
   claimCodeIndexBuildLease,
   deleteCodeIndexChunksForPaths,
@@ -29,6 +65,7 @@ import {
   markCodeIndexFileIndexed,
   releaseCodeIndexBuildLease,
   renewCodeIndexBuildLease,
+  retrieveCodeIndexChunks,
   truncateCodeIndexForRepo,
   upsertCodeIndexChunks,
 } from '@server/db/code-index';
@@ -634,6 +671,171 @@ dbDescribe('code index DB accessors (QA-IDX-01, plan 29-04)', () => {
       expect((await readStateRow(repoA))?.status).toBe('failed');
       expect((await readStateRow(repoB))?.status).toBe('building');
       expect((await readStateRow(repoB))?.last_error).toBeNull();
+    });
+  });
+
+  /** Run a real question through the shared splitter and the real ranked retrieval. */
+  async function retrieve(repositoryId: number, question: string, limit = 50) {
+    return retrieveCodeIndexChunks(env, {
+      repositoryId,
+      queryExpression: buildQueryExpression(buildQueryTerms(question)),
+      limit,
+    });
+  }
+
+  // =============================================================================================
+  // Group 6 — ranking (D-04): a path-token match outranks an incidental body mention
+  // =============================================================================================
+
+  describe('ranking (D-04)', () => {
+    it('ranks a path-token match ABOVE a body-only match for the same query', async () => {
+      const pathMatch = 'src/server/db/widget-registry-table.ts';
+      const bodyMatch = 'src/client/panel-glue.ts';
+
+      // The path-match chunk's BODY says nothing about the query; the body-match chunk's PATH says
+      // nothing about it. Only the weight labels can produce the ordering.
+      await seedChunk(repoA, pathMatch, 'export const unrelatedBodyText = 1;');
+      await seedChunk(repoA, bodyMatch, 'incidental mention of widget registry inside a comment');
+
+      const hits = await retrieve(repoA, 'where is the widget registry defined');
+
+      const rankOf = (p: string) => hits.find((hit) => hit.path === p)?.rank ?? -1;
+      // Both must actually match, or the comparison would be vacuous.
+      expect(rankOf(pathMatch)).toBeGreaterThan(0);
+      expect(rankOf(bodyMatch)).toBeGreaterThan(0);
+      expect(rankOf(pathMatch)).toBeGreaterThan(rankOf(bodyMatch));
+      // And the accessor's own ordering puts it first, so the top-K cut keeps the right one.
+      expect(hits[0]?.path).toBe(pathMatch);
+    });
+  });
+
+  // =============================================================================================
+  // Group 7 — path tokenization: the Pitfall-1 regression guard
+  // =============================================================================================
+
+  describe('path tokenization', () => {
+    it('matches a query word that appears ONLY inside the stored chunk\'s slash-separated path', async () => {
+      const chunkPath = 'src/server/core/zephyrBeacon.ts';
+      const content = 'export const value = 1;';
+
+      // The guarantee is only meaningful if the word is absent from the content.
+      expect(content.toLowerCase()).not.toContain('zephyr');
+      await seedChunk(repoA, chunkPath, content);
+
+      const hits = await retrieve(repoA, 'zephyr');
+
+      expect(hits.map((hit) => hit.path)).toEqual([chunkPath]);
+      // Re-read the stored row: the pre-split tokens are what makes this reachable, and the raw path
+      // alone would tokenize to one unsearchable lexeme.
+      const [row] = await queryRows<{ path_tokens: string }>(
+        env,
+        'SELECT path_tokens FROM code_index_chunks WHERE repository_id = $1 AND path = $2',
+        [repoA, chunkPath],
+      );
+      expect(row?.path_tokens).toContain(chunkPath);
+      expect(row?.path_tokens.split(/\s+/)).toContain('zephyr');
+    });
+  });
+
+  // =============================================================================================
+  // Group 8 — cross-repository isolation (T-29-04-01): the information-disclosure control
+  // =============================================================================================
+
+  describe('cross-repository isolation (T-29-04-01)', () => {
+    it('returns only the queried repository\'s rows when both repositories match the same query', async () => {
+      const aPaths = ['src/a/alpha-isolationprobe.ts', 'src/a/beta-isolationprobe.ts'];
+      const bPaths = ['src/b/gamma-isolationprobe.ts'];
+
+      for (const p of aPaths) await seedChunk(repoA, p, 'export const tenantA = 1;');
+      for (const p of bPaths) await seedChunk(repoB, p, 'export const tenantB = 2;');
+
+      // Both tenants' rows really are in the table, so a passing isolation assertion is not vacuous.
+      const [total] = await queryRows<{ n: number | string }>(
+        env,
+        "SELECT count(*)::int AS n FROM code_index_chunks WHERE repository_id = ANY($1::int[]) AND path LIKE '%isolationprobe%'",
+        [[repoA, repoB]],
+      );
+      expect(Number(total?.n)).toBe(3);
+
+      const hitsA = await retrieve(repoA, 'isolationprobe');
+      const hitsB = await retrieve(repoB, 'isolationprobe');
+
+      // Assert the PATH SET, not the count: a count alone cannot distinguish "returned the right
+      // repository's two rows" from "returned one row from each".
+      expect([...hitsA.map((hit) => hit.path)].sort()).toEqual([...aPaths].sort());
+      expect([...hitsB.map((hit) => hit.path)].sort()).toEqual([...bPaths].sort());
+      for (const hit of hitsA) expect(bPaths).not.toContain(hit.path);
+      for (const hit of hitsB) expect(aPaths).not.toContain(hit.path);
+      // Neither tenant's CONTENT crosses over either — the content column is what reaches the prompt.
+      expect(hitsA.every((hit) => !hit.content.includes('tenantB'))).toBe(true);
+      expect(hitsB.every((hit) => !hit.content.includes('tenantA'))).toBe(true);
+    });
+  });
+
+  // =============================================================================================
+  // Group 9 — pathological input (T-29-04-05): the JS cap runs before the insert
+  // =============================================================================================
+
+  describe('pathological input (T-29-04-05)', () => {
+    /** Store every window chunkLines produced, exactly the way the build path will. */
+    async function seedWindows(repositoryId: number, chunkPath: string, content: string) {
+      const windows = chunkLines(content);
+      const { pathTokens } = buildIndexTokens(chunkPath, content);
+      return upsertCodeIndexChunks(env, {
+        repositoryId,
+        path: chunkPath,
+        indexedSha: SHA_A,
+        pathTokens,
+        chunks: windows.map((w) => ({
+          chunkStart: w.start,
+          chunkEnd: w.end,
+          content: w.content,
+          contentTokens: buildIndexTokens(chunkPath, w.content).contentTokens,
+        })),
+      });
+    }
+
+    it('inserts a window far over CODE_INDEX_MAX_CHUNK_BYTES after the JS cap, without raising', async () => {
+      const chunkPath = 'src/generated/dense-bundle.ts';
+      // 60 dense lines of ~1.9 kB each: the first 50-line window is ~95 kB before the cap, roughly 3x
+      // CODE_INDEX_MAX_CHUNK_BYTES, and the trailing 10-line window is under it. Both paths exercised.
+      const content = Array.from({ length: 60 }, (_, i) =>
+        Array.from({ length: 60 }, (_, j) => `const denseIdentifier${i}x${j} = ${i * j};`).join(' '),
+      ).join('\n');
+      expect(new TextEncoder().encode(content).length).toBeGreaterThan(CODE_INDEX_MAX_CHUNK_BYTES * 3);
+
+      // The guarantee is that this RESOLVES — not that it throws a caught error.
+      await expect(seedWindows(repoA, chunkPath, content)).resolves.toBeUndefined();
+
+      const rows = await readChunkRows(repoA);
+      expect(rows.length).toBe(2);
+      for (const row of rows) {
+        expect(Number(row.octets)).toBeLessThanOrEqual(CODE_INDEX_MAX_CHUNK_BYTES);
+      }
+      // The stored line range is still the file's REAL range, so a retrieved hit cites lines that exist.
+      expect(rows.map((row) => Number(row.chunk_start))).toEqual([1, 51]);
+    });
+
+    it('inserts a chunk that is ONE unbroken lexeme past the Postgres lexeme limit, without raising', async () => {
+      const chunkPath = 'src/generated/single-token.min.js';
+      // One line, one token, 2 MB — far past both CODE_INDEX_MAX_CHUNK_BYTES and Postgres's ~2047-byte
+      // lexeme limit. to_tsvector emits a NOTICE and ignores the overlong word (postgres.js suppresses
+      // notices via onnotice); it must not ERROR, or the build step would burn its whole retry budget
+      // re-throwing the same deterministic failure.
+      const content = 'q'.repeat(2_000_000);
+
+      await expect(seedWindows(repoA, chunkPath, content)).resolves.toBeUndefined();
+
+      const rows = await readChunkRows(repoA);
+      expect(rows.length).toBe(1);
+      expect(Number(rows[0]!.octets)).toBeLessThanOrEqual(CODE_INDEX_MAX_CHUNK_BYTES);
+      // The row is real and readable — re-read the vector rather than trusting the insert returned.
+      const [vector] = await queryRows<{ lexemes: number | string }>(
+        env,
+        'SELECT length(search_vector) AS lexemes FROM code_index_chunks WHERE repository_id = $1 AND path = $2',
+        [repoA, chunkPath],
+      );
+      expect(Number(vector?.lexemes)).toBeGreaterThanOrEqual(0);
     });
   });
 });
