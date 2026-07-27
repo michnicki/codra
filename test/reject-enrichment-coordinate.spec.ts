@@ -4,7 +4,7 @@ import type { VcsProvider } from '@server/vcs/types';
 import { insertJob } from '@server/db/jobs';
 import { upsertFileReview } from '@server/db/file-reviews';
 import { queryRows } from '@server/db/client';
-import { findReviewCommentByCoordinate } from '@server/db/reject-feedback';
+import { findReviewCommentByCoordinate, pickReviewCommentByCommentBody } from '@server/db/reject-feedback';
 import { defaultRepoConfig, repoConfigSchema, type ParsedReviewComment, type RepoConfig } from '@shared/schema';
 import { createTestEnv, hasConfiguredTestDatabaseUrl } from './helpers';
 
@@ -279,5 +279,167 @@ dbDescribe('reject enrichment — provider-aware coordinate match (G-28-3)', () 
       position: null,
     });
     expect(result).toBeNull();
+  });
+});
+
+// Two findings sharing one coordinate is not hypothetical: live PR#9 had two findings on the same
+// path at position 32 / line 366. `LIMIT 1` alone would attribute the rejection to whichever row
+// the ordering happened to surface. The rejected comment's OWN body identifies the finding, because
+// `formatInlineComment` renders the title verbatim into `<strong>...</strong>`.
+const COLLIDE_A_TITLE = 'Missing error handling for replyToPrComment call';
+const COLLIDE_B_TITLE = 'Unbounded candidate fetch can read every row';
+
+dbDescribe('reject enrichment — ambiguous coordinate resolves by the rejected comment body', () => {
+  const env = createTestEnv();
+
+  const collidingComments: ParsedReviewComment[] = [
+    {
+      path: SEEDED_PATH,
+      line: SEEDED_LINE,
+      position: SEEDED_POSITION,
+      severity: 'P1',
+      category: 'bugs',
+      title: COLLIDE_A_TITLE,
+      body: 'The reply call is not wrapped in a try/catch.',
+    },
+    {
+      path: SEEDED_PATH,
+      line: SEEDED_LINE,
+      position: SEEDED_POSITION,
+      severity: 'P2',
+      category: 'performance',
+      title: COLLIDE_B_TITLE,
+      body: 'The candidate query has no row cap.',
+    },
+  ];
+
+  async function lookup(slug: string, commentBody?: string | null) {
+    return findReviewCommentByCoordinate(env, {
+      workspace: 'acme',
+      repoSlug: slug,
+      vcsProvider: 'github',
+      prNumber: 9,
+      path: SEEDED_PATH,
+      line: null,
+      position: SEEDED_POSITION,
+      commentBody,
+    });
+  }
+
+  it('selects the finding whose title appears in the body — BOTH directions', async () => {
+    const slug = `repo-lrn-collide-${Date.now()}`;
+    await seedFinishedJob(env, { slug, prNumber: 9, comments: collidingComments });
+
+    // Body naming the SECOND finding must resolve to the second, not to whichever row the
+    // ordering surfaces first.
+    const pickedB = await lookup(slug, formatterBody(COLLIDE_B_TITLE));
+    expect(pickedB?.title).toBe(COLLIDE_B_TITLE);
+    expect(pickedB?.category).toBe('performance');
+
+    // Mirror direction: a body naming the FIRST finding must resolve to the first. Asserting only
+    // one direction would pass against an arbitrary pick, so both are required.
+    const pickedA = await lookup(slug, formatterBody(COLLIDE_A_TITLE));
+    expect(pickedA?.title).toBe(COLLIDE_A_TITLE);
+    expect(pickedA?.category).toBe('bugs');
+  });
+
+  it('is deterministic across repeated calls when no body is available', async () => {
+    const slug = `repo-lrn-determ-${Date.now()}`;
+    await seedFinishedJob(env, { slug, prNumber: 9, comments: collidingComments });
+
+    const first = await lookup(slug);
+    const second = await lookup(slug);
+    expect(first).not.toBeNull();
+    expect(first).toEqual(second);
+  });
+});
+
+dbDescribe('reject enrichment — Bitbucket resolves on line (NREG-02 parity)', () => {
+  const env = createTestEnv();
+
+  const BB_LINE = 120;
+  // Deliberately != BB_LINE so a lookup that reached for `position` would miss.
+  const BB_POSITION = 47;
+
+  const bbComments: ParsedReviewComment[] = [
+    {
+      path: SEEDED_PATH,
+      line: BB_LINE,
+      position: BB_POSITION,
+      severity: 'P0',
+      category: 'security',
+      title: 'Bitbucket anchors inline comments by line',
+      body: 'Bitbucket sends inline: { path, to | from }.',
+    },
+  ];
+
+  it('resolves a Bitbucket finding from the line coordinate', async () => {
+    const slug = `repo-lrn-bb-${Date.now()}`;
+    await seedFinishedJob(env, { slug, prNumber: 11, comments: bbComments, provider: 'bitbucket' });
+
+    const result = await findReviewCommentByCoordinate(env, {
+      workspace: 'acme',
+      repoSlug: slug,
+      vcsProvider: 'bitbucket',
+      prNumber: 11,
+      path: SEEDED_PATH,
+      line: BB_LINE,
+      position: null,
+    });
+    expect(result?.category).toBe('security');
+    expect(result?.severity).toBe('P0');
+  });
+
+  it('returns null for Bitbucket when the line is null, even if a position is supplied', async () => {
+    const slug = `repo-lrn-bb-null-${Date.now()}`;
+    await seedFinishedJob(env, { slug, prNumber: 11, comments: bbComments, provider: 'bitbucket' });
+
+    // No cross-provider coordinate borrowing: the Bitbucket path must not fall back to `position`.
+    const result = await findReviewCommentByCoordinate(env, {
+      workspace: 'acme',
+      repoSlug: slug,
+      vcsProvider: 'bitbucket',
+      prNumber: 11,
+      path: SEEDED_PATH,
+      line: null,
+      position: BB_POSITION,
+    });
+    expect(result).toBeNull();
+  });
+});
+
+// Pure-helper units — no database, so these run even without TEST_DATABASE_URL.
+describe('pickReviewCommentByCommentBody (deterministic collision tiebreak)', () => {
+  const a = { title: 'Missing null check', category: 'bugs', severity: 'P1' };
+  const b = { title: 'Unbounded fetch', category: 'performance', severity: 'P2' };
+
+  it('returns null for no candidates', () => {
+    expect(pickReviewCommentByCommentBody([], 'anything')).toBeNull();
+  });
+
+  it('returns the only candidate regardless of body', () => {
+    expect(pickReviewCommentByCommentBody([a], null)).toEqual(a);
+    expect(pickReviewCommentByCommentBody([a], 'body naming nothing')).toEqual(a);
+  });
+
+  it('returns the first candidate when the body is empty or absent', () => {
+    expect(pickReviewCommentByCommentBody([a, b], null)).toEqual(a);
+    expect(pickReviewCommentByCommentBody([a, b], '')).toEqual(a);
+    expect(pickReviewCommentByCommentBody([a, b], undefined)).toEqual(a);
+  });
+
+  it('matches a title that the formatter HTML-escaped in the posted body', () => {
+    const escaped = { title: `Guard <input> & "quoted" 'value'`, category: 'security', severity: 'P0' };
+    const body = `⚠️ P1 <strong>Guard &lt;input&gt; &amp; &quot;quoted&quot; &#39;value&#39;</strong>\n\nsome body`;
+    expect(pickReviewCommentByCommentBody([b, escaped], body)).toEqual(escaped);
+  });
+
+  it('ignores markup and whitespace noise between the tags and the title', () => {
+    const body = `<img src="x" /> <strong>\n  Unbounded    fetch\n</strong>\n\ndetails`;
+    expect(pickReviewCommentByCommentBody([a, b], body)).toEqual(b);
+  });
+
+  it('falls back to the first candidate when no title matches the body', () => {
+    expect(pickReviewCommentByCommentBody([a, b], 'a body naming neither finding')).toEqual(a);
   });
 });
