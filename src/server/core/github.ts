@@ -489,6 +489,43 @@ export class GitHubClient {
     });
   }
 
+  // QA-IDX-01 (D-09): repository metadata read, used ONLY to resolve the default branch for the
+  // index build. Narrowed to the two branch fields on purpose -- the endpoint returns ~100 keys and
+  // the seam has no business carrying any of the rest. `master_branch` is the legacy alias some
+  // very old repositories still report; the adapter prefers `default_branch` and falls back.
+  async getRepositoryMetadata(owner: string, repo: string) {
+    return withRetry(`getRepositoryMetadata ${owner}/${repo}`, async () => {
+      const response = await this.requestAndCheck(repoApiPath(owner, repo));
+      return (await response.json()) as { default_branch?: string; master_branch?: string };
+    });
+  }
+
+  // QA-IDX-01 (D-09): one recursive tree read enumerates the whole default branch.
+  //
+  // The `tree_sha` path segment ACCEPTS A REF NAME, not just a SHA1 [CITED:
+  // docs.github.com/en/rest/git/trees -- "Returns a single tree using the SHA1 value or ref name for
+  // that tree"], so the branch name works directly and no separate ref-resolution call is needed.
+  // That is what keeps the whole GitHub enumeration at 2 subrequests (one repo read for the default
+  // branch, this one tree read).
+  //
+  // `recursive=1` is what makes it ONE call instead of a per-directory walk, and it is also what
+  // introduces the truncation case: the recursive endpoint sets `truncated: true` above 100 000
+  // entries or 7 MB and returns an arbitrary prefix. The flag is surfaced verbatim to the adapter --
+  // see the `listDefaultBranchTree` doc comment in vcs/types.ts for why swallowing it would be a
+  // silent partial index.
+  async getTree(owner: string, repo: string, treeIsh: string) {
+    return withRetry(`getTree ${owner}/${repo}@${treeIsh}`, async () => {
+      const response = await this.requestAndCheck(
+        `${repoApiPath(owner, repo)}/git/trees/${encodeURIComponent(treeIsh)}?recursive=1`,
+      );
+      return (await response.json()) as {
+        sha: string;
+        truncated: boolean;
+        tree: Array<{ path: string; type: 'blob' | 'tree' | 'commit'; sha: string; size?: number }>;
+      };
+    });
+  }
+
   // --- PROV-02 GraphQL plumbing (review-thread listing + resolution) ---
   //
   // The thread family (D-05..D-07) is exposed only via GraphQL -- the REST review-comment endpoint

@@ -33,6 +33,19 @@ export class GitHubService {
     return this.client.getCompareDiff(owner, repo, base, head);
   }
 
+  // QA-IDX-01 (D-09): the two reads the index build's tree enumeration needs. Declared HERE and not
+  // only on GitHubClient because `GithubAdapter` holds a `GitHubService`, never a `GitHubClient` --
+  // that module boundary is load-bearing for the three specs that `vi.mock('@server/services/github')`
+  // (see the GithubAdapter class comment). A method missing from this pass-through seam is
+  // unreachable from the adapter.
+  async getRepositoryMetadata(owner: string, repo: string) {
+    return this.client.getRepositoryMetadata(owner, repo);
+  }
+
+  async getTree(owner: string, repo: string, treeIsh: string) {
+    return this.client.getTree(owner, repo, treeIsh);
+  }
+
   // PROV-02: GraphQL thread listing (D-05..D-07, R-2). Cursor-paged via the client; the optional
   // tracker is forwarded so the search consumer (Phase 19) can gate pagination near the Workers
   // subrequest cap (R-9). REQUIRED here so the vi.mock('@server/services/github') seam intercepts.
