@@ -59,6 +59,11 @@
       "name": "codra-review-workflow",
       "binding": "REVIEW_WORKFLOW",
       "class_name": "ReviewWorkflow"
+    },
+    {
+      "name": "codra-index-workflow",
+      "binding": "INDEX_WORKFLOW",
+      "class_name": "IndexWorkflow"
     }
   ],
   "triggers": {
