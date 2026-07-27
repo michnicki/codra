@@ -25,7 +25,7 @@ import {
   CODE_INDEX_PATH_WEIGHT,
   buildIndexTokens,
 } from '@server/core/code-index';
-import { queryRows } from './client';
+import { queryRows, queryTransaction } from './client';
 
 /**
  * One window to store. `contentTokens` is the pre-split content token string the 'D'-weighted half of
@@ -47,6 +47,15 @@ export type CodeIndexChunkHit = {
   content: string;
   rank: number;
 };
+
+/**
+ * The documented `code_index_files.skip_reason` vocabulary from migration 018. Deliberately a TS union
+ * rather than a Postgres CHECK constraint (migration 018 records why: a CHECK would turn adding a
+ * reason into a schema migration on a column whose only writer is markCodeIndexFileIndexed). This type
+ * is that single writer's contract -- a SHORT MACHINE TOKEN, never provider text and never file
+ * content, so the column can be surfaced to an operator without a redaction pass.
+ */
+export type CodeIndexSkipReason = 'empty' | 'generated' | 'oversized' | 'unreadable';
 
 export type CodeIndexStateRow = {
   repository_id: number;
@@ -261,6 +270,204 @@ export async function markCodeIndexBuildStarted(
       input.buildingSha,
       input.workflowInstanceId,
       Math.max(1, Math.floor(input.leaseSeconds)),
+    ],
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Incremental refresh / full rebuild (D-12)
+//
+// LEASE-AGNOSTIC PRIMITIVES. Neither deleteCodeIndexChunksForPaths nor truncateCodeIndexForRepo
+// checks or acquires the build lease, because the SAME delete is needed by a full rebuild, by a push
+// refresh, and by any future repair path -- three callers with three different lease stories. Making
+// the delete claim a lease itself would either double-claim under the build Workflow (which already
+// holds one) or silently steal it.
+//
+// The consequence is a CALLER CONTRACT, stated here so a future caller does not assume this module
+// protects it: sequencing a destructive delete AFTER a successful claimCodeIndexBuildLease is the
+// caller's responsibility. The enforcing half lives in the build Workflow (plan 29-05), which is the
+// only caller: it must truncate only after the claim returned true, and must log a failed claim as a
+// coalesced build rather than returning silently.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * D-12's INCREMENTAL-REFRESH half: drop every stored window for a changed path set so the caller can
+ * reinsert the current content. An empty `paths` array is a no-op (no statement issued).
+ *
+ * Both index tables are cleared for those paths. Deleting from code_index_files too is not optional
+ * bookkeeping: a path whose chunks are gone but whose progress row survives reads as "already indexed
+ * at this sha" to listIndexedPathsForSha, so a resumed build would skip a file it no longer has any
+ * chunks for -- a silent, permanent retrieval hole for that path.
+ *
+ * The measured plan for this is an Index Scan on code_index_chunks_pkey, which is exactly why that
+ * primary key is ordered (repository_id, path, chunk_start) -- see migration 018's KEY DESIGN 1.
+ * `repository_id = $1` is bound and mandatory (T-29-04-01): a refresh for one repository can never
+ * touch another's rows.
+ */
+export async function deleteCodeIndexChunksForPaths(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  input: { repositoryId: number; paths: readonly string[] },
+): Promise<void> {
+  if (input.paths.length === 0) return;
+
+  const params = [input.repositoryId, [...input.paths]];
+  await queryRows(
+    env,
+    'DELETE FROM code_index_chunks WHERE repository_id = $1 AND path = ANY($2::text[])',
+    params,
+  );
+  await queryRows(
+    env,
+    'DELETE FROM code_index_files WHERE repository_id = $1 AND path = ANY($2::text[])',
+    params,
+  );
+}
+
+/**
+ * D-12's FULL-REBUILD half: remove one repository's entire index and reset its state counters.
+ *
+ * Runs inside queryTransaction, not as two or three queryRows calls, because D-12 requires the
+ * truncate-and-reinsert to be atomic: a crash between the chunk delete and the file delete would leave
+ * progress rows claiming paths whose chunks are gone, and a resumed build would skip every one of them.
+ *
+ * Every statement is bounded to one BOUND `repository_id`. This is deliberately NOT a table-level
+ * TRUNCATE (T-29-04-01): a single table holds every tenant's indexed source, so an unscoped delete
+ * would destroy other repositories' indexes -- and under D-15's fail-open policy those repositories'
+ * Q&A would silently degrade to diff-only with nothing anywhere reporting why.
+ *
+ * `indexed_sha` / `indexed_at` are cleared alongside the counters because after this returns the
+ * repository genuinely has no chunks; a surviving `indexed_sha` would tell the operator panel an index
+ * exists at that commit. Clearing to NULL is not "writing a completed value" -- only
+ * markCodeIndexBuildCompleted does that. `indexed_ref`, `mode`, `status` and the lease are left alone:
+ * they belong to the build that is running, and this accessor is not that build.
+ *
+ * Returns the deleted row counts (29-REVIEWS.md, Antigravity S-03). The deletes already know them, and
+ * an operator reading Worker logs after a rebuild needs "removed 4 812 chunks across 501 files" rather
+ * than "reset done". The counts are FOR OBSERVABILITY ONLY -- no caller may branch on them, because a
+ * legitimately empty index and a repository that was never indexed both report zero.
+ */
+export async function truncateCodeIndexForRepo(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  input: { repositoryId: number },
+): Promise<{ deletedChunks: number; deletedFiles: number }> {
+  return queryTransaction(env, async (tx) => {
+    // DELETE ... RETURNING wrapped in a CTE is how the row count is obtained: postgres.js surfaces
+    // rows, not a command tag, through this client's query() shape.
+    const [chunks] = await tx.query<{ n: number | string }>(
+      `
+        WITH removed AS (
+          DELETE FROM code_index_chunks WHERE repository_id = $1 RETURNING 1
+        )
+        SELECT count(*)::int AS n FROM removed
+      `,
+      [input.repositoryId],
+    );
+    const [files] = await tx.query<{ n: number | string }>(
+      `
+        WITH removed AS (
+          DELETE FROM code_index_files WHERE repository_id = $1 RETURNING 1
+        )
+        SELECT count(*)::int AS n FROM removed
+      `,
+      [input.repositoryId],
+    );
+    await tx.query(
+      `
+        UPDATE code_index_state
+        SET file_count = 0,
+            chunk_count = 0,
+            truncated = false,
+            indexed_sha = NULL,
+            indexed_at = NULL,
+            updated_at = now()
+        WHERE repository_id = $1
+      `,
+      [input.repositoryId],
+    );
+
+    return {
+      deletedChunks: Number(chunks?.n ?? 0),
+      deletedFiles: Number(files?.n ?? 0),
+    };
+  });
+}
+
+/**
+ * D-05's RESUMABILITY read: which paths this repository has already recorded at `indexedSha`. Empty
+ * array when none. This is the per-unit-progress convention the review path already uses for per-file
+ * review results (db/file-reviews.ts) -- persist what is done so a retried run skips it.
+ *
+ * It MUST be read at the IN-PROGRESS build sha (`code_index_state.building_sha`), never at
+ * `indexed_sha`. At the in-progress sha it answers "what did this build already fetch"; at the last
+ * completed sha it would answer "what did the PREVIOUS build fetch", so a resumed build would skip
+ * files whose content has since changed and quietly keep serving stale windows for them.
+ *
+ * code_index_files is keyed (repository_id, path) and holds CURRENT STATE only (D-12), so this returns
+ * empty for any older sha. That is correct, not a gap: only the in-progress sha matters for
+ * resumability, and auditing "what was indexed three commits ago" is not something D-12's mutable
+ * table is meant to answer (29-REVIEWS.md, OpenCode 29-04 LOW -- accepted as designed).
+ */
+export async function listIndexedPathsForSha(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  input: { repositoryId: number; indexedSha: string },
+): Promise<string[]> {
+  const rows = await queryRows<{ path: string }>(
+    env,
+    `
+      SELECT path
+      FROM code_index_files
+      WHERE repository_id = $1
+        AND indexed_sha = $2
+      ORDER BY path ASC
+    `,
+    [input.repositoryId, input.indexedSha],
+  );
+  return rows.map((row) => row.path);
+}
+
+/**
+ * Record one file's per-build progress (D-05). Upserts on (repository_id, path) so a re-index
+ * overwrites the row in place rather than accumulating history -- the same mutable-current-state rule
+ * the chunk table follows.
+ *
+ * A file that produced ZERO chunks -- empty, generated, or over CODE_INDEX_MAX_FILE_BYTES -- MUST
+ * still be recorded here, with `skipReason` set. Skipping the write for a zero-chunk file is the
+ * failure mode this contract exists to prevent: listIndexedPathsForSha would never return that path,
+ * so every continuation of the build re-fetches it, spends a subrequest on it, drops it again, and
+ * makes no progress -- forever, until the continuation ceiling kills the build.
+ *
+ * `skipReason` is a short machine token from the documented CodeIndexSkipReason vocabulary. It is
+ * NEVER provider text, an error message, or file content: the column is operator-visible and this
+ * module cannot redact (see markCodeIndexBuildFailed's note on the core/ import direction).
+ */
+export async function markCodeIndexFileIndexed(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  input: {
+    repositoryId: number;
+    path: string;
+    indexedSha: string;
+    chunkCount: number;
+    skipReason?: CodeIndexSkipReason | null;
+  },
+): Promise<void> {
+  await queryRows(
+    env,
+    `
+      INSERT INTO code_index_files
+        (repository_id, path, indexed_sha, chunk_count, skip_reason, updated_at)
+      VALUES ($1, $2, $3, $4, $5, now())
+      ON CONFLICT (repository_id, path) DO UPDATE SET
+        indexed_sha = EXCLUDED.indexed_sha,
+        chunk_count = EXCLUDED.chunk_count,
+        skip_reason = EXCLUDED.skip_reason,
+        updated_at = now()
+    `,
+    [
+      input.repositoryId,
+      input.path,
+      input.indexedSha,
+      Math.max(0, Math.floor(input.chunkCount)),
+      input.skipReason ?? null,
     ],
   );
 }
