@@ -87,3 +87,40 @@ export async function findRepositoryByBitbucketIdentity(
   );
   return row ? row.id : null;
 }
+
+/**
+ * Phase 29 / QA-IDX-01: STRICTLY READ-ONLY repository-id resolution, for either provider.
+ *
+ * WHY IT EXISTS: the question-answering path (core/qa.ts) is documented read-only (QA-02), so it
+ * cannot call getOrCreateRepository -- EVERY branch of that accessor INSERTs (both the Bitbucket and
+ * the GitHub branch are `INSERT ... ON CONFLICT ... DO UPDATE`), which would make merely asking a
+ * question create or touch a repositories row. This accessor is a SELECT and nothing else.
+ *
+ * WHY IT FILTERS ON `vcs_provider`: a GitHub repository and a Bitbucket repository can carry the SAME
+ * owner and repo text, which is exactly the collision findRepositoryByBitbucketIdentity already exists
+ * to avoid. Without the provider filter a question asked on one platform could resolve the other
+ * platform's row -- and, for the index-retrieval caller, read that other tenant's stored source
+ * (T-29-07-03).
+ *
+ * `ownerOrWorkspace` is matched against whichever column that provider's UNIQUE key uses: `workspace`
+ * for Bitbucket (migration 005's (vcs_provider, workspace, repo)) and `owner` for GitHub (migration
+ * 001, re-keyed by 005 to (vcs_provider, owner, repo)). Two complete literal statements rather than an
+ * interpolated column name, so no part of the SQL string is ever constructed and each branch matches
+ * its own UNIQUE index directly.
+ *
+ * `null` means "no such repository row". Callers treat that as a NORMAL ABSENCE, never an error: a
+ * repository that has never been reviewed simply has no row yet.
+ */
+export async function findRepositoryIdByIdentity(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  input: { vcsProvider: 'github' | 'bitbucket'; ownerOrWorkspace: string; repo: string },
+): Promise<number | null> {
+  const [row] = await queryRows<{ id: number }>(
+    env,
+    input.vcsProvider === 'bitbucket'
+      ? `SELECT id FROM repositories WHERE vcs_provider = $1 AND workspace = $2 AND repo = $3`
+      : `SELECT id FROM repositories WHERE vcs_provider = $1 AND owner = $2 AND repo = $3`,
+    [input.vcsProvider, input.ownerOrWorkspace, input.repo],
+  );
+  return row ? row.id : null;
+}

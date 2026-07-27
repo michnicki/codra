@@ -16,9 +16,14 @@ import type { AppBindings } from '../env';
 import type { RepoConfig } from '@shared/schema';
 import type { VcsProvider } from '../vcs/types';
 import { ModelService } from '../services/model';
-import { buildQaPrompt } from '../prompts/qa';
+import { buildQaPrompt, type QaIndexChunk } from '../prompts/qa';
 import { parseUnifiedDiff, filterReviewableFiles, type FileDiff } from './diff';
 import { logger } from './logger';
+// Phase 29 / QA-IDX-01. All three imports serve the ONE fail-open retrieval block below.
+// findRepositoryIdByIdentity is deliberately the read-only lookup, never getOrCreateRepository.
+import { buildQueryExpression, buildQueryTerms } from './code-index';
+import { getCodeIndexState, retrieveCodeIndexChunks } from '@server/db/code-index';
+import { findRepositoryIdByIdentity } from '@server/db/repositories';
 
 // The classified Q&A context handed to answerQuestion. `provider` is the VCS platform name (used
 // only to namespace the rate-limit key); the actual provider client is injected separately so this
@@ -119,9 +124,14 @@ async function recordRateLimitIncrement(env: Pick<AppBindings, 'APP_KV'>, key: s
  *      front would burn the budget on every retry (at rate_limit_per_hour:1 it would self-drop the retry).
  *   3. Fetch the PR + diff via the INJECTED provider; a diff-fetch failure degrades to an empty
  *      diff so the model still answers scope-honestly (QA-01/D-04) rather than erroring.
- *   4. Build the capped, fenced prompt (buildQaPrompt) and run ModelService.answerPrQuestion — the
+ *   4. Phase 29 (QA-IDX-01): when review.interactive.qa.index.enabled is on AND this repository has a
+ *      READY codebase index, retrieve the top-K ranked excerpts for the question. EVERY failure mode —
+ *      toggle off, no repository row, no/unfinished/failed index, unusable question, zero hits, or a
+ *      thrown DB error — degrades silently to the diff-only answer of step 3 (D-15). READ-ONLY: this
+ *      step adds no DB write, no job and no audit event.
+ *   5. Build the capped, fenced prompt (buildQaPrompt) and run ModelService.answerPrQuestion — the
  *      single public prose path; this handler NEVER touches the private selectModel/callResolvedModel.
- *   5. Post the answer via the provider comment/reply primitive (createPrComment top-level, or
+ *   6. Post the answer via the provider comment/reply primitive (createPrComment top-level, or
  *      replyToPrComment when ctx.threadable && ctx.commentRef — Phase 12), THEN record the rate-limit
  *      increment. A thrown post propagates BEFORE the increment, so a failed post consumes no budget.
  */
@@ -167,12 +177,109 @@ export async function answerQuestion(
     files = [];
   }
 
+  // -------------------------------------------------------------------------------------------
+  // Phase 29 / QA-IDX-01: config-gated, FAIL-OPEN retrieval of ranked repository excerpts, so a
+  // question can reach code this PR's diff does not contain. The shape below is copied from the
+  // diff-fetch degrade DIRECTLY ABOVE rather than inventing a second error-handling idiom in the
+  // same function.
+  //
+  // THREE CONSTRAINTS make this block correct, and all three are load-bearing:
+  //
+  //  1. ANY retrieval problem degrades SILENTLY to today's diff-only answer (D-15): the toggle off, no
+  //     repositories row, no index-state row, a build still running, a failed build, a question that
+  //     normalizes to nothing, zero hits, or a thrown database error. A reviewer must never be met with
+  //     silence — or with an error — because a BACKGROUND subsystem is not ready; the answer without
+  //     the excerpts is still exactly the useful answer this handler shipped before Phase 29.
+  //  2. NO audit event and NO database write may be added here. This module's header pins the QA-02
+  //     read-only invariant, and D-15 declined BOTH explicitly — an audit event IS a write, and a write
+  //     on this path means asking a question mutates state. That is also why the repository id is
+  //     resolved with findRepositoryIdByIdentity and NEVER with getOrCreateRepository, whose every
+  //     branch inserts.
+  //  3. The rate-limit increment at the bottom of this function must STAY LAST (WR-04). Nothing here
+  //     can reach it, so a retrieval failure costs no rate-limit budget.
+  //
+  // WHAT THIS DELIBERATELY DOES NOT CHECK: the only index-state gate is `status === 'ready'`. NO
+  // staleness comparison against the pull request's BASE commit is made, for three reasons.
+  //   (a) There is no cheap correct comparison to make. The index tracks the DEFAULT BRANCH at
+  //       `indexed_sha`, while a pull request's base is a different commit and frequently a different
+  //       branch, so "stale relative to this PR" has no single well-defined meaning.
+  //   (b) Staleness is already bounded by push-event frequency (D-08) — that is the freshness mechanism
+  //       the requirement asks for, and it is the one that actually keeps the index current.
+  //   (c) D-15 already fails open on staleness BY NAME. A half-defined staleness check would therefore
+  //       degrade MORE answers to diff-only than this gate does, for no gain in accuracy.
+  // The honest consequence, kept visible rather than hidden: a retrieved excerpt CAN be newer than the
+  // pull request's base. That is exactly why the variant system prompt states the excerpts come from
+  // the default branch at a named commit and may be stale or incomplete relative to the change under
+  // review (D-14) — the disclosure carries what a check cannot.
+  // -------------------------------------------------------------------------------------------
+  let indexChunks: QaIndexChunk[] = [];
+  let indexedSha: string | null = null;
+  try {
+    // FIRST statement in the block (NREG-01): a repository that has not opted in performs no
+    // repository lookup, no state read and no query — it does not touch the index tables at all.
+    if (config.review.interactive.qa.index.enabled) {
+      const repositoryId = await findRepositoryIdByIdentity(env, {
+        vcsProvider: ctx.provider,
+        ownerOrWorkspace: ctx.workspace,
+        repo: ctx.repo,
+      });
+
+      // null = no repositories row for this identity yet. A NORMAL absence, not an error (D-15).
+      if (repositoryId !== null) {
+        const state = await getCodeIndexState(env, { repositoryId });
+
+        // 'ready' is the ONLY status that means a completed, queryable index. 'building' and 'failed'
+        // degrade to diff-only exactly like a missing index (D-15): a partially populated table would
+        // otherwise answer from an arbitrary fraction of the repository, which is worse than answering
+        // from the diff and saying so.
+        if (state !== null && state.status === 'ready') {
+          const queryExpression = buildQueryExpression(buildQueryTerms(ctx.question));
+
+          // DELIBERATE DEFENSE IN DEPTH, not redundancy: retrieveCodeIndexChunks ALSO returns [] for a
+          // null expression (added in 29-01). This caller guard skips a call that provably cannot
+          // match; the accessor's guard protects every FUTURE call site. Neither may later be deleted
+          // as duplicated logic — removing either one leaves a single point of failure behind a policy
+          // (D-15) that makes the resulting total retrieval miss completely silent.
+          if (queryExpression !== null) {
+            const hits = await retrieveCodeIndexChunks(env, {
+              repositoryId,
+              queryExpression,
+              limit: config.review.interactive.qa.index.top_k,
+            });
+            // Map rather than pass through, so the retrieval `rank` is dropped here at the boundary: an
+            // ordinal in the prompt would invite the model to reason about scores it cannot interpret.
+            indexChunks = hits.map((hit) => ({
+              path: hit.path,
+              chunkStart: hit.chunkStart,
+              chunkEnd: hit.chunkEnd,
+              content: hit.content,
+            }));
+            // Provenance for the variant prompt: the commit the excerpts were indexed at (D-14).
+            indexedSha = state.indexed_sha;
+          }
+        }
+      }
+    }
+  } catch (error) {
+    // D-15: degrade to diff-only — silently for the REVIEWER, never silently for the OPERATOR.
+    indexChunks = [];
+    indexedSha = null;
+    logger.warn('Q&A index retrieval failed; answering from the PR diff only (fail-open)', {
+      // ONLY the error message and the PR number (T-29-07-05). No chunk content, no file content, no
+      // question text and no retrieved path may reach the log; the logger's redaction applies on top.
+      error: error instanceof Error ? error.message : String(error),
+      prNumber: ctx.prNumber,
+    });
+  }
+
   const { systemPrompt, userPrompt } = buildQaPrompt({
     question: ctx.question,
     prTitle: pr.title,
     prBody: pr.body,
     files,
     config: config.review,
+    indexChunks,
+    indexedSha,
   });
 
   const modelService = new ModelService(env);
