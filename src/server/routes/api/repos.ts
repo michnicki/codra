@@ -1,18 +1,31 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import type { AppEnv } from '@server/env';
+import type { AppBindings, AppEnv } from '@server/env';
 import { getRepoConfigRecord, listRepoConfigs, upsertRepoConfig, syncRepoConfig, updateRepoConfigEnabled, deleteStaleRepoConfigs } from '@server/db/repo-configs';
 import { jsonError } from '@server/core/http';
 import { GitHubClient, type GitHubRepository } from '@server/core/github';
 import { invalidateRepoConfigCache } from '@server/core/config';
 import { repoConfigSchema } from '@shared/schema';
-import { getOrCreateRepository } from '@server/db/repositories';
+import { findRepositoryIdByIdentity, getOrCreateRepository } from '@server/db/repositories';
 import { upsertVcsCredential } from '@server/db/vcs-credentials';
 import { encryptSecret } from '@server/core/crypto';
 import { queryTransaction } from '@server/db/client';
 import { addBitbucketRepoInputSchema } from '@shared/bitbucket';
 import { clusterRejectFeedback, synthesizeRules } from '@server/core/learned-rules';
 import { getRejectFeedbackForRepo } from '@server/db/reject-feedback';
+import { requireSession } from '@server/middleware/auth';
+import { requireCsrfHeader } from '@server/middleware/csrf';
+import {
+  claimCodeIndexBuildLease,
+  getCodeIndexState,
+  releaseCodeIndexBuildLease,
+} from '@server/db/code-index';
+import {
+  INDEX_BUILD_LEASE_SECONDS,
+  codeIndexInstanceId,
+  type IndexBuildParams,
+} from '@server/core/code-index-build';
+import { logger } from '@server/core/logger';
 
 const repoConfigPatchSchema = z
   .object({
@@ -44,6 +57,44 @@ async function mapWithConcurrency<T, R>(
 
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
   return results;
+}
+
+/** A non-null record as returned by `getRepoConfigRecord` (i.e. `repoConfigRecordSchema`'s shape). */
+type ResolvedRepoConfigRecord = NonNullable<Awaited<ReturnType<typeof getRepoConfigRecord>>>;
+
+/**
+ * Resolve the internal `repositories.id` for a record `getRepoConfigRecord` already returned.
+ *
+ * WHY THIS EXISTS AT ALL, since it looks like a second lookup for data the caller "already has":
+ * `getRepoConfigRecord`'s SELECT never includes `r.id`, and `mapRepo` builds its result through the
+ * SHARED `repoConfigRecordSchema` — the very schema serialized into the `/api/repos` list response and
+ * the `/api/repos/:owner/:repo/config` read. Widening either one to carry an internal database id would
+ * put a brand-new field on the dashboard's wire contract for the convenience of two internal callers,
+ * so the id is RESOLVED through 29-07's read-only accessor instead. Do not "optimize" this away by
+ * adding `r.id` to that SELECT.
+ *
+ * The record's OWN `vcsProvider` is used here, never the narrowed `?provider=` query value: an omitted
+ * provider parameter must still resolve against the provider the record actually belongs to, and
+ * `findRepositoryIdByIdentity` filters on `vcs_provider` so a same-named GitHub/Bitbucket pair can never
+ * cross-resolve (T-29-08-02).
+ *
+ * The `workspace` fallback is provider-conditional because the two UNIQUE keys differ: Bitbucket's is
+ * (vcs_provider, workspace, repo) and GitHub's is (vcs_provider, owner, repo) — migration 005. A
+ * Bitbucket record added through the dashboard sets owner === workspace, so the `?? owner` fallback is
+ * a safety net for a row written before that invariant held rather than the normal path.
+ *
+ * `null` means "no such repositories row", which callers must treat as a plain 404 and never an error.
+ */
+async function resolveRepositoryIdForRecord(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  record: ResolvedRepoConfigRecord,
+): Promise<number | null> {
+  return findRepositoryIdByIdentity(env, {
+    vcsProvider: record.vcsProvider,
+    ownerOrWorkspace:
+      record.vcsProvider === 'bitbucket' ? (record.workspace ?? record.owner) : record.owner,
+    repo: record.repo,
+  });
 }
 
 export function createReposRouter() {
@@ -395,6 +446,218 @@ export function createReposRouter() {
     await invalidateRepoConfigCache(c.env, owner, repo);
 
     return c.json({ ok: true, rule: updatedRules[ruleIndex] });
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // Phase 29 / QA-IDX-01: the codebase index's two operator endpoints (D-07).
+  //
+  // D-07 is explicit that an index build starts ONLY from a deliberate dashboard action, on both
+  // providers, through ONE code path — there is no auto-build on repository install and no auto-build
+  // on a question that finds nothing. THESE HANDLERS ARE THAT PATH: without them 29-05's
+  // IndexWorkflow has no trigger at all, and an operator has no way to see whether an index exists,
+  // how fresh it is, or why the last build failed.
+  //
+  // Both are modelled on POST /:owner/:repo/learned-rules/synthesize above, and both are
+  // provider-agnostic by construction — `getRepoConfigRecord` handles a Bitbucket repository with a
+  // NULL installation_id (repo-configs.ts types the column `string | null` and lazily materializes a
+  // missing Bitbucket `repo_configs` row, which the add-Bitbucket flow does not create), and
+  // `findRepositoryIdByIdentity` matches each provider's own UNIQUE key.
+  // ---------------------------------------------------------------------------------------------
+
+  // POST /api/repos/:owner/:repo/code-index/build — start a FULL rebuild of the codebase index.
+  //
+  // `requireSession` + `requireCsrfHeader` are applied EXPLICITLY here as defense in depth over the
+  // group-level /api/* guards in app.ts, matching the learned-rules endpoints' C6 treatment
+  // (T-29-08-01). The repository is resolved SERVER-SIDE from the authenticated path plus the narrowed
+  // provider query parameter; no repository identifier is ever read from the body or the query, so a
+  // caller cannot start a build for a repository other than the one named in the path (T-29-08-02).
+  app.post('/:owner/:repo/code-index/build', requireSession, requireCsrfHeader, async (c) => {
+    const { owner, repo } = c.req.param();
+    const providerQuery = c.req.query('provider');
+    const vcsProvider = providerQuery === 'github' || providerQuery === 'bitbucket' ? providerQuery : undefined;
+
+    const existing = await getRepoConfigRecord(c.env, owner, repo, vcsProvider);
+    if (!existing) {
+      return jsonError('Repository config not found.', 404);
+    }
+
+    // NREG-01 / T-29-08-04: the toggle gate precedes the lease claim AND the instance creation, so a
+    // repository whose operator has not opted in cannot have a build started for it at all. The message
+    // names the exact config key, because "not enabled" without the key is not actionable.
+    const config = existing.parsedJson;
+    if (!config.review.interactive.qa.index.enabled) {
+      return jsonError(
+        'Codebase indexing is not enabled for this repository. Enable review.interactive.qa.index.enabled first.',
+        400,
+      );
+    }
+
+    const repositoryId = await resolveRepositoryIdForRecord(c.env, existing);
+    if (repositoryId === null) {
+      return jsonError('Repository config not found.', 404);
+    }
+
+    // THE INSTANCE ID AND THE LEASE OWNER MUST BE THE SAME STRING, and that is not a stylistic
+    // preference. `IndexWorkflow.execute` claims the lease under `event.instanceId` — the LIVE id of the
+    // instance created below — and `claimCodeIndexBuildLease` only permits a re-claim when
+    // `workflow_instance_id` matches. Claiming here under any other value (a fresh UUID, say) would make
+    // the workflow's own first claim fail, so the build it just started would coalesce ITSELF away and
+    // nothing would ever index.
+    //
+    // `codeIndexInstanceId` is CALLED, never re-implemented: 29-06's two push branches key on the same
+    // helper, and the whole `instance.already_exists` coalescing story needs all three sites to produce a
+    // byte-identical id. A locally formatted "stable per-repository id" differing by one character makes
+    // that rejection unreachable and leaves the durable lease as the only guard.
+    const workflowInstanceId = codeIndexInstanceId(repositoryId);
+
+    const coalesced = (reason: string) =>
+      c.json({
+        ok: true,
+        coalesced: true,
+        build: { mode: 'full' as const, workflowInstanceId },
+        message: 'A codebase index build is already running for this repository.',
+        reason,
+      });
+
+    // T-29-08-03: the lease claim precedes the instance creation, and a FAILED claim is a BENIGN
+    // COALESCED DUPLICATE rather than an error — a second press while a build is live is not a client
+    // mistake, and answering 409 would train an operator to retry the one thing that must not be retried.
+    const claimed = await claimCodeIndexBuildLease(c.env, {
+      repositoryId,
+      workflowInstanceId,
+      leaseSeconds: INDEX_BUILD_LEASE_SECONDS,
+    });
+    if (!claimed) {
+      logger.info('Codebase index build request coalesced: a build already holds the lease', {
+        repositoryId,
+        vcsProvider: existing.vcsProvider,
+        reason: 'lease_held',
+      });
+      return coalesced('lease_held');
+    }
+
+    // `mode: 'full'` is D-07's dashboard rebuild, and `continuation: 0` marks a genuinely NEW build (a
+    // fresh-instance handoff deliberately starts at 1 so it cannot re-run the destructive reset).
+    const params: IndexBuildParams = {
+      repositoryId,
+      vcsProvider: existing.vcsProvider,
+      owner: existing.owner,
+      repo: existing.repo,
+      workspace: existing.workspace ?? null,
+      installationId: existing.installationId,
+      mode: 'full',
+      workflowInstanceId,
+      continuation: 0,
+    };
+
+    try {
+      await c.env.INDEX_WORKFLOW.create({ id: workflowInstanceId, params });
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('instance.already_exists')) {
+        // The same disposition the queue consumer already gives this rejection (src/server/index.ts):
+        // an instance for this repository is live, so the press is a duplicate rather than a failure.
+        // Reachable even though the lease claim succeeded — a re-claim by the SAME instance id is legal,
+        // which is exactly the case where a still-running instance already owns this id.
+        logger.info('Codebase index build request coalesced: workflow instance already exists', {
+          repositoryId,
+          vcsProvider: existing.vcsProvider,
+          reason: 'instance_already_exists',
+        });
+        return coalesced('instance_already_exists');
+      }
+
+      // RELEASE THE LEASE THE REQUEST JUST TOOK. Without this, a Cloudflare-side create failure leaves
+      // the state row reading `building` with a live 15-minute lease and no build behind it: the panel
+      // shows a phantom build and every retry in that window coalesces against a lease nobody owns.
+      // Best-effort — a failed release must not mask the create error, and lease expiry is the backstop.
+      try {
+        await releaseCodeIndexBuildLease(c.env, { repositoryId, workflowInstanceId });
+      } catch (releaseError) {
+        logger.error(
+          'Failed to release the codebase index build lease after a failed workflow create',
+          releaseError instanceof Error ? releaseError : new Error(String(releaseError)),
+        );
+      }
+
+      logger.error(
+        'Failed to start the codebase index build workflow',
+        error instanceof Error ? error : new Error(String(error)),
+      );
+      return jsonError('Failed to start the codebase index build.', 500);
+    }
+
+    // NO CONFIG WRITE, DELIBERATELY. The learned-rules handler this is modelled on ends with
+    // `upsertRepoConfig` + `invalidateRepoConfigCache`; starting a build mutates NO configuration, so
+    // copying that tail would bump `repo_configs.updated_at` and evict the config cache on every press —
+    // making an operator action look like a config edit to every downstream reader (the repo list's
+    // "updated" column, the cache, anything auditing config churn) and re-serializing a config nobody
+    // asked to change (T-29-08-06).
+    return c.json({
+      ok: true,
+      coalesced: false,
+      // Returned so an operator report ("I pressed build and nothing happened") can be correlated with
+      // the actual Workflow instance in the Cloudflare dashboard. Derived server-side from the resolved
+      // repository; never accepted as input.
+      build: { mode: 'full' as const, workflowInstanceId },
+    });
+  });
+
+  // GET /api/repos/:owner/:repo/code-index/status — the operator's read of the current index.
+  //
+  // `requireSession` is applied explicitly for the same defense-in-depth reason as the POST.
+  // `requireCsrfHeader` is deliberately NOT listed: it self-exempts GET/HEAD/OPTIONS, so adding it here
+  // would be an inert line that reads as a guard. The group-level /api/* guards cover this route too.
+  app.get('/:owner/:repo/code-index/status', requireSession, async (c) => {
+    const { owner, repo } = c.req.param();
+    const providerQuery = c.req.query('provider');
+    const vcsProvider = providerQuery === 'github' || providerQuery === 'bitbucket' ? providerQuery : undefined;
+
+    const existing = await getRepoConfigRecord(c.env, owner, repo, vcsProvider);
+    if (!existing) {
+      return jsonError('Repository config not found.', 404);
+    }
+
+    const repositoryId = await resolveRepositoryIdForRecord(c.env, existing);
+    if (repositoryId === null) {
+      return jsonError('Repository config not found.', 404);
+    }
+
+    // Scoped to the resolved repository ONLY — `getCodeIndexState` is keyed on the bound repository_id,
+    // so this response can never describe another tenant's index (T-29-08-05).
+    const state = await getCodeIndexState(c.env, { repositoryId });
+
+    // A NEVER-BUILT REPOSITORY GETS A WELL-DEFINED RESPONSE, NOT A 404. The absence of a
+    // `code_index_state` row is a normal state ("no build has ever run"), not a missing resource, and
+    // 404 here would force the panel to render an error for the one case where it should render an
+    // invitation to press Build. `status: 'idle'` is migration 018's documented word for exactly that
+    // state, so the panel has one status vocabulary rather than a null special case.
+    //
+    // The keys are the dashboard's camelCase wire convention (matching `mapJob`), projecting the
+    // `code_index_state` columns `status`, `mode`, `indexed_sha`, `indexed_at`, `file_count`,
+    // `chunk_count`, `truncated` and `last_error`.
+    //
+    // `mode` IS INCLUDED DELIBERATELY (review: OpenCode 29-09 #15 — "Last refresh: never / push /
+    // manual"). It is the operator's answer to "what produced the index I am looking at": `full` for a
+    // dashboard rebuild, `incremental` for a push-triggered refresh, NULL before the first build. That is
+    // the question a stale `indexed_at` actually raises — a Bitbucket repository whose webhook
+    // subscription was never edited to include the push event sits at `mode: 'full'` forever no matter
+    // how many merges land, and without `mode` the panel cannot tell that apart from a quiet repository.
+    //
+    // `lastError` IS ALREADY REDACTED where it was written (AUD-01: `runIndexBuild` routes it through
+    // `redactErrorMessage` at the single `markCodeIndexBuildFailed` call site, because db/ must not
+    // import core/). It is passed through UNCHANGED — do not re-process, enrich, or re-expand it here.
+    return c.json({
+      index: {
+        status: state?.status ?? 'idle',
+        mode: state?.mode ?? null,
+        indexedSha: state?.indexed_sha ?? null,
+        indexedAt: state?.indexed_at ?? null,
+        fileCount: state?.file_count ?? 0,
+        chunkCount: state?.chunk_count ?? 0,
+        truncated: state?.truncated ?? false,
+        lastError: state?.last_error ?? null,
+      },
+    });
   });
 
   return app;
