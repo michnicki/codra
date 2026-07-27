@@ -290,22 +290,39 @@ export const GENERATION_MARKERS = [
 ] as const;
 
 /**
+ * True iff a GENERATION_MARKER appears in the upper-cased first 500 characters of ARBITRARY text
+ * (QA-IDX-01, D-09). Same detector, same 500-character window, same `String.includes` scan as
+ * `isGeneratedFile` — this is that function's inner half, extracted because the codebase index build
+ * holds FULL FILE CONTENT rather than parsed hunks and has nothing to build a `FileDiff` from.
+ *
+ * D-09 CONSEQUENCE the index build depends on: detection is CONTENT-based, so a file must be FETCHED
+ * before it can be dropped. The configured max-files value therefore caps FETCHES, not stored files —
+ * treating it as a cap on stored files makes the worst-case build cost unstatable.
+ */
+export function isGeneratedContent(text: string): boolean {
+  const window = text.slice(0, 500).toUpperCase();
+  return GENERATION_MARKERS.some((marker) => window.includes(marker));
+}
+
+/**
  * True iff a GENERATION_MARKER appears in the upper-cased first 500 chars of the joined content of
  * the file's first TWO hunks (D-09; window locked by PRIO-02/SC2). Reads `l.content` directly — the
  * diff +/-/space prefix is already stripped at parse (parseUnifiedDiff, line.slice(1); RESEARCH
  * Pitfall 3) so do NOT re-strip. Pure and total: a zero-hunk / empty-content file yields '' and
  * returns false, never throws. Case-insensitive via locale-independent toUpperCase; no Unicode
  * normalization is applied — markers match as UTF-16 code-unit substrings.
+ *
+ * QA-IDX-01: builds the same first-two-hunks joined window it always built and delegates the scan to
+ * `isGeneratedContent`. Signature and results are unchanged (NREG-01) — the window construction, NOT
+ * the scan, is the diff-specific part.
  */
 export function isGeneratedFile(file: FileDiff): boolean {
   const text = file.hunks
     .slice(0, 2)
     .flatMap((hunk) => hunk.lines)
     .map((line) => line.content)
-    .join('\n')
-    .slice(0, 500)
-    .toUpperCase();
-  return GENERATION_MARKERS.some((marker) => text.includes(marker));
+    .join('\n');
+  return isGeneratedContent(text);
 }
 
 /** The result of the single shared selection routine (D-04). `dropped` is consumed by the Plan 15-05
