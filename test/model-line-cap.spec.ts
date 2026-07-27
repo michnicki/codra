@@ -2,6 +2,37 @@ import { vi, expect, describe, it } from 'vitest';
 import { ModelService, COMPACT_REVIEW_PROMPT_LINE_CAP } from '@server/services/model';
 import { createTestEnv, hasConfiguredTestDatabaseUrl } from './helpers';
 import { runWithDb } from '@server/db/client';
+import { defaultRepoConfig } from '@shared/schema';
+import type { FileDiff } from '@server/core/diff';
+
+// Full parsed config with only max_diff_lines_per_file overridden. A hand-rolled partial
+// (`{ review: { max_diff_lines_per_file: 800 } } as any`) reaches buildFileReviewPrompts, which
+// dereferences config.custom_rules.length and throws before the assertion runs.
+const configWithLineCap = (maxDiffLinesPerFile: number) => ({
+  ...defaultRepoConfig,
+  review: { ...defaultRepoConfig.review, max_diff_lines_per_file: maxDiffLinesPerFile },
+});
+
+// A real FileDiff, not a `{ content, lineCount }` stand-in: submitReviewBatch types `file` as
+// `any`, but it forwards through truncateFileDiff into buildFileReviewPrompts, which reads
+// `file.path` (getLanguageForFile) and iterates `file.hunks`. Mirrors test/file-review-prompt.spec.ts.
+const file: FileDiff = {
+  path: 'src/app.ts',
+  previousPath: null,
+  isNew: false,
+  isDeleted: false,
+  isBinary: false,
+  lineCount: 2,
+  hunks: [
+    {
+      header: '@@ -1,2 +1,2 @@',
+      lines: [
+        { kind: 'context', content: 'const a = 1;', newLineNumber: 1, position: 1 },
+        { kind: 'add', content: 'const b = a + 1;', newLineNumber: 2, position: 2 },
+      ],
+    },
+  ],
+};
 
 const dbDescribe = hasConfiguredTestDatabaseUrl() ? describe : describe.skip;
 
@@ -27,10 +58,10 @@ dbDescribe('submitReviewBatch modelLineCap derivation', () => {
       });
 
       const result = await model.submitReviewBatch({
-        file: { content: 'test', lineCount: 100 },
+        file,
         prTitle: null,
         prDescription: null,
-        config: { review: { max_diff_lines_per_file: 800 } } as any,
+        config: configWithLineCap(800),
         totalLineCount: 100,
         compactPrompt: false,
       });
@@ -57,10 +88,10 @@ dbDescribe('submitReviewBatch modelLineCap derivation', () => {
       });
 
       const result = await model.submitReviewBatch({
-        file: { content: 'test', lineCount: 100 },
+        file,
         prTitle: null,
         prDescription: null,
-        config: { review: { max_diff_lines_per_file: 800 } } as any,
+        config: configWithLineCap(800),
         totalLineCount: 100,
         compactPrompt: true,
       });
