@@ -550,6 +550,14 @@ export function createReposRouter() {
       continuation: 0,
     };
 
+    // KNOWN LIMITATION, TRACKED IN THIS PHASE'S deferred-items.md, NOT A BUG IN THIS HANDLER.
+    // Cloudflare rejects a `create` for an id that already exists, and an instance RECORD outlives the
+    // run, so a per-repository id that never varies may mean a repository can only ever be built ONCE —
+    // every later press (and every later push refresh in 29-06) would be reported as a benign coalesce
+    // and start nothing. That cannot be observed from a mock; 29-09 UAT has to press Build twice against
+    // the real runtime. If it reproduces, the fix is to vary the id by the build's target commit, which
+    // keeps coalescing meaningful per commit — NOT to stop calling `codeIndexInstanceId`, which would
+    // silently break the shared-id contract with both push branches.
     try {
       await c.env.INDEX_WORKFLOW.create({ id: workflowInstanceId, params });
     } catch (error) {
