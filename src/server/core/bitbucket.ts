@@ -141,6 +141,34 @@ function repositoryPath(workspace: string, repoSlug: string) {
   return `/repositories/${encodeURIComponent(workspace)}/${encodeURIComponent(repoSlug)}`;
 }
 
+/**
+ * Segment-wise path encoding for the `/src/{ref}/{path}` family. `encodeURIComponent` over a WHOLE
+ * slash-bearing path would percent-encode the slashes and collapse `src/server/x.ts` into a single
+ * literal filename segment, so the delimiters must survive the encode. Extracted verbatim from
+ * `getFileContent` (which now calls it) so the tree walk cannot drift from the file read.
+ */
+function encodeSrcPathSegments(path: string) {
+  return path.split('/').map((segment) => encodeURIComponent(segment)).join('/');
+}
+
+// QA-IDX-01 (D-09): `max_depth` makes the `/src` listing perform a BREADTH-FIRST descent, so one
+// request can cover many directories instead of one request per directory [community.atlassian.com:
+// "performs a breadth-first search to return the contents of subdirectories up to the depth
+// specified"]. IMPORTANT: this parameter shape is COMMUNITY-SOURCED, not confirmed by the official
+// Atlassian API reference, and the same source reports that too large a value makes the call time out
+// and return HTTP 555. The walk therefore treats depth as an OPTIMIZATION WITH A FALLBACK rather than
+// a requirement: on 555 it retries the same directory once at SRC_TREE_FALLBACK_MAX_DEPTH, and if the
+// parameter turned out to be ignored entirely the walk still terminates correctly (it would simply
+// enqueue every subdirectory and cost more pages).
+const SRC_TREE_MAX_DEPTH = 10;
+const SRC_TREE_FALLBACK_MAX_DEPTH = 2;
+// The undocumented status Bitbucket is reported to return when a `max_depth` request times out.
+// Named because a bare `555` in a status comparison reads as a typo.
+const SRC_TREE_DEPTH_TIMEOUT_STATUS = 555;
+// Matches the existing paginated walks (listRawPullRequestComments / listPullRequestComments) so the
+// per-page entry count stays one number across the client.
+const SRC_TREE_PAGE_LEN = 100;
+
 export class BitbucketClient {
   constructor(
     private readonly env: Pick<AppBindings, 'BOT_USERNAME'>,
@@ -214,7 +242,7 @@ export class BitbucketClient {
   // delimiters survive (`encodeURIComponent` on the whole path would lose them). 404 -> null
   // (D-08 delete-at-head); any other non-2xx throws BitbucketError.
   async getFileContent(workspace: string, repoSlug: string, ref: string, path: string): Promise<string | null> {
-    const encodedPath = path.split('/').map((segment) => encodeURIComponent(segment)).join('/');
+    const encodedPath = encodeSrcPathSegments(path);
     const apiPath = `${repositoryPath(workspace, repoSlug)}/src/${encodeURIComponent(ref)}/${encodedPath}`;
     try {
       const response = await this.request('GET', apiPath, undefined, 'text/plain');
@@ -238,6 +266,210 @@ export class BitbucketClient {
     const path = `${repositoryPath(workspace, repoSlug)}/diff/${spec}?context=3&topic=true`;
     const response = await this.request('GET', path, undefined, 'text/plain');
     return response.text();
+  }
+
+  // QA-IDX-01 (D-09): repository metadata read, used ONLY to resolve the default branch for the index
+  // build. Narrowed to `mainbranch` on purpose -- the endpoint returns a large object and the seam has
+  // no business carrying any of the rest. Note Bitbucket's repository payload carries the branch NAME
+  // but no commit hash, which is why `getBranchCommitSha` exists as a separate read.
+  async getRepositoryMetadata(workspace: string, repoSlug: string): Promise<{ mainbranch?: { name?: string } }> {
+    const response = await this.request('GET', repositoryPath(workspace, repoSlug));
+    return (await response.json()) as { mainbranch?: { name?: string } };
+  }
+
+  // QA-IDX-01 (D-12): resolve a branch name to the commit it points at, so the adapter can report a
+  // REAL commit sha for `indexed_sha` instead of persisting a branch name that moves under it.
+  // Returns null when the branch does not exist (404) so the adapter can distinguish "no such branch"
+  // from a transport failure; any other non-2xx throws.
+  async getBranchCommitSha(workspace: string, repoSlug: string, branch: string): Promise<string | null> {
+    const path = `${repositoryPath(workspace, repoSlug)}/refs/branches/${encodeSrcPathSegments(branch)}`;
+    try {
+      const response = await this.request('GET', path);
+      const body = (await response.json()) as { target?: { hash?: string } };
+      const hash = body.target?.hash;
+      return typeof hash === 'string' && hash.length > 0 ? hash : null;
+    } catch (error) {
+      if (error instanceof BitbucketError && error.status === 404) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * QA-IDX-01 (D-09): enumerate the blob paths under `ref` via the paginated `/src` listing.
+   *
+   * Modelled DIRECTLY on `listRawPullRequestComments` below, and it keeps all five of that walk's
+   * mechanisms verbatim in behavior:
+   *   1. the FIRST url of every directory is built LOCALLY and is the only TRUSTED url;
+   *   2. every `next` url from a response body is UNTRUSTED and must pass
+   *      `isValidBitbucketNextUrl` (origin + `/2.0/` path prefix) before it is fetched (T-29-03-01);
+   *   3. a `seenNextUrls` set guards cycles;
+   *   4. `tracker.hasRemainingSafeBudget(1)` is consulted BEFORE issuing each page (T-29-03-02);
+   *   5. the total page count is bounded by the named cap `MAX_SRC_TREE_PAGES`.
+   *
+   * ONE DELIBERATE DIVERGENCE from the thread-list template: cap (or budget) exhaustion returns a
+   * PARTIAL result flagged `truncated: true` instead of throwing. A partial TREE is still a usable
+   * index -- the consumer applies a max-files cap to it anyway -- whereas a partial THREAD LIST is
+   * not (a missing thread is silently treated as resolved, which is why Phase 17 chose fail-closed
+   * there). That fail-closed choice was correct for its own caller and is intentionally NOT copied.
+   *
+   * Directory handling: entries are `{ path, type: 'commit_file' | 'commit_directory' }` with `path`
+   * already absolute from the repo root. `commit_file` entries become paths; `commit_directory`
+   * entries are re-enqueued ONLY when the depth-limited response did not already return their
+   * contents, so no subtree is silently dropped and no directory is walked twice.
+   */
+  static readonly MAX_SRC_TREE_PAGES = 50;
+
+  async listSrcTree(
+    workspace: string,
+    repoSlug: string,
+    ref: string,
+    tracker?: { hasRemainingSafeBudget?(needed?: number): boolean },
+  ): Promise<{ paths: string[]; truncated: boolean }> {
+    const maxPages = BitbucketClient.MAX_SRC_TREE_PAGES;
+    const paths: string[] = [];
+    const seenPaths = new Set<string>();
+    const seenNextUrls = new Set<string>();
+    // Directory queue seeded with the repository ROOT (the empty path). `queuedDirectories` doubles
+    // as the cycle guard for the directory dimension of the walk.
+    const pendingDirectories: string[] = [''];
+    const queuedDirectories = new Set<string>(['']);
+    let pagesFetched = 0;
+
+    const buildDirectoryUrl = (directory: string, depth: number) => {
+      const encodedDirectory = encodeSrcPathSegments(directory);
+      return (
+        `${BITBUCKET_API_BASE_URL}${repositoryPath(workspace, repoSlug)}` +
+        `/src/${encodeURIComponent(ref)}/${encodedDirectory}` +
+        `?max_depth=${depth}&pagelen=${SRC_TREE_PAGE_LEN}`
+      );
+    };
+
+    // Pages are fetched with the ABSOLUTE url directly (NOT through `request()`, which would
+    // re-prefix the api base), mirroring `listRawPullRequestComments`. Same auth/timeout/tracking.
+    const fetchPage = (url: string) => {
+      const headers: Record<string, string> = {
+        Accept: 'application/json',
+        Authorization: `Bearer ${this.token}`,
+        'User-Agent': this.env.BOT_USERNAME ?? 'codra-bot',
+      };
+      this.tracker?.incrementSubrequests(1);
+      return withTimeout(`Bitbucket GET ${new URL(url).pathname}`, BITBUCKET_TIMEOUT_MS, (signal) =>
+        globalThis.fetch(url, { method: 'GET', signal, headers }),
+      );
+    };
+
+    while (pendingDirectories.length > 0) {
+      const directory = pendingDirectories.shift() as string;
+      const entries: Array<{ path: string; isDirectory: boolean }> = [];
+      let depth = SRC_TREE_MAX_DEPTH;
+      let nextUrl: string | null = buildDirectoryUrl(directory, depth);
+      // True while `nextUrl` is a url THIS code built. Flipped off the moment a response-supplied
+      // `next` link is adopted, which is what gates the SSRF/cycle checks below.
+      let isLocallyBuiltUrl = true;
+
+      while (nextUrl !== null) {
+        if (pagesFetched >= maxPages) {
+          // Cap reached with work outstanding: partial listing, flagged. See the divergence note.
+          return { paths, truncated: true };
+        }
+        if (tracker?.hasRemainingSafeBudget && !tracker.hasRemainingSafeBudget(1)) {
+          // Same disposition as the page cap, for the same reason: a build invocation that spent its
+          // subrequest budget enumerating should hand back what it has rather than throw away the
+          // pages it already paid for.
+          return { paths, truncated: true };
+        }
+        if (!isLocallyBuiltUrl) {
+          if (seenNextUrls.has(nextUrl)) {
+            // Cycle: the server handed back a link we already followed. STOP the walk (the listing is
+            // incomplete, so it is flagged) rather than loop until the page cap absorbs it.
+            return { paths, truncated: true };
+          }
+          if (!isValidBitbucketNextUrl(nextUrl, seenNextUrls)) {
+            // A response-supplied link is untrusted INPUT, not a trusted continuation (T-29-03-01).
+            // Off-origin or off-path FAILS the walk -- it is not a degradation, it is an attack or a
+            // provider bug, and either way it must be loud.
+            throw new BitbucketError(
+              502,
+              `Bitbucket next-link did not pass origin/path validation`,
+              '/src/{ref}/{path}',
+              `Bitbucket src-tree pagination next URL failed SSRF validation`,
+            );
+          }
+        }
+
+        pagesFetched += 1;
+        const response = await fetchPage(nextUrl);
+        if (!response.ok) {
+          if (
+            response.status === SRC_TREE_DEPTH_TIMEOUT_STATUS &&
+            isLocallyBuiltUrl &&
+            depth > SRC_TREE_FALLBACK_MAX_DEPTH
+          ) {
+            // Reported `max_depth` timeout. Retry THIS directory once at a smaller depth rather than
+            // failing the whole build. Restricted to a locally-built url (page 1 of the directory) so
+            // the retry cannot double-count entries already collected from earlier pages.
+            depth = SRC_TREE_FALLBACK_MAX_DEPTH;
+            nextUrl = buildDirectoryUrl(directory, depth);
+            continue;
+          }
+          const errorBody = await response.text();
+          throw new BitbucketError(
+            response.status,
+            errorBody,
+            new URL(nextUrl).pathname,
+            `Bitbucket API GET ${new URL(nextUrl).pathname} failed with ${response.status}`,
+            retryAfterMs(response),
+          );
+        }
+
+        const body = (await response.json()) as {
+          values?: Array<{ path?: unknown; type?: unknown }>;
+          next?: string | null;
+        };
+        for (const value of body.values ?? []) {
+          if (typeof value?.path !== 'string' || value.path.length === 0) continue;
+          if (value.type === 'commit_file') {
+            entries.push({ path: value.path, isDirectory: false });
+            // Committed to `paths` IMMEDIATELY, not after this directory's pagination finishes: every
+            // early return below (page cap, budget exhaustion, cycle) must hand back the pages it has
+            // already paid for. Flushing at the end of the directory loop instead would silently throw
+            // away a whole in-flight directory on exactly the degradation paths that exist to preserve
+            // partial work.
+            if (!seenPaths.has(value.path)) {
+              seenPaths.add(value.path);
+              paths.push(value.path);
+            }
+          } else if (value.type === 'commit_directory') {
+            entries.push({ path: value.path, isDirectory: true });
+          }
+          // Any other `type` is dropped: only blobs are indexable and only directories are walkable.
+        }
+
+        if (!body.next) break;
+        seenNextUrls.add(nextUrl);
+        nextUrl = body.next;
+        isLocallyBuiltUrl = false;
+      }
+
+      for (const entry of entries) {
+        if (!entry.isDirectory) continue;
+        // A directory whose contents the depth-limited response ALREADY returned needs no second
+        // request; one at the depth boundary is listed without its children and must be enqueued or
+        // its whole subtree vanishes from the index silently.
+        const childPrefix = `${entry.path}/`;
+        const contentsAlreadyReturned = entries.some(
+          (other) => other !== entry && other.path.startsWith(childPrefix),
+        );
+        if (contentsAlreadyReturned) continue;
+        if (queuedDirectories.has(entry.path)) continue;
+        queuedDirectories.add(entry.path);
+        pendingDirectories.push(entry.path);
+      }
+    }
+
+    return { paths, truncated: false };
   }
 
   /**
