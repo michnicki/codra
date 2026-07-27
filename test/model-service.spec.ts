@@ -543,7 +543,11 @@ describe('ModelService', () => {
             passes: { security: { enabled: false, cross_file: false }, critic: { enabled: false }, ensemble: { runs: 1, temperature: 0.7 } },
             interactive: {
               commands: { enabled: false, bitbucket_allowed_account_ids: [], bitbucket_bot_account_id: null },
-              qa: { enabled: false, rate_limit_per_hour: 10 },
+              qa: {
+                enabled: false,
+                rate_limit_per_hour: 10,
+                index: { enabled: false, max_files: 500, chunk_lines: 50, top_k: 8 },
+              },
             },
             severity_engine: { enabled: true },
             dedup: { enabled: true },

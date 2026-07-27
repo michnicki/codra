@@ -278,7 +278,12 @@ function InteractivePanel({ repo, onChange }: InteractivePanelProps) {
           // Editable Bitbucket bot account_id (D-06): report the trimmed value, empty→null.
           bitbucket_bot_account_id: normalizedBotAccountId,
         },
+        // Spread the current `qa` FIRST so keys this panel does not edit — notably the QA-IDX-01
+        // `index` block (Phase 29) — survive the round-trip. mergeReviewPatch applies `interactive`
+        // LAST (Phase 16 decision), so a draft that rebuilt `qa` from scratch would silently drop
+        // the operator's index configuration on every Interactive-panel Apply.
         qa: {
+          ...interactive.qa,
           enabled: qaEnabled,
           rate_limit_per_hour: rateLimitValid ? rateLimitNum : interactive.qa.rate_limit_per_hour,
         },

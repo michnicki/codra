@@ -7,7 +7,7 @@ import {
   updateRepoConfigEnabled,
 } from '@server/db/repo-configs';
 import { getOrCreateRepository } from '@server/db/repositories';
-import { defaultRepoConfig, normalizeRepoConfig } from '@shared/schema';
+import { defaultRepoConfig, normalizeRepoConfig, repoConfigSchema } from '@shared/schema';
 import { createTestEnv, hasConfiguredTestDatabaseUrl } from './helpers';
 
 // Requires migrations 001-009 applied to TEST_DATABASE_URL (run via `npm test`). Skipped when no
@@ -208,5 +208,105 @@ dbDescribe('repo-configs — Bitbucket read/write path (D-04/D-05, provider isol
     const bbAfter = await getRepoConfigRecord(env, name, name, 'bitbucket');
     expect(bbAfter?.enabled).toBe(false); // toggled
     expect(ghAfter?.enabled).toBe(true); // untouched
+  });
+});
+
+// Pure schema assertions — deliberately NOT inside dbDescribe. These pin the QA-IDX-01 default-off
+// contract (NREG-01) and must run on every host, including one with no TEST_DATABASE_URL.
+describe('repoConfigSchema — review.interactive.qa.index (QA-IDX-01 / D-16-R, NREG-01 default-off)', () => {
+  const INDEX_DEFAULTS = { enabled: false, max_files: 500, chunk_lines: 50, top_k: 8 } as const;
+
+  // The four shapes below each exercise a DIFFERENT Zod resolution path. Zod 4 returns a
+  // `.default(literal)` value WITHOUT re-parsing it, so an edit that only touched the inner
+  // `z.object` would leave `index` undefined for the three outer shapes. Each case therefore pins one
+  // literal, and together they would fail on an inner-object-only edit.
+  const shapes: Array<{ label: string; input: unknown }> = [
+    { label: 'nothing at all (outer reviewConfigSchema.default literal)', input: {} },
+    { label: 'review present, interactive absent (interactive .default literal)', input: { review: {} } },
+    { label: 'interactive present, qa absent (qa .default literal)', input: { review: { interactive: {} } } },
+    { label: 'qa present as {} (index z.object .default)', input: { review: { interactive: { qa: {} } } } },
+  ];
+
+  for (const { label, input } of shapes) {
+    it(`materializes every index default when the config supplies ${label}`, () => {
+      const index = repoConfigSchema.parse(input).review.interactive.qa.index;
+
+      // NREG-01: the toggle is off, so a repository that has not opted in does no retrieval, stores
+      // no index and runs no build.
+      expect(index.enabled).toBe(false);
+      // Real values, not `undefined` — the whole point of the three-site discipline.
+      expect(index).toEqual(INDEX_DEFAULTS);
+      expect(typeof index.max_files).toBe('number');
+      expect(typeof index.chunk_lines).toBe('number');
+      expect(typeof index.top_k).toBe('number');
+    });
+  }
+
+  it('leaves the other three knobs at their defaults when only index.enabled is supplied', () => {
+    const index = repoConfigSchema.parse({
+      review: { interactive: { qa: { index: { enabled: true } } } },
+    }).review.interactive.qa.index;
+
+    expect(index).toEqual({ ...INDEX_DEFAULTS, enabled: true });
+  });
+
+  it('does not disturb the pre-existing qa defaults', () => {
+    expect(defaultRepoConfig.review.interactive.qa.enabled).toBe(false);
+    expect(defaultRepoConfig.review.interactive.qa.rate_limit_per_hour).toBe(10);
+    // defaultRepoConfig is itself repoConfigSchema.parse({}), so this doubles as the exported-oracle
+    // assertion for the new block.
+    expect(defaultRepoConfig.review.interactive.qa.index).toEqual(INDEX_DEFAULTS);
+  });
+
+  // T-29-02-01: every numeric key is bounded so an authenticated-but-malicious config write cannot
+  // request an unbounded build or an unbounded retrieval.
+  it.each([
+    ['max_files', 2_001],
+    ['chunk_lines', 501],
+    ['top_k', 51],
+  ])('rejects %s above its declared .max() bound (%i)', (key, value) => {
+    const result = repoConfigSchema.safeParse({
+      review: { interactive: { qa: { index: { [key]: value } } } },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it.each([
+    ['max_files', 0],
+    ['chunk_lines', 0],
+    ['top_k', -1],
+  ])('rejects a non-positive %s (%i)', (key, value) => {
+    const result = repoConfigSchema.safeParse({
+      review: { interactive: { qa: { index: { [key]: value } } } },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  // BOUNDARY PAIR on max_files. The 2 000 ceiling was confirmed by the developer at the 29-02 Task 1
+  // checkpoint (D-16-R), tightened from a drafted 5 000 because the build advances ~12 files per
+  // minute, so 2 000 is roughly a three-hour worst legal request and 5 000 roughly seven hours.
+  // Pinning BOTH sides means the ceiling cannot drift looser without failing this suite.
+  it('accepts max_files exactly at the confirmed 2000 ceiling and rejects 2001', () => {
+    const accepted = repoConfigSchema.safeParse({
+      review: { interactive: { qa: { index: { max_files: 2_000 } } } },
+    });
+    expect(accepted.success).toBe(true);
+    expect(accepted.success && accepted.data.review.interactive.qa.index.max_files).toBe(2_000);
+
+    const rejected = repoConfigSchema.safeParse({
+      review: { interactive: { qa: { index: { max_files: 2_001 } } } },
+    });
+    expect(rejected.success).toBe(false);
+  });
+
+  it('round-trips the index block through normalizeRepoConfig unchanged (spread-based, no special case)', () => {
+    const parsed = repoConfigSchema.parse({
+      review: { interactive: { qa: { index: { enabled: true, max_files: 1_200 } } } },
+    });
+    expect(normalizeRepoConfig(parsed).review.interactive.qa.index).toEqual({
+      ...INDEX_DEFAULTS,
+      enabled: true,
+      max_files: 1_200,
+    });
   });
 });

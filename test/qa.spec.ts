@@ -182,6 +182,9 @@ function qaConfig(overrides: { enabled?: boolean; rate_limit_per_hour?: number }
       interactive: {
         ...defaultRepoConfig.review.interactive,
         qa: {
+          // Spread the real default first so keys this helper does not override — the QA-IDX-01
+          // `index` block (Phase 29) — stay at their schema defaults instead of being dropped.
+          ...defaultRepoConfig.review.interactive.qa,
           enabled: overrides.enabled ?? true,
           rate_limit_per_hour: overrides.rate_limit_per_hour ?? 10,
         },
