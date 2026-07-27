@@ -220,12 +220,83 @@ export const reviewConfigSchema = z.object({
           // REVIEW (OpenCode 11-04): the Q&A hourly cap as a config knob, not a hardcoded constant.
           // Additive + defaulted so an existing config parses byte-identically (NREG-01).
           rate_limit_per_hour: z.number().int().positive().default(10),
+          // Phase 29 (QA-IDX-01, D-16 / D-16-R): codebase-index-backed Q&A. `enabled` is
+          // REQUIREMENTS' `qa.index_enabled` expressed at the PRE-EXISTING `review.interactive.qa`
+          // config path rather than as a new top-level `qa` block, so Q&A configuration is not split
+          // across two places. Default-off for NREG-01 inertness: `repoConfigSchema.parse({})` yields
+          // `review.interactive.qa.index.enabled === false`, so a repository whose operator has not
+          // explicitly opted in sees no retrieval, no index storage and no build activity.
+          //
+          // Every numeric key carries a `.max()` bound because these values later size provider
+          // fetches, stored rows and prompt bytes — the bound is what stops an authenticated-but-
+          // malicious config write from requesting an unbounded build or an unbounded retrieval
+          // (T-29-02-01, following the Phase 13 bounds precedent on `ensemble.runs` and the
+          // `.max(20)` on `evidence.hard_drop_exempt_categories`).
+          //
+          // ONE-WAY (D-16): these keys enter `repo_configs.parsed_json` for any repository that sets
+          // them, so removing one after it ships risks breaking config parsing for those repos. The
+          // key path, the four defaults and the `max_files` ceiling were confirmed by the developer
+          // at the Plan 29-02 Task 1 checkpoint (recorded as D-16-R in 29-CONTEXT.md).
+          index: z
+            .object({
+              enabled: z.boolean().default(false),
+              // Caps FETCHES, not stored files. Generated-file detection is content-based (D-09), so
+              // a file must be fetched before it can be dropped — a build that fetches `max_files`
+              // files therefore stores at most, and usually fewer than, `max_files` files. The
+              // schema cannot express that distinction, hence this note.
+              //
+              // BUILD COST — the number an operator types here is the ONLY place the build's
+              // wall-clock cost is chosen, so the arithmetic belongs where the value is picked
+              // (review: OpenCode 29-02 #8 / Consensus Agreed Concern 4). Derivation, entirely from
+              // constants that already exist in this repository: `TokenTracker`'s
+              // MAX_SUBREQUESTS = 50 minus SAFE_MARGIN = 25 leaves a fresh `remainingSafeBudget()`
+              // of 25; at ESTIMATED_SUBREQUESTS_PER_INDEX_FILE = 2 that funds floor(25 / 2) = 12
+              // files per invocation; and each continuation sleeps
+              // INDEX_FRESH_INVOCATION_YIELD_SECONDS = 60 to force hibernation. So a build advances
+              // roughly 12 FILES PER MINUTE — the 500 default is about 42 minutes and the 2 000
+              // ceiling about 2.8 hours.
+              //
+              // A large value is SLOW, NOT SILENTLY CAPPED: MAX_INDEX_CONTINUATIONS hands off to a
+              // fresh instance rather than abandoning the build, so a large request does finish; it
+              // just costs hours of wall clock and provider quota. The ceiling therefore bounds how
+              // long an operator can ask a build to run, NOT how much gets indexed. 2 000 was chosen
+              // over a drafted 5 000 (~7 hours) because it keeps 4x headroom over the 500 default
+              // while bounding the worst legal request to roughly three hours. The exact boundary is
+              // pinned by a spec PAIR in test/repo-configs.spec.ts (2 000 parses, 2 001 rejects) so
+              // it cannot drift looser without failing the suite.
+              //
+              // Deliberately NOT a `.refine()` cross-checking the budget constants: this file is
+              // imported by the dashboard client, so reaching into `core/code-index-build.ts` would
+              // drag server-side build constants into the browser bundle and invert the layering
+              // (`shared/` depends on nothing server-side). The bound plus this documented
+              // arithmetic is the whole mitigation.
+              max_files: z.number().int().positive().max(2_000).default(500),
+              // BAKED INTO STORED ROWS: the line window is persisted with every chunk at build time,
+              // so changing this value requires a FULL RE-INDEX, not a migration. 50 deliberately
+              // equals `WINDOW_LINE_COUNT` because D-10 reuses that windowing vocabulary. Bounded at
+              // 500 so a config write cannot demand pathologically large chunks.
+              chunk_lines: z.number().int().positive().max(500).default(50),
+              // Retrieval breadth per question. Bounded at 50 because every hit spends prompt bytes
+              // inside the `QA_MAX_INDEX_CHARS` retrieved-context fence (D-13).
+              top_k: z.number().int().positive().max(50).default(8),
+            })
+            .default({ enabled: false, max_files: 500, chunk_lines: 50, top_k: 8 }),
         })
-        .default({ enabled: false, rate_limit_per_hour: 10 }),
+        // Zod 4 returns a `.default(literal)` value WITHOUT re-parsing it, so this literal must carry
+        // `index` too — it is the value produced whenever `qa` itself is absent from a stored config.
+        .default({
+          enabled: false,
+          rate_limit_per_hour: 10,
+          index: { enabled: false, max_files: 500, chunk_lines: 50, top_k: 8 },
+        }),
     })
     .default({
       commands: { enabled: false, bitbucket_allowed_account_ids: [], bitbucket_bot_account_id: null },
-      qa: { enabled: false, rate_limit_per_hour: 10 },
+      qa: {
+        enabled: false,
+        rate_limit_per_hour: 10,
+        index: { enabled: false, max_files: 500, chunk_lines: 50, top_k: 8 },
+      },
     }),
   // v1.2 severity/category engine + lifecycle toggle blocks (SEV-01..04, consumed by Phases 14/18/19).
   // Follows the existing uniform `{ enabled: boolean }` toggle-block shape.
@@ -334,7 +405,14 @@ export const repoConfigSchema = z.object({
     passes: { security: { enabled: false, cross_file: false }, critic: { enabled: false }, ensemble: { runs: 1, temperature: 0.7 } },
     interactive: {
       commands: { enabled: false, bitbucket_allowed_account_ids: [], bitbucket_bot_account_id: null },
-      qa: { enabled: false, rate_limit_per_hour: 10 },
+      qa: {
+        enabled: false,
+        rate_limit_per_hour: 10,
+        // QA-IDX-01 index block, identical to the two `interactive`-level literals above. A divergence
+        // between the three is a silent config bug that only surfaces for repositories whose parent
+        // key happens to be absent from `parsed_json`.
+        index: { enabled: false, max_files: 500, chunk_lines: 50, top_k: 8 },
+      },
     },
     severity_engine: { enabled: true },
     dedup: { enabled: true },
