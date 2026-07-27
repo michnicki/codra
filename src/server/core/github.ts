@@ -500,6 +500,36 @@ export class GitHubClient {
     });
   }
 
+  // QA-IDX-01 (D-12): resolve a branch name to the COMMIT it points at.
+  //
+  // This exists because `getTree` below CANNOT supply it. The trees endpoint echoes back the TREE
+  // sha, never the commit sha -- passing a branch name resolves to that branch head's root tree and
+  // `response.sha` is that tree's object id. A tree sha is not a valid `compare` operand and is not
+  // what `code_index_state.indexed_sha` means ("the commit the window's content was read at",
+  // migration 018), so returning it would put a value in that column that the incremental-refresh
+  // path cannot use. One extra subrequest buys a correct commit sha; it also makes the GitHub adapter
+  // structurally symmetric with the Bitbucket one, which needs the same read for the same reason.
+  //
+  // Returns null on 404 (no such branch) so the adapter can distinguish that from a transport
+  // failure; any other non-2xx throws.
+  async getBranchCommitSha(owner: string, repo: string, branch: string): Promise<string | null> {
+    return withRetry(`getBranchCommitSha ${owner}/${repo}@${branch}`, async () => {
+      try {
+        const response = await this.requestAndCheck(
+          `${repoApiPath(owner, repo)}/branches/${encodeGitHubContentPath(branch)}`,
+        );
+        const data = (await response.json()) as { commit?: { sha?: string } };
+        const sha = data.commit?.sha;
+        return typeof sha === 'string' && sha.length > 0 ? sha : null;
+      } catch (error) {
+        if (error instanceof GitHubError && error.status === 404) {
+          return null;
+        }
+        throw error;
+      }
+    });
+  }
+
   // QA-IDX-01 (D-09): one recursive tree read enumerates the whole default branch.
   //
   // The `tree_sha` path segment ACCEPTS A REF NAME, not just a SHA1 [CITED:
@@ -513,6 +543,9 @@ export class GitHubClient {
   // entries or 7 MB and returns an arbitrary prefix. The flag is surfaced verbatim to the adapter --
   // see the `listDefaultBranchTree` doc comment in vcs/types.ts for why swallowing it would be a
   // silent partial index.
+  //
+  // NOTE the returned `sha` is the TREE sha, NOT the commit sha -- see `getBranchCommitSha` above.
+  // The adapter deliberately discards it.
   async getTree(owner: string, repo: string, treeIsh: string) {
     return withRetry(`getTree ${owner}/${repo}@${treeIsh}`, async () => {
       const response = await this.requestAndCheck(

@@ -42,6 +42,10 @@ export class GitHubService {
     return this.client.getRepositoryMetadata(owner, repo);
   }
 
+  async getBranchCommitSha(owner: string, repo: string, branch: string) {
+    return this.client.getBranchCommitSha(owner, repo, branch);
+  }
+
   async getTree(owner: string, repo: string, treeIsh: string) {
     return this.client.getTree(owner, repo, treeIsh);
   }
