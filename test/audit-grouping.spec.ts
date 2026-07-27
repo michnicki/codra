@@ -198,3 +198,57 @@ describe('groupAuditByStage — Phase 24 D-01 / D-02', () => {
     expect(group!.events.map((e) => e.stage)).toEqual(['evidence_missing', 'evidence_missing_summary']);
   });
 });
+
+describe('Phase 28 (LRN-01) / G-28-4 — learned_rule_suppressed is its own display group', () => {
+  // (a) PRIMARY DISCRIMINATOR. Proves the collapse branch is gone from the normalizer.
+  // FAILS PRE-FIX: the pre-fix normalizer returned 'evidence_missing' for this stage.
+  it('does not collapse learned_rule_suppressed into the evidence_missing display stage', () => {
+    expect(normalizeAuditDisplayStage('learned_rule_suppressed')).toBe('learned_rule_suppressed');
+  });
+
+  // (b) BADGE HONESTY. The viewer renders each group's `count` as the group heading badge, so this
+  // is the pure-function form of "Evidence missing: N is not inflated by suppressions".
+  // FAILS PRE-FIX: pre-fix all three events land in ONE evidence_missing group of count 3, so both
+  // the group count (1 vs 2) and the evidence count (3 vs 2) are wrong.
+  it('keeps the evidence_missing count free of suppression events', () => {
+    const legacy = ev('evidence_missing', '2026-01-01T00:00:01Z');
+    const hardDropped = ev('evidence_hard_dropped', '2026-01-01T00:00:02Z');
+    const suppressed = ev('learned_rule_suppressed', '2026-01-01T00:00:03Z');
+
+    const groups = groupAuditByStage([legacy, hardDropped, suppressed]);
+
+    expect(groups.map((g) => g.stage)).toEqual(['evidence_missing', 'learned_rule_suppressed']);
+
+    const evidenceGroup = groups.find((g) => g.stage === 'evidence_missing')!;
+    expect(evidenceGroup.count).toBe(2);
+    expect(evidenceGroup.events.map((e) => e.stage)).toEqual([
+      'evidence_missing',
+      'evidence_hard_dropped',
+    ]);
+
+    const suppressionGroup = groups.find((g) => g.stage === 'learned_rule_suppressed')!;
+    expect(suppressionGroup.count).toBe(1);
+    expect(suppressionGroup.events).toEqual([suppressed]);
+  });
+
+  // (c) The STAGE_ORDER entry is LIVE (not dead code) and drives placement independent of arrival
+  // order — input is deliberately REVERSED relative to STAGE_ORDER.
+  // FAILS PRE-FIX: pre-fix both events collapse into a single evidence_missing group, so only one
+  // stage comes back.
+  it('emits the suppression group after evidence_missing regardless of arrival order', () => {
+    const suppressed = ev('learned_rule_suppressed', '2026-01-01T00:00:01Z');
+    const hardDropped = ev('evidence_hard_dropped', '2026-01-01T00:00:02Z');
+
+    const groups = groupAuditByStage([suppressed, hardDropped]);
+
+    expect(groups.map((g) => g.stage)).toEqual(['evidence_missing', 'learned_rule_suppressed']);
+  });
+
+  // (d) REGRESSION GUARD — NOT a discriminator: this passes both before AND after the fix. It
+  // exists solely to catch an over-broad edit that strips the NEIGHBOURING collapse branches while
+  // removing the Phase 28 one. Both of these must keep collapsing.
+  it('still collapses evidence_hard_dropped and evidence_missing_summary into evidence_missing', () => {
+    expect(normalizeAuditDisplayStage('evidence_hard_dropped')).toBe('evidence_missing');
+    expect(normalizeAuditDisplayStage('evidence_missing_summary')).toBe('evidence_missing');
+  });
+});
