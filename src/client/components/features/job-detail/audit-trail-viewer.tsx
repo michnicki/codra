@@ -213,6 +213,33 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
           )}
         </li>
       );
+    // Phase 28 (LRN-01) / gap G-28-4: learned_rule_suppressed aggregate event — one event per
+    // (file, pass) when learned-rule suppression removed >=1 finding in finalize. `droppedCount` is
+    // the FULL total, NOT the (max-20) sample length. Mirrors the evidence_hard_dropped row layout,
+    // but this event lands in its OWN 'Learned rule suppressed' group (a different gate — see the
+    // normalizer's Phase 28 note), and each sample names the matched rule id rather than a reason
+    // tag. The rule id renders IN FULL (never shortOpaqueRef): it is the key the operator uses to
+    // find the rule in the Learned Rules panel, so `break-all` wraps it inside the row instead.
+    case 'learned_rule_suppressed':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="file" value={event.file} />
+          <MetricLine label="pass" value={event.pass} />
+          <MetricLine label="suppressed" value={String(event.droppedCount)} />
+          {event.sample.length > 0 && (
+            <ul className="mt-2 flex flex-col gap-1.5 border-t border-border/30 pt-2">
+              {event.sample.map((s, i) => (
+                <li key={i}>
+                  <SampleIdentifier path={s.path} line={s.line} title={s.title} />
+                  <div className="text-[10px] text-muted-foreground/70 font-mono break-all">
+                    rule {s.matched_rule}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </li>
+      );
     // Phase 18 RND-01..05: every `rounds.*` sub-variant lands inside the normalized `Rounds`
     // DecisionGroup via the audit-grouping normalizer. The original event.stage distinguishes
     // each sub-variant for the per-row renderer below; .passthrough() keeps every known field

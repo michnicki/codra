@@ -62,6 +62,21 @@ export type AuditDisplayStage = typeof STAGE_ORDER[number];
  * phase-19 event names — they are mapped to a synthetic display stage so the `groupAuditByStage`
  * filter (which iterates over STAGE_ORDER) and the `DecisionEvent` renderer (which switches on the
  * event's stage) can route them through the same machinery as the existing synthetic groups.
+ *
+ * Phase 28 (LRN-01) / gap G-28-4 — DELIBERATELY NOT NORMALIZED: `learned_rule_suppressed` is its
+ * OWN display group (its STAGE_ORDER entry, between `evidence_missing` and `rounds`), exactly like
+ * `critic` / `ensemble` / `walkthrough` each wrap their single bounded aggregate. It is NOT a member
+ * of the `evidence_missing` group. Do NOT "helpfully" re-add a collapse branch for it:
+ *   - It is a DIFFERENT GATE with a DIFFERENT SAMPLE SHAPE. `evidence_hard_dropped` earns its
+ *     collapse because it shares the evidence gate's own reason enum (`'absent' | 'not_in_hunk'`);
+ *     `learned_rule_suppressed` samples carry `matched_rule` (a rule id) instead. The sample-shape
+ *     divergence is the tell.
+ *   - SEPARATE GROUPS KEEP THE COUNT BADGE HONEST. The viewer renders each group's `count` as a
+ *     badge, so collapsing suppressions into `evidence_missing` inflates "Evidence missing: N" with
+ *     events from an unrelated gate — a reader scanning the badge gets a false read of evidence-gate
+ *     health, and an operator reading the row gets the WRONG ROOT CAUSE (a model hallucinating a
+ *     line number vs. their own approved rule suppressing the finding). That is the defect G-28-4
+ *     documents; the collapse branch that used to sit here was its cause.
  */
 export function normalizeAuditDisplayStage(stage: JobAuditEvent['stage']): AuditDisplayStage {
   if (stage.startsWith('rounds.')) return 'rounds';
@@ -73,9 +88,6 @@ export function normalizeAuditDisplayStage(stage: JobAuditEvent['stage']): Audit
   // so the aggregate event lands in the same Evidence missing group as legacy per-finding events.
   if (stage === 'evidence_missing_summary') return 'evidence_missing';
   if (stage === 'evidence_hard_dropped') return 'evidence_missing';
-  // Phase 28 (LRN-01): learned_rule_suppressed maps to the evidence_missing display
-  // group so suppression events land alongside evidence hard-drop events.
-  if (stage === 'learned_rule_suppressed') return 'evidence_missing';
   return stage as AuditDisplayStage;
 }
 
