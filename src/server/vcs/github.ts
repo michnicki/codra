@@ -367,7 +367,9 @@ export class GithubAdapter implements VcsProvider {
     repo: string,
     prNumber: number,
     commentRef: string,
-  ): Promise<{ path: string; line: number | null; body: string } | null> {
+  ): Promise<{ path: string; line: number | null; position: number | null; body: string } | null> {
+    // `position` is GitHub's DIFF OFFSET — the coordinate createReview posts by — and flows through
+    // this adapter unchanged; do not remap or drop it (G-28-3).
     void prNumber; // GitHub's GET /pulls/comments/{id} doesn't need the PR number.
     const commentId = Number(commentRef);
     if (!Number.isFinite(commentId) || commentId <= 0) {

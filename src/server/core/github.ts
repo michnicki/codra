@@ -943,10 +943,16 @@ export class GitHubClient {
     });
   }
 
-  // Phase 28 (LRN-01): fetch a single pull request review comment by its id. Returns the
-  // comment's path, line, and body, or null on 404 (deleted comment). Uses this.request (NOT
+  // Phase 28 (LRN-01): fetch a single pull request review comment by its id. Returns the comment's
+  // `path`, `line`, `position` and `body`, or null on 404 (deleted comment). Uses this.request (NOT
   // requestAndCheck) so 404 returns null instead of throwing — same pattern as updateIssueComment
   // and getRepoFileOrNull. Any OTHER non-2xx still throws a GitHubError.
+  //
+  // `position` is the DIFF OFFSET the comment was posted at — the coordinate `createReview` above
+  // actually sends (`{ path, position, body }`) and therefore the only coordinate that round-trips
+  // against `review_comments.position`. `line` is re-derived by GitHub from that position against
+  // the current diff and drifts from the line Codra persisted, so it must NOT be used to join
+  // enrichment lookups (G-28-3). Both are surfaced; the consumer picks per provider.
   async getReviewComment(owner: string, repo: string, commentId: number) {
     return withRetry(`getReviewComment ${owner}/${repo} comment#${commentId}`, async () => {
       const commentPath = `${repoApiPath(owner, repo)}/pulls/comments/${commentId}`;
@@ -968,7 +974,7 @@ export class GitHubClient {
           `GitHub review comment fetch failed with ${response.status}: ${errText}`,
         );
       }
-      return (await response.json()) as { path: string; line: number | null; body: string };
+      return (await response.json()) as { path: string; line: number | null; position: number | null; body: string };
     });
   }
 

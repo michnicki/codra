@@ -301,6 +301,17 @@ export interface VcsProvider {
    * numeric `pull_request_review_comment.id`; Bitbucket uses the comment id from the PR comments
    * endpoint.
    *
+   * COORDINATE SYSTEMS ARE NOT INTERCHANGEABLE ACROSS PROVIDERS (G-28-3). GitHub anchors an inline
+   * comment by its diff `position` — `core/github.ts createReview` posts `{ path, position, body }`
+   * and never sends `line`, and the `line` GitHub reports back is re-derived from that position
+   * against the CURRENT diff, so it drifts from the line Codra persisted. Bitbucket has no diff
+   * offset at all: it anchors by `inline.to ?? inline.from`, i.e. a LINE, on both the post and the
+   * read path, and therefore reports `position: null`.
+   *
+   * Consequence for consumers: select the coordinate PER PROVIDER (GitHub -> `position`,
+   * Bitbucket -> `line`) rather than assuming `line` is comparable across providers. Matching a
+   * GitHub comment on `line` is the exact defect G-28-3 documents.
+   *
    * Error handling: returns null on 404/deleted/comment-not-found (never throws for missing
    * comments). Throws on auth errors, 5xx, or network failures so the caller can distinguish
    * "comment doesn't exist" from "provider is down".
@@ -310,7 +321,7 @@ export interface VcsProvider {
     repo: string,
     prNumber: number,
     commentRef: string,
-  ): Promise<{ path: string; line: number | null; body: string } | null>;
+  ): Promise<{ path: string; line: number | null; position: number | null; body: string } | null>;
 
   labels?: {
     ensure(owner: string, repo: string, name: string, color: string): Promise<void>;
