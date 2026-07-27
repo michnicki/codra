@@ -4,7 +4,7 @@ import type { VcsProvider } from '@server/vcs/types';
 import type { RepoConfig } from '@shared/schema';
 import { getBotIdentity, type BotIdentityResolver } from '@server/core/bot-identity';
 import { markPrPaused, markPrResumed, type PrReviewStateKey } from '@server/db/pr-review-state';
-import { insertRejectFeedback, findReviewCommentByPathLine } from '@server/db/reject-feedback';
+import { insertRejectFeedback, findReviewCommentByCoordinate } from '@server/db/reject-feedback';
 
 /**
  * Phase 11 Plan 03 — core/commands.ts: the webhook-layer command parser + dispatcher that is the
@@ -405,15 +405,20 @@ export async function executeCommand(
       try {
         if (cmd.findingRef) {
           const commentDetails = await provider.getInlineCommentDetails(ctx.owner, ctx.repo, ctx.prNumber, cmd.findingRef);
-          if (commentDetails && commentDetails.path && commentDetails.line != null) {
+          // A non-empty path is enough to record findingFilePath — it needs no coordinate match.
+          // (A file path with a null category still cannot cluster per D-02, so this is strictly
+          // more information at no risk.) Both coordinates are forwarded; the lookup selects the
+          // one its provider actually anchors by (GitHub -> position, Bitbucket -> line; G-28-3).
+          if (commentDetails && commentDetails.path) {
             findingFilePath = commentDetails.path;
-            const reviewComment = await findReviewCommentByPathLine(env, {
+            const reviewComment = await findReviewCommentByCoordinate(env, {
               workspace: ctx.workspace,
               repoSlug: ctx.repo,
               vcsProvider: provider.name,
               prNumber: ctx.prNumber,
               path: commentDetails.path,
               line: commentDetails.line,
+              position: commentDetails.position,
             });
             if (reviewComment) {
               findingTitle = reviewComment.title;

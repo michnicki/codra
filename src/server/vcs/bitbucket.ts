@@ -577,7 +577,7 @@ export class BitbucketAdapter implements VcsProvider {
     repo: string,
     prNumber: number,
     commentRef: string,
-  ): Promise<{ path: string; line: number | null; body: string } | null> {
+  ): Promise<{ path: string; line: number | null; position: number | null; body: string } | null> {
     void owner; // Bitbucket's workspace is canonical (this.job.repositoryWorkspace).
     const commentId = Number(commentRef);
     if (!Number.isFinite(commentId) || commentId <= 0) {
@@ -594,6 +594,12 @@ export class BitbucketAdapter implements VcsProvider {
     return {
       path: comment.inline.path,
       line: comment.inline.to ?? comment.inline.from ?? null,
+      // Bitbucket has NO diff offset to report, so `position` is always null here. The write path
+      // (`postPullRequestComment`) sends `inline: { path, to | from }` and this read path returns
+      // `inline.to ?? inline.from` — a LINE on both sides. The asymmetry with GitHub (which anchors
+      // by diff `position`) is intentional: each provider is matched on the coordinate it actually
+      // anchors by, so Bitbucket enrichment resolves on `review_comments.line` (NREG-02, G-28-3).
+      position: null,
       body: comment.content?.raw ?? '',
     };
   }

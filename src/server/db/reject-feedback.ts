@@ -103,19 +103,46 @@ export async function insertRejectFeedback(
 }
 
 /**
- * Phase 28 (LRN-01): Look up a review_comment by (path, line) for the most recent completed job
- * matching the given PR identity. Returns the finding's title, category, and severity, or null if
- * no matching review_comment is found. Used by the reject handler to denormalize finding metadata
- * onto reject_feedback rows (D-01).
+ * Phase 28 (LRN-01) / G-28-3: the coordinate each provider ACTUALLY anchors its inline comments by.
  *
- * Joins review_comments → file_reviews → jobs → repositories. The (path, line) match is unambiguous
- * for most PRs; if multiple Codra comments exist on the same (path, line), the most recent completed
- * job's comment is returned (ORDER BY jobs.created_at DESC, LIMIT 1).
+ * The fragment is selected by the provider KEY only and is a fixed literal SQL string — it is never
+ * assembled from, or concatenated with, any caller-supplied value. The coordinate VALUE always stays
+ * bound as `$6` through `queryRows` (ASVS V5 / the module-header rule T-11-01-1, threat T-28-06).
+ */
+const COORDINATE_PREDICATE_BY_PROVIDER: Record<VcsProvider, string> = {
+  github: 'rc.position = $6',
+  bitbucket: 'rc.line = $6',
+};
+
+/**
+ * Phase 28 (LRN-01): Look up a review_comment by (path, provider-appropriate coordinate) for the
+ * most recent completed job matching the given PR identity. Returns the finding's title, category
+ * and severity, or null when nothing matches. Used by the reject handler to denormalize finding
+ * metadata onto reject_feedback rows (D-01).
+ *
+ * TWO COORDINATE SYSTEMS, NOT ONE (this is the G-28-3 fix). Codra POSTs GitHub inline comments by
+ * diff `position` (`core/github.ts createReview` sends `{ path, position, body }` and never `line`),
+ * so the GitHub predicate reads `review_comments.position`. GitHub's own reported `line` is
+ * re-derived from that position against the current diff and drifts from the line the model reported
+ * and Codra persisted: on live PR michnicki/opencodra#9 `position` matched on both sampled comments
+ * and `line` matched on NEITHER (GitHub line 56/position 16 vs stored line 57; GitHub line 364/
+ * position 32 vs stored line 366). Bitbucket has no diff offset — it anchors by `inline.to ??
+ * inline.from` on both the post and the read path — so it keeps matching on `review_comments.line`
+ * (NREG-02: each provider matches on the coordinate it actually anchors by).
+ *
+ * There is deliberately NO cross-provider fallback. When the provider's own coordinate is null or
+ * matches nothing, the lookup returns null and the caller writes NULL enrichment columns (D-02
+ * excludes those rows from clustering). Falling back to the other provider's coordinate would
+ * silently re-attach the WRONG finding — precisely the defect being fixed.
+ *
+ * Joins review_comments → file_reviews → jobs → repositories. `ORDER BY j.created_at DESC, rc.id
+ * ASC` makes the ordering TOTAL: the colliding rows observed on PR#9 belong to the SAME job, so
+ * `created_at` alone leaves a tie the database may break arbitrarily.
  *
  * The vcs_provider filter ensures we don't cross-match between GitHub and Bitbucket repos that
  * share the same owner/workspace + repo slug.
  */
-export async function findReviewCommentByPathLine(
+export async function findReviewCommentByCoordinate(
   env: Pick<AppBindings, 'HYPERDRIVE'>,
   input: {
     workspace: string;
@@ -124,13 +151,20 @@ export async function findReviewCommentByPathLine(
     prNumber: number;
     path: string;
     line: number | null;
+    position: number | null;
   },
 ): Promise<{ title: string; category: string; severity: string } | null> {
-  // Line must be non-null to match — a comment with null line is a general PR comment, not an
-  // inline finding, so there's no meaningful review_comment to join against.
-  if (input.line == null) {
+  // Pick the coordinate the provider anchors by — GitHub the diff offset, Bitbucket the line.
+  const coordinate = input.vcsProvider === 'github' ? input.position : input.line;
+
+  // A null coordinate has nothing to match: a GitHub comment on an outdated diff has
+  // position: null, and a non-inline comment has no line. Return null rather than borrowing the
+  // other provider's coordinate (see the no-fallback note above).
+  if (coordinate == null) {
     return null;
   }
+
+  const coordinatePredicate = COORDINATE_PREDICATE_BY_PROVIDER[input.vcsProvider];
 
   const rows = await queryRows<{ title: string; category: string; severity: string }>(
     env,
@@ -146,8 +180,8 @@ export async function findReviewCommentByPathLine(
         AND j.pr_number = $4
         AND j.status = 'done'
         AND rc.path = $5
-        AND rc.line = $6
-      ORDER BY j.created_at DESC
+        AND ${coordinatePredicate}
+      ORDER BY j.created_at DESC, rc.id ASC
       LIMIT 1
     `,
     [
@@ -156,10 +190,12 @@ export async function findReviewCommentByPathLine(
       input.repoSlug,
       input.prNumber,
       input.path,
-      input.line,
+      coordinate,
     ],
   );
 
+  // Task 2 replaces this LIMIT 1 with a bounded candidate fetch plus a body-based tiebreak so an
+  // ambiguous coordinate resolves to the finding the user actually rejected.
   return rows[0] ?? null;
 }
 
