@@ -5535,4 +5535,132 @@ dbDescribe('learned rule suppression', () => {
     createSpy.mockRestore();
     getDiffSpy.mockRestore();
   }, REVIEW_FLOW_TIMEOUT_MS);
+
+  // D-14 ordering: EVID-02 hard-drop runs BEFORE learned-rule suppression, so a finding that fails
+  // BOTH gates is attributed to the STRICTER one. Lexical statement order in review.ts is trivially
+  // readable, but which audit stage a doubly-failing finding actually lands in — and whether the
+  // learned_rule_suppressed droppedCount double-counts it — is a runtime consequence. 28-VERIFICATION.md
+  // listed this as behavior-unverified (UAT test 6); this is the assertion that pins it.
+  it('attributes a doubly-failing finding to EVID-02, not the learned rule (D-14)', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const repo = `test-repo-${Date.now()}-lrn-evid02-order`;
+    const headSha = sha('o');
+
+    // Only 'console.log(1);' exists in the diff — any other existingCode is hallucinated evidence.
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+    );
+
+    let captured: any[] = [];
+    const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+      async (...args: any[]) => { captured = args[3]?.comments ?? []; return { id: 790 }; },
+    );
+
+    const ruleId = '55555555-5555-4555-8555-555555555555';
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 1,
+      prTitle: 'LRN-01 vs EVID-02 ordering test',
+      prAuthor: 'author',
+      commitSha: headSha,
+      baseSha: sha('0'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          // Both gates armed simultaneously. Empty exempt list so the security finding is
+          // evidence-checked too — otherwise the default ['security'] would mask the comparison.
+          evidence: { hard_drop: true, hard_drop_exempt_categories: [] },
+          learning: {
+            enabled: true,
+            learned_rules: [
+              {
+                id: ruleId,
+                category: 'quality',
+                file_pattern: 'src/app.ts',
+                status: 'active',
+                source_rejection_ids: ['rej-1', 'rej-2'],
+                created_at: '2026-01-01T00:00:00.000Z',
+              },
+            ],
+          },
+        },
+      },
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+    await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+
+    // Distinct lines/positions throughout so dedup never merges two of these findings and
+    // confounds the attribution being measured.
+    //   A "Doubly failing"  — quality + src/app.ts (matches rule) AND hallucinated evidence.
+    //                         Must be attributed to EVID-02 only.
+    //   B "Rule only"       — quality + src/app.ts (matches rule), evidence genuine.
+    //                         Must be attributed to the learned rule only.
+    //   C "Survivor"        — security (no rule match), evidence genuine. Must post.
+    await upsertFileReview(env, job.id, {
+      filePath: 'src/app.ts',
+      pass: 'main',
+      fileStatus: 'done',
+      modelUsed: 'test-model',
+      modelProvider: 'test-provider',
+      diffLineCount: 1,
+      diffInput: 'diff',
+      rawAiOutput: '{}',
+      parsedComments: [
+        comment({ title: 'Doubly failing', category: 'quality', existingCode: 'nonexistent.code.here', line: 1, position: 1 }),
+        comment({ title: 'Rule only', category: 'quality', existingCode: 'console.log(1);', line: 2, position: 2 }),
+        comment({ title: 'Survivor', category: 'security', severity: 'P1', existingCode: 'console.log(1);', line: 3, position: 3 }),
+      ],
+      inputTokens: 10,
+      outputTokens: 5,
+      durationMs: 1,
+      verdict: 'comment',
+      fileSummary: 'summary',
+      overallCorrectness: 'issues found',
+      confidenceScore: 0.9,
+      errorMessage: null,
+    });
+
+    await runWithDb(env, async () => {
+      const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-lrn-order-1', phase: 'finalize' });
+      expect(res).toEqual({ action: 'ack' });
+    });
+
+    // Only the survivor posts.
+    expect(captured).toHaveLength(1);
+    expect(captured[0].body).toContain('Survivor');
+    expect(captured[0].body).not.toContain('Doubly failing');
+    expect(captured[0].body).not.toContain('Rule only');
+
+    const detail = await getJobDetail(env, job.id);
+    const audit: any[] = detail!.audit;
+
+    // Audit sample titles pass through redactFindingTitle (privacy boundary T-26-02 / D-06), so
+    // attribution is keyed on `line` — the one per-finding discriminator the sample preserves
+    // verbatim. Line 1 = "Doubly failing", line 2 = "Rule only", line 3 = "Survivor".
+    const sampleLines = (events: any[]) => events.flatMap((e: any) => e.sample.map((s: any) => s.line));
+
+    // EVID-02 claims the doubly-failing finding — it never reaches the suppression pass.
+    const hardDropEvents = audit.filter((e: any) => e.stage === 'evidence_hard_dropped');
+    expect(hardDropEvents).toHaveLength(1);
+    expect(hardDropEvents[0].droppedCount).toBe(1);
+    expect(sampleLines(hardDropEvents)).toEqual([1]);
+
+    // The learned rule claims ONLY the evidence-clean match. droppedCount must not double-count
+    // the finding EVID-02 already removed, and line 1 must not appear in this stage at all.
+    const suppressedEvents = audit.filter((e: any) => e.stage === 'learned_rule_suppressed');
+    expect(suppressedEvents).toHaveLength(1);
+    expect(suppressedEvents[0].droppedCount).toBe(1);
+    expect(sampleLines(suppressedEvents)).toEqual([2]);
+    expect(suppressedEvents[0].sample[0].matched_rule).toBe(ruleId);
+
+    createSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
 });
