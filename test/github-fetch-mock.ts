@@ -108,6 +108,22 @@ export type GitHubFetchMockFixtures = {
    * thread fixtures with `author.databaseId: GH_BOT_USER_ID (99999)` pass the immutable-id filter.
    */
   botUserId?: number;
+  /**
+   * Response for GET /repos/{owner}/{repo}/pulls/comments/{id} (LRN-01, G-28-3). `status` defaults
+   * to 200. `position` is GitHub's DIFF OFFSET — the coordinate `createReview` posts by — and is
+   * surfaced separately from `line` because the two diverge in practice. Use `status: 404` to
+   * exercise the deleted-comment branch (the client maps 404 to null).
+   *
+   * When this fixture is OMITTED the route is not registered at all and the request falls through
+   * to the terminal 404, so every other spec's behavior is byte-identical.
+   */
+  reviewCommentResponse?: {
+    status?: number;
+    path?: string;
+    line?: number | null;
+    position?: number | null;
+    body?: string;
+  };
 };
 
 /**
@@ -266,6 +282,36 @@ export function installGitHubFetchMock(fixtures: GitHubFetchMockFixtures) {
     // mock 404s this route (:below), so the reply adapter test cannot exercise the endpoint (Codex MEDIUM).
     if (method === 'POST' && url.pathname === `${repoPrefix}/pulls/${fixtures.prNumber}/comments`) {
       return json({ id: replyCommentId, user: { id: commentUserId, login: commentUserLogin } }, 201);
+    }
+
+    // GET single review comment by id (LRN-01, G-28-3). Matches the LITERAL `comments` segment so it
+    // can never shadow `pulls/{prNumber}` (exact-equality match above) or `pulls/{prNumber}/reviews`
+    // (exact-equality match above), and it is GET-only so the POST reply route above is untouched.
+    // Registered ONLY when the fixture is supplied; otherwise the request falls through to the
+    // terminal 404 and every pre-existing spec behaves byte-identically (NREG-01).
+    if (
+      method === 'GET' &&
+      fixtures.reviewCommentResponse &&
+      url.pathname.startsWith(`${repoPrefix}/pulls/comments/`) &&
+      /\/pulls\/comments\/\d+$/.test(url.pathname)
+    ) {
+      const fixture = fixtures.reviewCommentResponse;
+      const status = fixture.status ?? 200;
+      if (status === 404) {
+        return json({ message: 'Not Found' }, 404);
+      }
+      if (status >= 400) {
+        return json({ message: `Review comment fetch error ${status}` }, status);
+      }
+      return json(
+        {
+          path: fixture.path ?? 'src/example.ts',
+          line: fixture.line ?? null,
+          position: fixture.position ?? null,
+          body: fixture.body ?? 'default review comment body',
+        },
+        status,
+      );
     }
 
     // GET list: single-page fixture. commentListItems may include a user-less entry so a spec can
