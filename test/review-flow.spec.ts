@@ -13,6 +13,7 @@ import { defaultRepoConfig, REVIEW_CONCURRENCY_LIMITS, type ParsedReviewComment,
 import { runWithDb, queryRows } from '@server/db/client';
 import { buildWalkthroughData, editWalkthroughComment, postWalkthroughPlaceholder, type WalkthroughReviewRow } from '@server/core/walkthrough';
 import { FormatterService } from '@server/services/formatter';
+import { renderFileDiff } from '@server/prompts/file-review';
 import type { VcsProvider } from '@server/vcs/types';
 
 const sha = (char: string) => char.repeat(40);
@@ -129,6 +130,20 @@ vi.mock('@server/services/model', () => {
             return {
                 rawText: '{"prune": []}',
                 modelUsed: 'critic-model',
+                inputTokens: 5,
+                outputTokens: 2,
+            };
+        }
+        // Phase 19 (verify-fixes) and Phase 27 SEC-XDIFF-01 (cross-file security) both route their
+        // single whole-set model call through callVerifierRaw. It MUST exist on this mock even though
+        // every consuming test overrides it: those tests use vi.spyOn(ModelService.prototype, ...),
+        // which throws "property is not defined on the object" when the method is absent rather than
+        // falling back to the real module. Default returns an empty finding set — the inert, fail-safe
+        // shape parseCrossFileSecurityResponse expects, mirroring critiqueFindings' empty-prune default.
+        async callVerifierRaw() {
+            return {
+                rawText: '{"findings": []}',
+                modelUsed: 'verifier-model',
                 inputTokens: 5,
                 outputTokens: 2,
             };
@@ -4599,7 +4614,11 @@ dbDescribe('Review Flow Lifecycle', () => {
           inputTokens: 10,
           outputTokens: 5,
           rawText: '{}',
-          userPrompt: '',
+          // review.ts persists `diffInput: response.userPrompt`, and the cross-file phase
+          // re-parses that column with parseUnifiedDiff to rebuild its whole-diff input. An empty
+          // string here leaves every main row with no diff_input, so the phase short-circuits on
+          // its `no_diff_input` skip branch and never reaches the model call under test.
+          userPrompt: renderFileDiff(params.file),
         }));
 
       // Mock callVerifierRaw to return cross-file findings with cross_references
@@ -4610,7 +4629,12 @@ dbDescribe('Review Flow Lifecycle', () => {
             body: 'The auth middleware does not protect the API route.',
             severity: 'P0',
             category: 'security',
-            confidence_score: 0.95,
+            // `path` is REQUIRED by crossFileSecurityFindingSchema and `confidence` is the key it
+            // reads (not `confidence_score`). Without `path` the finding is dropped by the parser's
+            // per-item tolerant filter and the phase persists 'skipped'/all_findings_invalid.
+            path: 'src/auth/middleware.ts',
+            line: 1,
+            confidence: 0.95,
             cross_references: [
               { path: 'src/routes/api.ts', line: 1, relationship: 'missing_auth_guard' },
               { path: 'src/auth/middleware.ts', line: 1, relationship: 'weak_auth_check' },
@@ -4733,7 +4757,9 @@ dbDescribe('Review Flow Lifecycle', () => {
         inputTokens: 10,
         outputTokens: 5,
         rawText: '{}',
-        userPrompt: '',
+        // Must be a re-parseable diff (see the multi-file test above): the phase needs to reach
+        // the model call for the fail-open path under test to be exercised at all.
+        userPrompt: renderFileDiff(params.file),
       }));
 
       // Cross-file model call throws
@@ -5259,7 +5285,10 @@ dbDescribe('learned rule suppression', () => {
             enabled: true,
             learned_rules: [
               {
-                id: 'rule-quality-app',
+                // `learnedRuleSchema.id` is `z.uuid()` (production ids come from
+                // crypto.randomUUID), so a readable slug here fails configSnapshot
+                // validation inside insertJob before the test body ever runs.
+                id: '11111111-1111-4111-8111-111111111111',
                 category: 'quality',
                 file_pattern: 'src/app.ts',
                 status: 'active',
@@ -5316,7 +5345,7 @@ dbDescribe('learned rule suppression', () => {
     const suppressedEvents = audit.filter((e: any) => e.stage === 'learned_rule_suppressed');
     expect(suppressedEvents.length).toBeGreaterThanOrEqual(1);
     expect(suppressedEvents[0].droppedCount).toBe(1);
-    expect(suppressedEvents[0].sample[0].matched_rule).toBe('rule-quality-app');
+    expect(suppressedEvents[0].sample[0].matched_rule).toBe('11111111-1111-4111-8111-111111111111');
 
     createSpy.mockRestore();
     getDiffSpy.mockRestore();
@@ -5356,7 +5385,10 @@ dbDescribe('learned rule suppression', () => {
             enabled: false, // disabled
             learned_rules: [
               {
-                id: 'rule-quality-app',
+                // `learnedRuleSchema.id` is `z.uuid()` (production ids come from
+                // crypto.randomUUID), so a readable slug here fails configSnapshot
+                // validation inside insertJob before the test body ever runs.
+                id: '11111111-1111-4111-8111-111111111111',
                 category: 'quality',
                 file_pattern: 'src/app.ts',
                 status: 'active',
@@ -5447,7 +5479,7 @@ dbDescribe('learned rule suppression', () => {
             enabled: true,
             learned_rules: [
               {
-                id: 'rule-pending',
+                id: '22222222-2222-4222-8222-222222222222',
                 category: 'quality',
                 file_pattern: 'src/app.ts',
                 status: 'pending', // pending, not active
