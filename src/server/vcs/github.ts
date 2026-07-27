@@ -1,4 +1,5 @@
 import { GitHubService } from '../services/github';
+import { GitHubError } from '../core/github';
 import type { AppBindings } from '../env';
 import type {
   VcsCapabilities,
@@ -7,6 +8,7 @@ import type {
   VcsPullRequest,
   VcsReviewThread,
   VcsSubmitReviewInput,
+  VcsTreeListing,
   VcsUpdateStatusCheckInput,
 } from './types';
 
@@ -81,6 +83,49 @@ export class GithubAdapter implements VcsProvider {
   // passes through as `''`; non-2xx throws GitHubError.
   async getCompareDiff(owner: string, repo: string, base: string, head: string): Promise<string> {
     return this.gh.getCompareDiff(owner, repo, base, head);
+  }
+
+  // QA-IDX-01 (D-09): default-branch blob listing. Thin delegation -- no new REST logic lives here.
+  //
+  // The WHOLE enumeration costs 2 SUBREQUESTS on GitHub: one repository read for the default branch,
+  // then one recursive tree read (the `git/trees` `tree_sha` segment accepts a ref name, so the
+  // branch name goes straight in). That is why the GitHub side needs no page budget at all while the
+  // Bitbucket side does.
+  //
+  // Only `type === 'blob'` entries survive: `'tree'` entries are directories (nothing to index) and
+  // `'commit'` entries are SUBMODULE pointers whose content lives in a different repository, so
+  // fetching them as files would 404 or -- worse -- index a gitlink sha as source text.
+  async listDefaultBranchTree(owner: string, repo: string): Promise<VcsTreeListing> {
+    const metadata = await this.gh.getRepositoryMetadata(owner, repo);
+    const branch = metadata.default_branch ?? metadata.master_branch;
+    if (typeof branch !== 'string' || branch.length === 0) {
+      // Throw rather than guessing 'main'/'master'. Indexing a branch the operator did not choose is
+      // a worse failure than a loud one, and it is symmetric with the Bitbucket adapter's
+      // absent-`mainbranch` behavior (NREG-02).
+      throw new GitHubError(
+        502,
+        JSON.stringify({ default_branch: metadata.default_branch, master_branch: metadata.master_branch }),
+        `/repos/${owner}/${repo}`,
+        `GitHub repository ${owner}/${repo} reported no default branch (neither default_branch nor master_branch)`,
+      );
+    }
+
+    const tree = await this.gh.getTree(owner, repo, branch);
+    const paths: string[] = [];
+    for (const entry of tree.tree ?? []) {
+      if (entry?.type !== 'blob') continue;
+      if (typeof entry.path !== 'string' || entry.path.length === 0) continue;
+      paths.push(entry.path);
+    }
+
+    return {
+      ref: branch,
+      sha: tree.sha,
+      paths,
+      // Surfaced from the provider response, NEVER hardcoded false: `truncated: true` means the
+      // returned set is an arbitrary prefix, not the whole tree (see vcs/types.ts).
+      truncated: tree.truncated === true,
+    };
   }
 
   // PROV-02 (D-05/D-06/D-07): unresolved-bot-thread listing. Pulls every page from the GraphQL

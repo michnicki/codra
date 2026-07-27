@@ -92,6 +92,22 @@ export type VcsReviewThread = {
 };
 
 /**
+ * Provider-agnostic default-branch tree listing (QA-IDX-01, D-09). Flat by design: the codebase
+ * index only ever needs "which blobs exist, at which commit", so the shape deliberately does NOT
+ * expose per-entry modes, sizes or a nested directory structure that would leak GitHub's
+ * `git/trees` payload (or Bitbucket's `/src` entry shape) into the shared contract.
+ *
+ * `ref` is the resolved default-branch NAME; `sha` is the commit that branch pointed at when the
+ * listing was taken. See `VcsProvider.listDefaultBranchTree` for the `truncated` semantics.
+ */
+export type VcsTreeListing = {
+  ref: string;
+  sha: string;
+  paths: string[];
+  truncated: boolean;
+};
+
+/**
  * Per-adapter capability flags (D-03/D-04). The block is the single extension point for future
  * capability flags (Phase 8 D-09). `supportsThreadListing` and `supportsThreadResolution` are
  * both `static: true` for GitHub and `static: true` for Bitbucket today, but Bitbucket's
@@ -144,6 +160,51 @@ export interface VcsProvider {
    * `context=3&topic=true` (R-5).
    */
   getCompareDiff(owner: string, repo: string, base: string, head: string): Promise<string>;
+
+  /**
+   * List the blob paths of the repository's DEFAULT branch (QA-IDX-01, D-09).
+   *
+   * The adapter RESOLVES THE DEFAULT BRANCH ITSELF. There is no webhook payload on the
+   * dashboard-triggered index-build path (D-07: the build is started by a button, not by a push),
+   * so the caller has no branch to supply. The resolved commit sha is returned ALONGSIDE the paths
+   * so the caller can persist `indexed_sha` (D-12) without a second round trip.
+   *
+   * `paths` contains BLOBS ONLY -- no directories -- as repo-root-absolute paths, UNSORTED. GitHub
+   * `tree` entries (directories) and `commit` entries (submodules) are dropped; Bitbucket
+   * `commit_directory` entries are dropped. A submodule's content is not in this repository, so an
+   * indexer must never try to read it as a file.
+   *
+   * `truncated` is true when the provider could not return the whole tree within its own limits:
+   * GitHub sets it above 100 000 entries or 7 MB on the recursive `git/trees` endpoint; the
+   * Bitbucket adapter sets it when its internal page budget is exhausted. A truncated result is
+   * USABLE but PARTIAL -- never returned silently, mirroring the D-09 "empty string is a real
+   * result" convention on `getCompareDiff`.
+   *
+   * ORDERING CONSEQUENCE OF TRUNCATION (read this before adding a max-files cap). The PROVIDER
+   * chooses which prefix of the tree to return, and that choice is ARBITRARY -- it is not
+   * priority-ordered in any way the consumer can influence. A consumer's priority sort (`scorePath`)
+   * therefore runs AFTER the truncation, so on a repository large enough to truncate, a
+   * high-priority path (an auth or crypto file) can be absent from the candidate pool ENTIRELY and
+   * no amount of downstream ranking recovers it. Two alternatives were considered and rejected:
+   * reordering the prefix server-side is impossible because the provider already made the cut, and
+   * re-walking per directory to beat truncation would cost thousands of subrequests against a
+   * 50-per-invocation budget. The ACCEPTED MITIGATION is disclosure -- `truncated` is persisted on
+   * the build-state row and rendered by the dashboard panel as a partial-index indication -- so an
+   * operator on a very large repository knows the index is a partial view rather than believing it
+   * is complete.
+   *
+   * Throws on any non-2xx that is NOT a documented degradation, so a real failure is not masked.
+   * That includes a provider that reports no default branch at all: both adapters throw rather than
+   * guessing a conventional branch name, because indexing a branch the operator did not choose is a
+   * worse failure than a loud one.
+   *
+   * BOTH adapters implement this (NREG-02) and there is deliberately NO capability flag. Neither
+   * provider LACKS the capability -- GitHub does it in one recursive call, Bitbucket in a paginated
+   * `/src` walk -- so they differ only in COST, which `truncated` plus the adapter-internal page
+   * budget already express. A flag here would be a flag no consumer ever branches on, exactly what
+   * the `VcsCapabilities` doc comment warns against.
+   */
+  listDefaultBranchTree(owner: string, repo: string): Promise<VcsTreeListing>;
 
   /**
    * Resolve the bot's own immutable identity for the comment self-filter (Phase 11, CMD-07). Returns
