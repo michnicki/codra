@@ -81,6 +81,19 @@ const SOURCE_SCAN_ALLOWLIST = new Set<string>([
 // listing, file content, and resolution behind its default-off config and provider capabilities.
 // Stored as `{ file -> Set<identifier> }` so the scan grants only the documented primitive to each
 // file rather than a blanket file-level pass.
+//
+// Phase 29 carve-out (QA-IDX-01 / D-08 / D-09): `src/server/core/code-index-build.ts` is the codebase
+// index build, which runs on its OWN Workflow binding (INDEX_WORKFLOW) and is not part of the review
+// flow at all. It consumes exactly two Phase-17 primitives, both of which 29-CONTEXT.md names as
+// deliberate reuse rather than new provider work: `getFileContent` fetches each file it indexes, and
+// `getCompareDiff` derives the changed-path set for a push-triggered incremental refresh ("D-08's
+// incremental refresh is a getCompareDiff call, not new provider work").
+//
+// GRANTING THIS DOES NOT WEAKEN THE INVARIANT THIS SPEC PROTECTS. SC4/NREG-01 exists so review OUTPUT
+// stays byte-identical; this consumer never runs inside a review job, is gated off by default
+// (`review.interactive.qa.index.enabled` defaults to false), and writes only to the code_index_* tables.
+// The carve-out is per-identifier rather than file-level, so a future edit that reached for
+// `resolveThread` or `getUnresolvedBotThreads` from the index build would still fail closed.
 const SC4_ALLOWLISTED_REVIEW_CALL_SITES = new Map<string, ReadonlySet<string>>([
   ['src/server/core/review.ts', new Set(['getUnresolvedBotThreads', 'getCompareDiff'])],
   ['src/server/core/rounds.ts', new Set(['getCompareDiff'])],
@@ -88,6 +101,7 @@ const SC4_ALLOWLISTED_REVIEW_CALL_SITES = new Map<string, ReadonlySet<string>>([
     'src/server/core/verify-fixes.ts',
     new Set(['getFileContent', 'getUnresolvedBotThreads', 'resolveThread']),
   ],
+  ['src/server/core/code-index-build.ts', new Set(['getFileContent', 'getCompareDiff'])],
 ]);
 
 function collectProductionFiles(dir: string): string[] {

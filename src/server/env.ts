@@ -28,13 +28,17 @@ export interface AppBindings {
   APP_KV: KVNamespace;
   REVIEW_QUEUE: QueueProducer<ReviewJobMessage>;
   REVIEW_WORKFLOW: Workflow;
-  // Phase 29 / QA-IDX-01 (D-06): the SEPARATE codebase-index build Workflow, deliberately not a new
-  // payload kind inside REVIEW_WORKFLOW (Phase 20.1 spent eight plans hardening that dispatch; an
+  // Phase 29 / QA-IDX-01 (D-06 / D-06-R): the SEPARATE codebase-index build Workflow, deliberately not
+  // a new payload kind inside REVIEW_WORKFLOW (Phase 20.1 spent eight plans hardening that dispatch; an
   // unrelated `index` branch is exactly the routing hole those BLOCKERs documented).
-  // Declared OPTIONAL in plan 29-01 on purpose: the wrangler.jsonc binding, the IndexWorkflow class
-  // and the cf-typegen regeneration land in plan 29-05, so until then the binding genuinely is absent
-  // at runtime and a required property would be a type-level lie. 29-05 makes it required.
-  INDEX_WORKFLOW?: Workflow;
+  //
+  // NOW REQUIRED (plan 29-05). It was declared OPTIONAL by plan 29-01 because the wrangler.jsonc
+  // binding, the IndexWorkflow class and the cf-typegen regeneration had not landed yet, so a required
+  // property would have been a type-level lie. All four wiring sites now exist -- the `codra-index-workflow`
+  // entry in wrangler.jsonc, this line, `export { IndexWorkflow }` in src/server/index.ts, and the
+  // regenerated src/server/worker-env.d.ts -- so the binding is genuinely always present at runtime and
+  // the `?` would only force pointless null-checks on callers that create instances.
+  INDEX_WORKFLOW: Workflow;
   ASSETS: AssetsBinding;
   HYPERDRIVE: HyperdriveBinding;
   APP_PRIVATE_KEY: string;

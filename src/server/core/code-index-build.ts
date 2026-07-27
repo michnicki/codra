@@ -382,6 +382,26 @@ export async function runIndexBuild(
     let buildingSha = enumerated.sha;
     let indexedRef = enumerated.ref;
 
+    if (!isFirstInvocation) {
+      const state = await getCodeIndexState(env, { repositoryId: params.repositoryId });
+      buildingSha = state?.building_sha ?? buildingSha;
+      indexedRef = state?.indexed_ref ?? indexedRef;
+    }
+
+    // RESUMABILITY (D-05): read at the IN-PROGRESS sha, never at `indexed_sha`. At the in-progress sha
+    // this answers "what has THIS build already fetched"; at the last completed sha it would answer
+    // "what did the PREVIOUS build fetch", so a resumed build would skip files whose content has since
+    // changed and quietly keep serving stale windows for them.
+    //
+    // Read BEFORE the destructive reset below, because it is also the second of the two guards that
+    // stop that reset from destroying live progress.
+    const alreadyIndexed = new Set(
+      await listIndexedPathsForSha(env, {
+        repositoryId: params.repositoryId,
+        indexedSha: buildingSha,
+      }),
+    );
+
     if (isFirstInvocation) {
       await markCodeIndexBuildStarted(env, {
         repositoryId: params.repositoryId,
@@ -392,15 +412,32 @@ export async function runIndexBuild(
         leaseSeconds: INDEX_BUILD_LEASE_SECONDS,
       });
 
-      // THE ORDERING HERE IS LOAD-BEARING. `truncateCodeIndexForRepo` and
-      // `deleteCodeIndexChunksForPaths` are LEASE-AGNOSTIC PRIMITIVES by contract (see the header
-      // comment on that section of db/code-index.ts) -- they neither check nor take the lease, because
-      // three callers have three different lease stories. Nothing but this call site prevents a
-      // coalesced duplicate from truncating an index a live build is still writing, which is why the
-      // destructive step sits AFTER the successful claim above and inside the first-invocation branch.
-      // Running it on a continuation would delete the progress the earlier invocations just made and
-      // loop the build forever.
-      if (params.mode === 'full') {
+      // THE ORDERING HERE IS LOAD-BEARING, AND IT IS GUARDED TWICE.
+      //
+      // `truncateCodeIndexForRepo` and `deleteCodeIndexChunksForPaths` are LEASE-AGNOSTIC PRIMITIVES by
+      // contract (see the header comment on that section of db/code-index.ts) -- they neither check nor
+      // take the lease, because three callers have three different lease stories. Nothing but this call
+      // site prevents a coalesced duplicate from truncating an index a live build is still writing,
+      // which is why the destructive step sits AFTER the successful claim above.
+      //
+      // GUARD 1 is `isFirstInvocation` (continuation === 0). GUARD 2 is "no progress rows exist at the
+      // sha we are about to build". Guard 2 is not redundant belt-and-braces: the fresh-instance handoff
+      // in workflows/index-build.ts creates a NEW Workflow instance for a build that is already half
+      // done, and if that handoff ever passed continuation 0 -- the natural-looking thing to write --
+      // guard 1 alone would truncate away everything the previous instance indexed and the build would
+      // restart from zero on every handoff, i.e. never finish on a repository large enough to need one.
+      // Guard 2 makes the destructive reset safe regardless of what a future caller puts on the payload.
+      //
+      // Consequence worth naming: re-triggering a full rebuild at a sha that already has partial
+      // progress RESUMES it rather than starting over. That is the D-05 resumability contract, not a
+      // missed truncate -- the stale-rows case a rebuild actually needs to clear is a PREVIOUS sha's
+      // rows, and those have no progress row at this sha so guard 2 lets the truncate through.
+      if (alreadyIndexed.size > 0) {
+        log.info('Resuming an interrupted codebase index build; skipping the destructive reset', {
+          alreadyIndexedAtBuildingSha: alreadyIndexed.size,
+          buildingSha,
+        });
+      } else if (params.mode === 'full') {
         const removed = await truncateCodeIndexForRepo(env, { repositoryId: params.repositoryId });
         log.info('Codebase index cleared for full rebuild', {
           deletedChunks: removed.deletedChunks,
@@ -412,22 +449,8 @@ export async function runIndexBuild(
           paths: enumerated.candidates,
         });
       }
-    } else {
-      const state = await getCodeIndexState(env, { repositoryId: params.repositoryId });
-      buildingSha = state?.building_sha ?? buildingSha;
-      indexedRef = state?.indexed_ref ?? indexedRef;
     }
 
-    // RESUMABILITY (D-05): read at the IN-PROGRESS sha, never at `indexed_sha`. At the in-progress sha
-    // this answers "what has THIS build already fetched"; at the last completed sha it would answer
-    // "what did the PREVIOUS build fetch", so a resumed build would skip files whose content has since
-    // changed and quietly keep serving stale windows for them.
-    const alreadyIndexed = new Set(
-      await listIndexedPathsForSha(env, {
-        repositoryId: params.repositoryId,
-        indexedSha: buildingSha,
-      }),
-    );
     const remaining = enumerated.candidates.filter((path) => !alreadyIndexed.has(path));
 
     if (remaining.length === 0) {
