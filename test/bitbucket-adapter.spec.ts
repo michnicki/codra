@@ -675,3 +675,70 @@ describe('BitbucketAdapter (VcsProvider mapping)', () => {
     expect(comments.every((c) => c.author.id !== '')).toBe(true);
   });
 });
+
+// G-28-3 / NREG-02: Bitbucket has NO diff offset — it anchors inline comments by
+// `inline.to ?? inline.from`, a LINE, on both the post and the read path. The adapter must therefore
+// report `position: null` explicitly rather than omitting the field, so the enrichment lookup
+// resolves Bitbucket on `review_comments.line` and never borrows GitHub's coordinate.
+describe('BitbucketAdapter.getInlineCommentDetails (LRN-01 coordinate contract)', () => {
+  it('returns the line from inline.to with position explicitly null', async () => {
+    installBitbucketFetchMock({
+      responseSequence: [
+        {
+          status: 200,
+          body: {
+            id: 77,
+            inline: { path: 'src/server/core/commands.ts', to: 120, from: 118 },
+            content: { raw: 'inline finding body' },
+          },
+        },
+      ],
+    });
+    const { adapter } = buildAdapter();
+
+    const details = await adapter.getInlineCommentDetails(WORKSPACE, REPO, PR_NUMBER, '77');
+    expect(details).toEqual({
+      path: 'src/server/core/commands.ts',
+      line: 120,
+      position: null,
+      body: 'inline finding body',
+    });
+    // Explicit, not merely absent: `position` must be present and null.
+    expect(details).toHaveProperty('position', null);
+  });
+
+  it('falls back to inline.from when inline.to is absent, still with position null', async () => {
+    installBitbucketFetchMock({
+      responseSequence: [
+        {
+          status: 200,
+          body: {
+            id: 78,
+            inline: { path: 'src/server/db/reject-feedback.ts', from: 96 },
+            content: { raw: 'deleted-side finding' },
+          },
+        },
+      ],
+    });
+    const { adapter } = buildAdapter();
+
+    const details = await adapter.getInlineCommentDetails(WORKSPACE, REPO, PR_NUMBER, '78');
+    expect(details).toEqual({
+      path: 'src/server/db/reject-feedback.ts',
+      line: 96,
+      position: null,
+      body: 'deleted-side finding',
+    });
+  });
+
+  it('returns null for a comment with no inline object (a general PR comment)', async () => {
+    installBitbucketFetchMock({
+      responseSequence: [
+        { status: 200, body: { id: 79, content: { raw: 'just a top-level comment' } } },
+      ],
+    });
+    const { adapter } = buildAdapter();
+
+    expect(await adapter.getInlineCommentDetails(WORKSPACE, REPO, PR_NUMBER, '79')).toBeNull();
+  });
+});
