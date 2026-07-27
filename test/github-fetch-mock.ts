@@ -124,6 +124,44 @@ export type GitHubFetchMockFixtures = {
     position?: number | null;
     body?: string;
   };
+  /**
+   * Response for GET /repos/{owner}/{repo} (QA-IDX-01, D-09) -- the repository read that resolves
+   * the default branch. `status` defaults to 200. Supply `body: {}` to exercise the
+   * no-default-branch throw, or `{ master_branch: 'master' }` to exercise the legacy alias.
+   *
+   * Registered ONLY when supplied, so every pre-existing spec falls through to the terminal 404
+   * exactly as before (NREG-01).
+   */
+  repositoryResponse?: {
+    status?: number;
+    body?: { default_branch?: string; master_branch?: string };
+  };
+  /**
+   * Response for GET /repos/{owner}/{repo}/branches/{branch} (QA-IDX-01, D-12) -- the branch read
+   * that resolves the head COMMIT sha (the trees endpoint only echoes a TREE sha). `status` defaults
+   * to 200. Supply `body: {}` to exercise the missing-commit-sha throw, or `status: 404` for the
+   * no-such-branch path.
+   *
+   * Registered ONLY when supplied (NREG-01).
+   */
+  branchResponse?: {
+    status?: number;
+    body?: { commit?: { sha?: string } };
+  };
+  /**
+   * Response for GET /repos/{owner}/{repo}/git/trees/{treeIsh}?recursive=1 (QA-IDX-01, D-09).
+   * `status` defaults to 200. `truncated` flows straight through to the listing, and `tree` entries
+   * carry the real `type` discriminator so a spec can prove directories ('tree') and submodules
+   * ('commit') are dropped.
+   *
+   * Registered ONLY when supplied (NREG-01).
+   */
+  treeResponse?: {
+    status?: number;
+    sha?: string;
+    truncated?: boolean;
+    tree?: Array<{ path: string; type: 'blob' | 'tree' | 'commit'; sha?: string; size?: number }>;
+  };
 };
 
 /**
@@ -220,6 +258,44 @@ export function installGitHubFetchMock(fixtures: GitHubFetchMockFixtures) {
         return new Response(fixture.body, { status, headers });
       }
       return new Response(JSON.stringify(fixture.body), { status, headers });
+    }
+
+    // --- QA-IDX-01: GET /repos/{owner}/{repo} and GET .../git/trees/{treeIsh}?recursive=1 (D-09) ---
+    // Both are registered ONLY when their fixture is supplied so every other spec's route table is
+    // byte-identical. The tree route matches the literal `/git/trees/` segment, which cannot collide
+    // with any existing route.
+    if (method === 'GET' && fixtures.repositoryResponse && url.pathname === repoPrefix) {
+      const fixture = fixtures.repositoryResponse;
+      const status = fixture.status ?? 200;
+      if (status >= 400) {
+        return json({ message: `Repository read error ${status}` }, status);
+      }
+      return json(fixture.body ?? {}, status);
+    }
+
+    if (method === 'GET' && fixtures.branchResponse && url.pathname.startsWith(`${repoPrefix}/branches/`)) {
+      const fixture = fixtures.branchResponse;
+      const status = fixture.status ?? 200;
+      if (status >= 400) {
+        return json({ message: `Branch read error ${status}` }, status);
+      }
+      return json(fixture.body ?? { commit: { sha: 'commitsha000000000' } }, status);
+    }
+
+    if (method === 'GET' && fixtures.treeResponse && url.pathname.startsWith(`${repoPrefix}/git/trees/`)) {
+      const fixture = fixtures.treeResponse;
+      const status = fixture.status ?? 200;
+      if (status >= 400) {
+        return json({ message: `Tree read error ${status}` }, status);
+      }
+      return json(
+        {
+          sha: fixture.sha ?? 'treesha0000000000',
+          truncated: fixture.truncated ?? false,
+          tree: fixture.tree ?? [],
+        },
+        status,
+      );
     }
 
     if (method === 'GET' && url.pathname === `${repoPrefix}/pulls/${fixtures.prNumber}`) {

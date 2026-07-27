@@ -1,6 +1,6 @@
 import type { AppBindings } from '@server/env';
 import { logger } from '@server/core/logger';
-import { BitbucketClient } from '@server/core/bitbucket';
+import { BitbucketClient, BitbucketError } from '@server/core/bitbucket';
 import { decryptSecret } from '@server/core/crypto';
 import { parseUnifiedDiff, getValidNewLines, type FileDiff } from '@server/core/diff';
 import { getVcsCredentialSecrets } from '@server/db/vcs-credentials';
@@ -17,6 +17,7 @@ import type {
   VcsReviewComment,
   VcsReviewThread,
   VcsSubmitReviewInput,
+  VcsTreeListing,
   VcsUpdateStatusCheckInput,
 } from './types';
 
@@ -202,6 +203,42 @@ export class BitbucketAdapter implements VcsProvider {
   // (R-5). Empty success passes through as `''`; non-2xx throws BitbucketError.
   async getCompareDiff(owner: string, repo: string, base: string, head: string): Promise<string> {
     return this.client.getCompareDiff(owner, repo, base, head);
+  }
+
+  // QA-IDX-01 (D-09): default-branch blob listing. Thin delegation -- three client reads, no walk
+  // logic here: `mainbranch.name`, that branch's commit hash, then the paginated `/src` walk.
+  //
+  // Cost asymmetry versus GitHub is REAL and is what `truncated` exists to express: GitHub finishes
+  // in 2 subrequests, Bitbucket needs 2 + one page per ~100 entries per directory level. The walk
+  // owns its own page cap and live-budget check, so this method never needs a capability flag
+  // (NREG-02) -- see the contract in vcs/types.ts.
+  async listDefaultBranchTree(owner: string, repo: string): Promise<VcsTreeListing> {
+    const metadata = await this.client.getRepositoryMetadata(owner, repo);
+    const branch = metadata.mainbranch?.name;
+    if (typeof branch !== 'string' || branch.length === 0) {
+      // Throw rather than guessing 'main'/'master'. Deliberately SYMMETRIC with the GitHub adapter,
+      // which also throws rather than guessing: indexing a branch the operator did not choose is a
+      // worse failure than a loud one.
+      throw new BitbucketError(
+        502,
+        JSON.stringify({ mainbranch: metadata.mainbranch ?? null }),
+        `/repositories/${owner}/${repo}`,
+        `Bitbucket repository ${owner}/${repo} reported no mainbranch name`,
+      );
+    }
+
+    const sha = await this.client.getBranchCommitSha(owner, repo, branch);
+    if (!sha) {
+      throw new BitbucketError(
+        502,
+        JSON.stringify({ branch }),
+        `/repositories/${owner}/${repo}/refs/branches/${branch}`,
+        `Bitbucket branch ${branch} on ${owner}/${repo} reported no target commit hash`,
+      );
+    }
+
+    const { paths, truncated } = await this.client.listSrcTree(owner, repo, branch, this.tracker);
+    return { ref: branch, sha, paths, truncated };
   }
 
   // PROV-02 (D-05/D-06/D-07): unresolved-bot-thread listing. Walks paginated comments, filters to
