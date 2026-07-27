@@ -51,28 +51,64 @@ Plans:
 **Goal:** Cluster `reject` feedback (CMD-05 already captures) by similarity, synthesize suppression rules stored in repo config, dashboard-reviewable before activation. Config-gated (`learning.enabled`, default off).
 **Requirements**: LRN-01
 **Depends on:** Phase 26 (independent of SEC-XDIFF-01, benefits from EVID-02 signal)
-**Plans:** 0/3 plans complete
+**Plans:** 4/4 plans complete
 
 Plans:
 
 **Wave 1**
 
-- [ ] 28-01-PLAN.md — Schema additions (learning config block, audit event, RejectFeedbackRow) + migration 016 + VCS getInlineCommentDetails + reject handler enrichment
+- [x] 28-01-PLAN.md — Schema additions (learning config block, audit event, RejectFeedbackRow) + migration 016 + VCS getInlineCommentDetails + reject handler enrichment
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 28-02-PLAN.md — Core learned-rules.ts (clustering + synthesis + suppression) + finalize wiring + audit event builder + API routes (POST synthesize, PATCH rule status)
+- [x] 28-02-PLAN.md — Core learned-rules.ts (clustering + synthesis + suppression) + finalize wiring + audit event builder + API routes (POST synthesize, PATCH rule status)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 28-03-PLAN.md — Dashboard UI (LearnedRulesPanel + RuleCard) + repo config page integration + audit stage normalization
+- [x] 28-03-PLAN.md — Dashboard UI (LearnedRulesPanel + RuleCard) + repo config page integration + audit stage normalization
+
+**Wave 4** *(gap closure — G-28-3 blocker from 28-UAT.md)*
+
+- [x] 28-04-PLAN.md — Provider-aware coordinate enrichment (GitHub matches review_comments.position, Bitbucket keeps line) + deterministic collision tiebreak + the missing discriminating regression test
 
 ### Phase 29: QA-IDX-01 Codebase-index-backed Q&A
 
 **Goal:** Index default-branch tree into embeddings/keyword index (KV or Postgres) on repo install. Q&A queries index for relevant code beyond PR diff. Index freshness via webhook push events. Config-gated (`qa.index_enabled`, default off).
 **Requirements**: QA-IDX-01
 **Depends on:** Phase 26 (independent, heaviest lift)
-**Plans:** TBD
+**Plans:** 9 plans
+
+> Planning note: the goal line above restates REQUIREMENTS' original wording. Phase 29's locked
+> decisions deliberately narrow it — Postgres native full-text search rather than embeddings (D-01),
+> Postgres rather than KV (D-01), and an explicit dashboard build action rather than a repo-install
+> trigger (D-07). The divergence table in `29-RESEARCH.md` records why each is a satisfaction of the
+> requirement rather than a deviation from it.
+
+Plans:
+
+**Wave 1** *(tracer — verified before any expansion plan starts)*
+
+- [ ] 29-01-PLAN.md — Tracer: migration 018, the pure splitter/chunker, ranked repository-scoped retrieval, and the retrieved-context prompt fence, proven end to end
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 29-02-PLAN.md — Config contract: the `review.interactive.qa.index` block at all three Zod sites, default-off pinned (one-way decision checkpoint)
+- [ ] 29-03-PLAN.md — Ingest seam: `listDefaultBranchTree` on both adapters, the SSRF-guarded Bitbucket `/src` walk, and additive `scorePath` / `isGeneratedContent` extractions
+- [ ] 29-04-PLAN.md — Index refresh, per-file progress, build lease, and the DB guarantee battery (ranking, cross-repository isolation, pathological input)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 29-05-PLAN.md — `IndexWorkflow` on its own `INDEX_WORKFLOW` binding, re-derived subrequest budget, resumable build (one-way decision checkpoint)
+- [ ] 29-07-PLAN.md — Fail-open retrieval inside the read-only Q&A path, with the byte-identical disabled prompt pinned
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [ ] 29-06-PLAN.md — Default-branch push freshness on both providers, including the Bitbucket identity-projection fix that currently rejects `repo:push` before verification (blocking payload-shape verification: both cross-AI reviewers rated the unvalidated GitHub/Bitbucket push payloads the phase's top risk and asked for one real delivery per provider before this plan is considered complete)
+- [ ] 29-08-PLAN.md — Build-trigger and index-status endpoints, session- and CSRF-guarded, with lease coalescing
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
+- [ ] 29-09-PLAN.md — Dashboard index panel, the manual Bitbucket subscription step, and end-to-end human verification
 
 ### Phase 30: ANNO-01 Bitbucket Code Insights annotations
 
