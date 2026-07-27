@@ -512,3 +512,80 @@ describe('GithubAdapter (VcsProvider mapping)', () => {
     }
   });
 });
+
+// G-28-3: GitHub posts inline comments by diff `position` (`createReview` sends
+// `{ path, position, body }`), so the adapter MUST surface that position — the original `as` cast in
+// `core/github.ts getReviewComment` silently dropped it, which made every GitHub reject enrich to
+// NULL. This block runs the FULL chain (stubbed fetch -> GitHubClient -> GitHubService pass-through
+// -> GithubAdapter) that the DB-level specs stub out, so re-dropping `position` fails here.
+describe('getInlineCommentDetails (LRN-01 coordinate contract)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('surfaces the diff position alongside path/line/body', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const { restore } = installGitHubFetchMock(
+      buildFixtures({
+        reviewCommentResponse: {
+          path: 'src/server/core/commands.ts',
+          line: 364,
+          position: 32,
+          body: 'inline finding body',
+        },
+      }),
+    );
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      const details = await adapter.getInlineCommentDetails(OWNER, REPO, PR_NUMBER, '900123');
+
+      expect(details).toEqual({
+        path: 'src/server/core/commands.ts',
+        line: 364,
+        position: 32,
+        body: 'inline finding body',
+      });
+      // Asserted EXPLICITLY: a spec that only checked `line` would not have caught G-28-3.
+      expect(details?.position).toBe(32);
+      expect(details?.position).not.toBeUndefined();
+    } finally {
+      restore();
+    }
+  });
+
+  it('returns null when the comment was deleted (404)', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const { restore } = installGitHubFetchMock(
+      buildFixtures({ reviewCommentResponse: { status: 404 } }),
+    );
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      expect(await adapter.getInlineCommentDetails(OWNER, REPO, PR_NUMBER, '900123')).toBeNull();
+    } finally {
+      restore();
+    }
+  });
+
+  it('returns null for a non-numeric or non-positive commentRef WITHOUT calling the API', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const { calls, restore } = installGitHubFetchMock(
+      buildFixtures({ reviewCommentResponse: { path: 'a.ts', line: 1, position: 1, body: 'b' } }),
+    );
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      expect(await adapter.getInlineCommentDetails(OWNER, REPO, PR_NUMBER, 'not-a-number')).toBeNull();
+      expect(await adapter.getInlineCommentDetails(OWNER, REPO, PR_NUMBER, '0')).toBeNull();
+      expect(await adapter.getInlineCommentDetails(OWNER, REPO, PR_NUMBER, '-5')).toBeNull();
+      // The adapter's guard short-circuits before any transport call.
+      expect(calls).toHaveLength(0);
+    } finally {
+      restore();
+    }
+  });
+});
