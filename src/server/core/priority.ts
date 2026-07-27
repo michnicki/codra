@@ -56,21 +56,46 @@ function countChanges(file: FileDiff): number {
 }
 
 /**
+ * The PATH-DERIVED half of `scoreFile`, callable with nothing but a path (QA-IDX-01, D-09).
+ *
+ * This exists because the codebase index build has a path and NO diff. The obvious alternative --
+ * fabricating a `FileDiff` from full file content so `scoreFile` can be reused directly -- type-checks
+ * and runs, but silently collapses the ranking to keyword tiers only: `countChanges` counts only
+ * `add`/`del` hunk lines, so an all-`context` shim always scores 0 on the size bonus, and the
+ * new/deleted/modified nudge degenerates to the same constant for every file. The result looks like a
+ * priority ordering and is not one. Extracting the path tiers makes the honest half reusable and the
+ * missing half obviously absent.
+ *
+ * Same tier semantics as `scoreFile`: lower-cased once, plain `String.includes` (non-backtracking,
+ * linear -- threat T-15-02-01), each tier applying AT MOST ONCE regardless of how many of its
+ * keywords hit, and additive across tiers (+5 -5 = 0). Weights are locked verbatim by PRIO-01/SC1.
+ */
+export function scorePath(path: string): number {
+  const lowerCasedPath = path.toLowerCase();
+
+  let score = 0;
+
+  // Additive keyword tiers (each tier applies at most once, regardless of how many of its keywords hit).
+  if (SENSITIVE_KEYWORDS.some((kw) => lowerCasedPath.includes(kw))) score += 5;
+  if (LOW_PRIORITY_KEYWORDS.some((kw) => lowerCasedPath.includes(kw))) score -= 5;
+  if (NEVER_REVIEW_KEYWORDS.some((kw) => lowerCasedPath.includes(kw))) score -= 100;
+
+  return score;
+}
+
+/**
  * Score a single file for review priority (PRIO-01). Pure, deterministic, I/O-free. Higher = higher
  * priority. Additive (D-08): keyword tiers stack, so a path matching both a sensitive and a
  * low-priority keyword nets out (+5 -5 = 0). Weights are locked verbatim by PRIO-01/SC1 (D-06).
  *
  * Returns a number ONLY — never drops, filters, or excludes a file (priority is a soft ordering).
+ *
+ * QA-IDX-01: the keyword tiers now live in `scorePath` and this function ADDS the two components
+ * that genuinely need a `FileDiff`. Signature and numeric results are unchanged (NREG-01) and
+ * test/code-index-selection.spec.ts pins them against explicit expected numbers.
  */
 export function scoreFile(file: FileDiff): number {
-  const path = file.path.toLowerCase();
-
-  let score = 0;
-
-  // Additive keyword tiers (each tier applies at most once, regardless of how many of its keywords hit).
-  if (SENSITIVE_KEYWORDS.some((kw) => path.includes(kw))) score += 5;
-  if (LOW_PRIORITY_KEYWORDS.some((kw) => path.includes(kw))) score -= 5;
-  if (NEVER_REVIEW_KEYWORDS.some((kw) => path.includes(kw))) score -= 100;
+  let score = scorePath(file.path);
 
   // Size bonus: saturates at 5 once >=250 lines changed, 0 at no changes.
   score += Math.min(5, countChanges(file) / 50);
