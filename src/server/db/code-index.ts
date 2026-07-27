@@ -12,12 +12,15 @@
 // degraded answer is still a useful answer. A DB module that quietly returned [] on error would make
 // a real outage indistinguishable from an empty index for every future caller.
 //
-// SURFACE IS DELIBERATELY PARTIAL. This plan wires the write path, the ranked read path, and the
-// build-start upsert. The remaining lease, incremental-refresh and completion accessors
-// (claimCodeIndexBuildLease, renewCodeIndexBuildLease, releaseCodeIndexBuildLease,
-// markCodeIndexBuildCompleted, markCodeIndexBuildFailed, listIndexedPathsForSha,
-// markCodeIndexFileIndexed, deleteCodeIndexChunksForPaths, truncateCodeIndexForRepo) land in plan
-// 29-04. Do not read this file as the complete accessor set.
+// SURFACE COMPLETE for both consumers. The write path, the ranked read path, the build-state read,
+// the build lifecycle (start / claim / renew / release / complete / fail), the incremental-refresh and
+// full-rebuild deletes, and the per-file resumability pair are all here. A new accessor should be
+// needed only by a genuinely new consumer, not to finish an existing one.
+//
+// THIS MODULE IMPORTS NOTHING FROM core/ EXCEPT the pure code-index splitter and its weight labels.
+// The codebase's dependency direction is routes -> core -> services -> models/db, so a db/ module
+// reaching back into core/ inverts it. The load-bearing consequence is markCodeIndexBuildFailed:
+// redaction (AUD-01) cannot be performed here, so it is the CALLER's contract -- see that accessor.
 
 import type { AppBindings } from '@server/env';
 import {
@@ -469,5 +472,212 @@ export async function markCodeIndexFileIndexed(
       Math.max(0, Math.floor(input.chunkCount)),
       input.skipReason ?? null,
     ],
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Build lease + terminal state
+//
+// The lease vocabulary mirrors the jobs table's (db/jobs.ts claimJobLease / heartbeatJobLease /
+// releaseJobLease): a claim is a SINGLE conditional statement whose WHERE clause encodes the entire
+// precondition, and success is read off the returned row count -- never from a preceding SELECT, which
+// would open a check-then-act window two concurrent build triggers can both pass through.
+// ---------------------------------------------------------------------------------------------
+
+/** Clamp a caller-supplied lease/renewal window to a whole positive number of seconds. */
+function normalizeLeaseSeconds(leaseSeconds: number): number {
+  return Math.max(1, Math.floor(leaseSeconds));
+}
+
+/**
+ * Take the exclusive build lease for one repository. Returns true when this instance now owns it.
+ *
+ * This is the concurrency guard for a second build start (T-29-04-04): a dashboard press and a push
+ * event can race, and two builds writing the same (repository_id, path, chunk_start) rows at two
+ * different shas produce an index that is half of each commit.
+ *
+ * WHY A LEASE AND NOT JUST WORKFLOW INSTANCE-ID DEDUP: `instance.already_exists` is already treated as
+ * a benign duplicate elsewhere in this codebase, which handles the double-press case -- but a DEAD
+ * instance's id ALSO collides, which is precisely why the review path has to set a fresh-instance flag
+ * during recovery. Instance-id dedup alone therefore turns a crashed build into a permanently
+ * un-restartable one. The durable lease with an expiry is the authoritative guard; the instance-id
+ * dedup is defense in depth on top of it.
+ *
+ * The whole precondition lives in one statement: the INSERT branch covers "no state row at all", and
+ * the ON CONFLICT ... WHERE covers "not building", "the lease has expired", and "this same instance is
+ * re-entering". The last of those is not a convenience -- a Workflow that hibernates and resumes
+ * re-enters with the same instance id, so without it a build would lock ITSELF out of its own lease
+ * and stall until expiry on every single continuation.
+ *
+ * `make_interval(secs => $3::double precision)` is deliberate and VERIFIED, not accidental: cross-AI
+ * review asked whether it is portable, and it was executed against the live test database
+ * (PostgreSQL 17.10) during that review. Do NOT rewrite it to `now() + ($3 || ' seconds')::interval` --
+ * that form builds an interval LITERAL out of a value, where make_interval takes typed seconds.
+ */
+export async function claimCodeIndexBuildLease(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  input: { repositoryId: number; workflowInstanceId: string; leaseSeconds: number },
+): Promise<boolean> {
+  const rows = await queryRows<{ repository_id: number }>(
+    env,
+    `
+      INSERT INTO code_index_state
+        (repository_id, status, workflow_instance_id, lease_expires_at, updated_at)
+      VALUES ($1, 'building', $2, now() + make_interval(secs => $3::double precision), now())
+      ON CONFLICT (repository_id) DO UPDATE SET
+        status = 'building',
+        workflow_instance_id = EXCLUDED.workflow_instance_id,
+        lease_expires_at = EXCLUDED.lease_expires_at,
+        updated_at = now()
+      WHERE code_index_state.status <> 'building'
+         OR code_index_state.lease_expires_at IS NULL
+         OR code_index_state.lease_expires_at <= now()
+         OR code_index_state.workflow_instance_id = $2
+      RETURNING repository_id
+    `,
+    [input.repositoryId, input.workflowInstanceId, normalizeLeaseSeconds(input.leaseSeconds)],
+  );
+  return rows.length > 0;
+}
+
+/**
+ * Extend the lease, but ONLY for the instance that holds it. Returns whether it did.
+ *
+ * The instance match is the whole point: a heartbeat from a build that already lost the lease (because
+ * it stalled past expiry and another build claimed it) must NOT extend the new owner's window.
+ */
+export async function renewCodeIndexBuildLease(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  input: { repositoryId: number; workflowInstanceId: string; leaseSeconds: number },
+): Promise<boolean> {
+  const rows = await queryRows<{ repository_id: number }>(
+    env,
+    `
+      UPDATE code_index_state
+      SET lease_expires_at = now() + make_interval(secs => $3::double precision),
+          updated_at = now()
+      WHERE repository_id = $1
+        AND workflow_instance_id = $2
+      RETURNING repository_id
+    `,
+    [input.repositoryId, input.workflowInstanceId, normalizeLeaseSeconds(input.leaseSeconds)],
+  );
+  return rows.length > 0;
+}
+
+/**
+ * Release the lease AND resolve the status, in one statement, for the owning instance only.
+ *
+ * BOTH halves are needed (29-REVIEWS.md, OpenCode 29-04 #11). Clearing only the lease leaves a row
+ * reading `status = 'building'` with no live lease -- which is exactly the state the operator panel
+ * renders as "a build is running", for as long as nobody rebuilds. The lease expiry guards
+ * CORRECTNESS (a new build can claim), but nothing repairs the DISPLAY. So a row still marked
+ * `building` at release time becomes `idle`.
+ *
+ * The status is forced ONLY from `building`, never from `ready` or `failed`. The terminal accessors run
+ * BEFORE release in the happy and unhappy paths respectively, and their status is the authoritative
+ * outcome; clobbering it to `idle` here would erase a success or failure that was just recorded.
+ */
+export async function releaseCodeIndexBuildLease(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  input: { repositoryId: number; workflowInstanceId: string },
+): Promise<void> {
+  await queryRows(
+    env,
+    `
+      UPDATE code_index_state
+      SET lease_expires_at = NULL,
+          workflow_instance_id = NULL,
+          status = CASE WHEN status = 'building' THEN 'idle' ELSE status END,
+          updated_at = now()
+      WHERE repository_id = $1
+        AND workflow_instance_id = $2
+    `,
+    [input.repositoryId, input.workflowInstanceId],
+  );
+}
+
+/**
+ * Record a successful build: the index now describes `indexedSha` at `indexedRef`.
+ *
+ * This is the ONLY accessor that advances `indexed_sha` to a completed value, and it runs only on
+ * success. An interrupted build therefore never leaves the row claiming a commit it did not finish --
+ * the in-progress commit lives in `building_sha`, which is cleared here, and D-12's "retrieval never
+ * filters by ref" only holds because `indexed_sha` is provenance rather than a query key.
+ *
+ * `continuation_count` is reset so the next build starts with a full continuation budget, and
+ * `last_error` is cleared so a previous failure does not haunt the operator panel after a good build.
+ */
+export async function markCodeIndexBuildCompleted(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  input: {
+    repositoryId: number;
+    indexedRef: string | null;
+    indexedSha: string;
+    fileCount: number;
+    chunkCount: number;
+    truncated: boolean;
+  },
+): Promise<void> {
+  await queryRows(
+    env,
+    `
+      UPDATE code_index_state
+      SET status = 'ready',
+          indexed_ref = $2,
+          indexed_sha = $3,
+          indexed_at = now(),
+          file_count = $4,
+          chunk_count = $5,
+          truncated = $6::boolean,
+          building_sha = NULL,
+          lease_expires_at = NULL,
+          workflow_instance_id = NULL,
+          continuation_count = 0,
+          last_error = NULL,
+          updated_at = now()
+      WHERE repository_id = $1
+    `,
+    [
+      input.repositoryId,
+      input.indexedRef,
+      input.indexedSha,
+      Math.max(0, Math.floor(input.fileCount)),
+      Math.max(0, Math.floor(input.chunkCount)),
+      input.truncated,
+    ],
+  );
+}
+
+/**
+ * Record a failed build and clear the lease so the failure is not mistaken for a live build.
+ *
+ * `message` MUST ARRIVE ALREADY REDACTED. AUD-01 requires operator-visible error text to be routed
+ * through `redactErrorMessage` (src/server/core/audit-redact.ts), and that is the CALLER's
+ * responsibility, not this module's: `db/` modules must not import `core/` (the dependency direction is
+ * routes -> core -> services -> models/db), so redaction cannot happen here. Stating the contract at
+ * the boundary is what keeps it from being silently skipped -- if this layer quietly took redaction
+ * over, `last_error` would become the one operator surface where a raw provider response body or a
+ * stack frame could land.
+ *
+ * `indexed_sha` is deliberately NOT touched: a failed refresh leaves the previously-completed index in
+ * place and still usable, which is what D-15's fail-open Q&A reads.
+ */
+export async function markCodeIndexBuildFailed(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  input: { repositoryId: number; message: string },
+): Promise<void> {
+  await queryRows(
+    env,
+    `
+      UPDATE code_index_state
+      SET status = 'failed',
+          last_error = $2,
+          lease_expires_at = NULL,
+          workflow_instance_id = NULL,
+          updated_at = now()
+      WHERE repository_id = $1
+    `,
+    [input.repositoryId, input.message],
   );
 }
