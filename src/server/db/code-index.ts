@@ -429,6 +429,42 @@ export async function listIndexedPathsForSha(
 }
 
 /**
+ * The build's FINAL COUNTS at `indexedSha`, for markCodeIndexBuildCompleted's `fileCount` /
+ * `chunkCount` arguments.
+ *
+ * This exists because those counts are TOTALS FOR THE WHOLE BUILD, and a build spans many Workflow
+ * invocations with no in-memory state surviving between them (D-05: per-file progress lives in
+ * code_index_files precisely so nothing has to travel on the payload). The finishing invocation
+ * therefore cannot have accumulated them and must read them back.
+ *
+ * `fileCount` counts only files that produced AT LEAST ONE CHUNK. A file recorded with a skip reason
+ * has a row here for resumability (see markCodeIndexFileIndexed) but is NOT part of the index, and
+ * `code_index_state.file_count` is the operator-facing "how much of your repository is searchable" --
+ * counting oversized lockfiles and generated bundles in it would overstate the index.
+ * `chunkCount` sums `chunk_count`, so those skip rows contribute zero by construction.
+ */
+export async function countIndexedForSha(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  input: { repositoryId: number; indexedSha: string },
+): Promise<{ fileCount: number; chunkCount: number }> {
+  const [row] = await queryRows<{ file_count: number | string; chunk_count: number | string }>(
+    env,
+    `
+      SELECT count(*) FILTER (WHERE chunk_count > 0)::int AS file_count,
+             COALESCE(sum(chunk_count), 0)::int AS chunk_count
+      FROM code_index_files
+      WHERE repository_id = $1
+        AND indexed_sha = $2
+    `,
+    [input.repositoryId, input.indexedSha],
+  );
+  return {
+    fileCount: Number(row?.file_count ?? 0),
+    chunkCount: Number(row?.chunk_count ?? 0),
+  };
+}
+
+/**
  * Record one file's per-build progress (D-05). Upserts on (repository_id, path) so a re-index
  * overwrites the row in place rather than accumulating history -- the same mutable-current-state rule
  * the chunk table follows.
