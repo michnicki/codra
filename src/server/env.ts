@@ -28,6 +28,13 @@ export interface AppBindings {
   APP_KV: KVNamespace;
   REVIEW_QUEUE: QueueProducer<ReviewJobMessage>;
   REVIEW_WORKFLOW: Workflow;
+  // Phase 29 / QA-IDX-01 (D-06): the SEPARATE codebase-index build Workflow, deliberately not a new
+  // payload kind inside REVIEW_WORKFLOW (Phase 20.1 spent eight plans hardening that dispatch; an
+  // unrelated `index` branch is exactly the routing hole those BLOCKERs documented).
+  // Declared OPTIONAL in plan 29-01 on purpose: the wrangler.jsonc binding, the IndexWorkflow class
+  // and the cf-typegen regeneration land in plan 29-05, so until then the binding genuinely is absent
+  // at runtime and a required property would be a type-level lie. 29-05 makes it required.
+  INDEX_WORKFLOW?: Workflow;
   ASSETS: AssetsBinding;
   HYPERDRIVE: HyperdriveBinding;
   APP_PRIVATE_KEY: string;
