@@ -20,10 +20,15 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { buildIndexTokens } from '@server/core/code-index';
 import {
+  claimCodeIndexBuildLease,
   deleteCodeIndexChunksForPaths,
   listIndexedPathsForSha,
+  markCodeIndexBuildCompleted,
+  markCodeIndexBuildFailed,
   markCodeIndexBuildStarted,
   markCodeIndexFileIndexed,
+  releaseCodeIndexBuildLease,
+  renewCodeIndexBuildLease,
   truncateCodeIndexForRepo,
   upsertCodeIndexChunks,
 } from '@server/db/code-index';
@@ -371,6 +376,264 @@ dbDescribe('code index DB accessors (QA-IDX-01, plan 29-04)', () => {
 
       expect(await listIndexedPathsForSha(env, { repositoryId: repoB, indexedSha: SHA_A })).toEqual([]);
       expect(await listIndexedPathsForSha(env, { repositoryId: repoA, indexedSha: SHA_A })).toEqual([shared]);
+    });
+  });
+
+  // =============================================================================================
+  // Group 4 — the build lease: the concurrency guard (T-29-04-04)
+  // =============================================================================================
+
+  describe('build lease', () => {
+    const OWNER = 'index-instance-1';
+    const RIVAL = 'index-instance-2';
+
+    /** Force the stored lease into the past without touching status or instance id. */
+    async function expireLease(repositoryId: number) {
+      await queryRows(
+        env,
+        "UPDATE code_index_state SET lease_expires_at = now() - interval '1 minute' WHERE repository_id = $1",
+        [repositoryId],
+      );
+    }
+
+    it('claims when there is no state row at all, and records the owner and a future expiry', async () => {
+      expect(await readStateRow(repoA)).toBeNull();
+
+      await expect(
+        claimCodeIndexBuildLease(env, { repositoryId: repoA, workflowInstanceId: OWNER, leaseSeconds: 120 }),
+      ).resolves.toBe(true);
+
+      const state = await readStateRow(repoA);
+      expect(state?.status).toBe('building');
+      expect(state?.workflow_instance_id).toBe(OWNER);
+      expect(new Date(state!.lease_expires_at!).getTime()).toBeGreaterThan(Date.now());
+    });
+
+    it('runs all four transitions: first claim true, foreign claim false, same-instance re-claim true, post-release foreign claim true', async () => {
+      expect(
+        await claimCodeIndexBuildLease(env, { repositoryId: repoA, workflowInstanceId: OWNER, leaseSeconds: 300 }),
+      ).toBe(true);
+
+      // A second build press while the lease is live is REFUSED, and it must not have stolen the row.
+      expect(
+        await claimCodeIndexBuildLease(env, { repositoryId: repoA, workflowInstanceId: RIVAL, leaseSeconds: 300 }),
+      ).toBe(false);
+      expect((await readStateRow(repoA))?.workflow_instance_id).toBe(OWNER);
+
+      // The owning instance re-enters after a hibernation — it must NOT lock itself out.
+      expect(
+        await claimCodeIndexBuildLease(env, { repositoryId: repoA, workflowInstanceId: OWNER, leaseSeconds: 300 }),
+      ).toBe(true);
+      expect((await readStateRow(repoA))?.workflow_instance_id).toBe(OWNER);
+
+      await releaseCodeIndexBuildLease(env, { repositoryId: repoA, workflowInstanceId: OWNER });
+
+      expect(
+        await claimCodeIndexBuildLease(env, { repositoryId: repoA, workflowInstanceId: RIVAL, leaseSeconds: 300 }),
+      ).toBe(true);
+      expect((await readStateRow(repoA))?.workflow_instance_id).toBe(RIVAL);
+    });
+
+    it('claims over an EXPIRED lease, so a crashed build cannot hold it forever', async () => {
+      await claimCodeIndexBuildLease(env, { repositoryId: repoA, workflowInstanceId: OWNER, leaseSeconds: 300 });
+      await expireLease(repoA);
+
+      expect(
+        await claimCodeIndexBuildLease(env, { repositoryId: repoA, workflowInstanceId: RIVAL, leaseSeconds: 300 }),
+      ).toBe(true);
+      const state = await readStateRow(repoA);
+      expect(state?.workflow_instance_id).toBe(RIVAL);
+      expect(new Date(state!.lease_expires_at!).getTime()).toBeGreaterThan(Date.now());
+    });
+
+    it('is scoped per repository: one repository\'s live lease never blocks another\'s claim', async () => {
+      await claimCodeIndexBuildLease(env, { repositoryId: repoA, workflowInstanceId: OWNER, leaseSeconds: 300 });
+
+      expect(
+        await claimCodeIndexBuildLease(env, { repositoryId: repoB, workflowInstanceId: OWNER, leaseSeconds: 300 }),
+      ).toBe(true);
+      expect((await readStateRow(repoA))?.workflow_instance_id).toBe(OWNER);
+      expect((await readStateRow(repoB))?.workflow_instance_id).toBe(OWNER);
+    });
+
+    it('renews only for the instance that owns the lease', async () => {
+      await claimCodeIndexBuildLease(env, { repositoryId: repoA, workflowInstanceId: OWNER, leaseSeconds: 60 });
+      const before = new Date((await readStateRow(repoA))!.lease_expires_at!).getTime();
+
+      // A heartbeat from a build that does not hold the lease must not extend the owner's window.
+      expect(
+        await renewCodeIndexBuildLease(env, { repositoryId: repoA, workflowInstanceId: RIVAL, leaseSeconds: 3600 }),
+      ).toBe(false);
+      expect(new Date((await readStateRow(repoA))!.lease_expires_at!).getTime()).toBe(before);
+
+      expect(
+        await renewCodeIndexBuildLease(env, { repositoryId: repoA, workflowInstanceId: OWNER, leaseSeconds: 3600 }),
+      ).toBe(true);
+      expect(new Date((await readStateRow(repoA))!.lease_expires_at!).getTime()).toBeGreaterThan(before);
+    });
+
+    it('release from `building` clears the lease AND lands on `idle`, so no released row reads as a live build', async () => {
+      await claimCodeIndexBuildLease(env, { repositoryId: repoA, workflowInstanceId: OWNER, leaseSeconds: 300 });
+      expect((await readStateRow(repoA))?.status).toBe('building');
+
+      await releaseCodeIndexBuildLease(env, { repositoryId: repoA, workflowInstanceId: OWNER });
+
+      const state = await readStateRow(repoA);
+      expect(state?.status).toBe('idle');
+      expect(state?.lease_expires_at).toBeNull();
+      expect(state?.workflow_instance_id).toBeNull();
+    });
+
+    it.each([
+      ['ready', 'markCodeIndexBuildCompleted'],
+      ['failed', 'markCodeIndexBuildFailed'],
+    ] as const)(
+      'release after a terminal transition leaves `%s` intact rather than erasing the recorded outcome',
+      async (terminalStatus, _accessor) => {
+        await claimCodeIndexBuildLease(env, { repositoryId: repoA, workflowInstanceId: OWNER, leaseSeconds: 300 });
+
+        if (terminalStatus === 'ready') {
+          await markCodeIndexBuildCompleted(env, {
+            repositoryId: repoA,
+            indexedRef: 'main',
+            indexedSha: SHA_A,
+            fileCount: 3,
+            chunkCount: 9,
+            truncated: false,
+          });
+        } else {
+          await markCodeIndexBuildFailed(env, { repositoryId: repoA, message: 'provider_5xx' });
+        }
+        expect((await readStateRow(repoA))?.status).toBe(terminalStatus);
+
+        // Both terminal accessors already clear workflow_instance_id, so the ordinary release that
+        // follows them matches no row. Restoring the instance id drives the CASE branch directly, so
+        // this asserts the statement's behavior and not just the WHERE clause's.
+        await queryRows(env, 'UPDATE code_index_state SET workflow_instance_id = $2 WHERE repository_id = $1', [
+          repoA,
+          OWNER,
+        ]);
+
+        await releaseCodeIndexBuildLease(env, { repositoryId: repoA, workflowInstanceId: OWNER });
+
+        const state = await readStateRow(repoA);
+        expect(state?.status).toBe(terminalStatus);
+        expect(state?.lease_expires_at).toBeNull();
+        expect(state?.workflow_instance_id).toBeNull();
+      },
+    );
+  });
+
+  // =============================================================================================
+  // Group 5 — terminal state
+  // =============================================================================================
+
+  describe('terminal state', () => {
+    it('markCodeIndexBuildCompleted advances indexed_sha, writes the counts, and clears the lease', async () => {
+      await markCodeIndexBuildStarted(env, {
+        repositoryId: repoA,
+        mode: 'full',
+        indexedRef: 'main',
+        buildingSha: SHA_A,
+        workflowInstanceId: 'index-instance-1',
+        leaseSeconds: 300,
+      });
+      // A previous failure must not survive a good build.
+      await markCodeIndexBuildFailed(env, { repositoryId: repoA, message: 'model_timeout' });
+      expect((await readStateRow(repoA))?.last_error).toBe('model_timeout');
+
+      await markCodeIndexBuildCompleted(env, {
+        repositoryId: repoA,
+        indexedRef: 'refs/heads/main',
+        indexedSha: SHA_A,
+        fileCount: 501,
+        chunkCount: 4812,
+        truncated: true,
+      });
+
+      const state = await readStateRow(repoA);
+      expect(state?.status).toBe('ready');
+      expect(state?.indexed_sha).toBe(SHA_A);
+      expect(state?.indexed_ref).toBe('refs/heads/main');
+      expect(state?.indexed_at).not.toBeNull();
+      expect(Number(state?.file_count)).toBe(501);
+      expect(Number(state?.chunk_count)).toBe(4812);
+      expect(state?.truncated).toBe(true);
+      // The in-progress commit and the lease are gone; the continuation budget is reset.
+      expect(state?.building_sha).toBeNull();
+      expect(state?.lease_expires_at).toBeNull();
+      expect(state?.workflow_instance_id).toBeNull();
+      expect(Number(state?.continuation_count)).toBe(0);
+      expect(state?.last_error).toBeNull();
+      // mode is written at build START and survives completion, so the panel can still say what ran.
+      expect(state?.mode).toBe('full');
+    });
+
+    it('markCodeIndexBuildFailed stores the supplied (already-redacted) message and clears the lease', async () => {
+      await markCodeIndexBuildStarted(env, {
+        repositoryId: repoA,
+        mode: 'incremental',
+        indexedRef: 'main',
+        buildingSha: SHA_B,
+        workflowInstanceId: 'index-instance-1',
+        leaseSeconds: 300,
+      });
+
+      // 'provider_5xx' is a MachineErrorReason token — the shape the caller's redactErrorMessage
+      // produces (AUD-01). This module cannot redact, so the token arriving intact is the contract.
+      await markCodeIndexBuildFailed(env, { repositoryId: repoA, message: 'provider_5xx' });
+
+      const state = await readStateRow(repoA);
+      expect(state?.status).toBe('failed');
+      expect(state?.last_error).toBe('provider_5xx');
+      expect(state?.lease_expires_at).toBeNull();
+      expect(state?.workflow_instance_id).toBeNull();
+    });
+
+    it('a failed refresh leaves the previously-completed index readable (D-15 fail-open)', async () => {
+      await markCodeIndexBuildStarted(env, {
+        repositoryId: repoA,
+        mode: 'full',
+        indexedRef: 'main',
+        buildingSha: SHA_A,
+        workflowInstanceId: 'index-instance-1',
+        leaseSeconds: 300,
+      });
+      await markCodeIndexBuildCompleted(env, {
+        repositoryId: repoA,
+        indexedRef: 'main',
+        indexedSha: SHA_A,
+        fileCount: 2,
+        chunkCount: 5,
+        truncated: false,
+      });
+
+      await markCodeIndexBuildFailed(env, { repositoryId: repoA, message: 'network_reset' });
+
+      const state = await readStateRow(repoA);
+      expect(state?.status).toBe('failed');
+      // The completed sha and counts are untouched — Q&A can still retrieve from the standing index.
+      expect(state?.indexed_sha).toBe(SHA_A);
+      expect(Number(state?.chunk_count)).toBe(5);
+    });
+
+    it('terminal transitions are scoped to one repository', async () => {
+      for (const id of [repoA, repoB]) {
+        await markCodeIndexBuildStarted(env, {
+          repositoryId: id,
+          mode: 'full',
+          indexedRef: 'main',
+          buildingSha: SHA_A,
+          workflowInstanceId: `inst-${id}`,
+          leaseSeconds: 300,
+        });
+      }
+
+      await markCodeIndexBuildFailed(env, { repositoryId: repoA, message: 'unknown' });
+
+      expect((await readStateRow(repoA))?.status).toBe('failed');
+      expect((await readStateRow(repoB))?.status).toBe('building');
+      expect((await readStateRow(repoB))?.last_error).toBeNull();
     });
   });
 });
