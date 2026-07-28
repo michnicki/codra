@@ -88,10 +88,63 @@ export const pullRequestCommentCreatedPayloadSchema = bitbucketPullRequestWebhoo
   comment: bitbucketWebhookCommentSchema,
 }).passthrough();
 
+// Phase 29 (QA-IDX-01, D-08): the `repo:push` webhook variant — the Bitbucket half of index
+// freshness. A push to the repository's main branch triggers an incremental index build carrying
+// the old/new target hashes; the changed-file set is derived from the existing `getCompareDiff`
+// primitive, not from the payload's `commits[]` list.
+//
+// ASSUMPTION A2 — the `push.changes[]` field shape is COMMUNITY-SOURCED rather than confirmed by
+// the official Atlassian docs (the docs page is truncated), which is exactly why the inbound
+// convention here is `z.looseObject`: an unexpected extra field does not fail the parse. The
+// residual risk is a RENAMED field (e.g. `new.target.hash` under a different path), which degrades
+// to a parse failure and an ignored acknowledgement — indistinguishable from a correctly-ignored
+// delivery. The first real delivery in acceptance testing is what confirms the guess.
+//
+// `new` is null on a ref deletion, `old` is null on a ref creation (no ancestor to compare
+// against), and `repo:push` fires for tags too — consumers must filter on `new.type === 'branch'`
+// plus the branch name. The repository sub-object keeps the shape the base schema already uses.
+const repoPushRefSchema = z.looseObject({
+  type: z.string().min(1),
+  name: z.string().min(1),
+  target: z.looseObject({
+    hash: z.string().min(1),
+  }),
+});
+
+const repoPushChangeSchema = z.looseObject({
+  new: repoPushRefSchema.nullable().optional(),
+  old: repoPushRefSchema.nullable().optional(),
+  created: z.boolean().optional(),
+  closed: z.boolean().optional(),
+  forced: z.boolean().optional(),
+  truncated: z.boolean().optional(),
+});
+
+export const repoPushPayloadSchema = z
+  .object({
+    eventName: z.literal('repo:push'),
+    repository: repositorySchema,
+    push: z.looseObject({
+      changes: z.array(repoPushChangeSchema),
+    }),
+  })
+  // NOTE on the catchall: the plan's inbound convention is `z.looseObject` ("an unexpected extra
+  // field does not fail the parse"), and this catchall is RUNTIME-IDENTICAL to it — unknown keys
+  // are validated against `z.any()` (always succeeds) and preserved in the output. It is not
+  // written as `z.looseObject(...)` for one type-level reason: `z.looseObject` infers an
+  // `[k: string]: unknown` index signature, and adding a member with that signature to the
+  // discriminated union below degrades every UNNARROWED union property access (e.g.
+  // `result.data.pullrequest` in test/bitbucket-schema.spec.ts, which must pass unmodified) to
+  // `unknown`, failing the typecheck. The `z.any()` catchall infers `[k: string]: any` instead, so
+  // the union access resolves exactly as it did with three members. The inner objects keep the
+  // `z.looseObject` convention; only the union-member top level needs this.
+  .catchall(z.any());
+
 export const pullRequestWebhookPayloadSchema = z.discriminatedUnion('eventName', [
   pullRequestCreatedPayloadSchema,
   pullRequestUpdatedPayloadSchema,
   pullRequestCommentCreatedPayloadSchema,
+  repoPushPayloadSchema,
 ]);
 
 const commentContentSchema = z.object({
@@ -150,6 +203,7 @@ export type BitbucketPullRequestWebhookBase = z.infer<typeof bitbucketPullReques
 export type PullRequestCreatedPayload = z.infer<typeof pullRequestCreatedPayloadSchema>;
 export type PullRequestUpdatedPayload = z.infer<typeof pullRequestUpdatedPayloadSchema>;
 export type PullRequestCommentCreatedPayload = z.infer<typeof pullRequestCommentCreatedPayloadSchema>;
+export type RepoPushPayload = z.infer<typeof repoPushPayloadSchema>;
 export type PullRequestWebhookPayload = z.infer<typeof pullRequestWebhookPayloadSchema>;
 export type PrComment = z.infer<typeof prCommentSchema>;
 export type CodeInsightsReport = z.infer<typeof codeInsightsReportSchema>;
