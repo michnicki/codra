@@ -207,6 +207,21 @@ export interface VcsProvider {
   listDefaultBranchTree(owner: string, repo: string): Promise<VcsTreeListing>;
 
   /**
+   * Repository metadata read narrowed to `mainbranch` (QA-IDX-01, D-08). The `repo:push` webhook
+   * branch resolves the repository's main branch through this method — Bitbucket's push payload
+   * carries no default-branch field (unlike GitHub's, which carries `default_branch` on the
+   * payload), so the Bitbucket route spends one subrequest to learn it.
+   *
+   * OPTIONAL, following the `labels?` feature-detect pattern: only the Bitbucket adapter implements
+   * it today. GitHub's push branch reads the default branch off the payload and has no use for the
+   * call, so callers must feature-detect with `provider.getRepositoryMetadata?.(...)` rather than
+   * assume it. `mainbranch` may be absent on the response (a repository with no main branch
+   * configured) — the caller treats that as "cannot resolve" rather than guessing a conventional
+   * branch name, the same discipline `listDefaultBranchTree` throws on.
+   */
+  getRepositoryMetadata?(owner: string, repo: string): Promise<{ mainbranch?: { name?: string } }>;
+
+  /**
    * Resolve the bot's own immutable identity for the comment self-filter (Phase 11, CMD-07). Returns
    * the bot's immutable provider account id (GitHub bot-user numeric id as a string / Bitbucket
    * `account_id`) plus its optional login.

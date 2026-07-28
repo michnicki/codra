@@ -16,6 +16,8 @@ import { getGlobalConfig } from '@server/core/config';
 import { defaultRepoConfig, type RepoConfig } from '@shared/schema';
 import { bytesToHex } from '@server/db/jobs';
 import { pullRequestWebhookPayloadSchema } from '@shared/bitbucket';
+import { codeIndexInstanceId, type IndexBuildParams } from '@server/core/code-index-build';
+import { VcsService } from '@server/services/vcs';
 import type { CommentContext } from '@server/core/commands';
 
 // POST /webhook/bitbucket — the live entry point that closes the Phase-3 deferred item
@@ -30,7 +32,12 @@ import type { CommentContext } from '@server/core/commands';
 //   3.  REV-M-6: parse JUST the identity-bearing projection as a small Zod projection
 //       (NOT the full payload schema) to obtain {workspace, repo_slug} for credential
 //       lookup. Order: identity-projection parse -> getVcsCredentialSecrets -> decryptSecret
-//       -> verifyWebhookSignature -> full payload parse.
+//       -> verifyWebhookSignature -> full payload parse. Phase 29 (QA-IDX-01, D-08): the
+//       projection identifies the REPOSITORY for ANY event kind — `repository.name` and
+//       `repository.workspace.slug` stay hard-required, while the pull-request half is
+//       optional so a `repo:push` delivery (which carries no `pullrequest`) can be
+//       identified. Event-specific fields are validated only AFTER verification, at the
+//       step-8 full parse.
 //   4.  D-19: lowercase `workspace + repo_slug` defensively to match the stored
 //       credential key (Phase 4 storage normalization).
 //   5.  getVcsCredentialSecrets; null OR encryptedWebhookSecret null -> 401 (D-05 fail-closed).
@@ -56,13 +63,24 @@ import type { CommentContext } from '@server/core/commands';
 //  16.  Logger redaction of token/secret keys is the trust boundary (T-04-02 carry-over);
 //       the raw body is never logged.
 //
-// All 401/400 paths fail closed (D-05, D-06). The route makes no api.bitbucket.org calls;
-// the actual external calls happen in the worker, not the route.
+// All 401/400 paths fail closed (D-05, D-06). With one exception the route makes no
+// api.bitbucket.org calls: the Phase-29 `repo:push` branch spends ONE subrequest on
+// `getRepositoryMetadata` to resolve the repository's main branch, because Bitbucket's push
+// payload carries no default-branch field (GitHub's does, so the GitHub side of D-08 needs no
+// call). Everything else — the actual external work — happens in the worker, not the route.
 
 // Small Zod projection used to extract only the identity-bearing prefix of the raw body.
 // Strict-by-default; documented provider fields beyond `{repository.workspace.slug,
 // repository.name, pullrequest.id}` are dropped here on purpose — the full payload parse
 // at step 8 uses the (now passthrough) pullRequestWebhookPayloadSchema.
+//
+// Phase 29 (QA-IDX-01, D-08): `pullrequest` is present-but-OPTIONAL so the projection identifies
+// the repository for ANY event kind — a `repo:push` delivery carries no `pullrequest` and was
+// rejected here with a 400 BEFORE the HMAC verify (BLOCKER-1). The repository half stays
+// hard-required: the credential lookup still keys on `{repository.name, repository.workspace.slug}`,
+// both of which a `repo:push` body carries. The field is kept (not deleted) so type inference for
+// the three pull-request event kinds is preserved rather than widened away (review: Antigravity
+// S-02). Event-specific fields are validated only after verification, at the step-8 full parse.
 const bitbucketIdentityProjectionSchema = z.object({
   repository: z.object({
     name: z.string().min(1),
@@ -72,7 +90,7 @@ const bitbucketIdentityProjectionSchema = z.object({
   }),
   pullrequest: z.object({
     id: z.number().int().positive(),
-  }),
+  }).optional(),
 });
 
 export async function handleBitbucketWebhook(c: Context<AppEnv>) {
@@ -135,6 +153,13 @@ export async function handleBitbucketWebhook(c: Context<AppEnv>) {
   // header (X-Event-Key was not part of rawBody — it was a separate header); an attacker
   // cannot forge an eventName inside the body because the body's eventName field is
   // ignored (the header value is the source of truth).
+  //
+  // THE VERIFICATION ORDER IS FIXED AND MUST NOT BE "SIMPLIFIED": identity projection, then
+  // credential lookup, then decrypt, then HMAC verify, then full parse. A new event type
+  // (Phase 29 added `repo:push`) is validated only AFTER verification — a new event adds
+  // payload-validation work, never verification work, and `src/server/core/verify.ts` is
+  // event-agnostic precisely so it needs no change here. Moving the full parse earlier
+  // would run schema validation on unauthenticated input; do not do it.
   let parsedBody: unknown;
   try {
     parsedBody = JSON.parse(rawBody);
@@ -165,8 +190,14 @@ export async function handleBitbucketWebhook(c: Context<AppEnv>) {
   // the same commit hash as the incoming pullrequest.source.commit.hash, treat this event
   // as a UI/PR-edit re-delivery and skip enqueueing. This matches the Bitbucket semantics
   // where `pullrequest:updated` fires on title/body/description edits too.
-  const prNumber = parsed.data.pullrequest.id;
-  const incomingCommitSha = parsed.data.pullrequest.source.commit.hash;
+  //
+  // Phase 29 (QA-IDX-01, D-08): the pull-request field reads are GUARDED BY THE EVENT KIND.
+  // Only the three pull-request event kinds carry `pullrequest`; a `repo:push` delivery has
+  // none, so reading these unconditionally would throw (and before that, would fail the
+  // typecheck). The repo:push branch below returns for that event, so these values are never
+  // consumed for it.
+  const prNumber = parsed.data.eventName !== 'repo:push' ? parsed.data.pullrequest.id : 0;
+  const incomingCommitSha = parsed.data.eventName !== 'repo:push' ? parsed.data.pullrequest.source.commit.hash : '';
   if (xEventKey === 'pullrequest:updated') {
     const recent = await mostRecentJobForPullRequest(c.env, {
       vcsProvider: 'bitbucket',
@@ -337,6 +368,153 @@ export async function handleBitbucketWebhook(c: Context<AppEnv>) {
     // returns queued_event — map any other outcome defensively as an ignore).
     const reason = result.outcome === 'ignored_comment' ? result.reason : result.outcome;
     return c.json({ ok: true, eventName: xEventKey, ignored: true, reason }, 202);
+  }
+
+  // Phase 29 (QA-IDX-01, D-08): the `repo:push` branch — a push to the repository's main branch
+  // refreshes the codebase index. Placed AFTER the full-payload parse (step 8), the repository
+  // resolution (step 9), the delivery idempotency record (step 12) and the config resolution
+  // (step 13b), so it runs only on verified, schema-valid input; and BEFORE step 13, which reads
+  // pull-request fields a push delivery does not carry. Every path inside returns.
+  if (parsed.data.eventName === 'repo:push') {
+    const pushData = parsed.data;
+    // As with the GitHub branch: the event kind goes in the LOG payload for every ignore path
+    // (an operator tracing a missing refresh reads logs), never in the response body (it arrives
+    // on a client-supplied header from an unauthenticated caller).
+    const pushIgnored = (reason: string) => {
+      logger.info('Bitbucket repo:push delivery ignored', {
+        workspace,
+        repo: repoSlug,
+        eventKind: xEventKey,
+        reason,
+      });
+      return c.json({ ok: true, ignored: true, reason }, 202);
+    };
+
+    // NREG-01 / T-29-06-03: checked FIRST so an opted-out repository spends no subrequest on the
+    // metadata read below. `configSnapshot.review.interactive` already carries the per-repo row
+    // (relocated step 13b), so this is the same toggle the GitHub branch reads.
+    if (!configSnapshot.review.interactive.qa.index.enabled) {
+      return pushIgnored('index_disabled');
+    }
+
+    // Resolve the repository's main branch through the adapter's getRepositoryMetadata
+    // (`mainbranch.name`) — the SAME adapter-resolves-its-own-default-branch shape the GitHub
+    // side of D-08 uses and the same client read `listDefaultBranchTree` resolves through. Do NOT
+    // introduce a third resolution path (a payload field, a hardcoded 'master'). THE ASYMMETRY
+    // THAT REMAINS, and why it is unavoidable: GitHub's push payload carries the default branch
+    // on the payload so no extra call is needed there, while Bitbucket's does not — so this
+    // branch spends one subrequest to learn it. A failed read or a missing main branch gets the
+    // same failure discipline as the GitHub both-absent path: a warning and an ignored
+    // acknowledgement, so neither provider can skip a refresh silently.
+    let mainBranch: string | null = null;
+    try {
+      const provider = await VcsService.forProvider(c.env, { provider: 'bitbucket', workspace, repo: repoSlug });
+      const metadata = await provider.getRepositoryMetadata?.(workspace, repoSlug);
+      mainBranch = metadata?.mainbranch?.name ?? null;
+    } catch (error) {
+      logger.warn('Bitbucket repo:push ignored: main-branch metadata read failed', {
+        workspace,
+        repo: repoSlug,
+        eventKind: xEventKey,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      return c.json({ ok: true, ignored: true, reason: 'default_branch_unknown' }, 202);
+    }
+    if (!mainBranch) {
+      logger.warn('Bitbucket repo:push ignored: repository reports no main branch', {
+        workspace,
+        repo: repoSlug,
+        eventKind: xEventKey,
+      });
+      return c.json({ ok: true, ignored: true, reason: 'default_branch_unknown' }, 202);
+    }
+
+    // THE INSTANCE ID COMES FROM THE SHARED HELPER, never a hand-built string — the GitHub push
+    // branch and the dashboard trigger key on the same helper, and the `instance.already_exists`
+    // coalescing all three rely on can only fire when the ids are byte-identical.
+    const workflowInstanceId = codeIndexInstanceId(repositoryId);
+    let startedMode: 'full' | 'incremental' | null = null;
+    let coalesced = false;
+    let firstIgnoreReason: string | null = null;
+
+    for (const change of pushData.push.changes) {
+      // A null `new` is a ref deletion — nothing to index.
+      if (!change.new) {
+        firstIgnoreReason ??= 'deleted';
+        logger.info('Bitbucket repo:push change ignored', { workspace, repo: repoSlug, eventKind: xEventKey, reason: 'deleted' });
+        continue;
+      }
+      // `repo:push` fires for tags too; only branch pushes can refresh the default-branch index.
+      if (change.new.type !== 'branch') {
+        firstIgnoreReason ??= 'non_branch_ref';
+        logger.info('Bitbucket repo:push change ignored', { workspace, repo: repoSlug, eventKind: xEventKey, reason: 'non_branch_ref' });
+        continue;
+      }
+      if (change.new.name !== mainBranch) {
+        firstIgnoreReason ??= 'non_default_branch';
+        logger.info('Bitbucket repo:push change ignored', { workspace, repo: repoSlug, eventKind: xEventKey, reason: 'non_default_branch' });
+        continue;
+      }
+
+      // A null `old` means the push CREATED the branch, so there is no ancestor to compare
+      // against — start a full rebuild instead of a compare against a missing sha. A FORCED push
+      // may leave the old hash not an ancestor of the new one; the incremental build's own
+      // failure handling covers that and records the reason.
+      const mode = change.old ? 'incremental' : 'full';
+      const params: IndexBuildParams = {
+        repositoryId,
+        vcsProvider: 'bitbucket',
+        owner: workspace,
+        repo: repoSlug,
+        workspace,
+        installationId: null,
+        mode,
+        ...(mode === 'incremental'
+          ? { baseSha: change.old!.target.hash, headSha: change.new.target.hash }
+          : {}),
+        workflowInstanceId,
+        continuation: 0,
+      };
+      try {
+        await c.env.INDEX_WORKFLOW.create({ id: workflowInstanceId, params });
+        startedMode ??= mode;
+      } catch (error) {
+        if (error instanceof Error && error.message.includes('instance.already_exists')) {
+          // Benign coalesced duplicate — the same disposition the queue consumer gives this
+          // rejection. A second actionable change for the same branch lands here too.
+          coalesced = true;
+          logger.info('Codebase index refresh coalesced: workflow instance already exists', {
+            workspace,
+            repo: repoSlug,
+            eventKind: xEventKey,
+            repositoryId,
+            reason: 'instance_already_exists',
+          });
+        } else {
+          throw error;
+        }
+      }
+    }
+
+    if (startedMode !== null) {
+      logger.info('Bitbucket repo:push triggered a codebase index refresh', {
+        workspace,
+        repo: repoSlug,
+        eventKind: xEventKey,
+        mode: startedMode,
+        repositoryId,
+      });
+      return c.json(
+        startedMode === 'full'
+          ? { ok: true, refreshed: true, mode: startedMode, reason: 'branch_created_full_rebuild' }
+          : { ok: true, refreshed: true, mode: startedMode },
+        202,
+      );
+    }
+    if (coalesced) {
+      return c.json({ ok: true, coalesced: true, reason: 'instance_already_exists' }, 202);
+    }
+    return c.json({ ok: true, ignored: true, reason: firstIgnoreReason ?? 'no_actionable_change' }, 202);
   }
 
   // Step 13: construct the ReviewRequest-shaped value carrying the Bitbucket identity.

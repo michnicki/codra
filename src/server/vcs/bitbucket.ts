@@ -241,6 +241,15 @@ export class BitbucketAdapter implements VcsProvider {
     return { ref: branch, sha, paths, truncated };
   }
 
+  // QA-IDX-01 (D-08): repository metadata read, narrowed to `mainbranch`. Thin delegation — the
+  // same client read `listDefaultBranchTree` resolves its default branch through, surfaced so the
+  // `repo:push` webhook branch can learn the main branch name without reaching into the private
+  // client. Declared OPTIONAL on the interface (the `labels?` pattern): only this adapter
+  // implements it, because only Bitbucket's push payload lacks a default-branch field.
+  async getRepositoryMetadata(owner: string, repo: string): Promise<{ mainbranch?: { name?: string } }> {
+    return this.client.getRepositoryMetadata(owner, repo);
+  }
+
   // PROV-02 (D-05/D-06/D-07): unresolved-bot-thread listing. Walks paginated comments, filters to
   // UNRESOLVED root comments authored by the immutable bot account_id (configured FIRST, then
   // `GET /2.0/user` fallback), and computes `outdated` locally via the current PR diff (R-4).
