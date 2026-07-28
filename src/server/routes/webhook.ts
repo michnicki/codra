@@ -274,7 +274,8 @@ export async function handleGitHubWebhook(c: Context<AppEnv>) {
       // byte-identical.
       const workflowInstanceId = codeIndexInstanceId(repositoryId);
       // A CREATED branch has an all-zeros before-sha, so a compare is meaningless — start a full
-      // rebuild instead of passing a zero sha to `getCompareDiff` as if it were a real ancestor.
+      // rebuild instead of passing a zero sha to the build's compare call as if it were a real
+      // ancestor.
       // A FORCED push may leave the before-sha not an ancestor of the after-sha, so the compare can
       // be large or fail; the incremental build's own failure handling covers that and the reason is
       // recorded rather than silently swallowed.
