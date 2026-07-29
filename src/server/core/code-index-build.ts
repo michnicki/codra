@@ -488,6 +488,13 @@ export async function runIndexBuild(
       // has landed, so the liveness floor above is not undone on the very first iteration.
       if (processed > 0 && tracker.remainingSafeBudget() < ESTIMATED_SUBREQUESTS_PER_INDEX_FILE) break;
 
+      // DIAGNOSTIC (29-09 UAT): logged BEFORE the fetch, not after, so a file whose fetch itself throws
+      // or exhausts the budget still identifies itself in the logs -- a post-fetch log line would never
+      // print for exactly the failure case this exists to diagnose.
+      log.info('Codebase index build: fetching file', {
+        path,
+        remainingSafeBudgetBeforeFetch: tracker.remainingSafeBudget(),
+      });
       await indexOneFile(env, provider, params, {
         path,
         buildingSha,
