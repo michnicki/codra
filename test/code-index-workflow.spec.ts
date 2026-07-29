@@ -140,8 +140,8 @@ describe('codeIndexInstanceId (QA-IDX-01, D-06)', () => {
     expect(codeIndexInstanceId(41)).not.toBe(codeIndexInstanceId(42));
   });
 
-  it('is the documented code-index:{repositoryId} shape', () => {
-    expect(codeIndexInstanceId(7)).toBe('code-index:7');
+  it('is the documented code-index-{repositoryId} shape (dash — Cloudflare rejects colons with instance.invalid_id)', () => {
+    expect(codeIndexInstanceId(7)).toBe('code-index-7');
   });
 });
 
