@@ -41,6 +41,32 @@ export type ProviderPayload = {
 };
 type RepoConfigPatch = Partial<Pick<RepoConfig, 'review' | 'model'> & { enabled: boolean }>;
 
+// Phase 29 (QA-IDX-01): wire shapes of the code-index endpoints. CamelCase to match the
+// dashboard convention the handler projects (`mapJob`), not the `code_index_state` column names.
+export interface CodeIndexStatus {
+  status: 'idle' | 'building' | 'ready' | 'failed';
+  /** What produced the current index: 'full' = dashboard rebuild, 'incremental' = push refresh, null = never built. */
+  mode: 'full' | 'incremental' | null;
+  indexedSha: string | null;
+  indexedAt: string | null;
+  fileCount: number;
+  chunkCount: number;
+  truncated: boolean;
+  /** Already redacted at the server write site (AUD-01) — render as-is, never re-process. */
+  lastError: string | null;
+}
+
+export interface CodeIndexStatusResponse {
+  index: CodeIndexStatus;
+}
+
+export interface CodeIndexBuildResponse {
+  ok: boolean;
+  /** True when the press coalesced against a live build (already_exists / lease_held) — informational, not an error. */
+  coalesced: boolean;
+  build: { mode: 'full'; workflowInstanceId: string };
+}
+
 async function request<T>(input: string, init?: RequestInit) {
   const method = init?.method?.toUpperCase() ?? 'GET';
   const headers = new Headers(init?.headers);
@@ -299,6 +325,22 @@ export const api = {
     return request<{ ok: boolean }>(
       `/api/repos/${pathSegment(owner)}/${pathSegment(repo)}/learned-rules/${pathSegment(ruleId)}${query}`,
       { method: 'PATCH', body: JSON.stringify({ status }) },
+    );
+  },
+  // Phase 29 (QA-IDX-01, D-07): the dashboard build trigger and the operator status read.
+  // Neither sets the CSRF header by hand — the shared `request` helper sets `x-requested-with`
+  // on every non-safe method (T-29-09-01).
+  buildCodeIndex(owner: string, repo: string, vcsProvider?: VcsProvider) {
+    const query = vcsProvider ? `?provider=${vcsProvider}` : '';
+    return request<CodeIndexBuildResponse>(
+      `/api/repos/${pathSegment(owner)}/${pathSegment(repo)}/code-index/build${query}`,
+      { method: 'POST' },
+    );
+  },
+  getCodeIndexStatus(owner: string, repo: string, vcsProvider?: VcsProvider) {
+    const query = vcsProvider ? `?provider=${vcsProvider}` : '';
+    return request<CodeIndexStatusResponse>(
+      `/api/repos/${pathSegment(owner)}/${pathSegment(repo)}/code-index/status${query}`,
     );
   },
 };
