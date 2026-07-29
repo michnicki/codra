@@ -695,7 +695,7 @@ dbDescribe('push webhooks (Phase 29 D-08): default-branch index freshness on bot
     // agreement being proven is that BOTH branches produce the shared helper's output for a given
     // repository id, which is what makes the cross-trigger `instance.already_exists` coalescing
     // real rather than assumed. Read the expected value from the imported helper, never a retyped
-    // `code-index:{id}` literal, so the assertion tracks the helper instead of freezing a copy of
+    // `code-index-{id}` literal, so the assertion tracks the helper instead of freezing a copy of
     // its current output.
     findRepositoryIdMock.mockResolvedValue(bitbucketRepositoryId);
 

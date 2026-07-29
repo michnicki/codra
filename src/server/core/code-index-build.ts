@@ -159,7 +159,7 @@ export function budgetAwareIndexFileLimit(remainingSafeBudget: number, batchFile
 }
 
 /**
- * The Workflow instance id for a repository's index build: `code-index:{repositoryId}`.
+ * The Workflow instance id for a repository's index build: `code-index-{repositoryId}`.
  *
  * A SHARED EXPORTED HELPER rather than a string built at each call site, on purpose. THREE sites create
  * index-build instances -- the dashboard "Build index" endpoint (plan 29-08), the GitHub `push` branch
@@ -169,12 +169,17 @@ export function budgetAwareIndexFileLimit(remainingSafeBudget: number, batchFile
  * would silently start a second build and only the durable lease would catch it; the instance-id layer
  * that the plans claim as defense in depth would be inert. Every creation site MUST call this.
  *
+ * The separator is a DASH, not a colon: Cloudflare rejects instance ids containing `:` with
+ * `WorkflowError: (instance.invalid_id)`, which no mock surfaces -- this was caught by the 29-09 live
+ * UAT's first real build press (2026-07-29), not by any spec. Keep the id to letters, digits and
+ * dashes.
+ *
  * THE FRESH-INSTANCE HANDOFF DELIBERATELY DOES NOT USE THIS HELPER. A handoff must create a genuinely
  * NEW instance; keying it on this id would collide with the instance that is handing off and be dropped
  * as a benign duplicate, stalling the build at exactly the point the handoff exists to rescue.
  */
 export function codeIndexInstanceId(repositoryId: number): string {
-  return `code-index:${repositoryId}`;
+  return `code-index-${repositoryId}`;
 }
 
 /**
