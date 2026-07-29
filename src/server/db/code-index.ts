@@ -58,7 +58,7 @@ export type CodeIndexChunkHit = {
  * is that single writer's contract -- a SHORT MACHINE TOKEN, never provider text and never file
  * content, so the column can be surfaced to an operator without a redaction pass.
  */
-export type CodeIndexSkipReason = 'empty' | 'generated' | 'oversized' | 'unreadable';
+export type CodeIndexSkipReason = 'empty' | 'generated' | 'oversized' | 'unreadable' | 'binary';
 
 export type CodeIndexStateRow = {
   repository_id: number;

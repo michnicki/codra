@@ -289,6 +289,12 @@ function isTransientBuildError(error: unknown): boolean {
   // A timeout is deliberately NOT transient here, matching isRetryableFileReviewErrorMessage: retrying
   // a timeout just spends the retry budget re-timing-out.
   if (isTimeoutMessage(lower)) return false;
+  // Cloudflare's 50-subrequest-per-invocation limit is a budget exhaustion, not a provider failure.
+  // The budget resets on the next invocation (after the step.sleep yields), so retrying is correct.
+  // Without this, the first subrequest-budget hit marks the build as permanently failed and the
+  // Workflow's own step retries (which DO reset the budget) are wasted because the state row already
+  // reads 'failed' and the panel shows an error.
+  if (lower.includes('too many subrequests')) return true;
   return matchesAnyTransientSubstring(lower);
 }
 
@@ -670,6 +676,14 @@ async function indexOneFile(
     // D-09's stated cost: generated detection is CONTENT-based, so the fetch above was already paid for.
     // That is exactly why the configured max-files value caps fetches rather than stored files.
     await record(0, 'generated');
+    return;
+  }
+  // PostgreSQL rejects NULL bytes (0x00) in UTF-8 text columns with "invalid byte sequence for
+  // encoding 'UTF8': 0x00". Binary files (images, compiled objects, fonts, etc.) commonly contain
+  // NULL bytes and are not meaningful to index. Check the first 8 KB — a binary file almost always
+  // has a NULL byte in its header, and scanning the entire file would be wasteful for large binaries.
+  if (content.slice(0, 8192).includes('\0')) {
+    await record(0, 'binary');
     return;
   }
 
