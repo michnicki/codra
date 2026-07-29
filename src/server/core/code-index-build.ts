@@ -508,13 +508,30 @@ export async function runIndexBuild(
       });
     }
 
-    await renewCodeIndexBuildLease(env, {
-      repositoryId: params.repositoryId,
-      workflowInstanceId: params.workflowInstanceId,
-      leaseSeconds: INDEX_BUILD_LEASE_SECONDS,
-    });
-
     const freshInstance = params.continuation >= MAX_INDEX_CONTINUATIONS;
+
+    if (freshInstance) {
+      // About to hand off to a brand-new Workflow instance (workflows/index-build.ts creates it under a
+      // fresh random UUID right after this returns). Renewing the lease under THIS instance's id here
+      // would leave it live and owned by an id that is about to stop calling runIndexBuild -- the
+      // handoff instance's own claimCodeIndexBuildLease would then see a lease it does not own and
+      // coalesce away, doing no work, confirmed live in the 29-09 UAT checkpoint (deferred-items.md's
+      // 29-08 entry). Release instead, so the handoff's claim lands on a free lease. The brief gap
+      // between release and the handoff's create is safe: the destructive full-rebuild reset is
+      // independently guarded by "no progress rows exist at the build sha" (see the ordering comment
+      // above), so a duplicate trigger racing into that gap cannot destroy this build's progress.
+      await releaseCodeIndexBuildLease(env, {
+        repositoryId: params.repositoryId,
+        workflowInstanceId: params.workflowInstanceId,
+      });
+    } else {
+      await renewCodeIndexBuildLease(env, {
+        repositoryId: params.repositoryId,
+        workflowInstanceId: params.workflowInstanceId,
+        leaseSeconds: INDEX_BUILD_LEASE_SECONDS,
+      });
+    }
+
     log.info('Codebase index build continuing', {
       indexedThisInvocation: processed,
       remainingAfterThisInvocation: remaining.length - processed,
