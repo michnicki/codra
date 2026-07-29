@@ -5,16 +5,16 @@ milestone_name: Deferred Candidates
 current_phase: 29
 current_phase_name: qa-idx-01-codebase-index-backed-q-a
 status: executing
-stopped_at: Completed 29-02-PLAN.md
-last_updated: "2026-07-29T08:25:00.000Z"
-last_activity: 2026-07-28
-last_activity_desc: Phase 29 execution started
+stopped_at: Completed 29-06-PLAN.md
+last_updated: "2026-07-29T11:15:00.000Z"
+last_activity: 2026-07-29
+last_activity_desc: 29-06 closed out (safe-resume); A1 confirmed, A2 deferred to 29-09
 progress:
   total_phases: 10
   completed_phases: 7
   total_plans: 21
-  completed_plans: 19
-  percent: 70
+  completed_plans: 20
+  percent: 95
 ---
 
 # Project State
@@ -29,9 +29,9 @@ See: .planning/PROJECT.md (updated 2026-07-25 for v1.2 closure)
 ## Current Position
 
 Phase: 29 (qa-idx-01-codebase-index-backed-q-a) — EXECUTING
-Plan: 1 of 9
+Plan: 8 of 9 complete — 29-09 (dashboard panel + end-to-end human gate) remaining
 Status: Executing Phase 29
-Last activity: 2026-07-28 — Phase 29 execution started
+Last activity: 2026-07-29 — 29-06 closed out under the safe-resume gate (tasks 1–3 landed 2026-07-28; A1 confirmed against a real GitHub push; A2 deferred to 29-09's gate with developer approval)
 
 ### Phase 27 Plan 27-01 Decisions (SEC-XDIFF-01)
 
@@ -259,6 +259,11 @@ Decisions carried from v1.1 execution (still load-bearing for v1.2 — Phase 14 
 - [Phase 29]: findRepositoryIdByIdentity added as a read-only provider-filtered SELECT so the documented read-only Q&A path never calls the inserting getOrCreateRepository — Plan 29-07 Task 1; QA-02 read-only invariant plus T-29-07-03 cross-tenant isolation
 - [Phase 29]: 29-08: the build endpoint claims the lease under codeIndexInstanceId(repositoryId), the same id it keys the Workflow instance on, because IndexWorkflow re-claims under event.instanceId and a mismatched owner would coalesce the build away silently
 - [Phase 29]: 29-08: the index status response uses camelCase wire keys (matching mapJob) and returns status 'idle' with a 200 for a never-built repository rather than a 404
+- [Phase 29]: 29-06: A1 CONFIRMED on a real GitHub push delivery (temporary repository-webhook capture, 2026-07-28) — repository.default_branch AND master_branch both present; A2 (Bitbucket repo:push push.changes[].new.target.hash) deferred to 29-09's end-to-end gate with developer approval because no CF/prod/Bitbucket credentials exist in this environment (probe preserved at scratchpad/probe-a2-bitbucket.mjs; scratch spec moved to scratchpad/ so npm test stays green)
+- [Phase 29]: 29-06: the Bitbucket identity projection is event-aware — repository.name + workspace.slug hard-required, pullrequest present-but-optional — with the verification order (projection → credentials → decrypt → HMAC → full parse) byte-identical; repo:push validates only after the verified parse
+- [Phase 29]: 29-06: repoPushPayloadSchema joins the union via catchall(z.any()) at the member top level, not z.looseObject — runtime-identical looseness, but the union's unnarrowed property-access inference is preserved (Rule 3)
+- [Phase 29]: 29-06: Bitbucket main branch resolves through the adapter's getRepositoryMetadata (mainbranch.name) — the VcsProvider optional method + adapter delegation were added (Rule 3: the plan referenced a client-only method); GitHub reads default_branch ?? master_branch off the payload and warns + ignores when both are absent
+- [Phase 29]: 29-06: recordWebhookDelivery deliberately stays BEFORE the supported-event gate (every push delivery is recorded — diagnosability over row count); branch-creation pushes (zero/null before) start a FULL rebuild, never a zero-sha compare
 
 ### Roadmap Evolution
 
@@ -329,10 +334,10 @@ Items acknowledged and carried forward:
 
 ## Session Continuity
 
-Last session: 2026-07-27T20:36:39.346Z
-Stopped at: Completed 29-02-PLAN.md
+Last session: 2026-07-29T11:15:00.000Z
+Stopped at: Completed 29-06-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
 
-- Execute Phase 28 plans with /gsd-execute-phase 28
+- Execute Phase 29's final plan with /gsd-execute-phase 29 (29-09: dashboard code-index panel + blocking end-to-end human gate — needs npm run deploy and real GitHub + Bitbucket repositories)

@@ -103,7 +103,7 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 29-06-PLAN.md — Default-branch push freshness on both providers, including the Bitbucket identity-projection fix that currently rejects `repo:push` before verification (blocking payload-shape verification: both cross-AI reviewers rated the unvalidated GitHub/Bitbucket push payloads the phase's top risk and asked for one real delivery per provider before this plan is considered complete)
+- [x] 29-06-PLAN.md — Default-branch push freshness on both providers, including the Bitbucket identity-projection fix that currently rejects `repo:push` before verification (blocking payload-shape verification: both cross-AI reviewers rated the unvalidated GitHub/Bitbucket push payloads the phase's top risk and asked for one real delivery per provider before this plan is considered complete)
 - [x] 29-08-PLAN.md — Build-trigger and index-status endpoints, session- and CSRF-guarded, with lease coalescing
 
 **Wave 5** *(blocked on Wave 4 completion)*
