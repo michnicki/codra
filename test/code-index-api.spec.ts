@@ -303,7 +303,7 @@ dbDescribe('codebase-index routes (QA-IDX-01 build trigger + status read)', () =
 
   // --- Behavior 4: the double press --------------------------------------------------------------
 
-  it('coalesces a second press instead of starting a second instance', async () => {
+  it('retries with a fresh instance id when the per-repository id is already taken', async () => {
     const { env, workflow } = createIndexTestEnv();
     const token = await getAuthCookie(env);
     const repo = `ci-double-${Date.now()}`;
@@ -315,16 +315,23 @@ dbDescribe('codebase-index routes (QA-IDX-01 build trigger + status read)', () =
 
     const second = await app.request(buildUrl(repo, 'github'), { method: 'POST', headers: writeHeaders(token) }, env);
 
-    // An ok response reporting coalescing — not an error. A 409 here would train an operator to retry
-    // the one action that must not be retried.
+    // The per-repository id is taken (terminated instance record), so the endpoint retries with a
+    // fresh unique id. This is NOT coalescing — a terminated instance can never resume, so the build
+    // must proceed under a new id rather than being silently dropped.
     expect(second.status).toBe(200);
-    await expect(second.json()).resolves.toMatchObject({ ok: true, coalesced: true });
+    const body = await second.json() as { ok: boolean; coalesced: boolean };
+    expect(body.ok).toBe(true);
+    expect(body.coalesced).toBe(false);
 
-    // The count is the assertion that matters: still ONE creation after two presses.
-    expect(workflow.created).toHaveLength(1);
+    // Two creations: one per-repository id (first press), one fresh id (second press after retry).
+    expect(workflow.created).toHaveLength(2);
+    expect(workflow.created[0].id).toBe(codeIndexInstanceId(repositoryId));
+    expect(workflow.created[1].id).not.toBe(codeIndexInstanceId(repositoryId));
+    expect(workflow.created[1].id).toContain(codeIndexInstanceId(repositoryId));
 
     const state = await getCodeIndexState(env, { repositoryId });
-    expect(state!.workflow_instance_id).toBe(codeIndexInstanceId(repositoryId));
+    // The state is updated to the fresh instance id from the second (successful) create.
+    expect(state!.workflow_instance_id).toBe(workflow.created[1].id);
   });
 
   it('coalesces when a DIFFERENT instance holds the live lease (the handoff case)', async () => {
