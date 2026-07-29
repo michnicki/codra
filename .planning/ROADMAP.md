@@ -17,17 +17,17 @@
 **Goal:** Promote EVID-01 from soft/audit-only to hard-drop — findings with hallucinated `existingCode` evidence are dropped from posted comments (not just recorded in audit). Config-gated (`evidence.hard_drop`, default off). Per-category opt-out.
 **Requirements**: EVID-02
 **Depends on:** v1.3 (Phase 21 EVID-03 bounded telemetry)
-**Plans:** 0/2 plans complete
+**Plans:** 2/2 plans complete
 
 Plans:
 
 **Wave 1**
 
-- [ ] 26-01-PLAN.md — Schema + evidence block (bounded at 20) + checkEvidence extraction + audit builder + config.ts default injection + 17 unit tests
+- [x] 26-01-PLAN.md — Schema + evidence block (bounded at 20) + checkEvidence extraction + audit builder + config.ts default injection + 17 unit tests
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 26-02-PLAN.md — Finalize wiring (persisted finalizeRetriedPastPost gate) + API shallow-merge fix + integration tests + dashboard config UI + audit viewer renderer
+- [x] 26-02-PLAN.md — Finalize wiring (persisted finalizeRetriedPastPost gate) + API shallow-merge fix + integration tests + dashboard config UI + audit viewer renderer
 
 ### Phase 27: SEC-XDIFF-01 Whole-diff cross-file security reasoning
 
@@ -88,23 +88,23 @@ Plans:
 
 **Wave 1** *(tracer — verified before any expansion plan starts)*
 
-- [ ] 29-01-PLAN.md — Tracer: migration 018, the pure splitter/chunker, ranked repository-scoped retrieval, and the retrieved-context prompt fence, proven end to end
+- [x] 29-01-PLAN.md — Tracer: migration 018, the pure splitter/chunker, ranked repository-scoped retrieval, and the retrieved-context prompt fence, proven end to end
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 29-02-PLAN.md — Config contract: the `review.interactive.qa.index` block at all three Zod sites, default-off pinned (one-way decision checkpoint)
-- [ ] 29-03-PLAN.md — Ingest seam: `listDefaultBranchTree` on both adapters, the SSRF-guarded Bitbucket `/src` walk, and additive `scorePath` / `isGeneratedContent` extractions
-- [ ] 29-04-PLAN.md — Index refresh, per-file progress, build lease, and the DB guarantee battery (ranking, cross-repository isolation, pathological input)
+- [x] 29-02-PLAN.md — Config contract: the `review.interactive.qa.index` block at all three Zod sites, default-off pinned (one-way decision checkpoint)
+- [x] 29-03-PLAN.md — Ingest seam: `listDefaultBranchTree` on both adapters, the SSRF-guarded Bitbucket `/src` walk, and additive `scorePath` / `isGeneratedContent` extractions
+- [x] 29-04-PLAN.md — Index refresh, per-file progress, build lease, and the DB guarantee battery (ranking, cross-repository isolation, pathological input)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 29-05-PLAN.md — `IndexWorkflow` on its own `INDEX_WORKFLOW` binding, re-derived subrequest budget, resumable build (one-way decision checkpoint)
-- [ ] 29-07-PLAN.md — Fail-open retrieval inside the read-only Q&A path, with the byte-identical disabled prompt pinned
+- [x] 29-05-PLAN.md — `IndexWorkflow` on its own `INDEX_WORKFLOW` binding, re-derived subrequest budget, resumable build (one-way decision checkpoint)
+- [x] 29-07-PLAN.md — Fail-open retrieval inside the read-only Q&A path, with the byte-identical disabled prompt pinned
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
 - [ ] 29-06-PLAN.md — Default-branch push freshness on both providers, including the Bitbucket identity-projection fix that currently rejects `repo:push` before verification (blocking payload-shape verification: both cross-AI reviewers rated the unvalidated GitHub/Bitbucket push payloads the phase's top risk and asked for one real delivery per provider before this plan is considered complete)
-- [ ] 29-08-PLAN.md — Build-trigger and index-status endpoints, session- and CSRF-guarded, with lease coalescing
+- [x] 29-08-PLAN.md — Build-trigger and index-status endpoints, session- and CSRF-guarded, with lease coalescing
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
