@@ -39,6 +39,7 @@ import {
 } from '@client/components/features/models/model-chain';
 import { ReviewSettingsPanel } from '@client/components/features/repos/review-settings-panel';
 import { LearnedRulesPanel } from '@client/components/features/repos/learned-rules-panel';
+import { CodeIndexPanel } from '@client/components/features/repos/code-index-panel';
 import { mergeReviewPatch, type ReviewSettingsDraft } from '@client/lib/review-config-draft';
 
 const EMPTY_MODEL_ROUTE: ModelRouteConfig = {
@@ -481,6 +482,9 @@ function RepoModelModal({
   const [interactiveDraft, setInteractiveDraft] = useState<InteractiveDraft | null>(null);
   const [reviewSettingsDraft, setReviewSettingsDraft] = useState<ReviewSettingsDraft | null>(null);
   const [learningDraft, setLearningDraft] = useState<RepoConfig['review']['learning'] | null>(null);
+  // QA-IDX-01: the code-index toggle is lifted as a dirty-tracked config edit, exactly like the
+  // learning draft — the panel never posts the toggle directly.
+  const [indexDraft, setIndexDraft] = useState<RepoConfig['review']['interactive']['qa']['index'] | null>(null);
 
   useEffect(() => {
     if (!repo) return;
@@ -492,6 +496,7 @@ function RepoModelModal({
     setInteractiveDraft(null);
     setReviewSettingsDraft(null);
     setLearningDraft(null);
+    setIndexDraft(null);
   }, [selectedRepoId, globalRouteKey]);
 
   const modelDirty = useMemo(() => !routesEqual(route, initialRoute), [initialRoute, route]);
@@ -500,7 +505,8 @@ function RepoModelModal({
   const reviewSettingsDirty = reviewSettingsDraft?.dirty ?? false;
   const reviewSettingsValid = reviewSettingsDraft?.valid ?? true;
   const learningDirty = learningDraft !== null;
-  const dirty = modelDirty || interactiveDirty || reviewSettingsDirty || learningDirty;
+  const indexDirty = indexDraft !== null;
+  const dirty = modelDirty || interactiveDirty || reviewSettingsDirty || learningDirty || indexDirty;
   const canApply = !!repo && dirty && interactiveValid && reviewSettingsValid && saving === null;
   const hasStoredStrategy = repo ? hasStoredModelStrategy(repo) : false;
 
@@ -526,11 +532,27 @@ function RepoModelModal({
               ...(learningDirty && learningDraft ? { learning: learningDraft } : {}),
             }
           : null;
+      // QA-IDX-01: the index toggle lives at review.interactive.qa.index, so it merges through the
+      // `interactive` argument — and it is overlaid LAST because the InteractivePanel's draft spreads
+      // `interactive.qa` from the repo prop, which predates an index edit made afterwards in the same
+      // modal session (the same stale-draft clobber class as REVIEW #4).
+      const effectiveInteractive =
+        interactiveDirty || indexDirty
+          ? (() => {
+              const base =
+                interactiveDirty && interactiveDraft
+                  ? interactiveDraft.interactive
+                  : repo.parsedJson.review.interactive;
+              return indexDraft
+                ? { ...base, qa: { ...base.qa, index: indexDraft } }
+                : base;
+            })()
+          : null;
       const nextReview =
-        interactiveDirty || settingsFields
+        effectiveInteractive || settingsFields
           ? mergeReviewPatch(
               repo.parsedJson.review,
-              interactiveDirty && interactiveDraft ? interactiveDraft.interactive : null,
+              effectiveInteractive,
               settingsFields,
             )
           : null;
@@ -654,6 +676,27 @@ function RepoModelModal({
                   owner={repo.owner}
                   repo={repo.repo}
                   vcsProvider={repo.vcsProvider}
+                />
+                <div className="my-6 border-t border-border" />
+                <CodeIndexPanel
+                  key={`${selectedRepoId}-code-index`}
+                  owner={repo.owner}
+                  repo={repo.repo}
+                  vcsProvider={repo.vcsProvider}
+                  config={indexDraft ?? repo.parsedJson.review.interactive.qa.index}
+                  onIndexChange={setIndexDraft}
+                  onRefreshed={async () => {
+                    // Re-read config from the server after a build press (same C7 pattern as the
+                    // learned-rules panel) — best-effort, stale data is acceptable until next open.
+                    try {
+                      const fresh = await api.getRepo(repo.owner, repo.repo, repo.vcsProvider);
+                      if (fresh?.repo) {
+                        onRepoRefreshed(fresh.repo);
+                      }
+                    } catch {
+                      // best-effort
+                    }
+                  }}
                 />
               </>
             )}
