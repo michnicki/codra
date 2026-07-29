@@ -562,16 +562,68 @@ export function createReposRouter() {
       await c.env.INDEX_WORKFLOW.create({ id: workflowInstanceId, params });
     } catch (error) {
       if (error instanceof Error && error.message.includes('instance.already_exists')) {
-        // The same disposition the queue consumer already gives this rejection (src/server/index.ts):
-        // an instance for this repository is live, so the press is a duplicate rather than a failure.
-        // Reachable even though the lease claim succeeded — a re-claim by the SAME instance id is legal,
-        // which is exactly the case where a still-running instance already owns this id.
-        logger.info('Codebase index build request coalesced: workflow instance already exists', {
+        // The instance record may be TERMINATED (from a previous failed build) rather than live.
+        // A terminated instance's id is still reserved by Cloudflare, so `create` throws
+        // `instance.already_exists` even though nothing is running. In that case, release the lease
+        // and retry with a fresh unique id — a terminated instance can never resume, so treating it
+        // as "coalesced" leaves the build permanently stuck.
+        //
+        // The `instance_already_exists` path is only a benign coalesce when the instance is actually
+        // running; for terminated instances, the per-repository id must be abandoned in favor of a
+        // unique one so the build can proceed.
+        const freshInstanceId = `${workflowInstanceId}-${Date.now()}`;
+        logger.info('Codebase index build: instance already exists; retrying with fresh instance id', {
           repositoryId,
-          vcsProvider: existing.vcsProvider,
-          reason: 'instance_already_exists',
+          originalId: workflowInstanceId,
+          freshId: freshInstanceId,
         });
-        return coalesced('instance_already_exists');
+        // Re-claim the lease under the fresh id so the Workflow's `runIndexBuild` (which re-claims
+        // under `event.instanceId`) can enter its own lease. The original claim is still held, so
+        // this is a re-claim by a DIFFERENT id — `claimCodeIndexBuildLease` treats that as a foreign
+        // claim and rejects it. Release first, then re-claim.
+        try {
+          await releaseCodeIndexBuildLease(c.env, { repositoryId, workflowInstanceId });
+          const reClaimed = await claimCodeIndexBuildLease(c.env, {
+            repositoryId,
+            workflowInstanceId: freshInstanceId,
+            leaseSeconds: INDEX_BUILD_LEASE_SECONDS,
+          });
+          if (!reClaimed) {
+            // Another build grabbed the lease in the gap — treat as coalesced.
+            return coalesced('lease_held_after_release');
+          }
+        } catch (leaseError) {
+          logger.error(
+            'Failed to transfer lease to fresh instance id',
+            leaseError instanceof Error ? leaseError : new Error(String(leaseError)),
+          );
+          // Proceed anyway — the Workflow will try to claim on entry.
+        }
+        try {
+          await c.env.INDEX_WORKFLOW.create({ id: freshInstanceId, params: { ...params, workflowInstanceId: freshInstanceId } });
+          return c.json({
+            ok: true,
+            coalesced: false,
+            build: { mode: 'full' as const, workflowInstanceId: freshInstanceId },
+            message: 'Codebase index build started.',
+          });
+        } catch (retryError) {
+          // If the fresh id also fails, this is a real Cloudflare-side issue — release the lease and
+          // surface the error.
+          try {
+            await releaseCodeIndexBuildLease(c.env, { repositoryId, workflowInstanceId: freshInstanceId });
+          } catch (releaseError) {
+            logger.error(
+              'Failed to release the codebase index build lease after a failed retry',
+              releaseError instanceof Error ? releaseError : new Error(String(releaseError)),
+            );
+          }
+          logger.error(
+            'Codebase index build failed even with a fresh instance id',
+            retryError instanceof Error ? retryError : new Error(String(retryError)),
+          );
+          return jsonError('Failed to start codebase index build. Please try again.', 500);
+        }
       }
 
       // RELEASE THE LEASE THE REQUEST JUST TOOK. Without this, a Cloudflare-side create failure leaves
