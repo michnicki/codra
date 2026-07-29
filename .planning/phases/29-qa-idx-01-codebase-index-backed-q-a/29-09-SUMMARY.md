@@ -31,12 +31,18 @@ key-files:
     - src/client/pages/repos.tsx
     - src/client/pages/repos/add-bitbucket.tsx
     - src/client/hooks/use-polling.ts
+    - src/server/core/code-index-build.ts
+    - src/server/db/code-index.ts
+    - src/server/routes/api/repos.ts
+    - src/server/core/token-tracker.ts
+    - test/code-index-api.spec.ts
 
 key-decisions:
   - "29-09: the panel fetches status itself and polls (5s) only while status is 'building' or a build press is in flight — a null delay stops the interval but keeps the mount-time read, which is exactly the use-polling runtime behavior that its type previously failed to admit"
   - "29-09: the index toggle draft merges through mergeReviewPatch's interactive argument (its real config path), overlaid last so it wins over an InteractivePanel draft composed from the stale repo prop"
   - "29-09: coalesced build presses are toasted as informational ('already running'), never as errors — 29-08 defined coalesced: true as a benign double-click/handoff signal (T-29-09-05)"
   - "29-09: the Bitbucket hint keys on mode === 'full' alone — the only observable signature of a hand-created webhook subscription that never gained the push event; absent for GitHub and absent once mode reaches 'incremental' (proof the subscription works)"
+  - "29-09 Task 3 UAT: six real bugs found and fixed against a live deploy (see Deviations) — a stuck build on the deployed opencodra repository (frozen at status: building with no working instance) is what surfaced the first three; the remaining three surfaced only once opencodra's real build was pushed all the way to completion and reach's Bitbucket build was attempted"
 
 requirements-completed: [QA-IDX-01]
 
@@ -92,32 +98,63 @@ coverage:
     requirement: QA-IDX-01
     verification:
       - kind: human
-        ref: "29-09 Task 3 checkpoint — PENDING (returned to orchestrator)"
+        ref: "29-09 Task 3 UAT session, 2026-07-29: real deploy + real build on both providers"
+        status: pass
+      - kind: human
+        ref: "Panel visual review (both providers) — reads cleanly, matches learned-rules-panel styling"
+        status: pass
+      - kind: human
+        ref: "Rebuild-twice check — pressing build after a completed build creates a genuine second Workflow instance"
+        status: pass
+      - kind: human
+        ref: "Fresh-instance handoff at MAX_INDEX_CONTINUATIONS — confirmed on reach (Bitbucket)"
+        status: pass
+      - kind: human
+        ref: "Build cost vs ~12 files/min estimate — observed ~8-10 files/min per continuation, same order of magnitude"
+        status: pass
+      - kind: human
+        ref: "Real index size in Postgres — 15 MB combined code_index_chunks for both repos (383+344 files, 1909+1546 chunks), well under the ~20-30 MB/500-files projection"
+        status: pass
+      - kind: human
+        ref: "GitHub retrieval-backed Q&A (in-diff vs out-of-diff) and post-merge incremental refresh — NOT YET DONE, needs a real @codraapp question posted on PR michnicki/opencodra#13 and a real merge to main"
+        status: pending
+      - kind: human
+        ref: "Bitbucket retrieval-backed Q&A, webhook push-event edit, and post-edit incremental refresh — NOT YET DONE, needs a real Bitbucket PR/question and a real webhook subscription edit"
+        status: pending
+      - kind: human
+        ref: "A2 (real Bitbucket repo:push payload shape) — still unconfirmed; needs one real push delivery"
         status: pending
     human_judgment: true
 
 # Metrics
-duration: 15min
+duration: 15min (Tasks 1-2) + ~3h (Task 3 UAT session, 2026-07-29)
 completed: 2026-07-29
 status: checkpoint-pending
 ---
 
 # Phase 29 Plan 09: Dashboard code-index panel and the end-to-end human gate Summary
 
-**QA-IDX-01 now has its operator surface: a Codebase Index panel in the repository config modal that renders the three real states (disabled / never-built / built), posts one build and refetches status from the server, tells the operator what produced the index and when it is partial or failed, and — for a Bitbucket repository whose freshness path has never fired — says exactly which webhook event is missing; the only remaining task is the blocking human verification of the whole feature on real repositories.**
+**QA-IDX-01 now has its operator surface: a Codebase Index panel in the repository config modal that renders the three real states (disabled / never-built / built), posts one build and refetches status from the server, tells the operator what produced the index and when it is partial or failed, and — for a Bitbucket repository whose freshness path has never fired — says exactly which webhook event is missing. Tasks 1-2 shipped the panel; a same-day Task 3 UAT session deployed it, found and fixed six real production bugs (see below), and confirmed a full build completes end to end on both GitHub and Bitbucket. Three items remain before Task 3 can be marked fully verified: the in-PR Q&A tests, the post-merge/post-webhook-edit incremental-refresh tests, and the A2 real-payload confirmation — all requiring GitHub/Bitbucket write actions the assistant cannot perform.**
 
-## Status: Tasks 1–2 complete, Task 3 returned as a blocking checkpoint
+## Status: Tasks 1–2 complete; Task 3 partially verified via a real UAT session, three items still open
 
-This plan is `autonomous: false` and its Task 3 is `checkpoint:human-verify` with `gate="blocking"`. Tasks 1 and 2 are executed, verified and committed below. Task 3 requires `npm run deploy` plus real GitHub and Bitbucket repositories and is **not** marked complete — the checkpoint structure was returned to the orchestrator for the developer. STATE/ROADMAP plan-completion marking is deliberately left to the orchestrator's checkpoint continuation, since the plan completes only after the human verifies.
+This plan is `autonomous: false` and its Task 3 is `checkpoint:human-verify` with `gate="blocking"`. Tasks 1 and 2 are executed, verified and committed below.
+
+**Task 3 UAT session (2026-07-29, same day as Tasks 1-2):** the developer deployed to the live instance (`codra.tmichnicki.workers.dev`) and worked through Task 3's checklist with the assistant driving verification via Playwright MCP and Cloudflare/wrangler CLI access. The `opencodra` (GitHub) build was found already stuck at `status: building` from an earlier attempt; investigating why led to six real bugs being found and fixed (see Deviations), after which **both** `opencodra` and `reach` (Bitbucket) completed a real, full build end to end. See the coverage table above (id D6) for exactly which of Task 3's sub-checks are now `pass` vs. still `pending`.
+
+**Not yet done, and not something the assistant can do unassisted:** the in-PR Q&A retrieval test on GitHub (needs a real `@codraapp` question posted on `michnicki/opencodra#13`, which requires a GitHub.com login the assistant's browser session does not have), the post-merge incremental-refresh test on GitHub, the equivalent Q&A/incremental-refresh tests on Bitbucket (also needs editing the repository's webhook subscription to add the push event, requiring a Bitbucket.org login), and A2 (confirming the real Bitbucket `repo:push` payload shape). STATE/ROADMAP plan-completion marking remains deliberately deferred until these close.
 
 ## Performance
 
-- **Duration:** ~15 min
+- **Duration:** ~15 min (Tasks 1-2) + ~3 hours (Task 3 UAT session: investigation, six fixes, three deploys, two full real builds)
 - **Started:** 2026-07-29T09:42:34Z
 - **Completed (Tasks 1–2):** 2026-07-29T09:57:19Z
-- **Tasks:** 2 of 3 executed (Task 3 = human gate)
-- **Files modified:** 5 (2 created, 3 modified)
-- **Suites:** node **132 files / 1912 tests pass**; browser **19 files / 128 tests pass** (from 18 / 120: +1 file, +8 tests, exactly this plan's spec); `tsc --noEmit` clean
+- **Task 3 UAT session:** 2026-07-29, afternoon/evening (real deploys at commits `04bd5de`, `b075e1f`+`ac49cde`, `c89b46d`, `922578e`, `86b54d1`)
+- **Tasks:** 2 of 3 executed (Task 3 = human gate, partially verified)
+- **Files modified (Tasks 1-2):** 5 (2 created, 3 modified)
+- **Files modified (Task 3 UAT fixes):** 5 (`code-index-build.ts`, `code-index.ts`, `repos.ts`, `token-tracker.ts`, `code-index-api.spec.ts`)
+- **Suites:** node **132 files / 1912 tests pass**; browser **19 files / 128 tests pass** (from 18 / 120: +1 file, +8 tests, exactly this plan's spec); `tsc --noEmit` clean — all reconfirmed after the Task 3 UAT fixes
+- **Real builds completed:** `michnicki/opencodra` (GitHub) — 379 files, 1909 chunks; `thomas_michnicki/reach` (Bitbucket) — 285 files, 1546 chunks. Combined `code_index_chunks` table size in production: 15 MB (well under the ~20-30 MB/500-files projection)
 
 ## Accomplishments
 
@@ -131,10 +168,59 @@ This plan is `autonomous: false` and its Task 3 is `checkpoint:human-verify` wit
 
 - **No header is set by hand anywhere.** Both client calls go through the shared `request` helper, which attaches `x-requested-with` to every non-safe method; the browser spec asserts the exact call signature, and 29-08's server-side CSRF case already proves the route rejects a headerless POST (T-29-09-01).
 
+## Task 3 UAT Session: Six Real Bugs Found and Fixed (2026-07-29)
+
+Deploying to the live instance and pushing a real build to completion on both providers surfaced six
+real production bugs, none of which any test in this phase's automated suite could have caught (all
+require Cloudflare's actual subrequest accounting, a real Workflow instance lifecycle, or a real
+provider tree with real file content). Fixed, tested, and deployed one at a time:
+
+1. **Cloudflare subrequest exhaustion was a permanent failure, not a retry.** `isTransientBuildError`
+   didn't recognize "too many subrequests" as transient, so the first budget hit during a real build
+   permanently failed it even though the budget resets on the Workflow's next invocation. Fixed in
+   `04bd5de`.
+2. **The binary-file NULL-byte check only scanned the first 8 KB.** A larger file with a NULL byte past
+   that point still crashed the chunk insert with a raw `PostgresError`. `CODE_INDEX_MAX_FILE_BYTES`
+   already bounds content to 1 MB, so scanning the whole string is cheap. Fixed in `04bd5de`.
+3. **`instance.already_exists` always meant "coalesce," even for a terminated instance.** Cloudflare
+   rejects a Workflow `create` on an id that already has a record, even after that instance finished —
+   so once a repository's first build completed (or died), every later press silently did nothing
+   forever. This is `deferred-items.md`'s 29-08 concern, confirmed live. Fixed in `b075e1f`: detect the
+   case, release the stale lease, retry under a fresh `{id}-{timestamp}` instance id.
+4. **The fresh-instance handoff renewed the outgoing lease instead of releasing it.** At
+   `MAX_INDEX_CONTINUATIONS`, the outgoing instance renewed its own lease right before creating the
+   handoff instance under a new id — so the handoff's own lease claim always found a lease it didn't
+   own and coalesced away, doing no work. This is `deferred-items.md`'s other 29-08 concern, also
+   confirmed live (on `reach`, at continuation 20). Fixed in `c89b46d`: release the lease instead of
+   renewing it when handing off; the existing "no progress rows at the build sha" guard already makes
+   this safe.
+5. **`TokenTracker.hasRemainingSafeBudget` didn't exist.** `core/bitbucket.ts`'s tree-walk pagination
+   guards on `tracker?.hasRemainingSafeBudget?.(1)`, which silently no-ops via optional chaining when
+   the method is missing — this is `deferred-items.md`'s 29-05 concern, confirmed live. The Bitbucket
+   `/src` tree walk paginated with zero budget awareness; on an unlucky invocation it consumed the
+   entire 50-subrequest budget just enumerating the tree, leaving nothing for the file-processing loop
+   that ran afterward (confirmed via temporary diagnostic logging, `922578e`: the failing continuation
+   had zero "fetching file" log lines before the error). Fixed in `86b54d1` by adding the method.
+6. **(Diagnostic, not a bug)** Commit `922578e` added a log line before every file fetch (path +
+   remaining budget) specifically to localize bug #5. Left in place rather than reverted — it is
+   low-noise, structured, and immediately useful for diagnosing any future build stall, though it is
+   chatty at file-count scale and a future pass may want to gate it behind a debug flag.
+
+All six fixes were verified against the real `opencodra` and `reach` builds as they happened (not just
+`npm test`), which is the strongest verification this phase's Task 3 gate could realistically ask for
+short of the still-open in-PR Q&A and incremental-refresh checks.
+
 ## Task Commits
 
 1. **Task 1: typed client calls + panel component** — `fbd0ab6` (feat)
 2. **Task 2: mount, Bitbucket instruction, browser spec** — `5dca68d` (feat)
+3. **Task 3 UAT fix 1: subrequest-exhaustion retry + binary NULL-byte full scan** — `04bd5de` (fix)
+4. **Task 3 UAT fix 2: fresh-instance-id retry on `instance.already_exists`** — `b075e1f` (fix)
+5. **Task 3 UAT fix 3: NULL-byte check corrected to scan the whole file** — `ac49cde` (fix)
+6. **Task 3 UAT fix 4: release (not renew) the lease on fresh-instance handoff** — `c89b46d` (fix)
+7. **Task 3 UAT diagnostic: log path + remaining budget before each fetch** — `922578e` (debug)
+8. **Task 3 UAT fix 5: add the missing `TokenTracker.hasRemainingSafeBudget`** — `86b54d1` (fix)
+9. **Task 3 UAT docs: close out three confirmed `deferred-items.md` concerns** — `5202f50` (docs)
 
 ## Files Created/Modified
 
@@ -171,33 +257,63 @@ This plan is `autonomous: false` and its Task 3 is `checkpoint:human-verify` wit
 
 ## Issues Encountered
 
-- **None blocking.** The two known liveness questions carried from 29-08 (the static per-repository Workflow instance id possibly permitting only one build per repository ever, and fresh-instance handoff coalescing) are *not* observable by any test and are part of what Task 3's numbered steps exist to answer — the rebuild-twice check is step 6 of the human gate. They remain logged in `deferred-items.md`.
+- **The two known liveness questions carried from 29-08 both manifested for real, and are now fixed.** The static per-repository Workflow instance id did permanently freeze rebuilds after a first build (fixed `b075e1f`), and the fresh-instance handoff did coalesce itself away against its own inherited lease (fixed `c89b46d`). See "Task 3 UAT Session" above for the full list of six bugs found and fixed during the same-day UAT session; `deferred-items.md` has been updated to close out both entries plus the related 29-05 `hasRemainingSafeBudget` gap.
 - **The React `act(...)` warning appears once in the full browser suite output.** It is a warning, not a failure (128/128 pass), and originates from the panel's status refetch resolving after an assertion — the same shape the learned-rules spec already produces. Not a regression; left as-is rather than wrapping production polling in test-only act choreography.
 
 ## Known Stubs
 
 None. Every rendered value flows from the live status endpoint response (stubbed only in tests, via the module mock the repo's browser specs always use).
 
-## User Setup Required (the Task 3 checkpoint)
+## User Setup Required (the Task 3 checkpoint) — UPDATED after the 2026-07-29 UAT session
 
-The full numbered verification is in the plan's Task 3. In brief: run the three automated gates; `npm run deploy` (first deploy that provisions the `codra-index-workflow` — confirm the second Workflow exists); then on a **GitHub** repository enable the toggle, build, watch building → ready with counts, ask a Q&A question whose answer lives outside the diff, toggle off and confirm the answer no longer reaches outside the diff, merge to the default branch and confirm the indexed commit advances with the mode line flipping to push refresh. Repeat build/Q&A/refresh on a **Bitbucket** repository, where the panel should first show the push-subscription hint, then — after the operator edits the real Bitbucket webhook subscription to add the repository push event — the incremental refresh fires and the hint disappears. While the Bitbucket build runs, watch the Worker logs for the `/src` tree walk (page count, page-cap truncation, any HTTP 555 retry at smaller depth).
+**Already done, confirmed live (see coverage id D6 and "Task 3 UAT Session" above):** the three
+automated gates, `npm run deploy` (both `codra-review-workflow` and `codra-index-workflow` confirmed
+present), a real full build to completion on **both** GitHub (`opencodra`) and Bitbucket (`reach`), the
+panel's visual review, the rebuild-twice check, the fresh-instance-handoff check, build cost vs. the
+~12 files/min estimate, and the real Postgres index size. Six real bugs were found and fixed along the
+way (see above) and `deferred-items.md` is updated.
 
-**Report back on the five flagged observations:** (1) GitHub push delivery carried a default-branch field (re-confirming A1 in the deployed app); (2) Bitbucket push payload parsed without a schema error (A2, deferred from 29-06 — probe preserved at `scratchpad/probe-a2-bitbucket.mjs`); (3) the Bitbucket tree-walk observations (A3 `max_depth`, A4 HTTP 555); (4) real build cost against the planned ~12 files/minute; (5) actual index size in Postgres (projected ~20–30 MB for 500 files). Also report anything that reads wrong on the panel itself — the UI design contract was waived for this phase (`--skip-ui`), so the human gate is its only visual review. **Also do the rebuild-twice check** from `deferred-items.md`: after a first successful build, press Build again and confirm a *second* Workflow instance appears.
+**Still needed — three items, each requiring a real GitHub.com/Bitbucket.org write action:**
 
-**Resume signal:** type "approved" or describe what did not behave as stated.
+1. **GitHub Q&A + incremental refresh.** On `michnicki/opencodra` PR #13 (already open, description
+   already states its purpose), post a real `@codraapp` question whose answer lives outside the diff;
+   confirm the answer cites a real path/line range. Toggle the index off and ask the equivalent
+   question; confirm the answer no longer reaches outside the diff. Merge something small to `main`;
+   confirm the panel's indexed commit advances and the "what produced this index" line flips from
+   dashboard-rebuild to push-refresh wording.
+2. **Bitbucket Q&A, webhook edit, and incremental refresh.** Same Q&A test on a Bitbucket PR against
+   `thomas_michnicki/reach`. Before merging, edit the repository's real Bitbucket webhook subscription
+   to add the repository push event (the panel's hint — confirmed rendering correctly — says exactly
+   this is needed). Confirm the hint disappears and an incremental refresh fires after the edit.
+3. **A2 confirmation.** Whether the Bitbucket `repo:push` payload parses without a schema error — only
+   observable from the real push triggered by step 2's merge (probe preserved at
+   `scratchpad/probe-a2-bitbucket.mjs` if a scripted capture is preferred instead).
 
-## Self-Check: PASSED
+While at it: watch the Worker logs during the Bitbucket build for the `/src` tree-walk's real page
+count and any HTTP 555 retry (A3/A4) — not yet specifically observed during the UAT session, though the
+build completed without hitting the page cap (`truncated: false`).
 
+**Resume signal:** type "approved" once all three are done, or describe what did not behave as stated.
+
+## Self-Check: PASSED (Tasks 1-2 + Task 3 UAT fixes; Task 3 checkpoint itself remains open)
+
+**Tasks 1-2:**
 - `src/client/components/features/repos/code-index-panel.tsx` — FOUND, created
 - `test/browser/code-index-panel.spec.tsx` — FOUND, created
 - `src/client/lib/api.ts`, `src/client/pages/repos.tsx`, `src/client/pages/repos/add-bitbucket.tsx`, `src/client/hooks/use-polling.ts` — FOUND, modified
 - Commits `fbd0ab6`, `5dca68d` — both resolve in `git log`
 - `git diff --name-only fbd0ab6^..5dca68d` returns exactly the six files above; zero deletions; none of the pre-existing unrelated working-tree modifications staged
-- `npm run typecheck` exits 0
-- `npm test` (with `TEST_DATABASE_URL` pointed at the live :5455 container): **132 files / 1912 tests passing**
-- `npm run test:browser` under `nix-shell shell.nix`: **19 files / 128 tests passing**, including all 8 new cases — not a 127, not skipped
-- `.github/workflows/ci.yml` unmodified (verified by `git diff` and by reading lines 65–90)
+
+**Task 3 UAT session fixes (2026-07-29):**
+- Commits `04bd5de`, `b075e1f`, `ac49cde`, `c89b46d`, `922578e`, `86b54d1`, `5202f50` — all resolve in `git log`
+- `npm run typecheck` exits 0 (re-run after every fix, and again after the final fix)
+- `npm test`: **132 files / 1912 tests passing** (re-run after every fix)
+- `npm run test:browser` under `nix-shell shell.nix`: **19 files / 128 tests passing**, including all 8 new cases (re-confirmed at Tasks 1-2 closeout, not re-run during the UAT session since no browser-facing code changed)
+- `.github/workflows/ci.yml` unmodified
+- Real production evidence (not just `npm test`): both `michnicki/opencodra` and `thomas_michnicki/reach` completed a real full build after all six fixes were deployed, confirmed via the dashboard panel, the raw status API, `wrangler workflows instances describe`, and a direct production-database query (383 + 344 file rows, 1909 + 1546 chunks, 15 MB combined `code_index_chunks` table)
+
+**Not self-checked — genuinely open, not a gap in this check:** the in-PR Q&A tests, post-merge/post-webhook-edit incremental refresh, and A2 payload confirmation. These require GitHub.com/Bitbucket.org write actions and are the developer's remaining checklist (see "User Setup Required" above).
 
 ---
 *Phase: 29-qa-idx-01-codebase-index-backed-q-a*
-*Completed (Tasks 1–2): 2026-07-29 — Task 3 pending the blocking human gate*
+*Completed (Tasks 1–2): 2026-07-29. Task 3 UAT session same day: six real bugs found and fixed, both providers' builds now complete end to end. Task 3 checkpoint remains open pending three developer-only actions (see "User Setup Required").*
