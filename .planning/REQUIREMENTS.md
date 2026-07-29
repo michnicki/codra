@@ -19,17 +19,17 @@
 
 ### Wave 1 — Evidence Hard-Drop (foundational)
 
-- [ ] **EVID-02**: Hard-drop findings with hallucinated `existingCode` evidence. Promote EVID-01 from soft/audit-only to hard-drop now that v1.3 bounded telemetry (EVID-03 evidence_missing_summary) provides a reliable signal. A finding whose `existing_code` is absent or not found in the hunk is dropped from the posted comment set rather than merely recorded in the audit trail. The drop decision is explainable via audit events. Config-gated with `evidence.hard_drop` toggle (default off — NREG-01). Per-category opt-out (e.g., security findings always post regardless). Legacy `evidence_missing` per-finding variant preserved in schema.
+- [x] **EVID-02**: Hard-drop findings with hallucinated `existingCode` evidence. Promote EVID-01 from soft/audit-only to hard-drop now that v1.3 bounded telemetry (EVID-03 evidence_missing_summary) provides a reliable signal. A finding whose `existing_code` is absent or not found in the hunk is dropped from the posted comment set rather than merely recorded in the audit trail. The drop decision is explainable via audit events. Config-gated with `evidence.hard_drop` toggle (default off — NREG-01). Per-category opt-out (e.g., security findings always post regardless). Legacy `evidence_missing` per-finding variant preserved in schema.
 
 ### Wave 2 — Review Quality
 
-- [ ] **SEC-XDIFF-01**: Whole-diff cross-file security reasoning. A new LLM pass that sees the entire PR diff (not per-file chunks) and reasons about security implications across file boundaries — e.g., an auth middleware change in one file combined with a new unprotected route in another. Scheduled as a separate phase after the per-file security pass. Its findings enter the same dedup → critic → post pipeline. Subject to the same subrequest budget with runs-aware chunk sizing. Provider-agnostic prompt.
+- [x] **SEC-XDIFF-01**: Whole-diff cross-file security reasoning. A new LLM pass that sees the entire PR diff (not per-file chunks) and reasons about security implications across file boundaries — e.g., an auth middleware change in one file combined with a new unprotected route in another. Scheduled as a separate phase after the per-file security pass. Its findings enter the same dedup → critic → post pipeline. Subject to the same subrequest budget with runs-aware chunk sizing. Provider-agnostic prompt.
 
-- [ ] **LRN-01**: Learned-rule synthesis from clustered `reject` feedback + approval queue. The `reject` command (CMD-05) already captures the finding the user rejected and their reason. This requirement clusters rejections by similarity (title, category, file pattern) and synthesizes suppression rules — "if a finding matches this pattern, suppress it" — stored as learned rules in the repo config. Rules are reviewable in the dashboard before activation. Config-gated (`learning.enabled`, default off).
+- [x] **LRN-01**: Learned-rule synthesis from clustered `reject` feedback + approval queue. The `reject` command (CMD-05) already captures the finding the user rejected and their reason. This requirement clusters rejections by similarity (title, category, file pattern) and synthesizes suppression rules — "if a finding matches this pattern, suppress it" — stored as learned rules in the repo config. Rules are reviewable in the dashboard before activation. Config-gated (`learning.enabled`, default off).
 
 ### Wave 3 — Indexing Subsystem
 
-- [ ] **QA-IDX-01**: Codebase-index-backed Q&A. v1.1 Q&A uses PR diff + file context only (QA-01/QA-02). This requirement adds a codebase indexing subsystem: on repo install, index the default-branch tree into embeddings (or a cheaper keyword index) stored in KV or Postgres. Q&A queries the index for relevant code sections beyond the PR diff. Index freshness maintained via webhook push events. Provider-agnostic. Config-gated (`qa.index_enabled`, default off).
+- [x] **QA-IDX-01**: Codebase-index-backed Q&A. v1.1 Q&A uses PR diff + file context only (QA-01/QA-02). This requirement adds a codebase indexing subsystem: on repo install, index the default-branch tree into embeddings (or a cheaper keyword index) stored in KV or Postgres. Q&A queries the index for relevant code sections beyond the PR diff. Index freshness maintained via webhook push events. Provider-agnostic. Config-gated (`qa.index_enabled`, default off).
 
 ### Wave 4 — Bitbucket Differentiators
 
@@ -41,8 +41,8 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| EVID-02 | Phase 26 | Planned |
-| SEC-XDIFF-01 | Phase 27 | Planned |
+| EVID-02 | Phase 26 | Done |
+| SEC-XDIFF-01 | Phase 27 | Done |
 | LRN-01 | Phase 28 | Planned |
 | QA-IDX-01 | Phase 29 | Planned |
 | ANNO-01 | Phase 30 | Planned |

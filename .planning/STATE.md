@@ -1,19 +1,20 @@
 ---
 gsd_state_version: 1.0
 milestone: v1.4
-milestone_name: Deferred Candidates — Hard-Drop Evidence + Review Quality + Bitbucket Differentiators
-current_phase: 26
-current_phase_name: evid-02-hard-drop-evidence-gate (next to discuss)
-status: ready — v1.4 scoped 2026-07-26, 6 requirements across 6 phases (26-31)
-stopped_at: v1.4 scoping complete — ready for /gsd-discuss-phase 26
-last_updated: "2026-07-26"
-last_activity: 2026-07-26
-last_activity_desc: v1.4 milestone scoped — all 6 deferred candidates promoted, dependency-ordered phases 26-31
+milestone_name: Deferred Candidates
+current_phase: 29
+current_phase_name: qa-idx-01-codebase-index-backed-q-a
+status: executing
+stopped_at: Completed 29-02-PLAN.md
+last_updated: "2026-07-29T08:25:00.000Z"
+last_activity: 2026-07-28
+last_activity_desc: Phase 29 execution started
 progress:
-  total_phases: 6
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
+  total_phases: 10
+  completed_phases: 7
+  total_plans: 21
+  completed_plans: 19
+  percent: 70
 ---
 
 # Project State
@@ -23,14 +24,34 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-25 for v1.2 closure)
 
 **Core value:** A Bitbucket Cloud PR gets the same AI review a GitHub PR gets, from one instance, without breaking GitHub — held end-to-end since v1.0, extended by v1.1 (every interactive/multi-pass capability shipped on both providers), extended by v1.2 (deterministic severity + real categories, audit-backed noise filter, priority file selection, incremental rounds, verify-fixes, critic v2, ensemble, walkthrough enrichment — all on both providers, every drop explainable from `jobs.audit`).
-**Current focus:** v1.4 scoped — 6 phases (26-31), dependency-ordered: EVID-02 → SEC-XDIFF-01 → LRN-01 → QA-IDX-01 → ANNO-01 ∥ WS-01. Next: /gsd-discuss-phase 26.
+**Current focus:** Phase 29 — qa-idx-01-codebase-index-backed-q-a
 
 ## Current Position
 
-Phase: 26 (evid-02-hard-drop-evidence-gate) — next to discuss
-Plan: none yet
-Status: Ready — v1.4 scoped, 6 requirements across 6 phases
-Last activity: 2026-07-26 -- v1.4 scoped with all 6 deferred candidates
+Phase: 29 (qa-idx-01-codebase-index-backed-q-a) — EXECUTING
+Plan: 1 of 9
+Status: Executing Phase 29
+Last activity: 2026-07-28 — Phase 29 execution started
+
+### Phase 27 Plan 27-01 Decisions (SEC-XDIFF-01)
+
+- cross_file_security is FIRST hop after review (before verify_fixes)
+- nextPhaseAfterCrossFileSecurity does NOT re-check toggle (Pitfall 1)
+- Fail-open: model errors persist skipped row + audit event
+- __cross_file__ sentinel path for synthetic file_review row
+- callVerifierRaw for single model call
+- CROSS_FILE_DIFF_MAX_LINES = 3000 (~12K tokens)
+- Priority-based diff truncation (security-sensitive paths first)
+- SENSITIVE_KEYWORDS extended: middleware, routes, session
+
+### Phase 27 Plan 27-02 Decisions (SEC-XDIFF-01)
+
+- No manual __cross_file__ append in finalize — automatic via reviews.flatMap / criticResult.kept
+- Walkthrough cross-file section identified by cross_references presence, NOT path === '__cross_file__'
+- __cross_file__ intentionally excluded from expected-units builder (synthetic row, not real file)
+- Main walkthrough severity counts stay main-only (NREG-01 preserved)
+- crossFileComments passed to buildWalkthroughData as optional parameter
+- Formatter "Also affects" links rendered inline after finding body
 
 ## Performance Metrics
 
@@ -106,6 +127,15 @@ Last activity: 2026-07-26 -- v1.4 scoped with all 6 deferred candidates
 | Phase 21 P01 | 7min | 2 tasks | 3 files |
 | Phase 21 P02 | 12min | 3 tasks | 5 files |
 | Phase 24 P01 | 4min | 4 tasks | 4 files |
+| Phase 27 P01 | ~45min | 2 tasks (merged) | 16 files |
+| Phase 28 P04 | 18min | 3 tasks | 10 files |
+| Phase 29 P01 | 25min | 2 tasks | 11 files |
+| Phase 29 P03 | 14min | 3 tasks | 11 files |
+| Phase 29 P04 | 16min | 3 tasks | 2 files |
+| Phase 29 P02 | 22min | 2 tasks | 6 files |
+| Phase 29 P07 | 35 min | 2 tasks | 3 files |
+| Phase 29 P05 | 22min | 3 tasks | 9 files |
+| Phase 29 P08 | 14min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -180,6 +210,20 @@ Decisions carried from v1.1 execution (still load-bearing for v1.2 — Phase 14 
 - [Phase 20]: Plan 20-02: because vitest.config.ts omits the Tailwind Vite plugin, the visual spec supplies exact installed-Tailwind declarations and separately asserts production utility classes without changing config.
 - [Phase 20]: Plan 20-03 records 31/31 requirements and 8/8 phase verification coverage while preserving AUD-01 as STRUCTURE_READY_HUMAN_SIGNATURE_REQUIRED until authentic signatures and dates are supplied.
 - [Phase 20]: MILESTONES.md remains owned by /gsd-complete-milestone; EVID-02, WR-01, cleanup items, and Phase 17 deployment checkpoints remain deferred.
+- [Phase 28]: D-01/D-02: Denormalize finding metadata (title, category, file_path, severity) into reject_feedback at reject time via VCS API lookup (Option 1 over research-recommended Option 2 — avoids review_comments schema change). All columns nullable.
+- [Phase 28]: D-03: Cluster by exact (finding_category, finding_file_path) — no embedding/semantic similarity.
+- [Phase 28]: D-04: Minimum cluster size of 2 rejections (excludes singletons).
+- [Phase 28]: D-05: Clustering happens at synthesis time, not at reject time (on-demand, not streaming).
+- [Phase 28]: D-06: Rule fields — id (crypto.randomUUID), category, file_pattern (picomatch glob), status, source_rejection_ids, created_at, updated_at.
+- [Phase 28]: D-07: pending → active → disabled lifecycle; no auto-expiration.
+- [Phase 28]: D-08: Rules stored in repo_configs.parsed_json.learned_rules (default []), normalized via parseJsonColumn/normalizeRepoConfig.
+- [Phase 28]: D-09: learning config block in reviewConfigSchema — enabled boolean (default false), min_cluster_size integer (default 2).
+- [Phase 28]: D-10: POST /api/repos/:id/learned-rules/synthesize — on-demand trigger from dashboard.
+- [Phase 28]: D-11: PATCH /api/repos/:id/learned-rules/:ruleId — status transitions.
+- [Phase 28]: D-12: Suppression in finalize, after EVID-02 hard-drop but before dedup.
+- [Phase 28]: D-13: learned_rule_suppressed audit event (per (file, pass) aggregate).
+- [Phase 28]: D-14: Suppression order: EVID-02 → learned rules → dedup → posting.
+- [Phase 28]: D-15: Dashboard rule management UI (toggle, synthesize button, rule list with approve/disable/re-enable).
 - [Phase 20.1]: Phase 20.1 D-01: redactFindingTitle returns `[title-redacted]` for every non-empty title and `[clamped:empty]` for nullish input — every title-bearing audit event now routes through this helper (9 references in audit.ts, 4 in model-output.ts). Closes BLOCKER-1.
 - [Phase 20.1]: Phase 20.1 D-02: redactErrorMessage maps arbitrary Error.message to one of 5 MACHINE_ERROR_REASONS codes (transient/network/rate_limit/auth/malformed); ModelService.runFileWithEnsemble derives failedRunReasons via this helper. Closes BLOCKER-1 ensemble producer site.
 - [Phase 20.1]: Phase 20.1 D-03: nextPhaseAfterReview selector now walks ALL successors including walkthrough.enabled — closed BLOCKER-2 (walkthrough-only review was unreachable).
@@ -189,6 +233,32 @@ Decisions carried from v1.1 execution (still load-bearing for v1.2 — Phase 14 
 - [Phase 20.1]: Phase 20.1 D-07: visual-backstops.spec.tsx loads production Vite/Tailwind CSS via loadProductionStylesheet; vitest.config.ts:91 globalSetup scoped to browser project's nested test block; per-test try/finally ServeHandle lifecycle. Closes WARNING-1.
 - [Phase 20.1]: Phase 20.1 D-08: all pre-existing test assertions asserting raw titles (test/noise-filter.spec.ts lines 291/303/320-326/344-345 and test/review-flow.spec.ts:4266-4273) updated by commit 4b0b2ad to assert [title-redacted] / [clamped:empty]; npm test reports 113 files / 1550 tests / 0 failures. Confirms BLOCKER-1 closure is durable.
 - [v1.2 closeout]: v1.2 closed 2026-07-25 — 31/31 requirements satisfied, all 5 BLOCKERs + 1 WARNING closed by Phase 20.1, milestone audit promoted from gaps_found to passed (re-run after Phase 20.1 closure), MILESTONES.md entry owned by /gsd-complete-milestone (entry content prepared in this milestone's final response for review before the irreversible archive CLI).
+- [Phase 28]: 28-04: GitHub reject enrichment joins review_comments.position (the coordinate createReview posts by); Bitbucket keeps joining review_comments.line — each provider matches on the coordinate it actually anchors by (NREG-02). No migration: position existed since migration 001 and was already persisted on both file-reviews write paths. Closes G-28-3.
+- [Phase 28]: 28-04: NO cross-provider coordinate fallback — a GitHub position miss leaves enrichment NULL rather than re-matching on line, because a line match is the exact defect G-28-3 documents (correctness over match rate).
+- [Phase 28]: 28-04: ambiguous same-coordinate matches resolve via pickReviewCommentByCommentBody (the rejected comment body carries the finding title verbatim from formatInlineComment); LIMIT 1 replaced by a bound LIMIT with COORDINATE_CANDIDATE_LIMIT=20, ordered by (j.created_at DESC, rc.id ASC) for a total order. Body is in-memory only — never bound into SQL, persisted, or logged.
+- [Phase 28]: 28-04 (deviation, Rule 1): body/title normalizers are deliberately ASYMMETRIC — the posted body is tag-stripped and entity-decoded, the stored title is not. A symmetric normalizer strips angle brackets out of a title like Guard <input> so it stops matching the body the formatter rendered it into.
+- [Phase 29]: 29-01: buildQueryTerms drops an explicit JS stopword list (not Postgres's dictionary) so buildQueryExpression returns null for an all-stopword question and the caller issues NO statement
+- [Phase 29]: 29-01: QA_MAX_INDEX_CHARS caps the EXCERPT text inside the retrieved-context fence, not the marker-bearing block, so an oversized chunk can never truncate away the closing UNTRUSTED_INDEX_END sentinel
+- [Phase 29]: 29-01: CODE_INDEX_MAX_CHUNK_BYTES stays 32_768 with no pg_column_size guard — the 16 KB review findings were rejected on the measured 134 KB (12.8% of the 1 048 575-byte ceiling) worst case, recorded in the constant's comment so it cannot be re-litigated as hardening
+- [Phase 29]: 29-01: one pure splitter serves BOTH directions and upsertCodeIndexChunks derives contentTokens from buildIndexTokens when omitted, so the shared-normalizer rule is a real import rather than a convention a caller can forget
+- [Phase 29]: 29-01 (deviation, Rule 3): AppBindings.INDEX_WORKFLOW declared OPTIONAL — required for test/helpers.ts to typecheck, and honest because the wrangler binding + IndexWorkflow class land in 29-05, which should tighten it to required
+- [Phase ?]: 29-03: the GitHub tree listing returns the branch head COMMIT sha from a third subrequest, not the trees endpoint's response sha (the TREE object id) — migration 018 defines indexed_sha as a commit and a tree sha is not a valid compare operand
+- [Phase ?]: 29-03: no capability flag for listDefaultBranchTree — both providers can list a tree and differ only in cost, which truncated plus the adapter-internal page budget already express (NREG-02)
+- [Phase ?]: 29-03: the Bitbucket /src walk returns a flagged PARTIAL listing on page-cap AND budget exhaustion instead of throwing, deliberately diverging from listRawPullRequestComments' fail-closed choice
+- [Phase ?]: 29-03: selection helpers extracted additively (scorePath, isGeneratedContent) rather than fabricating a FileDiff, which type-checks but silently collapses ranking to keyword tiers
+- [Phase ?]: 29-04: truncateCodeIndexForRepo clears indexed_sha/indexed_at alongside the counters — after the delete the repository genuinely has zero chunks, so a surviving indexed_sha would tell the operator panel an index exists at that commit; markCodeIndexBuildCompleted stays the only accessor that ADVANCES it
+- [Phase ?]: 29-04: releaseCodeIndexBuildLease resolves status as well as clearing the lease (a still-'building' row becomes 'idle', 'ready'/'failed' preserved by CASE) — lease expiry guards correctness but nothing repaired the operator DISPLAY
+- [Phase ?]: 29-04: the db/code-index 'no core/ import' rule is narrowed to 'nothing from core/ except the pure splitter and its weight labels' — 29-01 deliberately made the shared-splitter rule a real import; the load-bearing half is that audit-redact is NOT imported, so AUD-01 redaction cannot be silently absorbed by the db layer
+- [Phase ?]: 29-02: D-16-R (developer-confirmed at blocking checkpoint) — nested-index-block at review.interactive.qa.index.{enabled,max_files,chunk_lines,top_k}; flat-qa-keys rejected; defaults false/500/50/8
+- [Phase ?]: 29-02: max_files ceiling is .max(2_000) not the drafted 5_000 — bounds the worst legal build to ~3h at the derived ~12-files-per-minute rate; pinned by a 2000/2001 boundary spec PAIR so it cannot drift looser silently
+- [Phase ?]: 29-02: the index key lands at FOUR Zod resolution paths, not the three the plan named (the z.object plus the qa, interactive and outer reviewConfigSchema .default literals) — each independently mutation-verified, since Zod 4 returns a .default literal without re-parsing it
+- [Phase ?]: 29-02: NO .refine() cross-checking the build-budget constants — shared/schema.ts is imported by the dashboard client, so importing core/code-index-build.ts would drag server constants into the browser bundle and invert the layering; the bound plus documented arithmetic is the whole mitigation
+- [Phase ?]: 29-02 (deviation, Rule 1): the dashboard Interactive sub-editor rebuilt its qa draft from scratch and mergeReviewPatch applies interactive LAST, so every Apply would have wiped the operator index config — repos.tsx now spreads interactive.qa first
+- [Phase ?]: 29-02: the new NREG-01 parse assertions sit OUTSIDE dbDescribe in repo-configs.spec.ts — the file is entirely DB-gated, so gating pure schema assertions would silently skip the whole default-off proof on a host without TEST_DATABASE_URL (T-29-02-02)
+- [Phase 29]: Q&A index retrieval gates on status === 'ready' only; no PR-base staleness check (no well-defined comparison, push-bounded freshness D-08, D-15 fails open) with the D-14 variant prompt carrying the disclosure — Plan 29-07 Task 1, incorporating OpenCode 29-07 MEDIUM as a required comment rather than a check
+- [Phase 29]: findRepositoryIdByIdentity added as a read-only provider-filtered SELECT so the documented read-only Q&A path never calls the inserting getOrCreateRepository — Plan 29-07 Task 1; QA-02 read-only invariant plus T-29-07-03 cross-tenant isolation
+- [Phase 29]: 29-08: the build endpoint claims the lease under codeIndexInstanceId(repositoryId), the same id it keys the Workflow instance on, because IndexWorkflow re-claims under event.instanceId and a mismatched owner would coalesce the build away silently
+- [Phase 29]: 29-08: the index status response uses camelCase wire keys (matching mapJob) and returns status 'idle' with a 200 for a never-built repository rather than a 404
 
 ### Roadmap Evolution
 
@@ -202,6 +272,8 @@ Decisions carried from v1.1 execution (still load-bearing for v1.2 — Phase 14 
 
 ### Roadmap Evolution
 
+- Phase 28 complete (2026-07-27): 4/4 plans; UAT 6/6; verification `passed` (29/29 must-haves). Tests 1/3/4/6 were closed by automation rather than manual observation at the user's request — 3 new/extended specs (27 tests), all mutation-verified. One leg is deliberately recorded as un-run, not verified: live end-to-end suppression on a real GitHub PR.
+- Phase 26 complete (landed 2026-07-26, closed out 2026-07-29): 2/2 plans; verification `passed` (10/10 must-haves, EVID-02 satisfied). Safe-resume closeout — executors never wrote SUMMARY.md files, so ROADMAP/REQUIREMENTS tracking stayed stale until the summaries were authored retroactively from commits 6c4256b..a891d02 + 26-VERIFICATION.md; no code re-executed. Includes post-plan deviation fix a891d02 (migration 015 persists existing_code for immutable finalize re-checks).
 - Phase 21 added (2026-07-25): Evidence-missing aggregate summary event (schema + audit writer) — v1.3
 - Phase 21 complete (2026-07-25): Both plans (21-01 builder + 21-02 producer/coalescing/tests) executed; EVID-03 requirement satisfied; producer emits single aggregate evidence_missing_summary per (file, pass); multi-chunk coalescing resolves Codex HIGH REVIEWS finding
 - Phase 22 added (2026-07-25): WR-02 original-line capture in summary sample — v1.3
@@ -221,6 +293,8 @@ Decisions carried from v1.1 execution (still load-bearing for v1.2 — Phase 14 
 
 - [Env] `npm run test:browser` requires `nix-shell shell.nix --run "..."` on this NixOS host (missing libgbm.so.1 for headless Chromium) — pre-existing environment quirk, not a code issue. Carried forward.
 - [Env] Test DB accumulates rows — review-flow check-run tests flake once terminal jobs exceed LIMIT 500; fix with `TRUNCATE jobs CASCADE`, not a code change. Pre-flight for v1.2 closure audit re-run (test/severity-audit-integration.spec.ts case 6 and BLOCKER-1/5 test groups required clean DB state).
+- [Bookkeeping] Phase 26 (EVID-02) has 2 PLAN files and ZERO SUMMARY files, yet the code ships and `test/review-flow.spec.ts` "evidence hard-drop" passes — its ROADMAP plan boxes are still `[ ]` and it reads as `0/2 plans complete`. Phase 28 depended on it and is now closed, so the roadmap understates real progress. Needs reconciling before milestone close (surfaced during Phase 28 verification, 2026-07-27; not touched then, since inventing summaries after the fact would be worse than the gap).
+- [Bookkeeping] STATE `progress:` counters (total_phases 10 / completed_phases 6 / total_plans 12 / completed_plans 10) disagree with `progress.bar` (12/14 plans) and with v1.4's actual scope (phases 26-31 = 6 phases, 2 complete). Left as-is at the 28→29 transition rather than guessed at — the intended counting scope is ambiguous. See MEMORY.md "milestone-complete CLI undercounts".
 - [Audit] v1.2 milestone audit re-run on 2026-07-25 promoted status from `gaps_found` to `passed`; AUD-01 human acknowledgment signed (Thomas Michnicki, 2026-07-25); 13-UAT.md carries authentic signature/date pair. MILESTONES.md v1.2 shipped entry repaired after the CLI undercounted decimal Phase 20.1.
 
 ### Quick Tasks Completed
@@ -234,6 +308,7 @@ Decisions carried from v1.1 execution (still load-bearing for v1.2 — Phase 14 
 | 260721-ck9 | /settings version now derived from the latest git tag at build time (vite `__APP_VERSION__` via `git describe --tags`, leading `v` stripped, fallback to package.json) instead of the stale hardcoded 0.9.4 | 2026-07-21 | 964e738 | [260721-ck9-dashboard-settings-version-reflects-late](./quick/260721-ck9-dashboard-settings-version-reflects-late/) |
 | 260721-dvh | Fix PR #9 CI browser-test failures (run 29812072387): add static `__APP_VERSION__` define to vitest.config.ts + update stale 3-arg `updateRepoConfig` assertion in repos.spec.tsx to the real 4-arg call (`vcsProvider`); full browser suite 62/62 green | 2026-07-21 | 0e6e4ae | [260721-dvh-fix-ci-browser-test-failures-add-app-ver](./quick/260721-dvh-fix-ci-browser-test-failures-add-app-ver/) |
 | 260721-dvh (fast) | Bump GitHub Actions to Node 24 runtimes: checkout v7.0.1, setup-node v7.0.0, cache v6.1.0 (SHA-pinned), codeql-action v4.37.1; all SHAs verified node24 via GitHub API | 2026-07-21 | b061c80 | _(gsd-fast — no task dir)_ |
+| 260727-hvc | Fix G-28-4: `learned_rule_suppressed` now renders in its own audit-trail group (dropped the collapse into `evidence_missing`, added the `DecisionEvent` case) so suppressions are visible and no longer inflate the "Evidence missing" badge; discriminating node + browser assertions added | 2026-07-27 | c94aeb6 | [260727-hvc-fix-g-28-4-render-learned-rule-suppresse](./quick/260727-hvc-fix-g-28-4-render-learned-rule-suppresse/) |
 
 ## Deferred Items
 
@@ -254,10 +329,10 @@ Items acknowledged and carried forward:
 
 ## Session Continuity
 
-Last session: 2026-07-26T07:22:03.044Z
-Stopped at: Phase 25 context gathered
-Resume file: .planning/phases/25-milestone-closeout-audit-verification-sign-off/25-CONTEXT.md
+Last session: 2026-07-27T20:36:39.346Z
+Stopped at: Completed 29-02-PLAN.md
+Resume file: None
 
 ## Operator Next Steps
 
-- Start the next milestone with /gsd-new-milestone
+- Execute Phase 28 plans with /gsd-execute-phase 28
