@@ -478,7 +478,7 @@ if (config.review.evidence?.hard_drop ?? false) {
 
 **If this table is empty:** not applicable — see entries above.
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Should `evidence_hard_dropped` have dashboard rendering in this phase?**
    - What we know: The CONTEXT.md D-05 says the event "makes every drop decision explainable in the dashboard audit viewer." The out-of-scope section says "dashboard audit-trail rendering for the new event (follow-up Phase)." The CONTEXT.md explicitly leaves this as Claude's discretion.
