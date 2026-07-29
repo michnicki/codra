@@ -1,4 +1,16 @@
 
+## RESOLVED at 29-09's Task 3 UAT (2026-07-29): `hasRemainingSafeBudget` fixed live
+
+Confirmed exactly as predicted below: `reach`'s real Bitbucket build stalled repeatedly at a fixed
+continuation with "too many subrequests", and diagnostic logging (path + remaining budget logged
+before every file fetch, commit `922578e`) showed the failing continuation had **zero** `fetching
+file` log lines before the error — the enumeration/tree-walk step alone consumed the entire
+per-invocation budget, leaving nothing for the file loop. Fixed in commit `86b54d1` by adding
+`hasRemainingSafeBudget(needed = 1)` to `TokenTracker` exactly as suggested below. After redeploy the
+same already-running instance picked up the fix on its next retry (Cloudflare Workflows execute each
+step against the currently-deployed code, not a pinned version) and completed successfully: 285 files,
+1546 chunks. Original write-up preserved below for context.
+
 ## 29-05: `hasRemainingSafeBudget` is not a `TokenTracker` method (out of scope, pre-existing)
 
 **Found during:** plan 29-05 Task 2, while reasoning about whether tree enumeration can starve the file loop.
@@ -20,6 +32,18 @@ from making forward progress, and it carries this reasoning in its comment.
 **Suggested fix:** either add `hasRemainingSafeBudget(needed = 1)` to `TokenTracker` (returning
 `remainingSafeBudget() >= needed`) or change the call sites to `remainingSafeBudget() >= 1`. Prefer the
 former — two call sites already assume the method exists.
+
+## RESOLVED at 29-09's Task 3 UAT (2026-07-29): confirmed real, fixed live
+
+The live check this entry calls for happened: after `opencodra`'s first build, a second dashboard
+press (and every push-triggered rebuild afterward) returned `coalesced: true` against a Workflow
+instance that had already terminated hours earlier — exactly the frozen-index failure predicted below.
+Fixed in commit `b075e1f`: on `instance.already_exists`, release the stale lease and retry under a
+fresh `{constantId}-{Date.now()}` instance id (the suggested commit-suffix approach was considered but
+the timestamp suffix was simpler and sufficient — freshness is about the *lease*, not identifying which
+commit a build targets). Confirmed live: pressing build again after a completed build now returns
+`coalesced: false` with a new instance id and a second Workflow instance actually appears. Original
+write-up preserved below for context.
 
 ## 29-08: a static per-repository Workflow instance id may permit only ONE build per repository, ever
 
@@ -53,6 +77,16 @@ let it finish, then press Build again and confirm a *second* Workflow instance a
 dashboard. If it does not, the fix is to suffix the id with the build's target commit — e.g.
 `code-index:{repositoryId}:{headSha}` — which keeps push-vs-dashboard coalescing meaningful *per commit*
 while letting a later build for a different commit through.
+
+## RESOLVED at 29-09's Task 3 UAT (2026-07-29): confirmed real, fixed live
+
+`reach`'s Bitbucket build hit `MAX_INDEX_CONTINUATIONS` for real and handed off exactly as predicted:
+the outgoing instance completed gracefully, the fresh handoff instance also completed within 2 seconds
+having done no real work, and the build was left permanently stuck at `status: building`. Fixed in
+commit `c89b46d` using the exact approach suggested below: the outgoing instance releases its lease
+instead of renewing it when `freshInstance` is true, so the handoff's own claim lands on a free lease.
+The "no progress rows at the build sha" guard already made this safe, as predicted. Original write-up
+preserved below for context.
 
 ## 29-08: a fresh-instance handoff appears to coalesce itself away against the lease it inherited
 
