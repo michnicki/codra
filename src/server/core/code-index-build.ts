@@ -678,11 +678,13 @@ async function indexOneFile(
     await record(0, 'generated');
     return;
   }
-  // PostgreSQL rejects NULL bytes (0x00) in UTF-8 text columns with "invalid byte sequence for
-  // encoding 'UTF8': 0x00". Binary files (images, compiled objects, fonts, etc.) commonly contain
-  // NULL bytes and are not meaningful to index. Check the first 8 KB — a binary file almost always
-  // has a NULL byte in its header, and scanning the entire file would be wasteful for large binaries.
-  if (content.slice(0, 8192).includes('\0')) {
+  // PostgreSQL rejects NULL bytes (0x00) anywhere in a UTF-8 text column with "invalid byte sequence
+  // for encoding 'UTF8': 0x00" -- not just in the leading bytes, so a prefix-only scan can miss one
+  // past the checked window and let an uncaught PostgresError reach the chunk insert instead of the
+  // honest 'binary' skip. The oversized check above already bounds `content` to
+  // CODE_INDEX_MAX_FILE_BYTES (1 MB), so scanning the whole string here is a bounded, cheap operation,
+  // not the unbounded scan the file size gate exists to avoid.
+  if (content.includes('\0')) {
     await record(0, 'binary');
     return;
   }
