@@ -99,9 +99,12 @@ A Bitbucket Cloud pull request receives the same automated AI review — inline 
 - ✓ Dashboard surface for evidence_missing_summary audit events — v1.3 (Phase 24)
 - ✓ Nyquist compliance for all 4 deliverable phases, formal scored milestone audit, WR-01 resolved by design — v1.3 (Phase 25)
 
+<!-- Shipped in v1.4 Deferred Candidates (in flight). -->
+
+- ✓ EVID-02: Hard-drop evidence gate — findings with hallucinated `existingCode` dropped from posted comments before dedup, config-gated (`evidence.hard_drop`, default off), per-category opt-out (default `security`), at-most-once `evidence_hard_dropped` audit, dashboard toggle + audit renderer — Validated in Phase 26 (10/10 must-haves)
+
 ### Active (v1.4 candidates)
 
-- [ ] **EVID-02**: Hard-drop promotion of `existingCode` evidence (after telemetry bounding in v1.3)
 - [ ] **SEC-XDIFF-01**: Whole-diff cross-file security reasoning (carried from v1.1)
 - [ ] **LRN-01**: Learned-rule synthesis from `reject` feedback + approval queue (carried from v1.1)
 - [ ] **QA-IDX-01**: Codebase-index-backed Q&A (carried from v1.1)
@@ -211,4 +214,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-07-25 — Milestone v1.3 Bounded Evidence Audit Telemetry started (WR-01 audit-event bounding, WR-02 point 1, IN-01; EVID-02 out of scope).*
+*Last updated: 2026-07-29 — Phase 26 complete: EVID-02 hard-drop evidence gate validated (10/10 must-haves) and moved to Validated; v1.4 in flight (Phase 29 executing).*
