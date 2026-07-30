@@ -2,6 +2,11 @@
 // a plain types module (no logic) that every per-provider adapter (`vcs/github.ts`,
 // and a future `vcs/bitbucket.ts`) implements. Lives in `vcs/`, not `src/shared/`,
 // because these shapes do not cross the worker/client boundary this phase.
+//
+// Phase 30 (ANNO-01): imports ParsedReviewComment from @shared/schema for
+// VcsPostAnnotationsInput.findings. This is a type-only import from a module that has no imports
+// back from vcs/types.ts, so no circular import is introduced.
+import type { ParsedReviewComment } from '@shared/schema';
 
 /**
  * Flattened PR metadata. Deliberately NOT the nested `{ head: { sha, ref }, base: {...},
@@ -69,6 +74,26 @@ export type VcsSubmitReviewInput = {
   // composes a single createReview POST that does not need the job id embedded in the body. The
   // field is optional so existing GitHub call sites continue to type-check unchanged.
   jobIdHint?: string;
+};
+
+/**
+ * Phase 30 (ANNO-01, D-11): the shape `submitReview`'s widened return threads per posted-or-
+ * matched comment -- populated for BOTH a freshly-posted comment and a dedup-matched (already
+ * existing) comment, so a re-review round's dedup-skipped comments still carry a `link` (closes
+ * RESEARCH.md Pitfall 1). `link` is optional because a comment's `links.html.href` is not
+ * guaranteed present on every response shape.
+ */
+export type VcsPostedComment = { path: string; line: number; body: string; link?: string };
+
+/**
+ * Phase 30 (ANNO-01): input to `postAnnotations?`. `postedComments` is OPTIONAL because a
+ * finalize retry that reuses an already-posted review has none from THIS invocation -- the
+ * caller (Plan 30-04) handles that branch via a type guard.
+ */
+export type VcsPostAnnotationsInput = {
+  commitSha: string;
+  findings: ParsedReviewComment[];
+  postedComments?: VcsPostedComment[];
 };
 
 /**
@@ -222,6 +247,23 @@ export interface VcsProvider {
   getRepositoryMetadata?(owner: string, repo: string): Promise<{ mainbranch?: { name?: string } }>;
 
   /**
+   * ANNO-01: bulk-create-or-replace Code Insights annotations mirroring the findings already
+   * posted as inline comments (D-07/D-08 -- exact mirror, no independent selection/cap).
+   *
+   * OPTIONAL, following the `getRepositoryMetadata?`/`labels?` feature-detect pattern: GitHub has
+   * no Code Insights concept (NREG-02 by exclusion) and MUST NOT implement this method -- callers
+   * feature-detect with `vcs.postAnnotations?.(...)` (mirroring the `labels?` block's
+   * `if (vcs.labels && ...)` convention at `core/review.ts:2797`) rather than assume every
+   * provider has it.
+   */
+  postAnnotations?(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    input: VcsPostAnnotationsInput,
+  ): Promise<void>;
+
+  /**
    * Resolve the bot's own immutable identity for the comment self-filter (Phase 11, CMD-07). Returns
    * the bot's immutable provider account id (GitHub bot-user numeric id as a string / Bitbucket
    * `account_id`) plus its optional login.
@@ -279,7 +321,7 @@ export interface VcsProvider {
    */
   updateStatusCheck(owner: string, repo: string, ref: string, input: VcsUpdateStatusCheckInput): Promise<void>;
 
-  submitReview(owner: string, repo: string, prNumber: number, input: VcsSubmitReviewInput): Promise<{ ref: string }>;
+  submitReview(owner: string, repo: string, prNumber: number, input: VcsSubmitReviewInput): Promise<{ ref: string; postedComments?: VcsPostedComment[] }>;
   findExistingReviewForCommit(owner: string, repo: string, prNumber: number, commitSha: string): Promise<{ ref: string } | null>;
 
   /**
