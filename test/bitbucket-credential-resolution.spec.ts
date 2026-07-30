@@ -64,6 +64,20 @@ describe('resolveBitbucketBotCredential (D-03 precedence)', () => {
     expect(getVcsWorkspaceCredentialSecretsMock).not.toHaveBeenCalled();
   });
 
+  it('falls back to the workspace secret when the per-repo row exists but its access token was cleared', async () => {
+    // A per-repo row can outlive its token (clearToken: true on POST /api/vcs-credentials keeps
+    // the row, e.g. to retain a webhook secret, while nulling the access token). Regression for
+    // the bug where `if (perRepo)` short-circuited on the row's mere existence, permanently
+    // blocking the workspace fallback even when a valid workspace credential was available.
+    getVcsCredentialSecretsMock.mockResolvedValue({ ...perRepoSecret, hasToken: false, encryptedAccessToken: null });
+    getVcsWorkspaceCredentialSecretsMock.mockResolvedValue(workspaceSecret);
+
+    const result = await resolveBitbucketBotCredential(env, key);
+
+    expect(result).toBe(workspaceSecret);
+    expect(getVcsWorkspaceCredentialSecretsMock).toHaveBeenCalledTimes(1);
+  });
+
   it('falls back to the workspace secret when only workspace-level is present', async () => {
     getVcsCredentialSecretsMock.mockResolvedValue(null);
     getVcsWorkspaceCredentialSecretsMock.mockResolvedValue(workspaceSecret);

@@ -102,7 +102,10 @@ export function AddBitbucketWorkspacePage() {
         workspace: workspace.trim(),
         accessToken: accessToken.trim(),
         webhookSecret: webhookSecret.trim(),
-        tokenExpiresAt: tokenExpiresAt || null,
+        // Omit the key entirely when blank so an untouched field means "leave untouched" (D-11),
+        // not an explicit clear -- this field is never prefilled from a stored value, so a
+        // resubmission-to-sync (D-06) must not wipe a previously-recorded expiry every time.
+        ...(tokenExpiresAt ? { tokenExpiresAt } : {}),
         // SORTED (not raw Set insertion order) for a deterministic payload regardless of which
         // order the operator checked rows in (OpenCode review finding, MEDIUM).
         selectedRepoSlugs: Array.from(selectedSlugs).sort(),
