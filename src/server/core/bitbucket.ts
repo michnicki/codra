@@ -5,6 +5,7 @@ import type {
   CodeInsightsReport,
   CommitBuildStatus,
   PrComment,
+  ReportAnnotation,
 } from '@shared/bitbucket';
 import type { VcsPullRequest } from '@server/vcs/types';
 import type { BotIdentityResolver } from '@server/core/bot-identity';
@@ -720,9 +721,49 @@ export class BitbucketClient {
     repoSlug: string,
     commit: string,
     report: CodeInsightsReport,
+    // Phase 30 (ANNO-01, D-01): optional 5th param, default 'codra-review' so every EXISTING call
+    // site (createStatusCheck/updateStatusCheck, vcs/bitbucket.ts) stays byte-identical (NREG-01).
+    // Plan 30-03's postAnnotations always passes the compile-time-pinned ANNOTATION_REPORT_ID.
+    reportId: string = 'codra-review',
   ): Promise<void> {
-    const path = `${repositoryPath(workspace, repoSlug)}/commit/${encodeURIComponent(commit)}/reports/codra-review`;
+    const path = `${repositoryPath(workspace, repoSlug)}/commit/${encodeURIComponent(commit)}/reports/${encodeURIComponent(reportId)}`;
     await this.request('PUT', path, report);
+  }
+
+  // Phase 30 (ANNO-01, D-09): delete-whole-report primitive. Mirrors editPullRequestComment's
+  // try/catch-on-BitbucketError.status 404-swallow idiom, but ONLY for 404 (round 1, no prior
+  // report) -- Bitbucket's DELETE report endpoint is not documented to also return 410. Any other
+  // error rethrows unchanged. No accumulate-across-rounds mechanism exists at this layer (D-09
+  // prohibition) -- this is a plain delete-then-recreate primitive, not a diff/upsert.
+  async deleteCodeInsightsReport(
+    workspace: string,
+    repoSlug: string,
+    commit: string,
+    reportId: string,
+  ): Promise<void> {
+    const path = `${repositoryPath(workspace, repoSlug)}/commit/${encodeURIComponent(commit)}/reports/${encodeURIComponent(reportId)}`;
+    try {
+      await this.request('DELETE', path);
+    } catch (e) {
+      if (e instanceof BitbucketError && e.status === 404) {
+        return;
+      }
+      throw e;
+    }
+  }
+
+  // Phase 30 (ANNO-01, D-09): bulk-create-or-update annotations. POSTs the caller-supplied array
+  // VERBATIM -- no batching or validation happens inside the client; chunking at
+  // ANNOTATION_BATCH_SIZE is Plan 30-03's postAnnotations responsibility.
+  async bulkUpsertAnnotations(
+    workspace: string,
+    repoSlug: string,
+    commit: string,
+    reportId: string,
+    annotations: ReportAnnotation[],
+  ): Promise<void> {
+    const path = `${repositoryPath(workspace, repoSlug)}/commit/${encodeURIComponent(commit)}/reports/${encodeURIComponent(reportId)}/annotations`;
+    await this.request('POST', path, annotations);
   }
 
   async postCommitBuildStatus(
