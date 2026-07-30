@@ -44,7 +44,7 @@
 | EVID-02 | Phase 26 | Done |
 | SEC-XDIFF-01 | Phase 27 | Done |
 | LRN-01 | Phase 28 | Planned |
-| QA-IDX-01 | Phase 29 | Planned |
+| QA-IDX-01 | Phase 29 | Done |
 | ANNO-01 | Phase 30 | Planned |
 | WS-01 | Phase 31 | Planned |
 
