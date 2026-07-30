@@ -786,6 +786,64 @@ describe('Dashboard API Suite', () => {
     expect(response.status).toBe(400);
   });
 
+  it('PATCHing review.evidence preserves sibling review settings (dedup, passes, rounds)', async () => {
+    const env = createTestEnv();
+    const token = await getAuthCookie(env);
+    const repo = `evidence-patch-${Date.now()}`;
+
+    await loadRepoConfig(env, {
+      installationId: '123',
+      owner: 'api-test-owner',
+      repo,
+    });
+
+    // Seed non-default review settings via a first PATCH so we can prove they survive a later
+    // evidence-only PATCH.
+    const seedResponse = await app.request(`/api/repos/api-test-owner/${repo}/config`, {
+      method: 'PATCH',
+      headers: {
+        Cookie: `codra_session=${token}`,
+        'x-requested-with': 'XMLHttpRequest',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        review: {
+          dedup: { enabled: false },
+          passes: { security: { enabled: true, cross_file: false }, critic: { enabled: false }, ensemble: { runs: 1, temperature: 0.7 } },
+          rounds: { incremental: true, escalate_floors: true },
+        },
+      }),
+    }, env);
+    expect(seedResponse.status).toBe(200);
+
+    const evidenceResponse = await app.request(`/api/repos/api-test-owner/${repo}/config`, {
+      method: 'PATCH',
+      headers: {
+        Cookie: `codra_session=${token}`,
+        'x-requested-with': 'XMLHttpRequest',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        review: {
+          evidence: { hard_drop: true },
+        },
+      }),
+    }, env);
+    expect(evidenceResponse.status).toBe(200);
+
+    const getResponse = await app.request(`/api/repos/api-test-owner/${repo}/config`, {
+      headers: { Cookie: `codra_session=${token}` },
+    }, env);
+    expect(getResponse.status).toBe(200);
+    const data = await getResponse.json() as { repo: { parsedJson: typeof defaultRepoConfig } };
+    const review = data.repo.parsedJson.review;
+
+    expect(review.evidence.hard_drop).toBe(true);
+    expect(review.dedup.enabled).toBe(false);
+    expect(review.passes.security.enabled).toBe(true);
+    expect(review.rounds.incremental).toBe(true);
+  });
+
   it('preserves path separators when fetching nested GitHub contents', async () => {
     const env = createTestEnv();
     await env.APP_KV.put('install:123', JSON.stringify({
