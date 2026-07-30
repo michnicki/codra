@@ -79,6 +79,26 @@ const QUERY_STOPWORDS = new Set([
   'who', 'why', 'will', 'with', 'would', 'you', 'your',
 ]);
 
+// 29-09 UAT finding, code-vocabulary half of the same list: `buildQueryExpression` OR-joins every
+// surviving term with EQUAL weight, and `ts_rank_cd` ranks purely on how a document's OWN lexemes
+// match -- it has no notion of how common a lexeme is ACROSS the repository (no IDF-like signal). A
+// reserved word like `function` or `return` appears in nearly every source-code chunk, so once it
+// survives into the query it contributes a nonzero rank to nearly every row and can outrank the one
+// chunk containing the question's actually-distinctive term. Confirmed live: three real Bitbucket
+// Q&A questions about `formatters.ts` retrieved eight completely unrelated chunks, because "function"
+// and "return" (both present in the question, neither filtered) dominated `ts_rank_cd` over the
+// genuinely rare identifier (`truncate`). This list is deliberately confined to reserved words and
+// literals -- `function`, `return`, `const`, etc. -- that are near-universal across common
+// C-family/scripting languages and virtually never the term a reviewer is actually asking about;
+// generic-but-plausibly-distinctive nouns like `get`/`id`/`name`/`data`/`type`/`value` are
+// DELIBERATELY EXCLUDED (see the pinned `getUserById` split-identifier case in
+// code-index-query.spec.ts, which asserts `get` and `id` survive as terms).
+const CODE_VOCABULARY_STOPWORDS = new Set([
+  'function', 'return', 'const', 'let', 'var', 'class', 'new', 'export', 'import', 'default',
+  'async', 'await', 'static', 'public', 'private', 'protected', 'void', 'null', 'undefined',
+  'true', 'false',
+]);
+
 // A window of a file: 1-based INCLUSIVE line bounds, mirroring the mergedStart / mergedEnd convention
 // of core/verify-fixes.ts so the whole codebase speaks one line-range dialect.
 export type CodeIndexWindow = {
@@ -247,7 +267,7 @@ export function buildQueryTerms(question: string): string[] {
     for (const candidate of candidates) {
       if (terms.length >= CODE_INDEX_MAX_QUERY_TERMS) return terms;
       if (!/^[a-z0-9]+$/.test(candidate)) continue;
-      if (candidate === 'or' || QUERY_STOPWORDS.has(candidate)) continue;
+      if (candidate === 'or' || QUERY_STOPWORDS.has(candidate) || CODE_VOCABULARY_STOPWORDS.has(candidate)) continue;
       if (seen.has(candidate)) continue;
       seen.add(candidate);
       terms.push(candidate);

@@ -707,6 +707,39 @@ dbDescribe('code index DB accessors (QA-IDX-01, plan 29-04)', () => {
       // And the accessor's own ordering puts it first, so the top-K cut keeps the right one.
       expect(hits[0]?.path).toBe(pathMatch);
     });
+
+    // 29-09 UAT regression guard: a real Bitbucket Q&A session asked three natural-language
+    // questions containing "function"/"return" and got wrong answers from unrelated chunks, because
+    // those near-universal reserved words survived into the query and outranked the one chunk
+    // containing the actually-distinctive identifier. Fixed by adding CODE_VOCABULARY_STOPWORDS.
+    it('a distinctive identifier outranks generic-code-heavy chunks for a natural-language question', async () => {
+      const relevant = 'src/lib/utils/formatters.ts';
+      const noisyA = 'src/lib/utils/vault.ts';
+      const noisyB = 'src/lib/utils/ansible.ts';
+
+      await seedChunk(repoA, relevant, 'export function zephyrTruncate(str) { return str.slice(0, 5); }');
+      // Dense in the exact reserved words the question uses, but never the distinctive identifier --
+      // this is what let a generic-code-heavy chunk outrank the relevant one before the fix.
+      await seedChunk(
+        repoA,
+        noisyA,
+        'function encrypt(value) { return value; } function decrypt(value) { return value; } function rotate(value) { return value; }',
+      );
+      await seedChunk(
+        repoA,
+        noisyB,
+        'function runPlaybook(value) { return value; } function applyRole(value) { return value; } function checkStatus(value) { return value; }',
+      );
+
+      const hits = await retrieve(repoA, 'what does the zephyrTruncate function return');
+
+      expect(hits[0]?.path).toBe(relevant);
+      // The noisy chunks share no OTHER surviving term with the question, so once "function"/"return"
+      // are filtered they must not match at all -- proving the fix removes their ranking signal
+      // entirely rather than merely reordering it.
+      expect(hits.map((hit) => hit.path)).not.toContain(noisyA);
+      expect(hits.map((hit) => hit.path)).not.toContain(noisyB);
+    });
   });
 
   // =============================================================================================
