@@ -28,6 +28,9 @@ OpenCodra listens to GitHub and Bitbucket pull request events, runs AI-powered r
 
 > **OpenCodra is a fork of [Codra](https://github.com/devarshishimpi/codra) by Devarshi Shimpi.** It exists for one reason: the original Codra requires a **Contributor License Agreement (CLA)** to accept contributions. OpenCodra removes that requirement — contributions are accepted under AGPL-3.0 with **no CLA**. Same license, original copyright retained; this fork adds Bitbucket support, removes the upstream anonymous usage telemetry, and welcomes open contributions.
 
+<!-- QA-IDX-01 UAT: GitHub post-merge incremental refresh verification, 2026-07-30 -->
+
+
 > **Beta** - OpenCodra is under active development. Expect rough edges, missing features, and breaking changes between releases. Feedback and bug reports are welcome via [GitHub Issues](https://github.com/michnicki/opencodra/issues).
 
 ## Why OpenCodra
