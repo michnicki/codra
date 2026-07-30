@@ -247,7 +247,7 @@ export async function handleBitbucketWebhook(c: Context<AppEnv>) {
   // comment branch below and the auto (created/updated) branch need it. defaultRepoConfig's model
   // section is empty ({ main: null, fallbacks: [], size_overrides: [] }), so snapshotting it verbatim
   // makes ModelService.selectModel throw "No review model strategy is configured" and fail every
-  // Bitbucket review before finalize. Merge the GLOBAL model strategy — the same source
+  // Bitbucket review before finalize. Fall back to the GLOBAL model strategy — the same source
   // loadRepoConfig uses for a repo with no per-repo override (KV key config:global_model) — so
   // Bitbucket jobs resolve a model chain exactly like GitHub jobs. We intentionally do NOT call
   // loadRepoConfig here: its syncRepoConfig -> getOrCreateRepository side effect is GitHub-shaped
@@ -261,9 +261,22 @@ export async function handleBitbucketWebhook(c: Context<AppEnv>) {
   // interactive config exists (NREG-01): defaultRepoConfig.review.interactive has both toggles off, so
   // the commands-gated pause/ignore gate never fires for a repo without a config row.
   const repoConfigRecord = await getRepoConfigByRepositoryId(c.env, repositoryId);
+  // 29-09 UAT fix: this used to overwrite `model` with `globalModel` unconditionally, silently
+  // discarding any per-repo model override -- confirmed live testing that a Bitbucket repo's own
+  // model strategy is never honored regardless of what the operator configures on the dashboard,
+  // unlike GitHub's `loadRepoConfig` (`hasRepoModelOverride` in this same file). Mirror that check
+  // here: only fall back to the global model when the repo genuinely has no override configured,
+  // same "empty sentinel" shape (`{ main: null, fallbacks: [], size_overrides: [] }`) `getGlobalConfig`
+  // itself guards against.
+  const repoModel = repoConfigRecord?.parsedJson.model;
+  const hasRepoModelOverride = Boolean(
+    repoModel?.main ||
+      (Array.isArray(repoModel?.fallbacks) && repoModel.fallbacks.length > 0) ||
+      (Array.isArray(repoModel?.size_overrides) && repoModel.size_overrides.length > 0),
+  );
   const configSnapshot: RepoConfig = {
     ...defaultRepoConfig,
-    model: globalModel,
+    model: hasRepoModelOverride ? repoModel! : globalModel,
     review: {
       ...defaultRepoConfig.review,
       interactive: repoConfigRecord?.parsedJson.review.interactive ?? defaultRepoConfig.review.interactive,
