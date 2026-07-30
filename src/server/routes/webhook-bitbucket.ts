@@ -16,7 +16,7 @@ import { getGlobalConfig } from '@server/core/config';
 import { defaultRepoConfig, type RepoConfig } from '@shared/schema';
 import { bytesToHex } from '@server/db/jobs';
 import { pullRequestWebhookPayloadSchema } from '@shared/bitbucket';
-import { codeIndexInstanceId, type IndexBuildParams } from '@server/core/code-index-build';
+import { startIndexBuild } from '@server/core/code-index-build';
 import { VcsService } from '@server/services/vcs';
 import type { CommentContext } from '@server/core/commands';
 
@@ -442,10 +442,6 @@ export async function handleBitbucketWebhook(c: Context<AppEnv>) {
       return c.json({ ok: true, ignored: true, reason: 'default_branch_unknown' }, 202);
     }
 
-    // THE INSTANCE ID COMES FROM THE SHARED HELPER, never a hand-built string — the GitHub push
-    // branch and the dashboard trigger key on the same helper, and the `instance.already_exists`
-    // coalescing all three rely on can only fire when the ids are byte-identical.
-    const workflowInstanceId = codeIndexInstanceId(repositoryId);
     let startedMode: 'full' | 'incremental' | null = null;
     let coalesced = false;
     let firstIgnoreReason: string | null = null;
@@ -474,7 +470,12 @@ export async function handleBitbucketWebhook(c: Context<AppEnv>) {
       // may leave the old hash not an ancestor of the new one; the incremental build's own
       // failure handling covers that and records the reason.
       const mode = change.old ? 'incremental' : 'full';
-      const params: IndexBuildParams = {
+      // The lease claim, instance-id derivation (the SHARED helper both push branches and the
+      // dashboard trigger key on), and the `instance.already_exists` stale-instance retry all live in
+      // `startIndexBuild` — see its doc comment for why a per-repository-stable id would otherwise
+      // mean a repository's index could only ever be refreshed once. Confirmed live during 29-09 UAT:
+      // a push to this exact `main` branch silently no-opped until this fix.
+      const outcome = await startIndexBuild(c.env, {
         repositoryId,
         vcsProvider: 'bitbucket',
         owner: workspace,
@@ -485,14 +486,9 @@ export async function handleBitbucketWebhook(c: Context<AppEnv>) {
         ...(mode === 'incremental'
           ? { baseSha: change.old!.target.hash, headSha: change.new.target.hash }
           : {}),
-        workflowInstanceId,
-        continuation: 0,
-      };
-      try {
-        await c.env.INDEX_WORKFLOW.create({ id: workflowInstanceId, params });
-        startedMode ??= mode;
-      } catch (error) {
-        if (error instanceof Error && error.message.includes('instance.already_exists')) {
+      });
+      if (!outcome.started) {
+        if (outcome.coalesced) {
           // Benign coalesced duplicate — the same disposition the queue consumer gives this
           // rejection. A second actionable change for the same branch lands here too.
           coalesced = true;
@@ -501,11 +497,13 @@ export async function handleBitbucketWebhook(c: Context<AppEnv>) {
             repo: repoSlug,
             eventKind: xEventKey,
             repositoryId,
-            reason: 'instance_already_exists',
+            reason: outcome.reason,
           });
         } else {
-          throw error;
+          throw outcome.error;
         }
+      } else {
+        startedMode ??= mode;
       }
     }
 

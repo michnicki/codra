@@ -183,6 +183,131 @@ export function codeIndexInstanceId(repositoryId: number): string {
 }
 
 /**
+ * Outcome of `startIndexBuild`. `started: true` means a NEW Workflow instance is running --
+ * either under the stable per-repository id or under a fresh id after a stale-instance retry.
+ * `started: false, coalesced: true` means a build is genuinely already running (the caller should
+ * treat this exactly like the old inline `instance.already_exists` catch: benign, no-op).
+ * `started: false, coalesced: false` means the Workflow create call failed for a real reason --
+ * the caller should surface an error.
+ */
+export type StartIndexBuildOutcome =
+  | { started: true; workflowInstanceId: string }
+  | { started: false; coalesced: true; workflowInstanceId: string; reason: 'lease_held' | 'lease_held_after_release' }
+  | { started: false; coalesced: false; workflowInstanceId: string; error: unknown };
+
+/**
+ * Claims the build lease and creates the Workflow instance for a repository's codebase index
+ * build -- the ONE place all three trigger sites (dashboard "Build index", GitHub `push`,
+ * Bitbucket `repo:push`) must call, so the `instance.already_exists` retry-with-fresh-id fix
+ * lives once instead of drifting across three inline copies.
+ *
+ * KNOWN LIMITATION THIS FUNCTION EXISTS TO FIX: Cloudflare rejects `INDEX_WORKFLOW.create` for an
+ * id that already exists, and an instance record OUTLIVES the run -- a completed or terminated
+ * instance's id stays reserved forever. `codeIndexInstanceId` is deliberately stable per
+ * repository (see its own doc comment), so without this retry, the SECOND build ever attempted
+ * for a repository -- whether a second dashboard press, a push after the first successful build,
+ * or any push thereafter -- would always hit `instance.already_exists` and be reported as a benign
+ * coalesce, permanently disabling the index for that repository. Confirmed live during 29-09 UAT:
+ * a push to Bitbucket's `main` after a prior full rebuild produced exactly this silent no-op.
+ *
+ * The lease claim BEFORE `create` is what makes the retry safe rather than reckless: if another
+ * build were genuinely in flight, it would hold the DB lease and this claim would fail first (the
+ * `lease_held` branch below), so `create` is only ever reached when we KNOW no build currently
+ * owns the lease. Reaching `instance.already_exists` after that point can only mean the reserved
+ * id belongs to a terminated/completed instance, never a live one -- so releasing this claim and
+ * retrying under a fresh, timestamped id is always correct there, never a race.
+ */
+export async function startIndexBuild(
+  env: AppBindings,
+  params: Omit<IndexBuildParams, 'workflowInstanceId' | 'continuation'>,
+): Promise<StartIndexBuildOutcome> {
+  const { repositoryId } = params;
+  const workflowInstanceId = codeIndexInstanceId(repositoryId);
+
+  const claimed = await claimCodeIndexBuildLease(env, {
+    repositoryId,
+    workflowInstanceId,
+    leaseSeconds: INDEX_BUILD_LEASE_SECONDS,
+  });
+  if (!claimed) {
+    logger.info('Codebase index build request coalesced: a build already holds the lease', {
+      repositoryId,
+      vcsProvider: params.vcsProvider,
+      reason: 'lease_held',
+    });
+    return { started: false, coalesced: true, workflowInstanceId, reason: 'lease_held' };
+  }
+
+  const fullParams: IndexBuildParams = { ...params, workflowInstanceId, continuation: 0 };
+
+  try {
+    await env.INDEX_WORKFLOW.create({ id: workflowInstanceId, params: fullParams });
+    return { started: true, workflowInstanceId };
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes('instance.already_exists')) {
+      try {
+        await releaseCodeIndexBuildLease(env, { repositoryId, workflowInstanceId });
+      } catch (releaseError) {
+        logger.error(
+          'Failed to release the codebase index build lease after a failed workflow create',
+          releaseError instanceof Error ? releaseError : new Error(String(releaseError)),
+        );
+      }
+      return { started: false, coalesced: false, workflowInstanceId, error };
+    }
+
+    // The instance record may be TERMINATED (from a previous build) rather than live -- see this
+    // function's doc comment for why that is the ONLY possibility once the lease claim above
+    // succeeded. Release this claim and retry under a fresh unique id.
+    const freshInstanceId = `${workflowInstanceId}-${Date.now()}`;
+    logger.info('Codebase index build: instance already exists; retrying with fresh instance id', {
+      repositoryId,
+      originalId: workflowInstanceId,
+      freshId: freshInstanceId,
+    });
+    try {
+      await releaseCodeIndexBuildLease(env, { repositoryId, workflowInstanceId });
+      const reClaimed = await claimCodeIndexBuildLease(env, {
+        repositoryId,
+        workflowInstanceId: freshInstanceId,
+        leaseSeconds: INDEX_BUILD_LEASE_SECONDS,
+      });
+      if (!reClaimed) {
+        // Another build grabbed the lease in the gap -- treat as coalesced.
+        return { started: false, coalesced: true, workflowInstanceId: freshInstanceId, reason: 'lease_held_after_release' };
+      }
+    } catch (leaseError) {
+      logger.error(
+        'Failed to transfer lease to fresh instance id',
+        leaseError instanceof Error ? leaseError : new Error(String(leaseError)),
+      );
+      // Proceed anyway -- the Workflow will try to claim on entry.
+    }
+    try {
+      await env.INDEX_WORKFLOW.create({
+        id: freshInstanceId,
+        params: { ...fullParams, workflowInstanceId: freshInstanceId },
+      });
+      return { started: true, workflowInstanceId: freshInstanceId };
+    } catch (retryError) {
+      try {
+        await releaseCodeIndexBuildLease(env, { repositoryId, workflowInstanceId: freshInstanceId });
+      } catch (releaseError) {
+        logger.error(
+          'Failed to release the codebase index build lease after a failed retry',
+          releaseError instanceof Error ? releaseError : new Error(String(releaseError)),
+        );
+      }
+      logger.error(
+        'Codebase index build failed even with a fresh instance id',
+        retryError instanceof Error ? retryError : new Error(String(retryError)),
+      );
+      return { started: false, coalesced: false, workflowInstanceId: freshInstanceId, error: retryError };
+    }
+  }
+}
+
+/**
  * D-09's SINGLE SELECTION VOCABULARY: the same three ideas the review path uses, applied to bare paths.
  *
  * Keeps only paths `isReviewableFile` accepts (the built-in lockfile/minified skips plus the

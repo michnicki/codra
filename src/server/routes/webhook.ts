@@ -14,7 +14,7 @@ import { extractReviewRequest, type ReviewRequest } from '@server/core/review';
 import { verifyGitHubWebhookSignature } from '@server/core/verify';
 import { jsonError } from '@server/core/http';
 import { ingestReviewWebhookEvent, isTransientCommentError, type WebhookIngestResult } from '@server/core/webhook-ingest';
-import { codeIndexInstanceId, type IndexBuildParams } from '@server/core/code-index-build';
+import { startIndexBuild } from '@server/core/code-index-build';
 import type { CommentContext } from '@server/core/commands';
 import { recordWebhookDelivery, deleteWebhookDelivery } from '@server/db/webhook-deliveries';
 import { findRepositoryIdByIdentity } from '@server/db/repositories';
@@ -268,11 +268,6 @@ export async function handleGitHubWebhook(c: Context<AppEnv>) {
         return pushIgnored('repository_not_registered');
       }
 
-      // THE INSTANCE ID COMES FROM THE SHARED HELPER, never a hand-built string: the dashboard
-      // trigger and the Bitbucket repo:push branch key on the same helper, and the
-      // `instance.already_exists` coalescing all three rely on can only fire when the ids are
-      // byte-identical.
-      const workflowInstanceId = codeIndexInstanceId(repositoryId);
       // A CREATED branch has an all-zeros before-sha, so a compare is meaningless — start a full
       // rebuild instead of passing a zero sha to the build's compare call as if it were a real
       // ancestor.
@@ -280,7 +275,11 @@ export async function handleGitHubWebhook(c: Context<AppEnv>) {
       // be large or fail; the incremental build's own failure handling covers that and the reason is
       // recorded rather than silently swallowed.
       const mode = push.created ? 'full' : 'incremental';
-      const params: IndexBuildParams = {
+      // The lease claim, instance-id derivation (the SHARED helper both push branches and the
+      // dashboard trigger key on), and the `instance.already_exists` stale-instance retry all live in
+      // `startIndexBuild` — see its doc comment for why a per-repository-stable id would otherwise
+      // mean a repository's index could only ever be refreshed once.
+      const outcome = await startIndexBuild(c.env, {
         repositoryId,
         vcsProvider: 'github',
         owner,
@@ -289,25 +288,19 @@ export async function handleGitHubWebhook(c: Context<AppEnv>) {
         installationId,
         mode,
         ...(mode === 'incremental' ? { baseSha: push.before, headSha: push.after } : {}),
-        workflowInstanceId,
-        continuation: 0,
-      };
-      try {
-        await c.env.INDEX_WORKFLOW.create({ id: workflowInstanceId, params });
-      } catch (error) {
-        if (error instanceof Error && error.message.includes('instance.already_exists')) {
-          // The same benign-duplicate disposition the queue consumer gives this rejection: a build
-          // for this repository is live, so the push is coalesced rather than failed.
+      });
+      if (!outcome.started) {
+        if (outcome.coalesced) {
           logger.info('Codebase index refresh coalesced: workflow instance already exists', {
             owner,
             repo,
             eventKind: eventName,
             repositoryId,
-            reason: 'instance_already_exists',
+            reason: outcome.reason,
           });
-          return c.json({ ok: true, coalesced: true, reason: 'instance_already_exists' }, 202);
+          return c.json({ ok: true, coalesced: true, reason: outcome.reason }, 202);
         }
-        throw error;
+        throw outcome.error;
       }
       logger.info('GitHub push triggered a codebase index refresh', {
         owner,
