@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BitbucketClient, BitbucketError } from '@server/core/bitbucket';
+import { addBitbucketWorkspaceInputSchema } from '@shared/bitbucket';
 import type { AppBindings } from '@server/env';
 import {
   BITBUCKET_FIXTURE_ACCOUNT_ID,
@@ -532,5 +533,95 @@ describe('BitbucketClient', () => {
 
       await expect(client.listWorkspaceRepositories('acme')).rejects.toBeInstanceOf(BitbucketError);
     });
+  });
+
+  // Phase 31 (WS-01, finalize): the workspace-webhook client methods the finalize endpoint's
+  // list-then-create-if-missing idempotency check depends on (T-31-03-04).
+  describe('listWorkspaceWebhooks / createWorkspaceWebhook', () => {
+    it('listWorkspaceWebhooks GETs /workspaces/{workspace}/hooks and maps to {uuid,url}[]', async () => {
+      const mock = installBitbucketFetchMock({
+        responseSequence: [
+          { body: { values: [{ uuid: '{hook-1}', url: 'https://codra.example.com/webhook/bitbucket' }] } },
+        ],
+      });
+      const { client, tracker } = createClient();
+
+      await expect(client.listWorkspaceWebhooks('acme')).resolves.toEqual([
+        { uuid: '{hook-1}', url: 'https://codra.example.com/webhook/bitbucket' },
+      ]);
+      expectBitbucketGet(mock.calls[0], '/2.0/workspaces/acme/hooks');
+      expectAuthenticated(mock.calls[0]);
+      expect(tracker.incrementSubrequests).toHaveBeenCalledTimes(1);
+    });
+
+    it('listWorkspaceWebhooks returns an empty array when the workspace has no hooks', async () => {
+      installBitbucketFetchMock({ responseSequence: [{ body: { values: [] } }] });
+      const { client } = createClient();
+
+      await expect(client.listWorkspaceWebhooks('acme')).resolves.toEqual([]);
+    });
+
+    it('createWorkspaceWebhook POSTs the expected body and returns the created uuid', async () => {
+      const mock = installBitbucketFetchMock({
+        responseSequence: [{ status: 201, body: { uuid: '{hook-2}' } }],
+      });
+      const { client, tracker } = createClient();
+
+      await expect(
+        client.createWorkspaceWebhook('acme', {
+          url: 'https://codra.example.com/webhook/bitbucket',
+          secret: 'whsec',
+          events: ['pullrequest:created', 'pullrequest:updated'],
+        }),
+      ).resolves.toEqual({ uuid: '{hook-2}' });
+      expectBitbucketPost(mock.calls[0], '/2.0/workspaces/acme/hooks');
+      expect(mock.calls[0].body).toEqual({
+        description: 'Codra review webhook',
+        url: 'https://codra.example.com/webhook/bitbucket',
+        active: true,
+        secret: 'whsec',
+        events: ['pullrequest:created', 'pullrequest:updated'],
+      });
+      expectAuthenticated(mock.calls[0]);
+      expect(tracker.incrementSubrequests).toHaveBeenCalledTimes(1);
+    });
+  });
+});
+
+// Phase 31 (WS-01): the finalize endpoint's input contract. Route-level acceptance (400 on an
+// invalid payload) is covered end-to-end in test/add-bitbucket-workspace.spec.ts; these are the
+// direct schema-boundary assertions the task's own acceptance criteria calls out.
+describe('addBitbucketWorkspaceInputSchema', () => {
+  const validInput = {
+    workspace: 'acme',
+    accessToken: 'tok',
+    webhookSecret: 'whsec',
+    selectedRepoSlugs: ['repo-a'],
+  };
+
+  it('accepts a valid finalize payload', () => {
+    expect(addBitbucketWorkspaceInputSchema.safeParse(validInput).success).toBe(true);
+  });
+
+  it('rejects an empty selectedRepoSlugs array', () => {
+    const result = addBitbucketWorkspaceInputSchema.safeParse({ ...validInput, selectedRepoSlugs: [] });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a selectedRepoSlugs array over 500 entries', () => {
+    const tooMany = Array.from({ length: 501 }, (_, i) => `repo-${i}`);
+    const result = addBitbucketWorkspaceInputSchema.safeParse({ ...validInput, selectedRepoSlugs: tooMany });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts exactly 500 selectedRepoSlugs entries (boundary)', () => {
+    const exactly500 = Array.from({ length: 500 }, (_, i) => `repo-${i}`);
+    const result = addBitbucketWorkspaceInputSchema.safeParse({ ...validInput, selectedRepoSlugs: exactly500 });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects an unknown key (strict)', () => {
+    const result = addBitbucketWorkspaceInputSchema.safeParse({ ...validInput, extra: 'nope' });
+    expect(result.success).toBe(false);
   });
 });
