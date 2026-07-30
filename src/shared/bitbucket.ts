@@ -266,3 +266,22 @@ export const addBitbucketRepoInputSchema = z.object({
 
 export type BitbucketOAuthProfile = z.infer<typeof bitbucketOAuthProfileSchema>;
 export type AddBitbucketRepoInput = z.infer<typeof addBitbucketRepoInputSchema>;
+
+// Phase 31 (WS-01, D-05): outbound workspace-discovery input. `.strict()` rejects unknown keys,
+// mirroring `addBitbucketRepoInputSchema` above. Discovery is a live, read-only, add-time-only
+// call -- this schema carries no persisted-record fields (no repoSlug, no webhookSecret).
+export const discoverBitbucketWorkspaceInputSchema = z.object({
+  workspace: z.string().trim().toLowerCase().min(1).max(100),
+  accessToken: z.string().trim().min(1).max(4096),
+}).strict();
+
+// Phase 31 (WS-01, D-04): one entry in the discover response's repo list. `alreadyOnboarded` is
+// computed server-side (a `repositories` table read), never supplied by Bitbucket.
+export const workspaceRepoListItemSchema = z.object({
+  slug: z.string(),
+  name: z.string(),
+  alreadyOnboarded: z.boolean(),
+});
+
+export type DiscoverBitbucketWorkspaceInput = z.infer<typeof discoverBitbucketWorkspaceInputSchema>;
+export type WorkspaceRepoListItem = z.infer<typeof workspaceRepoListItemSchema>;

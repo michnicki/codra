@@ -904,6 +904,13 @@ export function ReposPage() {
                   <BitbucketMark size={14} />
                   Add Bitbucket repository
                 </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="py-2"
+                  onClick={() => navigate('/repos/add/bitbucket-workspace')}
+                >
+                  <BitbucketMark size={14} />
+                  Add Bitbucket workspace
+                </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
           </div>

@@ -19,6 +19,7 @@ import type {
   VcsCredentialStoreInput,
   VcsProvider,
 } from '@shared/schema';
+import type { WorkspaceRepoListItem } from '@shared/bitbucket';
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
@@ -302,6 +303,12 @@ export const api = {
     tokenExpiresAt?: string | null;
   }) {
     return request<{ credential: VcsCredentialStatus }>('/api/repos/bitbucket', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    });
+  },
+  discoverBitbucketWorkspaceRepos(input: { workspace: string; accessToken: string }) {
+    return request<{ repos: WorkspaceRepoListItem[] }>('/api/repos/bitbucket/workspaces/discover', {
       method: 'POST',
       body: JSON.stringify(input),
     });

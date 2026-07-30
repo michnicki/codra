@@ -10,7 +10,8 @@ import { findRepositoryIdByIdentity, getOrCreateRepository } from '@server/db/re
 import { upsertVcsCredential } from '@server/db/vcs-credentials';
 import { encryptSecret } from '@server/core/crypto';
 import { queryTransaction } from '@server/db/client';
-import { addBitbucketRepoInputSchema } from '@shared/bitbucket';
+import { addBitbucketRepoInputSchema, discoverBitbucketWorkspaceInputSchema, type WorkspaceRepoListItem } from '@shared/bitbucket';
+import { BitbucketClient } from '@server/core/bitbucket';
 import { clusterRejectFeedback, synthesizeRules } from '@server/core/learned-rules';
 import { getRejectFeedbackForRepo } from '@server/db/reject-feedback';
 import { requireSession } from '@server/middleware/auth';
@@ -237,6 +238,58 @@ export function createReposRouter() {
     await invalidateRepoConfigCache(c.env, owner, repo);
 
     return c.json({ ok: true });
+  });
+
+  // POST /bitbucket/workspaces/discover -- WS-01 tracer slice (D-04/D-05). Read-only: this handler
+  // performs ZERO database writes. It calls the live Bitbucket API with the operator-supplied
+  // access token and annotates each returned repo with whether a `repositories` row already exists
+  // for it, so the dashboard can flag already-onboarded repos before the operator picks which ones
+  // to add. Mounted BEFORE `POST /bitbucket` below purely for reading order (route order does not
+  // matter here -- the two paths do not overlap).
+  app.post('/bitbucket/workspaces/discover', async (c) => {
+    const sessionUser = c.get('sessionUser');
+    if (!sessionUser) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    const raw = await c.req.json().catch(() => null);
+    const parsed = discoverBitbucketWorkspaceInputSchema.safeParse(raw);
+    if (!parsed.success) {
+      return jsonError('Invalid Bitbucket workspace discovery payload.', 400);
+    }
+
+    const { workspace, accessToken } = parsed.data;
+
+    try {
+      const client = new BitbucketClient(c.env, accessToken);
+      const repos = await client.listWorkspaceRepositories(workspace);
+
+      const annotated: WorkspaceRepoListItem[] = await Promise.all(
+        repos.map(async (repo) => {
+          // Antigravity review finding: Bitbucket's returned `slug` casing is not guaranteed
+          // lowercase, but `repositories.repo` is always stored lowercase (both
+          // `addBitbucketRepoInputSchema.repoSlug` and this phase's own selection schema normalize
+          // via `.trim().toLowerCase()`). An exact-match lookup without this normalization would
+          // render an already-onboarded repo as new.
+          const repositoryId = await findRepositoryIdByIdentity(c.env, {
+            vcsProvider: 'bitbucket',
+            ownerOrWorkspace: workspace,
+            repo: repo.slug.toLowerCase(),
+          });
+          return { slug: repo.slug, name: repo.name, alreadyOnboarded: repositoryId !== null };
+        }),
+      );
+
+      return c.json({ repos: annotated });
+    } catch (error) {
+      console.error('Failed to discover Bitbucket workspace repositories:', error);
+      // 502 (not 500): this failure is an upstream-API failure, distinct from the 400/401
+      // input/auth cases already used elsewhere in this file.
+      return jsonError(
+        error instanceof Error ? error.message : 'Failed to list workspace repositories.',
+        502,
+      );
+    }
   });
 
   // POST /bitbucket -- D-32 transactional add-repo endpoint. Reuses getOrCreateRepository's
