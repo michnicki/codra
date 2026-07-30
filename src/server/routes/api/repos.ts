@@ -58,6 +58,31 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
+/**
+ * Recursively merge `patch` onto `base`, descending into nested plain objects so an omitted key at
+ * any depth is left untouched rather than replaced. Arrays and primitives are replaced wholesale.
+ * Needed because `repoConfigSchema`'s nested objects all carry Zod `.default()`s: parsing a raw PATCH
+ * body through the schema back-fills every field the caller omitted with its own default, so merging
+ * the *parsed* patch (rather than the raw one) would silently reset untouched sibling settings.
+ */
+function deepMergePlain(base: unknown, patch: unknown): unknown {
+  if (
+    patch !== null &&
+    typeof patch === 'object' &&
+    !Array.isArray(patch) &&
+    base !== null &&
+    typeof base === 'object' &&
+    !Array.isArray(base)
+  ) {
+    const merged: Record<string, unknown> = { ...(base as Record<string, unknown>) };
+    for (const [key, value] of Object.entries(patch as Record<string, unknown>)) {
+      merged[key] = deepMergePlain(merged[key], value);
+    }
+    return merged;
+  }
+  return patch;
+}
+
 /** A non-null record as returned by `getRepoConfigRecord` (i.e. `repoConfigRecordSchema`'s shape). */
 type ResolvedRepoConfigRecord = NonNullable<Awaited<ReturnType<typeof getRepoConfigRecord>>>;
 
@@ -215,13 +240,15 @@ export function createReposRouter() {
     const updatedParsedJson = {
       ...existing.parsedJson,
       ...configPatch,
-      // CRITICAL PATH FIX #3 (Plan 26-02): deep-merge the `review` sub-object so patching specific
-      // review fields (e.g., `evidence`) does not destroy other review settings like `dedup`, `passes`,
-      // `rounds`. If configPatch.review is undefined the spread of undefined is a no-op.
-      review: {
-        ...existing.parsedJson.review,
-        ...configPatch.review,
-      },
+      // CRITICAL PATH FIX #3 (Plan 26-02, corrected): deep-merge the RAW `review` patch body (not
+      // `configPatch.review`, which is the Zod-parsed patch and therefore back-filled with a schema
+      // default for every field the caller omitted) onto the existing review config, so patching one
+      // nested field (e.g. `evidence.hard_drop`) cannot reset unrelated siblings (`dedup`, `passes`,
+      // `rounds`, ...) to their defaults. The merged result is still fully re-validated below.
+      review:
+        patch.review !== undefined
+          ? (deepMergePlain(existing.parsedJson.review, body.review) as typeof existing.parsedJson.review)
+          : existing.parsedJson.review,
     };
     const parsedConfig = repoConfigSchema.safeParse(updatedParsedJson);
 
