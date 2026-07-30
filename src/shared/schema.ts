@@ -1623,6 +1623,23 @@ export const vcsCredentialStoreSchema = z
   })
   .strict();
 export type VcsCredentialStoreInput = z.infer<typeof vcsCredentialStoreSchema>;
+
+// --- VCS workspace-level bot-credential contracts (Phase 31, WS-01, D-01/D-02) ---
+// Mirrors vcsCredentialStatusSchema exactly, minus repoSlug -- this is a workspace-scoped
+// (not per-repo) credential. Redacted READ DTO -- never carries secrets/ciphertext (D-10 mirrored).
+export const vcsWorkspaceCredentialStatusSchema = z.object({
+  vcsProvider: z.literal('bitbucket'),
+  workspace: z.string(),
+  hasToken: z.boolean(),
+  hasWebhookSecret: z.boolean(),
+  tokenExpiresAt: dateStringSchema.nullable(),
+  label: z.string().nullable(),
+  status: credentialStatusSchema,
+  createdAt: dateStringSchema,
+  updatedAt: dateStringSchema,
+});
+export type VcsWorkspaceCredentialStatus = z.infer<typeof vcsWorkspaceCredentialStatusSchema>;
+
 export type StatsPayload = z.infer<typeof statsSchema>;
 
 export const defaultRepoConfig = repoConfigSchema.parse({});
