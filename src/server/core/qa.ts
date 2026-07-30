@@ -257,6 +257,16 @@ export async function answerQuestion(
             // Provenance for the variant prompt: the commit the excerpts were indexed at (D-14).
             indexedSha = state.indexed_sha;
           }
+          // DIAGNOSTIC (29-09 UAT): qa.ts otherwise only logs on the failure path, so there is no way
+          // to tell "retrieved zero/wrong chunks silently" from "retrieved correctly but the model
+          // answered wrong anyway" from the logs alone. Log the outcome unconditionally here.
+          logger.info('Q&A index retrieval outcome', {
+            prNumber: ctx.prNumber,
+            provider: ctx.provider,
+            queryExpressionWasNull: queryExpression === null,
+            chunksFound: indexChunks.length,
+            paths: indexChunks.map((c) => c.path),
+          });
         }
       }
     }
