@@ -369,6 +369,19 @@ export const reviewConfigSchema = z.object({
         .default([]),
     })
     .default({ enabled: false, learned_rules: [] }),
+  // Phase 30 (ANNO-01, D-01/D-06): Bitbucket Code Insights annotations toggle. This is the FIRST
+  // purely Bitbucket-only capability toggle — no GitHub equivalent (NREG-02 by exclusion: GitHub
+  // already has native inline PR comments, so this capability only makes sense for Bitbucket).
+  // It is nested under `review` rather than added as a new top-level key on `repoConfigSchema` to
+  // preserve that schema's single-top-level-key shape, a choice explicitly confirmed at the Task 1
+  // checkpoint after cross-AI review flagged the config-key nesting question rather than defaulting
+  // it silently (30-REVIEWS.md, OpenCode Concern #3). Default-off for NREG-01 inertness:
+  // `repoConfigSchema.parse({})` yields `review.bitbucket.annotations_enabled === false`.
+  bitbucket: z
+    .object({
+      annotations_enabled: z.boolean().default(false),
+    })
+    .default({ annotations_enabled: false }),
 });
 
 export const repoConfigSchema = z.object({
@@ -422,6 +435,7 @@ export const repoConfigSchema = z.object({
     rounds: { incremental: false, escalate_floors: true },
     evidence: { hard_drop: false, hard_drop_exempt_categories: ['security'] },
     learning: { enabled: false, learned_rules: [] },
+    bitbucket: { annotations_enabled: false },
   }),
   model: z
     .object({

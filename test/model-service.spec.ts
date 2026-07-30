@@ -557,6 +557,7 @@ describe('ModelService', () => {
             rounds: { incremental: false, escalate_floors: true },
             evidence: { hard_drop: false, hard_drop_exempt_categories: ['security'] },
             learning: { enabled: false, learned_rules: [] },
+            bitbucket: { annotations_enabled: false },
           },
           model: {
             main: '@cf/zai-org/glm-4.7-flash',

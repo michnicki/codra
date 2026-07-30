@@ -84,6 +84,8 @@ describe('SC3: Phase-7 reviewConfig toggles default off; the three v1.2 always-o
     expect(cfg.review.severity_engine.enabled).toBe(true);
     expect(cfg.review.dedup.enabled).toBe(true);
     expect(cfg.review.file_selection.enabled).toBe(true);
+    // Phase 30 (ANNO-01, NREG-01): the Bitbucket Code Insights annotations toggle defaults off.
+    expect(cfg.review.bitbucket.annotations_enabled).toBe(false);
   });
 
   it('the exported defaultRepoConfig yields the same all-off values', () => {
@@ -94,6 +96,7 @@ describe('SC3: Phase-7 reviewConfig toggles default off; the three v1.2 always-o
     expect(defaultRepoConfig.review.interactive.commands.enabled).toBe(false);
     expect(defaultRepoConfig.review.interactive.qa.enabled).toBe(false);
     expect(defaultRepoConfig.review.interactive.commands.bitbucket_bot_account_id).toBeNull();
+    expect(defaultRepoConfig.review.bitbucket.annotations_enabled).toBe(false);
   });
 
   it('CMD-07: bitbucket_bot_account_id round-trips a configured value', () => {
@@ -105,6 +108,24 @@ describe('SC3: Phase-7 reviewConfig toggles default off; the three v1.2 always-o
     // Other commands defaults remain inert alongside the configured id.
     expect(cfg.review.interactive.commands.enabled).toBe(false);
     expect(cfg.review.interactive.commands.bitbucket_allowed_account_ids).toEqual([]);
+  });
+
+  it('ANNO-01: bitbucket.annotations_enabled round-trips true while every other review field stays at its own default', () => {
+    const cfg = repoConfigSchema.parse({
+      review: { bitbucket: { annotations_enabled: true } },
+    });
+
+    expect(cfg.review.bitbucket.annotations_enabled).toBe(true);
+    // Every other review field remains at its own independent default.
+    expect(cfg.review.passes.security.enabled).toBe(false);
+    expect(cfg.review.passes.critic.enabled).toBe(false);
+    expect(cfg.review.walkthrough.enabled).toBe(false);
+    expect(cfg.review.interactive.commands.enabled).toBe(false);
+    expect(cfg.review.interactive.qa.enabled).toBe(false);
+    expect(cfg.review.severity_engine.enabled).toBe(true);
+    expect(cfg.review.dedup.enabled).toBe(true);
+    expect(cfg.review.file_selection.enabled).toBe(true);
+    expect(cfg.review.learning.enabled).toBe(false);
   });
 });
 
