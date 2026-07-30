@@ -1,4 +1,52 @@
 
+## 29-09: code-index Q&A retrieval ranking is weak for natural-language questions (cross-provider, not fixed)
+
+**Found during:** the 29-09 Task 3 UAT session, 2026-07-30, live Q&A testing on
+`thomas_michnicki/reach` PR #5 (Bitbucket).
+
+Three real questions about a confirmed-indexed file (`src/lib/utils/formatters.ts`) all got
+confidently wrong answers — a fabricated file path, wrong return values, invented array contents.
+This looked at first like a Bitbucket-specific retrieval failure. A temporary diagnostic log
+(`src/server/core/qa.ts`, commit `a0f2ca8`: chunk count + retrieved paths, logged unconditionally
+right after retrieval — the existing code only logs on the *failure* path, so a wrong answer and a
+silently-empty retrieval are indistinguishable in the logs otherwise) resolved it: retrieval ran
+correctly and filled all 8 `top_k` slots with real repository content. It just never retrieved
+`formatters.ts`.
+
+**Root cause:** `buildQueryExpression` (`src/server/core/code-index.ts`) OR-joins every non-stopword
+query term with equal weight (`terms.join(' OR ')`). `QUERY_STOPWORDS` filters English question words
+(`what`, `does`, `the`, `for`) but NOT near-universal *code* vocabulary (`function`, `return`, and
+likely others like `value`, `const`, `export`). A natural-language question like "what does the
+truncate function return for truncate(...)?" tokenizes (after stopword removal) to roughly
+`['truncate', 'function', 'return', 'hello', 'world', '5']`. Since `function`/`return` appear in
+nearly every source file, `ts_rank_cd` can rank a chunk dense with generic code vocabulary above the
+one chunk containing the actually-distinctive term (`truncate`) — confirmed live: the 8 retrieved
+chunks were from three completely unrelated files (`vault.ts`, `ansible.ts`, `tofu.ts`), none of them
+`formatters.ts`.
+
+**This is cross-provider, not Bitbucket-specific.** The equivalent GitHub tests in this same UAT
+session (asking about `INDEX_BUILD_LEASE_SECONDS` and `redactErrorMessage`) happened to use rare,
+proper-noun-like identifiers that dominate ranking regardless of the OR-join weakness — they never
+exercised this failure mode. A similarly natural-language-phrased question on GitHub would very
+likely hit the same issue. A second research agent traced the Bitbucket-specific comment/config path
+end to end (`webhook-bitbucket.ts`, `findRepositoryIdByIdentity`'s workspace-vs-owner branching,
+`retrieveCodeIndexChunks`) and found it fully symmetric with GitHub's — no provider-specific plumbing
+bug, confirming the ranking algorithm itself is the shared root cause.
+
+**Not fixed here, deliberately.** This is a real design tradeoff, not a quick patch: extending
+`QUERY_STOPWORDS` with code-vocabulary words risks filtering out legitimate searches (e.g. "how does
+this framework's function decorator work"); weighting rare terms higher or AND-biasing the query
+would change ranking behavior broadly and needs its own test coverage. Worth a deliberate look in a
+future phase, not a rushed change at the tail of an already-large UAT session.
+
+**Suggested fix directions (any could work, none evaluated in depth):** (a) extend `QUERY_STOPWORDS`
+with the most common code-vocabulary noise words; (b) use `setweight()` + a two-tier query (rare
+identifier-shaped terms required, common words optional) instead of a flat OR-join; (c) prefer terms
+that appear in fewer total indexed chunks (an IDF-like signal) when ranking. Whichever direction is
+chosen, add a regression test asking a natural-language question (not just a bare identifier) against
+a small fixture index with both a relevant and several irrelevant-but-generic-code-heavy files, and
+assert the relevant one ranks first.
+
 ## RESOLVED at 29-09's Task 3 UAT (2026-07-29): `hasRemainingSafeBudget` fixed live
 
 Confirmed exactly as predicted below: `reach`'s real Bitbucket build stalled repeatedly at a fixed
