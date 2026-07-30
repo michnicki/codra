@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { RefreshCw } from 'lucide-react';
+import { GitBranch, RefreshCw } from 'lucide-react';
 import { api } from '@client/lib/api';
 import { PageHeader } from '@client/components/layout/page-header';
 import { Card, CardContent } from '@client/components/ui/card';
@@ -8,11 +8,15 @@ import { Button } from '@client/components/ui/button';
 import { Input } from '@client/components/ui/input';
 import { Alert } from '@client/components/ui/alert';
 import { Badge } from '@client/components/ui/badge';
+import { EmptyState } from '@client/components/shared/empty-state';
 import { cn } from '@client/lib/utils';
 import type { WorkspaceRepoListItem } from '@shared/bitbucket';
 
 const DISCOVER_ERROR_TITLE = 'Could not list repositories.';
 const DISCOVER_ERROR_DESCRIPTION = 'Check the workspace slug and access token, then try again.';
+const EMPTY_STATE_TITLE = 'No repositories found';
+const EMPTY_STATE_DESCRIPTION =
+  "This workspace doesn't have any repositories, or the token can't see any. Double-check the workspace slug and the token's scopes, then try again.";
 
 export function AddBitbucketWorkspacePage() {
   const navigate = useNavigate();
@@ -144,6 +148,14 @@ export function AddBitbucketWorkspacePage() {
               </Button>
             </div>
           </form>
+
+          {repos !== null && repos.length === 0 && (
+            <EmptyState
+              icon={<GitBranch />}
+              title={EMPTY_STATE_TITLE}
+              description={EMPTY_STATE_DESCRIPTION}
+            />
+          )}
 
           {repos !== null && repos.length > 0 && (
             <div className="mt-5 flex min-w-0 flex-col gap-2">
