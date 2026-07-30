@@ -15,16 +15,8 @@ import { clusterRejectFeedback, synthesizeRules } from '@server/core/learned-rul
 import { getRejectFeedbackForRepo } from '@server/db/reject-feedback';
 import { requireSession } from '@server/middleware/auth';
 import { requireCsrfHeader } from '@server/middleware/csrf';
-import {
-  claimCodeIndexBuildLease,
-  getCodeIndexState,
-  releaseCodeIndexBuildLease,
-} from '@server/db/code-index';
-import {
-  INDEX_BUILD_LEASE_SECONDS,
-  codeIndexInstanceId,
-  type IndexBuildParams,
-} from '@server/core/code-index-build';
+import { getCodeIndexState } from '@server/db/code-index';
+import { startIndexBuild } from '@server/core/code-index-build';
 import { logger } from '@server/core/logger';
 
 const repoConfigPatchSchema = z
@@ -497,48 +489,13 @@ export function createReposRouter() {
       return jsonError('Repository config not found.', 404);
     }
 
-    // THE INSTANCE ID AND THE LEASE OWNER MUST BE THE SAME STRING, and that is not a stylistic
-    // preference. `IndexWorkflow.execute` claims the lease under `event.instanceId` — the LIVE id of the
-    // instance created below — and `claimCodeIndexBuildLease` only permits a re-claim when
-    // `workflow_instance_id` matches. Claiming here under any other value (a fresh UUID, say) would make
-    // the workflow's own first claim fail, so the build it just started would coalesce ITSELF away and
-    // nothing would ever index.
-    //
-    // `codeIndexInstanceId` is CALLED, never re-implemented: 29-06's two push branches key on the same
-    // helper, and the whole `instance.already_exists` coalescing story needs all three sites to produce a
-    // byte-identical id. A locally formatted "stable per-repository id" differing by one character makes
-    // that rejection unreachable and leaves the durable lease as the only guard.
-    const workflowInstanceId = codeIndexInstanceId(repositoryId);
-
-    const coalesced = (reason: string) =>
-      c.json({
-        ok: true,
-        coalesced: true,
-        build: { mode: 'full' as const, workflowInstanceId },
-        message: 'A codebase index build is already running for this repository.',
-        reason,
-      });
-
-    // T-29-08-03: the lease claim precedes the instance creation, and a FAILED claim is a BENIGN
-    // COALESCED DUPLICATE rather than an error — a second press while a build is live is not a client
-    // mistake, and answering 409 would train an operator to retry the one thing that must not be retried.
-    const claimed = await claimCodeIndexBuildLease(c.env, {
-      repositoryId,
-      workflowInstanceId,
-      leaseSeconds: INDEX_BUILD_LEASE_SECONDS,
-    });
-    if (!claimed) {
-      logger.info('Codebase index build request coalesced: a build already holds the lease', {
-        repositoryId,
-        vcsProvider: existing.vcsProvider,
-        reason: 'lease_held',
-      });
-      return coalesced('lease_held');
-    }
-
-    // `mode: 'full'` is D-07's dashboard rebuild, and `continuation: 0` marks a genuinely NEW build (a
-    // fresh-instance handoff deliberately starts at 1 so it cannot re-run the destructive reset).
-    const params: IndexBuildParams = {
+    // `mode: 'full'` is D-07's dashboard rebuild. The lease claim, instance-id derivation, and the
+    // `instance.already_exists` stale-instance retry all live in `startIndexBuild` — the ONE place all
+    // three trigger sites (this endpoint, the GitHub `push` branch, the Bitbucket `repo:push` branch)
+    // call, so the retry fix cannot drift across three inline copies. See its doc comment for why a
+    // repository could otherwise only ever be built once (confirmed live during 29-09 UAT: a Bitbucket
+    // push after a prior full rebuild silently no-opped until this fix).
+    const outcome = await startIndexBuild(c.env, {
       repositoryId,
       vcsProvider: existing.vcsProvider,
       owner: existing.owner,
@@ -546,104 +503,23 @@ export function createReposRouter() {
       workspace: existing.workspace ?? null,
       installationId: existing.installationId,
       mode: 'full',
-      workflowInstanceId,
-      continuation: 0,
-    };
+    });
 
-    // KNOWN LIMITATION, TRACKED IN THIS PHASE'S deferred-items.md, NOT A BUG IN THIS HANDLER.
-    // Cloudflare rejects a `create` for an id that already exists, and an instance RECORD outlives the
-    // run, so a per-repository id that never varies may mean a repository can only ever be built ONCE —
-    // every later press (and every later push refresh in 29-06) would be reported as a benign coalesce
-    // and start nothing. That cannot be observed from a mock; 29-09 UAT has to press Build twice against
-    // the real runtime. If it reproduces, the fix is to vary the id by the build's target commit, which
-    // keeps coalescing meaningful per commit — NOT to stop calling `codeIndexInstanceId`, which would
-    // silently break the shared-id contract with both push branches.
-    try {
-      await c.env.INDEX_WORKFLOW.create({ id: workflowInstanceId, params });
-    } catch (error) {
-      if (error instanceof Error && error.message.includes('instance.already_exists')) {
-        // The instance record may be TERMINATED (from a previous failed build) rather than live.
-        // A terminated instance's id is still reserved by Cloudflare, so `create` throws
-        // `instance.already_exists` even though nothing is running. In that case, release the lease
-        // and retry with a fresh unique id — a terminated instance can never resume, so treating it
-        // as "coalesced" leaves the build permanently stuck.
-        //
-        // The `instance_already_exists` path is only a benign coalesce when the instance is actually
-        // running; for terminated instances, the per-repository id must be abandoned in favor of a
-        // unique one so the build can proceed.
-        const freshInstanceId = `${workflowInstanceId}-${Date.now()}`;
-        logger.info('Codebase index build: instance already exists; retrying with fresh instance id', {
-          repositoryId,
-          originalId: workflowInstanceId,
-          freshId: freshInstanceId,
+    if (!outcome.started) {
+      if (outcome.coalesced) {
+        return c.json({
+          ok: true,
+          coalesced: true,
+          build: { mode: 'full' as const, workflowInstanceId: outcome.workflowInstanceId },
+          message: 'A codebase index build is already running for this repository.',
+          reason: outcome.reason,
         });
-        // Re-claim the lease under the fresh id so the Workflow's `runIndexBuild` (which re-claims
-        // under `event.instanceId`) can enter its own lease. The original claim is still held, so
-        // this is a re-claim by a DIFFERENT id — `claimCodeIndexBuildLease` treats that as a foreign
-        // claim and rejects it. Release first, then re-claim.
-        try {
-          await releaseCodeIndexBuildLease(c.env, { repositoryId, workflowInstanceId });
-          const reClaimed = await claimCodeIndexBuildLease(c.env, {
-            repositoryId,
-            workflowInstanceId: freshInstanceId,
-            leaseSeconds: INDEX_BUILD_LEASE_SECONDS,
-          });
-          if (!reClaimed) {
-            // Another build grabbed the lease in the gap — treat as coalesced.
-            return coalesced('lease_held_after_release');
-          }
-        } catch (leaseError) {
-          logger.error(
-            'Failed to transfer lease to fresh instance id',
-            leaseError instanceof Error ? leaseError : new Error(String(leaseError)),
-          );
-          // Proceed anyway — the Workflow will try to claim on entry.
-        }
-        try {
-          await c.env.INDEX_WORKFLOW.create({ id: freshInstanceId, params: { ...params, workflowInstanceId: freshInstanceId } });
-          return c.json({
-            ok: true,
-            coalesced: false,
-            build: { mode: 'full' as const, workflowInstanceId: freshInstanceId },
-            message: 'Codebase index build started.',
-          });
-        } catch (retryError) {
-          // If the fresh id also fails, this is a real Cloudflare-side issue — release the lease and
-          // surface the error.
-          try {
-            await releaseCodeIndexBuildLease(c.env, { repositoryId, workflowInstanceId: freshInstanceId });
-          } catch (releaseError) {
-            logger.error(
-              'Failed to release the codebase index build lease after a failed retry',
-              releaseError instanceof Error ? releaseError : new Error(String(releaseError)),
-            );
-          }
-          logger.error(
-            'Codebase index build failed even with a fresh instance id',
-            retryError instanceof Error ? retryError : new Error(String(retryError)),
-          );
-          return jsonError('Failed to start codebase index build. Please try again.', 500);
-        }
       }
-
-      // RELEASE THE LEASE THE REQUEST JUST TOOK. Without this, a Cloudflare-side create failure leaves
-      // the state row reading `building` with a live 15-minute lease and no build behind it: the panel
-      // shows a phantom build and every retry in that window coalesces against a lease nobody owns.
-      // Best-effort — a failed release must not mask the create error, and lease expiry is the backstop.
-      try {
-        await releaseCodeIndexBuildLease(c.env, { repositoryId, workflowInstanceId });
-      } catch (releaseError) {
-        logger.error(
-          'Failed to release the codebase index build lease after a failed workflow create',
-          releaseError instanceof Error ? releaseError : new Error(String(releaseError)),
-        );
-      }
-
       logger.error(
         'Failed to start the codebase index build workflow',
-        error instanceof Error ? error : new Error(String(error)),
+        outcome.error instanceof Error ? outcome.error : new Error(String(outcome.error)),
       );
-      return jsonError('Failed to start the codebase index build.', 500);
+      return jsonError('Failed to start the codebase index build. Please try again.', 500);
     }
 
     // NO CONFIG WRITE, DELIBERATELY. The learned-rules handler this is modelled on ends with
@@ -658,7 +534,7 @@ export function createReposRouter() {
       // Returned so an operator report ("I pressed build and nothing happened") can be correlated with
       // the actual Workflow instance in the Cloudflare dashboard. Derived server-side from the resolved
       // repository; never accepted as input.
-      build: { mode: 'full' as const, workflowInstanceId },
+      build: { mode: 'full' as const, workflowInstanceId: outcome.workflowInstanceId },
     });
   });
 
