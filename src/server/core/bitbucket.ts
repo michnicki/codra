@@ -135,6 +135,10 @@ type BitbucketCommentRecord = {
   // self-filter key (NREG-02); `nickname` is the renameable @mention handle. Bitbucket comment
   // authors have NO `username` field (removed from the API in 2019) — never read it (Pitfall 4).
   user?: { account_id?: string; nickname?: string; display_name?: string };
+  // Additive permalink block (Phase 30, Pitfall 2). `html.href` is the comment's PR-visible
+  // permalink Bitbucket already returns; carried through so Plan 30-03's dedup-index widening can
+  // read it without an `as any` cast. Optional — absent fields are treated as undefined (NREG-01).
+  links?: { html?: { href?: string } };
 };
 
 function repositoryPath(workspace: string, repoSlug: string) {
@@ -605,10 +609,11 @@ export class BitbucketClient {
 
     return (page.values ?? []).map((comment) => ({
       // id, body, inline stay byte-identical — submitReview dedup depends on this exact shape
-      // (Pitfall 2, NREG-01). `author` is purely ADDITIVE.
+      // (Pitfall 2, NREG-01). `author` and `links` are purely ADDITIVE.
       id: comment.id,
       body: comment.content?.raw ?? '',
       inline: comment.inline,
+      links: comment.links,
       // author.id is `string | undefined` — a comment missing an immutable account_id must NOT be
       // minted as '' here (a false identity would defeat the Phase 11 self-filter, review F5). The
       // drop-missing-author policy lives in the ADAPTER (vcs/bitbucket.ts), not this shared client
@@ -626,7 +631,7 @@ export class BitbucketClient {
     repoSlug: string,
     prNumber: number,
     comment: PrComment,
-  ): Promise<{ id: number }> {
+  ): Promise<{ id: number; links?: { html?: { href?: string } } }> {
     const path = `${repositoryPath(workspace, repoSlug)}/pullrequests/${prNumber}/comments`;
     // `line_type` is Codra's internal classification. Bitbucket's OpenAPI accepts only path and
     // to/from on the wire: removed lines anchor with `from`, while added/context lines use `to`.
@@ -640,7 +645,7 @@ export class BitbucketClient {
         }
       : { content: { raw: comment.content.raw } };
     const response = await this.request('POST', path, body);
-    return (await response.json()) as { id: number };
+    return (await response.json()) as { id: number; links?: { html?: { href?: string } } };
   }
 
   // Net-new threaded reply (Phase 12, D-01). Mirrors postPullRequestComment's content-only branch
