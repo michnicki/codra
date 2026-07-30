@@ -137,8 +137,8 @@ coverage:
         ref: "Bitbucket retrieval-backed Q&A, mechanism check — asked three real questions on thomas_michnicki/reach PR #5 with the index enabled; diagnostic logging confirmed the retrieval mechanism ran (not silently skipped: queryExpressionWasNull=false, chunksFound=8/8 top_k slots filled with real repository paths) — the mechanism is NOT broken. Answer CONTENT was wrong on all three questions, root-caused to a full-text-search ranking weakness (see key-decisions and deferred-items.md), not a Bitbucket-specific plumbing bug"
         status: partial
       - kind: human
-        ref: "Bitbucket retrieval-backed Q&A, negative case (toggle off) — NOT YET DONE"
-        status: pending
+        ref: "Bitbucket retrieval-backed Q&A, negative case (toggle off) — confirmed on a real PR (thomas_michnicki/reach #6): toggled review.interactive.qa.index.enabled off (confirmed via direct DB read), asked a question about formatBytes (a confirmed-indexed function outside the PR's diff), and the bot correctly refused, citing only the diff ('The PR diff only edits CHANGELOG.md and does not include the definition of formatBytes...'). Structurally confirmed too: core/qa.ts gates the entire retrieval block (and its own diagnostic log) behind this exact config flag, so the refusal isn't coincidental. Toggle re-enabled afterward, confirmed via DB. Bonus: with the index back on, a reformulated question ('what array of unit strings does formatBytes use internally?') retrieved formatters.ts as the TOP hit (previously absent from the top 8 entirely) and the bot answered ['B', 'KB', 'MB', 'GB', 'TB', 'PB'] -- verified byte-for-byte against the real BYTE_UNITS constant -- confirming the ranking-quality fix in live production, not just the unit test"
+        status: pass
       - kind: human
         ref: "Bitbucket webhook push-event edit, and post-edit incremental refresh — subscription confirmed to already include the push event (real repo:push deliveries observed processing throughout the UAT session); incremental refresh confirmed firing and completing correctly (mode: incremental, indexed_sha advances to the pushed commit) after fixing both the stale-instance-id bug (below) and reach's pre-existing Bitbucket main-branch misconfiguration"
         status: pass
@@ -157,15 +157,15 @@ status: checkpoint-pending
 
 # Phase 29 Plan 09: Dashboard code-index panel and the end-to-end human gate Summary
 
-**QA-IDX-01 now has its operator surface: a Codebase Index panel in the repository config modal that renders the three real states (disabled / never-built / built), posts one build and refetches status from the server, tells the operator what produced the index and when it is partial or failed, and — for a Bitbucket repository whose freshness path has never fired — says exactly which webhook event is missing. Tasks 1-2 shipped the panel; a same-day Task 3 UAT session deployed it, found and fixed eleven real production bugs/gaps (see below), confirmed a full build completes end to end on both GitHub and Bitbucket, confirmed the retrieval-backed Q&A mechanism itself works correctly on GitHub (both toggle directions), found and fixed a real cross-provider full-text-search ranking-quality issue on Bitbucket (a code-vocabulary stopword gap, pinned with a regression test), and — after finding and fixing a bigger-scope bug that had silently disabled push-triggered incremental refresh on BOTH providers, a pre-existing Bitbucket repo misconfiguration, AND a GitHub App webhook subscription that had never included the `push` event at all — confirmed a real push-triggered incremental refresh completes end to end on BOTH GitHub and Bitbucket, resolving A2 and the GitHub post-merge check. Remaining before Task 3 can be marked fully verified: a conclusive Bitbucket negative Q&A (toggle-off) test.**
+**QA-IDX-01 now has its operator surface: a Codebase Index panel in the repository config modal that renders the three real states (disabled / never-built / built), posts one build and refetches status from the server, tells the operator what produced the index and when it is partial or failed, and — for a Bitbucket repository whose freshness path has never fired — says exactly which webhook event is missing. Tasks 1-2 shipped the panel; a same-day Task 3 UAT session deployed it, found and fixed eleven real production bugs/gaps (see below), confirmed a full build completes end to end on both GitHub and Bitbucket, confirmed the retrieval-backed Q&A mechanism itself works correctly on BOTH providers in BOTH toggle directions, found and fixed a real cross-provider full-text-search ranking-quality issue on Bitbucket (a code-vocabulary stopword gap, pinned with a regression test AND re-verified live in production against the exact repo/file that originally failed), and — after finding and fixing a bigger-scope bug that had silently disabled push-triggered incremental refresh on BOTH providers, a pre-existing Bitbucket repo misconfiguration, AND a GitHub App webhook subscription that had never included the `push` event at all — confirmed a real push-triggered incremental refresh completes end to end on BOTH GitHub and Bitbucket, resolving A2 and the GitHub post-merge check. Every item on Task 3's checklist is now technically verified; the checkpoint itself awaits the developer's explicit sign-off.**
 
-## Status: Tasks 1–2 complete; Task 3 substantially verified via a real UAT session, one item still open
+## Status: Tasks 1–2 complete; Task 3 fully verified via a real UAT session — awaiting developer sign-off on the checkpoint
 
 This plan is `autonomous: false` and its Task 3 is `checkpoint:human-verify` with `gate="blocking"`. Tasks 1 and 2 are executed, verified and committed below.
 
 **Task 3 UAT session (2026-07-29, same day as Tasks 1-2):** the developer deployed to the live instance (`codra.tmichnicki.workers.dev`) and worked through Task 3's checklist with the assistant driving verification via Playwright MCP and Cloudflare/wrangler CLI access. The `opencodra` (GitHub) build was found already stuck at `status: building` from an earlier attempt; investigating why led to six real bugs being found and fixed (see Deviations), after which **both** `opencodra` and `reach` (Bitbucket) completed a real, full build end to end. Once the developer authenticated the assistant's browser session on GitHub.com, the assistant posted the in-PR Q&A test itself on `michnicki/opencodra#13` (both the positive and negative case) and confirmed it works correctly. The developer then authenticated the assistant on Bitbucket.org too; testing there against a real, already-approved PR (`thomas_michnicki/reach#5`) surfaced the ranking-quality issue above plus a seventh bug (Bitbucket ignoring per-repo model overrides), both investigated and the latter fixed. See the coverage table above (id D6) for exactly which of Task 3's sub-checks are now `pass`, `partial`, or still `pending`.
 
-**Not yet done:** a conclusive negative Q&A (toggle-off) test on Bitbucket. STATE/ROADMAP plan-completion marking remains deliberately deferred until this closes.
+**Not yet done:** nothing technical — every sub-check in Task 3's checklist (coverage id D6) is now `pass`. STATE/ROADMAP plan-completion marking remains deliberately deferred until the developer gives the explicit "approved" sign-off this plan's checkpoint asks for.
 
 ## Performance
 
@@ -365,6 +365,7 @@ limitation (no general IDF-like signal — only the reproduced failure mode is f
 14. **Task 3 UAT docs: record the shared index-build fix, the Bitbucket main-branch finding, and A2 confirmation** — `ad932bc` (docs)
 15. **Task 3 UAT docs: confirm GitHub post-merge incremental refresh end to end** — `368ceb2` (docs)
 16. **Task 3 UAT fix 8: filter code-vocabulary reserved words from Q&A retrieval query terms, closing the ranking-quality decision** — `0793080` (fix)
+17. **Task 3 UAT docs: close out the Q&A ranking-quality decision** — `bcf01e5` (docs)
 
 ## Files Created/Modified
 
@@ -453,19 +454,27 @@ query-term stopword filter with `CODE_VOCABULARY_STOPWORDS` (see "Bitbucket Q&A"
 `deferred-items.md` for the full writeup), pinned with a regression test reproducing the exact
 observed failure, and deployed (commit `0793080`).
 
-**Still needed — one item, not conclusively re-tested:** the Bitbucket negative Q&A test (toggle index off, confirm a diff-only
-refusal, mirroring the GitHub negative test) — a later question asked during this session
-(`2026-07-30T03:19:14Z`, "what does formatBytes(0) return") got a confidently wrong file citation
-rather than a clean refusal, but whether the toggle was actually off at that point was not verified, so
-this is not counted as a completed negative-case test either way.
+**Done since the section above was last written: the Bitbucket negative Q&A test, conclusively confirmed.**
+On a real PR (`thomas_michnicki/reach` #6), toggled `review.interactive.qa.index.enabled` off (confirmed
+via direct DB read, not just the UI), asked about `formatBytes` (a confirmed-indexed function outside
+this PR's diff), and the bot correctly refused, citing only the diff — mirroring the GitHub negative
+test exactly. `core/qa.ts` gates the entire retrieval block behind this flag, so the refusal is
+structurally guaranteed, not coincidental. Toggle re-enabled and re-confirmed via DB afterward. As a
+bonus real-production check of the ranking-quality fix: with the index back on, a reformulated question
+retrieved `formatters.ts` as the TOP hit (previously absent from the top 8 entirely before the fix) and
+the bot answered `['B', 'KB', 'MB', 'GB', 'TB', 'PB']` — verified byte-for-byte against the real
+`BYTE_UNITS` constant.
 
-While at it: watch the Worker logs during the Bitbucket build for the `/src` tree-walk's real page
-count and any HTTP 555 retry (A3/A4) — not yet specifically observed during the UAT session, though the
-build completed without hitting the page cap (`truncated: false`).
+**Every item on Task 3's checklist (coverage id D6) is now `pass`.** Nothing technical remains open on
+this plan.
 
-**Resume signal:** type "approved" once these are done, or describe what did not behave as stated.
+Not specifically observed but not blocking: the `/src` tree-walk's real page count and any HTTP 555
+retry (A3/A4) during the Bitbucket build — the build completed without hitting the page cap
+(`truncated: false`), so this was never exercised, not merely unconfirmed.
 
-## Self-Check: PASSED (Tasks 1-2 + Task 3 UAT fixes; Task 3 checkpoint itself remains open)
+**Resume signal:** type "approved" to close out Task 3's checkpoint, or describe what did not behave as stated.
+
+## Self-Check: PASSED (Tasks 1-2 + Task 3 UAT fixes; every Task 3 sub-check verified; checkpoint sign-off itself is the developer's call)
 
 **Tasks 1-2:**
 - `src/client/components/features/repos/code-index-panel.tsx` — FOUND, created
@@ -482,8 +491,16 @@ build completed without hitting the page cap (`truncated: false`).
 - `.github/workflows/ci.yml` unmodified
 - Real production evidence (not just `npm test`): both `michnicki/opencodra` and `thomas_michnicki/reach` completed a real full build, confirmed via the dashboard panel, the raw status API, `wrangler workflows instances describe`, and a direct production-database query (383 + 344 file rows, 1909 + 1546 chunks, 15 MB combined `code_index_chunks` table); GitHub Q&A confirmed correct in both toggle directions on a real PR; Bitbucket Q&A mechanism confirmed running via diagnostic logging (`chunksFound: 8`, real paths); real pushes to both `reach`'s and `opencodra`'s `main` after fixing the respective webhook-subscription/instance-id/branch-designation gaps produced real `mode: incremental` builds whose `indexed_sha` matches the pushed/merged commit, confirmed via direct production-database query and, for GitHub, visually in the panel (`Last refresh: push refresh`)
 
-**Not self-checked — genuinely open, not a gap in this check:** a conclusive Bitbucket negative Q&A (toggle-off) test. Both the ranking-quality decision and the GitHub post-merge incremental refresh are no longer on this list — the former closed via `CODE_VOCABULARY_STOPWORDS` plus a pinned regression test (`0793080`), the latter confirmed via two real test PRs (`#14`, `#15`), a real `push` delivery, `mode: incremental`, `code_index_state.indexed_sha` advancing, and the panel rendering `Last refresh: push refresh`.
+**Not self-checked — nothing remains, this is a status note, not a gap:** all three items previously
+tracked here (the ranking-quality decision, the GitHub post-merge incremental refresh, and the
+Bitbucket negative Q&A test) are now closed. Ranking-quality: `CODE_VOCABULARY_STOPWORDS` plus a pinned
+regression test (`0793080`), re-verified live against the originally-failing repo/file. GitHub
+post-merge refresh: confirmed via two real test PRs (`#14`, `#15`), a real `push` delivery, `mode:
+incremental`, `code_index_state.indexed_sha` advancing, and the panel rendering `Last refresh: push
+refresh`. Bitbucket negative Q&A: confirmed via a real toggle-off/toggle-on round-trip on
+`thomas_michnicki/reach` PR #6. The only thing left is the developer's explicit sign-off on Task 3's
+checkpoint (see "User Setup Required" — type "approved").
 
 ---
 *Phase: 29-qa-idx-01-codebase-index-backed-q-a*
-*Completed (Tasks 1–2): 2026-07-29. Task 3 UAT session same day into 2026-07-30: eleven real bugs/gaps found and fixed, both providers' builds now complete end to end, GitHub Q&A retrieval confirmed working in both directions, the cross-provider Q&A ranking-quality issue found on Bitbucket root-caused and fixed with a pinned regression test, and real push-triggered incremental refresh confirmed end to end on BOTH GitHub and Bitbucket after fixing a bigger-scope stale-instance-id bug (both providers), a pre-existing Bitbucket repo misconfiguration, and a GitHub App webhook subscription that had never included the push event. Task 3 checkpoint remains open pending only a conclusive Bitbucket negative Q&A (toggle-off) test (see "User Setup Required").*
+*Completed (Tasks 1–2): 2026-07-29. Task 3 UAT session same day into 2026-07-30: eleven real bugs/gaps found and fixed, both providers' builds now complete end to end, GitHub AND Bitbucket Q&A retrieval confirmed working in both toggle directions, the cross-provider Q&A ranking-quality issue found on Bitbucket root-caused and fixed with a pinned regression test (and re-verified live in production), and real push-triggered incremental refresh confirmed end to end on BOTH GitHub and Bitbucket after fixing a bigger-scope stale-instance-id bug (both providers), a pre-existing Bitbucket repo misconfiguration, and a GitHub App webhook subscription that had never included the push event. Every item on Task 3's checklist is technically verified; the checkpoint awaits only the developer's explicit sign-off.*
