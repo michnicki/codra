@@ -186,4 +186,64 @@ describe('AddBitbucketWorkspacePage (D-31-05)', () => {
     expect(screen.getByRole('checkbox', { name: 'Select alpha-repo' })).toBeChecked();
     expect(navigateMock).not.toHaveBeenCalled();
   });
+
+  it('a rejected discoverBitbucketWorkspaceRepos call renders the destructive Alert with exact copy and preserves the typed workspace/token values', async () => {
+    vi.mocked(api.discoverBitbucketWorkspaceRepos).mockRejectedValue(new Error('boom'));
+
+    const user = userEvent.setup();
+    renderPage(<AddBitbucketWorkspacePage />, { route: '/repos/add/bitbucket-workspace' });
+    await fillAndDiscover(user);
+
+    expect(await screen.findByText('Could not list repositories.')).toBeInTheDocument();
+    expect(
+      screen.getByText('Check the workspace slug and access token, then try again.'),
+    ).toBeInTheDocument();
+
+    expect(screen.getByPlaceholderText('my-workspace')).toHaveValue('my-ws');
+    expect(screen.getByPlaceholderText('Workspace Access Token')).toHaveValue('tok-value');
+  });
+
+  it('a successful discovery resolving with zero repos renders the empty state with exact copy and no repo rows', async () => {
+    vi.mocked(api.discoverBitbucketWorkspaceRepos).mockResolvedValue({ repos: [] });
+
+    const user = userEvent.setup();
+    renderPage(<AddBitbucketWorkspacePage />, { route: '/repos/add/bitbucket-workspace' });
+    await fillAndDiscover(user);
+
+    expect(await screen.findByText('No repositories found')).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "This workspace doesn't have any repositories, or the token can't see any. Double-check the workspace slug and the token's scopes, then try again.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryAllByRole('checkbox')).toHaveLength(0);
+  });
+
+  it('renders the Step 1 instructional Alert with the required webhook scope and automatic-webhook-creation copy before any discovery happens', async () => {
+    renderPage(<AddBitbucketWorkspacePage />, { route: '/repos/add/bitbucket-workspace' });
+
+    expect(
+      await screen.findByText(/at least/i, { selector: 'p' }),
+    ).toBeInTheDocument();
+    const instructionalParagraph = screen.getByText(/at least/i, { selector: 'p' });
+    expect(instructionalParagraph.textContent).toContain('webhook');
+    expect(instructionalParagraph.textContent).toContain(
+      'you do not need to create the webhook yourself',
+    );
+    expect(instructionalParagraph.textContent).toContain(
+      'Codra creates a workspace webhook',
+    );
+    expect(instructionalParagraph.textContent).toContain('automatically');
+    expect(api.discoverBitbucketWorkspaceRepos).not.toHaveBeenCalled();
+  });
+
+  it('the PageHeader description retains the "whole workspace" scope-transparency framing verbatim', () => {
+    renderPage(<AddBitbucketWorkspacePage />, { route: '/repos/add/bitbucket-workspace' });
+
+    expect(
+      screen.getByText(
+        'Store a workspace access token and webhook secret so OpenCodra can discover and review pull requests across the whole workspace.',
+      ),
+    ).toBeInTheDocument();
+  });
 });
