@@ -275,6 +275,7 @@ dbDescribe('POST /api/repos/bitbucket/workspaces -- WS-01 finalize endpoint (D-0
     'ws-finalize-5',
     'ws-finalize-6',
     'ws-finalize-7',
+    'ws-finalize-8',
   ];
 
   beforeAll(async () => {
@@ -505,5 +506,46 @@ dbDescribe('POST /api/repos/bitbucket/workspaces -- WS-01 finalize endpoint (D-0
       [workspace],
     );
     expect(repoRows[0].count).toBe('1');
+  });
+
+  it('Test 8: resubmitting without tokenExpiresAt (D-06 sync) preserves a previously-recorded expiry rather than clearing it', async () => {
+    const workspace = 'ws-finalize-8';
+    mockNoMatchingHook();
+    const cookie = await getAuthCookie(app, env);
+    const expiry = '2099-01-01';
+
+    const firstRes = await authedFinalizePost(app, env, cookie, {
+      workspace,
+      accessToken: 'tok',
+      webhookSecret: 'whsec',
+      tokenExpiresAt: expiry,
+      selectedRepoSlugs: ['repo-a'],
+    });
+    expect(firstRes.status).toBe(201);
+
+    const afterFirst = await queryRows<{ token_expires_at: string | null }>(
+      env,
+      `SELECT token_expires_at FROM vcs_workspace_credentials WHERE vcs_provider = 'bitbucket' AND workspace = $1`,
+      [workspace],
+    );
+    expect(afterFirst[0].token_expires_at).not.toBeNull();
+
+    // Mirrors the real client: resubmitting to sync a newly-added repo omits tokenExpiresAt
+    // entirely (never prefilled), NOT an explicit null. This must leave the stored value alone.
+    const secondRes = await authedFinalizePost(app, env, cookie, {
+      workspace,
+      accessToken: 'tok',
+      webhookSecret: 'whsec',
+      selectedRepoSlugs: ['repo-a', 'repo-b'],
+    });
+    expect(secondRes.status).toBe(201);
+
+    const afterSecond = await queryRows<{ token_expires_at: string | null }>(
+      env,
+      `SELECT token_expires_at FROM vcs_workspace_credentials WHERE vcs_provider = 'bitbucket' AND workspace = $1`,
+      [workspace],
+    );
+    expect(afterSecond[0].token_expires_at).not.toBeNull();
+    expect(afterSecond[0].token_expires_at).toEqual(afterFirst[0].token_expires_at);
   });
 });

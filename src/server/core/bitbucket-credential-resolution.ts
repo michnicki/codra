@@ -20,7 +20,11 @@ export async function resolveBitbucketBotCredential(
     workspace: key.workspace,
     repoSlug: key.repoSlug,
   });
-  if (perRepo) return perRepo;
+  // A per-repo row can exist with its access token cleared (clearToken: true on
+  // POST /api/vcs-credentials) while the row itself remains. Short-circuiting on the row's
+  // mere existence would then permanently block the workspace-level fallback even though a
+  // valid workspace credential is available -- check for a usable token, not just a row.
+  if (perRepo?.encryptedAccessToken) return perRepo;
   return getVcsWorkspaceCredentialSecrets(env, {
     vcsProvider: 'bitbucket',
     workspace: key.workspace,

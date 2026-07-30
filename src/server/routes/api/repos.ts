@@ -336,7 +336,10 @@ export function createReposRouter() {
           workspace,
           encryptedAccessToken,
           encryptedWebhookSecret,
-          tokenExpiresAt: tokenExpiresAt ?? null,
+          // Pass through as-is: undefined must stay undefined (D-11 "leave untouched"), not
+          // collapse to null ("clear") -- an omitted field on a sync resubmission would otherwise
+          // silently wipe a previously-recorded expiry every time.
+          tokenExpiresAt,
         });
 
         // D-07: iterate ONLY selectedRepoSlugs, NEVER the full discovery list -- selection is the
@@ -458,7 +461,9 @@ export function createReposRouter() {
           repoSlug,
           encryptedAccessToken,
           encryptedWebhookSecret,
-          tokenExpiresAt: tokenExpiresAt ?? null,
+          // Pass through as-is: undefined must stay undefined (D-11 "leave untouched"), not
+          // collapse to null ("clear") -- same fix as the workspace finalize endpoint above.
+          tokenExpiresAt,
         });
       });
 
