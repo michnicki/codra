@@ -115,14 +115,48 @@ Plans:
 **Goal:** Per-line Code Insights `ANNOTATION` reports on Bitbucket Cloud PRs — gutter-level severity markers mirroring inline comments. Separate from existing summary report. Bitbucket-only. Config-gated (`bitbucket.annotations_enabled`, default off).
 **Requirements**: ANNO-01
 **Depends on:** v1.0 Bitbucket adapter (independent of all review-quality phases)
-**Plans:** TBD
+**Plans:** 4/4 plans complete
+
+Plans:
+
+**Wave 1**
+
+- [x] 30-01-PLAN.md — Config toggle (`review.bitbucket.annotations_enabled`) + pinned Bitbucket wire constants (report_id, severity/type mapping, batch size) + reportAnnotationSchema contract
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [x] 30-02-PLAN.md — BitbucketClient.bulkUpsertAnnotations/deleteCodeInsightsReport + widened upsertCodeInsightsReport(reportId) + links.html.href threaded through comment-carrying client types
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [x] 30-03-PLAN.md — VcsProvider.postAnnotations? seam + BitbucketAdapter.postAnnotations/buildAnnotation + widened buildDedupIndex/submitReview (D-11 link-following fix)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [x] 30-04-PLAN.md — Wire postAnnotations into runFinalizePhase (gated, fail-open, sequenced after submitReview)
 
 ### Phase 31: WS-01 Workspace-level token/webhook
 
 **Goal:** Workspace Access Token + workspace-level webhook auto-discovers repos in a Bitbucket workspace. Reduces per-repo onboarding friction to "add workspace, select repos." Dashboard workspace management UI. Bitbucket-only.
 **Requirements**: WS-01
 **Depends on:** v1.0 Bitbucket adapter (can run parallel with Phase 30)
-**Plans:** TBD
+**Plans:** 5 plans
+
+Plans:
+
+**Wave 1**
+
+- [ ] 31-01-PLAN.md — Tracer: live "discover a Bitbucket workspace's repos" flow end-to-end (dashboard form → new endpoint → BitbucketClient → DB-read annotation), read-only, no persistence
+- [ ] 31-02-PLAN.md — vcs_workspace_credentials table + DB module (mirrors vcs_credentials) + shared bitbucket-credential-resolution helper (D-03 precedence + webhook-candidate list)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 31-03-PLAN.md — Transactional finalize endpoint: encrypt + persist workspace credential, onboard only selected repos, idempotent workspace webhook creation (D-06/D-07)
+- [ ] 31-04-PLAN.md — Webhook route credential-resolution widening (tries both candidate secrets) + BitbucketAdapter.create bot-credential resolution (D-03) + D-07 regression test
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 31-05-PLAN.md — Interactive Step 2 checklist UI (hand-rolled Checkbox, select/deselect, already-onboarded badges) wired to the finalize endpoint
 
 <details>
 <summary>✅ v1.3 Bounded Evidence Audit Telemetry (Phases 21-25) — SHIPPED 2026-07-26</summary>
