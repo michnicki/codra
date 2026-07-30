@@ -92,3 +92,5 @@ Contributions are welcome — **no Contributor License Agreement required**. Ple
 ## License
 
 OpenCodra is licensed under the [GNU Affero General Public License v3.0](LICENSE). It is a fork of [Codra](https://github.com/devarshishimpi/codra) by Devarshi Shimpi; the original copyright is retained as required by the license.
+
+<!-- QA-IDX-01 UAT: GitHub push-event subscription enabled, incremental refresh verification, 2026-07-30 -->
