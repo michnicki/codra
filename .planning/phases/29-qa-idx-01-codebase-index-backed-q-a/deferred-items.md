@@ -1,5 +1,43 @@
 
-## 29-09: code-index Q&A retrieval ranking is weak for natural-language questions (cross-provider, not fixed)
+## RESOLVED (2026-07-30): code-index Q&A retrieval ranking weakness fixed via option (a)
+
+**Decision made and implemented same day.** Of the three suggested fix directions below, (a) —
+extend the stopword filter with code-vocabulary reserved words — was chosen over (b) (a two-tier
+required/optional query) and (c) (an IDF-like per-term rarity signal), because it is the smallest,
+most testable change that directly closes the exact reproduced failure, matches this module's
+existing design (`QUERY_STOPWORDS` already does precisely this for English words, with the same
+one-line "carries no retrieval signal" rationale), and carries the least risk: filtering a term can
+only ever narrow an OR-query, never silently corrupt one, so a filtered word can cost recall in a
+vanishingly rare edge case (a reviewer specifically asking about the keyword `function` itself) but
+can never cause a WRONG answer the way the original bug did.
+
+Implemented in `src/server/core/code-index.ts` as a new `CODE_VOCABULARY_STOPWORDS` set (`function`,
+`return`, `const`, `let`, `var`, `class`, `new`, `export`, `import`, `default`, `async`, `await`,
+`static`, `public`, `private`, `protected`, `void`, `null`, `undefined`, `true`, `false`) — deliberately
+confined to reserved words/literals near-universal across common languages, and deliberately
+EXCLUDING generic-but-plausibly-distinctive nouns (`get`, `id`, `name`, `data`, `type`, `value`) so the
+existing pinned `getUserById` split-identifier test (`code-index-query.spec.ts`) keeps passing
+unchanged. `buildQueryTerms` now filters against both stopword sets.
+
+**Pinned as a regression test**, exactly as this entry's own acceptance bar asked for:
+`test/code-index-db.spec.ts`'s `ranking (D-04)` group gained
+`'a distinctive identifier outranks generic-code-heavy chunks for a natural-language question'` — a
+fixture with one relevant chunk (a rare identifier, `zephyrTruncate`) and two chunks dense in
+`function`/`return` but never containing the distinctive term, asked via a real natural-language
+question containing both `function` and `return`. Asserts the relevant chunk ranks first AND that the
+noisy chunks don't match AT ALL post-fix (proving the fix removes their ranking signal entirely, not
+merely reorders it). Full suite: 133 files / 1913 tests passing; `npm run typecheck` clean. Deployed.
+
+**Known residual limitation, accepted rather than chased further:** this fixes the reproduced failure
+mode (near-universal reserved words drowning out a rare identifier) but does not add a general
+IDF-like signal — an unusual-but-genuinely-common English word not on either stopword list could still
+exhibit a milder version of the same dilution. Directions (b)/(c) below remain available if that
+proves to matter in practice; not pursued now because the reproduced case is fixed and a corpus-aware
+ranking signal is materially more design and test surface for a problem not yet observed to recur.
+
+## ORIGINAL WRITE-UP (superseded by the resolution above, preserved for context)
+
+### code-index Q&A retrieval ranking is weak for natural-language questions (cross-provider, not fixed)
 
 **Found during:** the 29-09 Task 3 UAT session, 2026-07-30, live Q&A testing on
 `thomas_michnicki/reach` PR #5 (Bitbucket).
