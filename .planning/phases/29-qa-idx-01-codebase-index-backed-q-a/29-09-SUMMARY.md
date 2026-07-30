@@ -129,8 +129,8 @@ coverage:
         ref: "GitHub retrieval-backed Q&A, negative case — toggled the index off, re-asked the identical question; bot correctly refused, citing only the diff ('The PR diff does not include the source code for redactErrorMessage...'). Index re-enabled afterward, index state unaffected by the toggle"
         status: pass
       - kind: human
-        ref: "GitHub post-merge incremental refresh (mode flips from dashboard-rebuild to push-refresh wording) — NOT YET DONE, needs a real merge to main"
-        status: pending
+        ref: "GitHub post-merge incremental refresh (mode flips from dashboard-rebuild to push-refresh wording) — confirmed live: CodraApp's GitHub App webhook subscription had NEVER included the push event (zero repo:push deliveries, ever), a bigger discovery than the merge test itself; the developer added it via https://github.com/settings/apps/CodraApp/permissions, then a real merge to michnicki/opencodra's main produced a real push delivery, mode: incremental, indexed_sha advancing to the merge commit, and the panel rendering 'Last refresh: push refresh' with the correct indexed commit"
+        status: pass
       - kind: human
         ref: "Bitbucket retrieval-backed Q&A, mechanism check — asked three real questions on thomas_michnicki/reach PR #5 with the index enabled; diagnostic logging confirmed the retrieval mechanism ran (not silently skipped: queryExpressionWasNull=false, chunksFound=8/8 top_k slots filled with real repository paths) — the mechanism is NOT broken. Answer CONTENT was wrong on all three questions, root-caused to a full-text-search ranking weakness (see key-decisions and deferred-items.md), not a Bitbucket-specific plumbing bug"
         status: partial
@@ -155,15 +155,15 @@ status: checkpoint-pending
 
 # Phase 29 Plan 09: Dashboard code-index panel and the end-to-end human gate Summary
 
-**QA-IDX-01 now has its operator surface: a Codebase Index panel in the repository config modal that renders the three real states (disabled / never-built / built), posts one build and refetches status from the server, tells the operator what produced the index and when it is partial or failed, and — for a Bitbucket repository whose freshness path has never fired — says exactly which webhook event is missing. Tasks 1-2 shipped the panel; a same-day Task 3 UAT session deployed it, found and fixed nine real production bugs (see below), confirmed a full build completes end to end on both GitHub and Bitbucket, confirmed the retrieval-backed Q&A mechanism itself works correctly on GitHub (both toggle directions), confirmed the Bitbucket Q&A mechanism runs correctly too but surfaced a real, cross-provider full-text-search ranking-quality issue (documented, not fixed — a design tradeoff, not a quick patch), and — after finding and fixing a bigger-scope bug that had silently disabled push-triggered incremental refresh on BOTH providers, plus a pre-existing Bitbucket repo misconfiguration — confirmed a real push-triggered incremental refresh completes end to end on Bitbucket, resolving A2. Remaining before Task 3 can be marked fully verified: the ranking-quality follow-up decision, GitHub's post-merge incremental-refresh test (the underlying bug is already fixed, only the merge itself remains), and a conclusive Bitbucket negative Q&A (toggle-off) test.**
+**QA-IDX-01 now has its operator surface: a Codebase Index panel in the repository config modal that renders the three real states (disabled / never-built / built), posts one build and refetches status from the server, tells the operator what produced the index and when it is partial or failed, and — for a Bitbucket repository whose freshness path has never fired — says exactly which webhook event is missing. Tasks 1-2 shipped the panel; a same-day Task 3 UAT session deployed it, found and fixed nine real production bugs (see below), confirmed a full build completes end to end on both GitHub and Bitbucket, confirmed the retrieval-backed Q&A mechanism itself works correctly on GitHub (both toggle directions), confirmed the Bitbucket Q&A mechanism runs correctly too but surfaced a real, cross-provider full-text-search ranking-quality issue (documented, not fixed — a design tradeoff, not a quick patch), and — after finding and fixing a bigger-scope bug that had silently disabled push-triggered incremental refresh on BOTH providers, a pre-existing Bitbucket repo misconfiguration, AND a GitHub App webhook subscription that had never included the `push` event at all — confirmed a real push-triggered incremental refresh completes end to end on BOTH GitHub and Bitbucket, resolving A2 and the GitHub post-merge check. Remaining before Task 3 can be marked fully verified: the ranking-quality follow-up decision and a conclusive Bitbucket negative Q&A (toggle-off) test.**
 
-## Status: Tasks 1–2 complete; Task 3 substantially verified via a real UAT session, two items still open
+## Status: Tasks 1–2 complete; Task 3 substantially verified via a real UAT session, one item still open
 
 This plan is `autonomous: false` and its Task 3 is `checkpoint:human-verify` with `gate="blocking"`. Tasks 1 and 2 are executed, verified and committed below.
 
 **Task 3 UAT session (2026-07-29, same day as Tasks 1-2):** the developer deployed to the live instance (`codra.tmichnicki.workers.dev`) and worked through Task 3's checklist with the assistant driving verification via Playwright MCP and Cloudflare/wrangler CLI access. The `opencodra` (GitHub) build was found already stuck at `status: building` from an earlier attempt; investigating why led to six real bugs being found and fixed (see Deviations), after which **both** `opencodra` and `reach` (Bitbucket) completed a real, full build end to end. Once the developer authenticated the assistant's browser session on GitHub.com, the assistant posted the in-PR Q&A test itself on `michnicki/opencodra#13` (both the positive and negative case) and confirmed it works correctly. The developer then authenticated the assistant on Bitbucket.org too; testing there against a real, already-approved PR (`thomas_michnicki/reach#5`) surfaced the ranking-quality issue above plus a seventh bug (Bitbucket ignoring per-repo model overrides), both investigated and the latter fixed. See the coverage table above (id D6) for exactly which of Task 3's sub-checks are now `pass`, `partial`, or still `pending`.
 
-**Not yet done:** the ranking-quality follow-up (a design decision, deliberately not rushed), the post-merge incremental-refresh test on GitHub (needs an actual merge to `main`; the underlying bug is already fixed), and a conclusive negative Q&A (toggle-off) test on Bitbucket. STATE/ROADMAP plan-completion marking remains deliberately deferred until these close.
+**Not yet done:** the ranking-quality follow-up (a design decision, deliberately not rushed) and a conclusive negative Q&A (toggle-off) test on Bitbucket. STATE/ROADMAP plan-completion marking remains deliberately deferred until these close.
 
 ## Performance
 
@@ -261,9 +261,24 @@ provider tree with real file content). Fixed, tested, and deployed one at a time
    section (not discoverable via the branching-model page's "Development branch" dropdown, which
    this session tried first and could not get to take effect).
 
-All nine fixes were verified against the real `opencodra` and `reach` builds/Q&A/push-refresh calls
-as they happened (not just `npm test`), which is the strongest verification this phase's Task 3 gate
-could realistically ask for.
+10. **CodraApp's GitHub App had never subscribed to the `push` webhook event, at all — not a Codra
+    bug, but a real configuration gap that made the GitHub side of the incremental-refresh checklist
+    untestable until fixed.** A direct query of `webhook_deliveries` for `michnicki/opencodra` showed
+    every event kind Codra actually handles (`pull_request`, `check_suite`, `issue_comment`, etc.) but
+    zero `push` rows ever, across the repository's entire history — the exact GitHub-App-level
+    counterpart to `reach`'s per-repo Bitbucket webhook gap this session also found. Merging a test PR
+    confirmed it live: no `push` delivery arrived at all (verified via `webhook_deliveries`), so the
+    already-fixed `a014df8` code path was never even reached. The developer added the `Push` event via
+    `https://github.com/settings/apps/CodraApp/permissions` → Subscribe to events (GitHub's sudo-mode
+    confirm page initially blocked the assistant's own authenticated session; the developer
+    re-authenticated it, after which the assistant located and checked the box itself). A second test
+    merge immediately after produced a real `push` delivery, `mode: incremental`, and a correctly
+    advanced `indexed_sha` — confirmed both via direct production-database query and visually in the
+    panel (`Last refresh: push refresh`).
+
+All ten fixes/findings were verified against the real `opencodra` and `reach` builds/Q&A/push-refresh
+calls as they happened (not just `npm test`), which is the strongest verification this phase's Task 3
+gate could realistically ask for.
 
 ### Retrieval-backed Q&A: confirmed working, plus one real observation (not a bug)
 
@@ -399,17 +414,26 @@ After both fixes, a real push to `main` produced `mode: incremental` and `code_i
 correctly advanced to the pushed commit — end-to-end confirmed. This also resolves A2 (the real
 `repo:push` payload parses cleanly across multiple real deliveries, branch/hash extract correctly).
 
-**Still needed — two items:**
+**Done since the section above was last written: GitHub post-merge incremental refresh, fully
+confirmed.** Merging a trivial doc-only PR (`#14`) to `michnicki/opencodra`'s `main` surfaced a second,
+independent app-level gap on top of everything else this UAT session found: **CodraApp's GitHub App
+webhook subscription had never included the `push` event at all** — `webhook_deliveries` showed zero
+`push` rows, ever, for this repository, across its entire history. This is symmetric to the Bitbucket
+per-repo webhook-subscription gap, just at the GitHub-App level instead of the per-repo level, and it
+meant no merge to `main` could ever have triggered a refresh regardless of the `a014df8` code fix. The
+developer added the `Push` event via `https://github.com/settings/apps/CodraApp/permissions` (GitHub's
+sudo-mode confirm page blocked the assistant's own browser session at first; the developer authenticated
+it, then the assistant drove the actual checkbox-and-save). A second merge (`#15`) immediately after
+confirmed the full chain: a real `push` delivery arrived, `mode: incremental`, `code_index_state`'s
+`indexed_sha` advanced to the merge commit, and the panel visually renders `Last refresh: push refresh`
+with the correct indexed commit — the exact flip from dashboard-rebuild wording this checklist item asked
+for.
+
+**Still needed — one item:**
 
 1. **The ranking-quality follow-up decision.** Deliberately not rushed — see "Bitbucket Q&A" above and
    the new `deferred-items.md` entry for the concrete tradeoffs (stopword-list extension vs. term
    weighting vs. AND-bias).
-2. **GitHub post-merge incremental refresh.** Merge something small to `main` on `michnicki/opencodra`
-   (PR #13 itself is a scratch PR meant to be closed unmerged, per its own description — use a
-   different small change); confirm the panel's indexed commit advances and the "what produced this
-   index" line flips from dashboard-rebuild to push-refresh wording. (The underlying bug that would
-   have blocked this — GitHub push refresh dying after the first build — is now already fixed
-   alongside the Bitbucket one in `a014df8`, since both providers shared the same broken code path.)
 
 **Not conclusively re-tested:** the Bitbucket negative Q&A test (toggle index off, confirm a diff-only
 refusal, mirroring the GitHub negative test) — a later question asked during this session
@@ -440,8 +464,8 @@ build completed without hitting the page cap (`truncated: false`).
 - `.github/workflows/ci.yml` unmodified
 - Real production evidence (not just `npm test`): both `michnicki/opencodra` and `thomas_michnicki/reach` completed a real full build, confirmed via the dashboard panel, the raw status API, `wrangler workflows instances describe`, and a direct production-database query (383 + 344 file rows, 1909 + 1546 chunks, 15 MB combined `code_index_chunks` table); GitHub Q&A confirmed correct in both toggle directions on a real PR; Bitbucket Q&A mechanism confirmed running via diagnostic logging (`chunksFound: 8`, real paths) even though answer quality surfaced the ranking issue; a real push to `reach`'s `main` after fixing both the repo's main-branch misconfiguration and the stale-instance-id bug produced a real `mode: incremental` build whose `indexed_sha` matches the pushed commit, confirmed via direct production-database query
 
-**Not self-checked — genuinely open, not a gap in this check:** the ranking-quality follow-up decision, GitHub post-merge incremental refresh (the underlying blocker for it is already fixed in `a014df8`, but the merge itself was not performed), and a conclusive Bitbucket negative Q&A (toggle-off) test. These require either a deliberate design decision or a GitHub.com write action, and are the developer's remaining checklist (see "User Setup Required" above).
+**Not self-checked — genuinely open, not a gap in this check:** the ranking-quality follow-up decision, and a conclusive Bitbucket negative Q&A (toggle-off) test. The GitHub post-merge incremental refresh is no longer on this list — confirmed via two real test PRs (`#14`, `#15`), a real `push` delivery, `mode: incremental`, `code_index_state.indexed_sha` advancing, and the panel rendering `Last refresh: push refresh`.
 
 ---
 *Phase: 29-qa-idx-01-codebase-index-backed-q-a*
-*Completed (Tasks 1–2): 2026-07-29. Task 3 UAT session same day into 2026-07-30: nine real bugs found and fixed, both providers' builds now complete end to end, GitHub Q&A retrieval confirmed working in both directions, Bitbucket Q&A mechanism confirmed running with a real cross-provider ranking-quality issue documented (not fixed), and a real Bitbucket push-triggered incremental refresh confirmed end to end after fixing a bigger-scope stale-instance-id bug (both providers) plus a pre-existing Bitbucket repo misconfiguration. Task 3 checkpoint remains open pending a design decision plus one GitHub write action (see "User Setup Required").*
+*Completed (Tasks 1–2): 2026-07-29. Task 3 UAT session same day into 2026-07-30: ten real bugs/gaps found and fixed, both providers' builds now complete end to end, GitHub Q&A retrieval confirmed working in both directions, Bitbucket Q&A mechanism confirmed running with a real cross-provider ranking-quality issue documented (not fixed), and real push-triggered incremental refresh confirmed end to end on BOTH GitHub and Bitbucket after fixing a bigger-scope stale-instance-id bug (both providers), a pre-existing Bitbucket repo misconfiguration, and a GitHub App webhook subscription that had never included the push event. Task 3 checkpoint remains open pending only the ranking-quality design decision (see "User Setup Required").*

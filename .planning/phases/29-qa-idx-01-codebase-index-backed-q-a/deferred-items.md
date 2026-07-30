@@ -207,6 +207,33 @@ correctly, and a subsequent push resolved and processed as expected. Nothing to 
 Codra's code — worth recording only because it caused ~15 minutes of live UAT time to be spent
 investigating what turned out to be entirely outside the application.
 
+## RESOLVED, outside Codra: CodraApp's GitHub App had never subscribed to the `push` webhook event
+
+**Found during:** 29-09 Task 3 UAT, 2026-07-30, while running the GitHub post-merge
+incremental-refresh test.
+
+Not a Codra bug. A direct query of `webhook_deliveries` for `michnicki/opencodra` showed every event
+kind Codra's routes actually handle (`pull_request`, `check_suite`, `issue_comment`,
+`pull_request_review`, etc.) but **zero `push` rows, ever** — the GitHub App (`CodraApp`) was simply
+never subscribed to the `push` event at the app level, so no merge to `main` could have triggered an
+incremental refresh regardless of any code fix. This is the exact GitHub-App-level counterpart to the
+per-repo Bitbucket webhook-subscription gap this session also investigated (see the `reach` entries
+above), just configured in a different place: GitHub Apps' webhook event subscriptions live on the
+app's own Permissions & events settings page, not per-repository.
+
+Confirmed via `https://github.com/settings/apps/CodraApp/permissions` → "Subscribe to events": `Push`
+was unchecked. The developer added it (GitHub's sudo-mode confirm page initially blocked the
+assistant's own authenticated browser session; the developer re-authenticated it, after which the
+assistant located and checked the box directly). A test merge immediately after produced a real `push`
+delivery, `mode: incremental`, and `code_index_state.indexed_sha` correctly advancing to the merge
+commit — confirmed both via direct production-database query and visually in the panel (`Last refresh:
+push refresh`).
+
+**Nothing to fix in Codra's code.** Worth recording because — like the `reach` main-branch
+misconfiguration — it could otherwise be misdiagnosed as a code defect in `webhook.ts`'s push handler
+(which was, separately, genuinely buggy — see the `codeIndexInstanceId` entry above — but that bug was
+never even reachable here until this subscription was added).
+
 ## 29-06: A2 (real Bitbucket `repo:push` payload shape) confirmed nowhere yet — deferred to 29-09's gate
 
 **Deferred at:** plan 29-06 closeout, 2026-07-29, with developer approval.
