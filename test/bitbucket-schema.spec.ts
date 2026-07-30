@@ -4,6 +4,7 @@ import {
   commitBuildStatusSchema,
   prCommentSchema,
   pullRequestWebhookPayloadSchema,
+  reportAnnotationSchema,
 } from '@shared/bitbucket';
 
 const parsedBody = {
@@ -251,5 +252,40 @@ describe('commitBuildStatusSchema', () => {
       description: baseStatus.description,
       url: baseStatus.url,
     }).success).toBe(false);
+  });
+});
+
+describe('reportAnnotationSchema', () => {
+  it('parses a minimal inline annotation with path/line', () => {
+    expect(reportAnnotationSchema.safeParse({
+      external_id: 'x',
+      annotation_type: 'BUG',
+      severity: 'CRITICAL',
+      path: 'a.ts',
+      line: 1,
+    }).success).toBe(true);
+  });
+
+  it('rejects unknown keys (.strict())', () => {
+    expect(reportAnnotationSchema.safeParse({
+      external_id: 'x',
+      annotation_type: 'BUG',
+      severity: 'CRITICAL',
+      unexpected_key: 'x',
+    }).success).toBe(false);
+  });
+
+  it('rejects a severity value outside the four verified literals', () => {
+    expect(reportAnnotationSchema.safeParse({
+      external_id: 'x',
+      severity: 'IMPOSSIBLE',
+    }).success).toBe(false);
+  });
+
+  it('parses an overview-modal annotation (no path/line) with a valid severity', () => {
+    expect(reportAnnotationSchema.safeParse({
+      external_id: 'x',
+      severity: 'LOW',
+    }).success).toBe(true);
   });
 });

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import {
+  ANNOTATION_SEVERITY_VALUES,
   BUILD_STATUS_STATE,
   LINE_TYPES,
   REPORT_RESULT,
@@ -198,6 +199,30 @@ export const commitBuildStatusSchema = z.object({
   description: z.string(),
   url: z.url(),
 }).strict();
+
+// Phase 30 (ANNO-01, D-01/D-04/D-05/D-06): the outbound per-annotation payload posted to
+// Bitbucket's Code Insights bulk annotations endpoint. `.strict()` mirrors codeInsightsReportSchema/
+// commitBuildStatusSchema's outbound-write convention so a future caller cannot smuggle unexpected
+// keys into the wire payload. `annotation_type` and `result` reuse the existing REPORT_TYPE_VALUES/
+// REPORT_RESULT enums (D-05/D-02) rather than inventing new ones; `severity` imports its literal
+// value set from ANNOTATION_SEVERITY_VALUES (bitbucket/constants.ts) so the client and schema
+// cannot drift apart. `path`/`line` are optional — an overview-modal annotation (no inline anchor)
+// omits both, per 30-RESEARCH.md. No `.max()` length bound on title/summary/details/external_id:
+// Bitbucket's swagger.json does not document one (30-RESEARCH.md Assumptions Log).
+export const reportAnnotationSchema = z.object({
+  external_id: z.string().min(1),
+  title: z.string().optional(),
+  annotation_type: z.enum(REPORT_TYPE_VALUES).optional(),
+  summary: z.string().optional(),
+  details: z.string().optional(),
+  result: z.enum(REPORT_RESULT).optional(),
+  severity: z.enum(ANNOTATION_SEVERITY_VALUES),
+  path: z.string().optional(),
+  line: z.number().int().positive().optional(),
+  link: z.url().optional(),
+}).strict();
+
+export type ReportAnnotation = z.infer<typeof reportAnnotationSchema>;
 
 export type BitbucketPullRequestWebhookBase = z.infer<typeof bitbucketPullRequestWebhookBaseSchema>;
 export type PullRequestCreatedPayload = z.infer<typeof pullRequestCreatedPayloadSchema>;
