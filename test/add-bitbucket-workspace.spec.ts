@@ -1,8 +1,9 @@
-import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll, afterEach } from 'vitest';
 import { createApp } from '@server/app';
 import { queryRows } from '@server/db/client';
 import { getOrCreateRepository } from '@server/db/repositories';
-import { discoverBitbucketWorkspaceInputSchema } from '@shared/bitbucket';
+import { BitbucketClient } from '@server/core/bitbucket';
+import { addBitbucketWorkspaceInputSchema, discoverBitbucketWorkspaceInputSchema } from '@shared/bitbucket';
 import { createTestEnv, hasConfiguredTestDatabaseUrl } from './helpers';
 
 const dbDescribe = hasConfiguredTestDatabaseUrl() ? describe : describe.skip;
@@ -227,5 +228,282 @@ dbDescribe('POST /api/repos/bitbucket/workspaces/discover -- WS-01 tracer slice 
     expect(res.status).not.toBe(200);
     const json = (await res.json()) as { error?: string; repos?: unknown };
     expect(json.repos).toBeUndefined();
+  });
+});
+
+// Phase 31 (WS-01, D-06/D-07): POST /api/repos/bitbucket/workspaces -- the transactional finalize
+// endpoint. Extends this file per the plan's file list, reusing the discover suite's auth/CSRF
+// harness. BitbucketClient.prototype.listWorkspaceWebhooks/createWorkspaceWebhook are mocked via
+// vi.spyOn rather than hitting a real Bitbucket API.
+async function authedFinalizePost(
+  app: ReturnType<typeof createApp>,
+  env: ReturnType<typeof createTestEnv>,
+  cookie: string,
+  body: unknown,
+  withCsrf = true,
+) {
+  return app.request(
+    '/api/repos/bitbucket/workspaces',
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        Cookie: `codra_session=${cookie}`,
+        ...(withCsrf ? { 'x-requested-with': 'XMLHttpRequest' } : {}),
+      },
+      body: JSON.stringify(body),
+    },
+    env,
+  );
+}
+
+dbDescribe('POST /api/repos/bitbucket/workspaces -- WS-01 finalize endpoint (D-06/D-07)', () => {
+  const env = createTestEnv();
+  const app = createApp();
+  const WEBHOOK_URL = 'http://localhost/webhook/bitbucket';
+
+  async function deleteWorkspaceIdentity(workspace: string) {
+    await queryRows(env, `DELETE FROM vcs_workspace_credentials WHERE vcs_provider = 'bitbucket' AND workspace = $1`, [workspace]);
+    await queryRows(env, `DELETE FROM repositories WHERE vcs_provider = 'bitbucket' AND workspace = $1`, [workspace]);
+  }
+
+  const WORKSPACES = [
+    'ws-finalize-1',
+    'ws-finalize-2',
+    'ws-finalize-3',
+    'ws-finalize-4',
+    'ws-finalize-5',
+    'ws-finalize-6',
+    'ws-finalize-7',
+  ];
+
+  beforeAll(async () => {
+    for (const workspace of WORKSPACES) await deleteWorkspaceIdentity(workspace);
+  });
+
+  afterEach(() => {
+    // `vi.spyOn` on an ALREADY-spied method returns the SAME mock instance (with its accumulated
+    // `.mock.calls` history) rather than a fresh one -- restore after every test so each test's
+    // spy/call-count assertions are scoped to that test alone, not the whole describe block.
+    vi.restoreAllMocks();
+  });
+
+  afterAll(async () => {
+    for (const workspace of WORKSPACES) await deleteWorkspaceIdentity(workspace);
+  });
+
+  function mockNoMatchingHook() {
+    vi.spyOn(BitbucketClient.prototype, 'listWorkspaceWebhooks').mockResolvedValue([]);
+    vi.spyOn(BitbucketClient.prototype, 'createWorkspaceWebhook').mockResolvedValue({ uuid: '{new-hook}' });
+  }
+
+  it('Test 1: a valid finalize payload with 2 selected repo slugs creates exactly 1 credential row and 2 repositories rows', async () => {
+    const workspace = 'ws-finalize-1';
+    mockNoMatchingHook();
+    const cookie = await getAuthCookie(app, env);
+
+    const res = await authedFinalizePost(app, env, cookie, {
+      workspace,
+      accessToken: 'tok',
+      webhookSecret: 'whsec',
+      selectedRepoSlugs: ['repo-a', 'repo-b'],
+    });
+    expect(res.status).toBe(201);
+    const json = (await res.json()) as { credential: unknown; repositoryCount: number };
+    expect(json.repositoryCount).toBe(2);
+
+    const credRows = await queryRows<{ count: string }>(
+      env,
+      `SELECT count(*)::text AS count FROM vcs_workspace_credentials WHERE vcs_provider = 'bitbucket' AND workspace = $1`,
+      [workspace],
+    );
+    expect(credRows[0].count).toBe('1');
+
+    const repoRows = await queryRows<{ count: string }>(
+      env,
+      `SELECT count(*)::text AS count FROM repositories WHERE vcs_provider = 'bitbucket' AND workspace = $1`,
+      [workspace],
+    );
+    expect(repoRows[0].count).toBe('2');
+  });
+
+  it('Test 2: a repo slug not present in selectedRepoSlugs never gets a repositories row', async () => {
+    const workspace = 'ws-finalize-2';
+    mockNoMatchingHook();
+    const cookie = await getAuthCookie(app, env);
+
+    const res = await authedFinalizePost(app, env, cookie, {
+      workspace,
+      accessToken: 'tok',
+      webhookSecret: 'whsec',
+      selectedRepoSlugs: ['repo-selected'],
+    });
+    expect(res.status).toBe(201);
+
+    const rows = await queryRows<{ repo: string }>(
+      env,
+      `SELECT repo FROM repositories WHERE vcs_provider = 'bitbucket' AND workspace = $1`,
+      [workspace],
+    );
+    expect(rows.map((r) => r.repo)).toEqual(['repo-selected']);
+    expect(rows.map((r) => r.repo)).not.toContain('repo-not-selected');
+  });
+
+  it('Test 3: createWorkspaceWebhook is skipped when a matching-URL hook already exists', async () => {
+    const workspace = 'ws-finalize-3';
+    vi.spyOn(BitbucketClient.prototype, 'listWorkspaceWebhooks').mockResolvedValue([
+      { uuid: '{existing-hook}', url: WEBHOOK_URL },
+    ]);
+    const createSpy = vi.spyOn(BitbucketClient.prototype, 'createWorkspaceWebhook').mockResolvedValue({ uuid: '{new-hook}' });
+    const cookie = await getAuthCookie(app, env);
+
+    const res = await authedFinalizePost(app, env, cookie, {
+      workspace,
+      accessToken: 'tok',
+      webhookSecret: 'whsec',
+      selectedRepoSlugs: ['repo-a'],
+    });
+    expect(res.status).toBe(201);
+    expect(createSpy).not.toHaveBeenCalled();
+  });
+
+  it('Test 4: resubmitting the SAME workspace with [already-onboarded, new] results in 1 credential row and exactly 1 additional repositories row', async () => {
+    const workspace = 'ws-finalize-4';
+    mockNoMatchingHook();
+    const cookie = await getAuthCookie(app, env);
+
+    const firstRes = await authedFinalizePost(app, env, cookie, {
+      workspace,
+      accessToken: 'tok',
+      webhookSecret: 'whsec',
+      selectedRepoSlugs: ['repo-existing'],
+    });
+    expect(firstRes.status).toBe(201);
+
+    const secondRes = await authedFinalizePost(app, env, cookie, {
+      workspace,
+      accessToken: 'tok-rotated',
+      webhookSecret: 'whsec-rotated',
+      selectedRepoSlugs: ['repo-existing', 'repo-new'],
+    });
+    expect(secondRes.status).toBe(201);
+
+    const credRows = await queryRows<{ count: string }>(
+      env,
+      `SELECT count(*)::text AS count FROM vcs_workspace_credentials WHERE vcs_provider = 'bitbucket' AND workspace = $1`,
+      [workspace],
+    );
+    expect(credRows[0].count).toBe('1');
+
+    const repoRows = await queryRows<{ repo: string }>(
+      env,
+      `SELECT repo FROM repositories WHERE vcs_provider = 'bitbucket' AND workspace = $1 ORDER BY repo`,
+      [workspace],
+    );
+    expect(repoRows.map((r) => r.repo)).toEqual(['repo-existing', 'repo-new']);
+  });
+
+  it('Test 5: selectedRepoSlugs: [] is rejected 400 by schema validation before any DB write or Bitbucket call', async () => {
+    const workspace = 'ws-finalize-5';
+    expect(
+      addBitbucketWorkspaceInputSchema.safeParse({
+        workspace,
+        accessToken: 'tok',
+        webhookSecret: 'whsec',
+        selectedRepoSlugs: [],
+      }).success,
+    ).toBe(false);
+
+    const listSpy = vi.spyOn(BitbucketClient.prototype, 'listWorkspaceWebhooks');
+    const cookie = await getAuthCookie(app, env);
+
+    const res = await authedFinalizePost(app, env, cookie, {
+      workspace,
+      accessToken: 'tok',
+      webhookSecret: 'whsec',
+      selectedRepoSlugs: [],
+    });
+    expect(res.status).toBe(400);
+    expect(listSpy).not.toHaveBeenCalled();
+
+    const credRows = await queryRows<{ count: string }>(
+      env,
+      `SELECT count(*)::text AS count FROM vcs_workspace_credentials WHERE vcs_provider = 'bitbucket' AND workspace = $1`,
+      [workspace],
+    );
+    expect(credRows[0].count).toBe('0');
+  });
+
+  it('Test 6 (concurrency): two simultaneous finalize requests for the SAME never-before-added workspace never duplicate the credential row', async () => {
+    const workspace = 'ws-finalize-6';
+    mockNoMatchingHook();
+    const cookie = await getAuthCookie(app, env);
+
+    const [firstRes, secondRes] = await Promise.all([
+      authedFinalizePost(app, env, cookie, {
+        workspace,
+        accessToken: 'tok-a',
+        webhookSecret: 'whsec-a',
+        selectedRepoSlugs: ['repo-a'],
+      }),
+      authedFinalizePost(app, env, cookie, {
+        workspace,
+        accessToken: 'tok-b',
+        webhookSecret: 'whsec-b',
+        selectedRepoSlugs: ['repo-b'],
+      }),
+    ]);
+    expect(firstRes.status).toBe(201);
+    expect(secondRes.status).toBe(201);
+
+    // The comparison is done IN SQL (not via JS `Date.getTime()`, which truncates to millisecond
+    // precision and can falsely report equality for two timestamptz values that differ only at
+    // the microsecond level) -- `updated_at > created_at` is evaluated by Postgres itself, at full
+    // native precision, on the SAME row.
+    const rows = await queryRows<{ count: string; updated_after_created: boolean }>(
+      env,
+      `SELECT count(*)::text AS count, bool_and(updated_at > created_at) AS updated_after_created
+       FROM vcs_workspace_credentials WHERE vcs_provider = 'bitbucket' AND workspace = $1`,
+      [workspace],
+    );
+    expect(rows[0].count).toBe('1');
+    // The row-count assertion alone proves the UNIQUE(vcs_provider, workspace) constraint
+    // prevented a duplicate INSERT. This second assertion proves the SECOND call's
+    // ON CONFLICT DO UPDATE branch genuinely executed (rather than the test harness accidentally
+    // serializing the two calls such that the second one no-ops).
+    expect(rows[0].updated_after_created).toBe(true);
+  });
+
+  it('Test 7: a webhook-creation failure after the transaction commits returns a distinct 502, with credential/repos rows confirmed present', async () => {
+    const workspace = 'ws-finalize-7';
+    vi.spyOn(BitbucketClient.prototype, 'listWorkspaceWebhooks').mockResolvedValue([]);
+    vi.spyOn(BitbucketClient.prototype, 'createWorkspaceWebhook').mockRejectedValueOnce(new Error('network blip'));
+    const cookie = await getAuthCookie(app, env);
+
+    const res = await authedFinalizePost(app, env, cookie, {
+      workspace,
+      accessToken: 'tok',
+      webhookSecret: 'whsec',
+      selectedRepoSlugs: ['repo-a'],
+    });
+    expect(res.status).toBe(502);
+    const json = (await res.json()) as { error?: string };
+    expect(json.error).toContain('credential and repositories were saved');
+    expect(json.error).toContain('Resubmit this form');
+    expect(json.error).not.toContain('Failed to add Bitbucket workspace.');
+
+    const credRows = await queryRows<{ count: string }>(
+      env,
+      `SELECT count(*)::text AS count FROM vcs_workspace_credentials WHERE vcs_provider = 'bitbucket' AND workspace = $1`,
+      [workspace],
+    );
+    expect(credRows[0].count).toBe('1');
+
+    const repoRows = await queryRows<{ count: string }>(
+      env,
+      `SELECT count(*)::text AS count FROM repositories WHERE vcs_provider = 'bitbucket' AND workspace = $1`,
+      [workspace],
+    );
+    expect(repoRows[0].count).toBe('1');
   });
 });
