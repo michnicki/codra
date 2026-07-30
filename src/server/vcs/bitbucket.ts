@@ -12,6 +12,7 @@ import type { RepoConfig } from '@shared/schema';
 import type {
   VcsCapabilities,
   VcsCreateStatusCheckInput,
+  VcsPostedComment,
   VcsProvider,
   VcsPullRequest,
   VcsReviewComment,
@@ -75,7 +76,15 @@ type TrackerLike = { incrementSubrequests(count?: number): void; hasRemainingSaf
 // per submitReview call — the API list is paginated by pagelen=100 which already covers all PRs
 // Codra is realistically asked to review. Stored on `this` so multiple inline-comment dedup checks
 // share the same lookup within a single submitReview invocation.
-type CommentListingItem = { id: number; body: string; inline?: { path: string; to?: number; from?: number } };
+type CommentListingItem = {
+  id: number;
+  body: string;
+  inline?: { path: string; to?: number; from?: number };
+  // Phase 30 (ANNO-01, D-11/Pitfall 2): a comment's PR-visible permalink, additive and optional --
+  // absent on any response shape that doesn't carry it (NREG-01 byte-compat). Threaded through
+  // buildDedupIndex/submitReview so postAnnotations can link an annotation back to its comment.
+  links?: { html?: { href?: string } };
+};
 
 // Stable machine token for the review summary comment's dedup anchor. Bitbucket Cloud has no hidden
 // HTML comments (a GitHub-style `<!-- ... -->` renders visibly and its inner HTML is sanitized), so
@@ -443,7 +452,7 @@ export class BitbucketAdapter implements VcsProvider {
     repo: string,
     prNumber: number,
     input: VcsSubmitReviewInput,
-  ): Promise<{ ref: string }> {
+  ): Promise<{ ref: string; postedComments: VcsPostedComment[] }> {
     const workspace = this.job.repositoryWorkspace;
 
     // REV-R-A step 1: fetch existing comments to seed the dedup index BEFORE posting anything.
@@ -453,6 +462,12 @@ export class BitbucketAdapter implements VcsProvider {
     // Walk the cached diff once so we can translate `position -> { to | from, line_type }`.
     const files = await this.loadCachedDiffFiles();
 
+    // Phase 30 (ANNO-01, D-11): collect a VcsPostedComment for BOTH the freshly-posted branch AND
+    // the dedup-matched (already-existing) branch below, so postAnnotations (called after this
+    // method returns) can link every current-round finding's annotation back to its comment --
+    // including findings whose comment already existed from a prior round (Pitfall 1).
+    const postedComments: VcsPostedComment[] = [];
+
     // REV-R-A step 2: post inline comments (or skip if a matching comment already exists).
     for (const comment of input.comments) {
       const anchor = anchorForComment(comment, files);
@@ -461,19 +476,24 @@ export class BitbucketAdapter implements VcsProvider {
         continue;
       }
 
-      if (dedup.has(deDupKey(comment.path, anchor, comment.body))) {
-        // Existing matching comment on this PR for this anchor + body — skip.
+      const key = deDupKey(comment.path, anchor, comment.body);
+      const existingMatch = dedup.get(key);
+      if (existingMatch) {
+        // Existing matching comment on this PR for this anchor + body — skip the POST, but still
+        // record its link (Pitfall 1 fix).
+        postedComments.push({ path: comment.path, line: anchor.line, body: comment.body, link: existingMatch.link });
         continue;
       }
 
-      await this.client.postPullRequestComment(workspace, repo, prNumber, {
+      const postedInline = await this.client.postPullRequestComment(workspace, repo, prNumber, {
         path: comment.path,
         line: anchor.line,
         line_type: anchor.line_type,
         content: { raw: comment.body },
       });
-      // Add to the in-memory set so subsequent comments with the same key are also dedup'd.
-      dedup.add(deDupKey(comment.path, anchor, comment.body));
+      postedComments.push({ path: comment.path, line: anchor.line, body: comment.body, link: postedInline.links?.html?.href });
+      // Add to the in-memory map so subsequent comments with the same key are also dedup'd.
+      dedup.set(key, { id: postedInline.id, link: postedInline.links?.html?.href });
     }
 
     // REV-R-A step 3: the summary as the SINGLE final post. The dedup anchor is a clean Bitbucket
@@ -491,7 +511,7 @@ export class BitbucketAdapter implements VcsProvider {
       await this.client.approvePullRequest(workspace, repo, prNumber);
     }
     void owner;
-    return { ref: String(posted.id) };
+    return { ref: String(posted.id), postedComments };
   }
 
   async findExistingReviewForCommit(
@@ -712,8 +732,15 @@ function deDupKey(path: string, anchor: AnchorShape, body: string) {
   return `${path}|${anchor.line_type}|${anchor.line}|${body}`;
 }
 
+/**
+ * Phase 30 (ANNO-01, D-11/Pitfall 1): widened from a `Set<string>` to a `Map<string, {id, link}>`
+ * so a dedup-matched comment on a re-review round still carries its id/link forward -- a bare Set
+ * only answered "does this need posting," discarding the id/link a later annotation-linking step
+ * needs. Both the freshly-posted and dedup-matched branches of submitReview's posting loop now
+ * populate `postedComments` from this map (closes RESEARCH.md Pitfall 1).
+ */
 function buildDedupIndex(items: CommentListingItem[]) {
-  const set = new Set<string>();
+  const map = new Map<string, { id: number; link?: string }>();
   for (const item of items) {
     if (!item.inline) continue;
     const anchor: AnchorShape = {
@@ -721,7 +748,7 @@ function buildDedupIndex(items: CommentListingItem[]) {
       line: item.inline.to ?? item.inline.from ?? 0,
       line_type: item.inline.from !== undefined ? 'removed' : 'added',
     };
-    set.add(deDupKey(item.inline.path, anchor, item.body));
+    map.set(deDupKey(item.inline.path, anchor, item.body), { id: item.id, link: item.links?.html?.href });
   }
-  return set;
+  return map;
 }
