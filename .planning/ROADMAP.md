@@ -76,7 +76,7 @@ Plans:
 **Goal:** Index default-branch tree into embeddings/keyword index (KV or Postgres) on repo install. Q&A queries index for relevant code beyond PR diff. Index freshness via webhook push events. Config-gated (`qa.index_enabled`, default off).
 **Requirements**: QA-IDX-01
 **Depends on:** Phase 26 (independent, heaviest lift)
-**Plans:** 9 plans
+**Plans:** 9/9 plans complete
 
 > Planning note: the goal line above restates REQUIREMENTS' original wording. Phase 29's locked
 > decisions deliberately narrow it — Postgres native full-text search rather than embeddings (D-01),
@@ -108,7 +108,7 @@ Plans:
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
-- [ ] 29-09-PLAN.md — Dashboard index panel, the manual Bitbucket subscription step, and end-to-end human verification
+- [x] 29-09-PLAN.md — Dashboard index panel, the manual Bitbucket subscription step, and end-to-end human verification
 
 ### Phase 30: ANNO-01 Bitbucket Code Insights annotations
 

@@ -5,16 +5,16 @@ milestone_name: Deferred Candidates
 current_phase: 29
 current_phase_name: qa-idx-01-codebase-index-backed-q-a
 status: executing
-stopped_at: Completed 29-06-PLAN.md
-last_updated: "2026-07-29T11:15:00.000Z"
-last_activity: 2026-07-29
-last_activity_desc: 29-06 closed out (safe-resume); A1 confirmed, A2 deferred to 29-09
+stopped_at: Completed 29-09-PLAN.md (Phase 29 complete)
+last_updated: "2026-07-30T06:10:00.000Z"
+last_activity: 2026-07-30
+last_activity_desc: Phase 29 complete — 29-09 Task 3 checkpoint developer-approved after real production UAT on both providers
 progress:
   total_phases: 10
-  completed_phases: 7
+  completed_phases: 8
   total_plans: 21
-  completed_plans: 20
-  percent: 95
+  completed_plans: 21
+  percent: 100
 ---
 
 # Project State
@@ -24,14 +24,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-25 for v1.2 closure)
 
 **Core value:** A Bitbucket Cloud PR gets the same AI review a GitHub PR gets, from one instance, without breaking GitHub — held end-to-end since v1.0, extended by v1.1 (every interactive/multi-pass capability shipped on both providers), extended by v1.2 (deterministic severity + real categories, audit-backed noise filter, priority file selection, incremental rounds, verify-fixes, critic v2, ensemble, walkthrough enrichment — all on both providers, every drop explainable from `jobs.audit`).
-**Current focus:** Phase 29 — qa-idx-01-codebase-index-backed-q-a
+**Current focus:** Phase 30 (ANNO-01) or Phase 31 (WS-01) — Phase 29 is complete, neither successor is planned yet
 
 ## Current Position
 
-Phase: 29 (qa-idx-01-codebase-index-backed-q-a) — EXECUTING
-Plan: 8 of 9 complete — 29-09 (dashboard panel + end-to-end human gate) remaining
-Status: Executing Phase 29
-Last activity: 2026-07-29 — 29-06 closed out under the safe-resume gate (tasks 1–3 landed 2026-07-28; A1 confirmed against a real GitHub push; A2 deferred to 29-09's gate with developer approval)
+Phase: 29 (qa-idx-01-codebase-index-backed-q-a) — COMPLETE
+Plan: 9 of 9 complete
+Status: Phase 29 complete; v1.4 milestone continues with Phase 30 (ANNO-01) or Phase 31 (WS-01, can run in parallel per the dependency order), neither yet planned
+Last activity: 2026-07-30 — Task 3's blocking human-verify checkpoint approved by the developer after a same-day live UAT session against the real deployed instance: 11 real bugs/gaps found and fixed (subrequest-exhaustion retry, binary NULL-byte scan, stale-instance-id retry shared across all 3 trigger sites, fresh-instance-handoff lease release, missing TokenTracker method, Bitbucket per-repo model override, a pre-existing Bitbucket repo main-branch misconfiguration, a GitHub App webhook subscription missing the push event, and a Q&A retrieval ranking-quality gap fixed with a pinned regression test); both GitHub and Bitbucket confirmed working end-to-end for full builds, push-triggered incremental refresh, and Q&A retrieval in both toggle directions
 
 ### Phase 27 Plan 27-01 Decisions (SEC-XDIFF-01)
 
@@ -264,6 +264,10 @@ Decisions carried from v1.1 execution (still load-bearing for v1.2 — Phase 14 
 - [Phase 29]: 29-06: repoPushPayloadSchema joins the union via catchall(z.any()) at the member top level, not z.looseObject — runtime-identical looseness, but the union's unnarrowed property-access inference is preserved (Rule 3)
 - [Phase 29]: 29-06: Bitbucket main branch resolves through the adapter's getRepositoryMetadata (mainbranch.name) — the VcsProvider optional method + adapter delegation were added (Rule 3: the plan referenced a client-only method); GitHub reads default_branch ?? master_branch off the payload and warns + ignores when both are absent
 - [Phase 29]: 29-06: recordWebhookDelivery deliberately stays BEFORE the supported-event gate (every push delivery is recorded — diagnosability over row count); branch-creation pushes (zero/null before) start a FULL rebuild, never a zero-sha compare
+- [Phase 29]: 29-09 UAT: `codeIndexInstanceId`'s stable per-repository id plus Cloudflare's permanent instance-id reservation silently disabled PUSH-triggered incremental refresh on BOTH providers after a repository's first-ever build (bigger scope than the dashboard-only fix 29-08 shipped) — fixed by extracting the lease-claim/create/stale-instance-retry logic into a shared `startIndexBuild()` helper used by all three trigger sites
+- [Phase 29]: 29-09 UAT: two real-world configuration gaps, neither a Codra bug, both discovered only by live end-to-end testing: `reach`'s Bitbucket repo had its "Main branch" designation pointed at a leftover scratch branch instead of `main`; CodraApp's GitHub App had never subscribed to the `push` webhook event at the app level (zero deliveries, ever)
+- [Phase 29]: 29-09 UAT: Q&A retrieval ranking was weak for natural-language questions — `ts_rank_cd` has no IDF-like signal, so a near-universal reserved word (`function`, `return`) surviving into the OR-joined query could outrank the chunk containing the actually-distinctive identifier. Fixed via a new `CODE_VOCABULARY_STOPWORDS` set (reserved words/literals only, deliberately excluding generic-but-distinctive nouns like `get`/`id`/`data`), pinned with a regression test, and re-verified live in production against the exact repo/file that originally failed
+- [Phase 29]: 29-09: Task 3's blocking human-verify checkpoint closed via real production UAT rather than mocks — every sub-check (full build both providers, Q&A retrieval both providers both toggle directions, push-triggered incremental refresh both providers, A2 payload confirmation) verified against the live deployed instance, not `npm test` alone
 
 ### Roadmap Evolution
 
@@ -277,6 +281,7 @@ Decisions carried from v1.1 execution (still load-bearing for v1.2 — Phase 14 
 
 ### Roadmap Evolution
 
+- Phase 29 complete (2026-07-30): 9/9 plans; QA-IDX-01 satisfied. Task 3's blocking human-verify checkpoint (29-09) closed via a real same-day production UAT session (deploy + real GitHub + real Bitbucket repositories) rather than mocks: full index build, push-triggered incremental refresh, and Q&A retrieval (both toggle directions) all confirmed on BOTH providers. 11 real bugs/gaps found and fixed along the way, including two that were pre-existing misconfigurations outside Codra's code (a Bitbucket repo's main-branch designation; a GitHub App's missing push-event subscription) and one cross-provider Q&A ranking-quality issue (fixed with a pinned regression test). Developer sign-off: "approved". See `.planning/phases/29-qa-idx-01-codebase-index-backed-q-a/29-09-SUMMARY.md`.
 - Phase 28 complete (2026-07-27): 4/4 plans; UAT 6/6; verification `passed` (29/29 must-haves). Tests 1/3/4/6 were closed by automation rather than manual observation at the user's request — 3 new/extended specs (27 tests), all mutation-verified. One leg is deliberately recorded as un-run, not verified: live end-to-end suppression on a real GitHub PR.
 - Phase 26 complete (landed 2026-07-26, closed out 2026-07-29): 2/2 plans; verification `passed` (10/10 must-haves, EVID-02 satisfied). Safe-resume closeout — executors never wrote SUMMARY.md files, so ROADMAP/REQUIREMENTS tracking stayed stale until the summaries were authored retroactively from commits 6c4256b..a891d02 + 26-VERIFICATION.md; no code re-executed. Includes post-plan deviation fix a891d02 (migration 015 persists existing_code for immutable finalize re-checks).
 - Phase 21 added (2026-07-25): Evidence-missing aggregate summary event (schema + audit writer) — v1.3
@@ -334,10 +339,12 @@ Items acknowledged and carried forward:
 
 ## Session Continuity
 
-Last session: 2026-07-29T11:15:00.000Z
-Stopped at: Completed 29-06-PLAN.md
+Last session: 2026-07-30T06:10:00.000Z
+Stopped at: Completed 29-09-PLAN.md (Phase 29 complete)
 Resume file: None
 
 ## Operator Next Steps
 
-- Execute Phase 29's final plan with /gsd-execute-phase 29 (29-09: dashboard code-index panel + blocking end-to-end human gate — needs npm run deploy and real GitHub + Bitbucket repositories)
+- Phase 29 (QA-IDX-01) is complete — no further action needed on it.
+- Neither Phase 30 (ANNO-01, Bitbucket Code Insights annotations) nor Phase 31 (WS-01, workspace-level token/webhook) is planned yet (`Plans: TBD` in ROADMAP.md). Per the dependency order (`... → QA-IDX-01 → ANNO-01 ∥ WS-01`), either can be planned next — they can run in parallel. Start with `/gsd-plan-phase 30` or `/gsd-plan-phase 31`.
+- Two pre-existing bookkeeping items remain unrelated to Phase 29 (see Blockers/Concerns): LRN-01/Phase 28's stale `Planned` traceability status, and the ambiguous STATE `progress:` counter scope — both flagged for reconciliation before v1.4's milestone close, not touched here to avoid guessing at their intended semantics.
