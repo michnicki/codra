@@ -152,6 +152,12 @@ function workspaceRepositoriesPath(workspace: string) {
   return `/repositories/${encodeURIComponent(workspace)}`;
 }
 
+// Phase 31 (WS-01, finalize): the workspace-level webhook-subscription collection. Used by the
+// finalize endpoint's list-then-create-if-missing idempotency check (T-31-03-04).
+function workspaceHooksPath(workspace: string) {
+  return `/workspaces/${encodeURIComponent(workspace)}/hooks`;
+}
+
 /**
  * Segment-wise path encoding for the `/src/{ref}/{path}` family. `encodeURIComponent` over a WHOLE
  * slash-bearing path would percent-encode the slashes and collapse `src/server/x.ts` into a single
@@ -331,6 +337,38 @@ export class BitbucketClient {
       '/repositories/{workspace}',
       `Bitbucket workspace repositories listing exceeded MAX_WORKSPACE_REPOS_PAGES=${maxPages}`,
     );
+  }
+
+  /**
+   * Phase 31 (WS-01, finalize): list a workspace's webhook subscriptions. This is the READ half of
+   * the finalize endpoint's list-then-create-if-missing idempotency check -- a resubmission for
+   * the same workspace must never create a second subscription for the same URL
+   * (T-31-03-04). Non-paginated: simple, single-page call via the existing `request()` helper,
+   * unlike `listWorkspaceRepositories` (which can legitimately span thousands of repos).
+   */
+  async listWorkspaceWebhooks(workspace: string): Promise<Array<{ uuid: string; url: string }>> {
+    const response = await this.request('GET', workspaceHooksPath(workspace));
+    const body = (await response.json()) as { values?: Array<{ uuid?: string; url?: string }> };
+    return (body.values ?? []).map((value) => ({ uuid: value.uuid ?? '', url: value.url ?? '' }));
+  }
+
+  /**
+   * Phase 31 (WS-01, finalize): create a workspace-level webhook subscription. Called ONLY after
+   * `listWorkspaceWebhooks` has confirmed no existing hook already matches the derived webhook
+   * URL -- see the finalize handler's idempotency comment (T-31-03-04/T-31-03-05).
+   */
+  async createWorkspaceWebhook(
+    workspace: string,
+    input: { url: string; secret: string; events: string[] },
+  ): Promise<{ uuid: string }> {
+    const response = await this.request('POST', workspaceHooksPath(workspace), {
+      description: 'Codra review webhook',
+      url: input.url,
+      active: true,
+      secret: input.secret,
+      events: input.events,
+    });
+    return (await response.json()) as { uuid: string };
   }
 
   async getPullRequest(workspace: string, repoSlug: string, prNumber: number): Promise<VcsPullRequest> {

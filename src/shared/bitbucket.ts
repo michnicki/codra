@@ -285,3 +285,20 @@ export const workspaceRepoListItemSchema = z.object({
 
 export type DiscoverBitbucketWorkspaceInput = z.infer<typeof discoverBitbucketWorkspaceInputSchema>;
 export type WorkspaceRepoListItem = z.infer<typeof workspaceRepoListItemSchema>;
+
+// Phase 31 (WS-01): outbound finalize input for `POST /api/repos/bitbucket/workspaces`. `.strict()`
+// mirrors `addBitbucketRepoInputSchema`'s outbound-write convention. `tokenExpiresAt`'s
+// `z.union([z.iso.date(), z.iso.datetime({ offset: true })])` shape is copied VERBATIM from
+// `addBitbucketRepoInputSchema` above -- same two accepted input formats, same nullable/optional
+// wrapping (OpenCode review finding #9 -- confirmed non-issue, no change needed).
+// `selectedRepoSlugs.min(1)` is the server-side zero-selection guard (D-07); `.max(500)` bounds
+// the per-request `getOrCreateRepository` onboarding loop (T-31-03-03).
+export const addBitbucketWorkspaceInputSchema = z.object({
+  workspace: z.string().trim().toLowerCase().min(1).max(100),
+  accessToken: z.string().trim().min(1).max(4096),
+  webhookSecret: z.string().trim().min(1).max(4096),
+  tokenExpiresAt: z.union([z.iso.date(), z.iso.datetime({ offset: true })]).nullable().optional(),
+  selectedRepoSlugs: z.array(z.string().trim().toLowerCase().min(1).max(100)).min(1).max(500),
+}).strict();
+
+export type AddBitbucketWorkspaceInput = z.infer<typeof addBitbucketWorkspaceInputSchema>;
