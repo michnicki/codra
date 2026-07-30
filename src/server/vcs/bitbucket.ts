@@ -3,7 +3,7 @@ import { logger } from '@server/core/logger';
 import { BitbucketClient, BitbucketError } from '@server/core/bitbucket';
 import { decryptSecret } from '@server/core/crypto';
 import { parseUnifiedDiff, getValidNewLines, type FileDiff } from '@server/core/diff';
-import { getVcsCredentialSecrets } from '@server/db/vcs-credentials';
+import { resolveBitbucketBotCredential } from '@server/core/bitbucket-credential-resolution';
 import {
   REPORT_TYPE,
   REPORT_RESULT,
@@ -179,8 +179,9 @@ export class BitbucketAdapter implements VcsProvider {
       throw new Error(`Bitbucket job ${job.id} is missing repositoryWorkspace`);
     }
 
-    const secrets = await getVcsCredentialSecrets(env, {
-      vcsProvider: 'bitbucket',
+    // Phase 31 (WS-01, D-03): resolves the per-repo credential when present, falling back to the
+    // workspace-level credential only when no per-repo row exists (per-repo wins).
+    const secrets = await resolveBitbucketBotCredential(env, {
       workspace,
       repoSlug: job.repo,
     });
