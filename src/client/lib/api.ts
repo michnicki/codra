@@ -18,8 +18,9 @@ import type {
   VcsCredentialStatus,
   VcsCredentialStoreInput,
   VcsProvider,
+  VcsWorkspaceCredentialStatus,
 } from '@shared/schema';
-import type { WorkspaceRepoListItem } from '@shared/bitbucket';
+import type { AddBitbucketWorkspaceInput, WorkspaceRepoListItem } from '@shared/bitbucket';
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
@@ -312,6 +313,15 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(input),
     });
+  },
+  addBitbucketWorkspace(input: AddBitbucketWorkspaceInput) {
+    return request<{ credential: VcsWorkspaceCredentialStatus; repositoryCount: number }>(
+      '/api/repos/bitbucket/workspaces',
+      {
+        method: 'POST',
+        body: JSON.stringify(input),
+      },
+    );
   },
   deleteVcsCredential(key: { vcsProvider: string; workspace: string; repoSlug: string }) {
     return request<{ ok: boolean }>(
