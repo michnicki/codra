@@ -26,6 +26,16 @@ export type BitbucketFetchMockOptions = {
   approvePullRequestResponse?: BitbucketMockResponse;
   upsertCodeInsightsReportResponse?: BitbucketMockResponse;
   postCommitBuildStatusResponse?: BitbucketMockResponse;
+  /**
+   * Phase 30 (ANNO-01): response for DELETE .../commit/{commit}/reports/{reportId} (any reportId).
+   * Defaults to a 204. Use `status: 404` to exercise the round-1-no-prior-report swallow path.
+   */
+  deleteCodeInsightsReportResponse?: BitbucketMockResponse;
+  /**
+   * Phase 30 (ANNO-01): response for POST .../commit/{commit}/reports/{reportId}/annotations.
+   * Defaults to a 200 with an empty array body.
+   */
+  bulkUpsertAnnotationsResponse?: BitbucketMockResponse;
   responseSequence?: Array<BitbucketMockResponse | Response | ResponseFactory>;
   /**
    * Response for GET /repositories/{workspace}/{repo}/src/{ref}/{path} (PROV-01, D-08).
@@ -85,9 +95,20 @@ const defaultPullRequest = {
   state: 'OPEN',
 };
 
+// The Fetch spec forbids a body on a null-body status (the WHATWG "null body status" list:
+// 101/103/204/205/304) -- the Response constructor throws if one is supplied. Phase 30's
+// deleteCodeInsightsReportResponse default (`{ status: 204 }`) exercises this path for the first
+// time in this shared helper (Rule 1 fix, scoped to toResponse only).
+const NULL_BODY_STATUSES = new Set([101, 103, 204, 205, 304]);
+
 function toResponse(spec: BitbucketMockResponse) {
   const status = spec.status ?? 200;
   const headers = new Headers(spec.headers);
+
+  if (NULL_BODY_STATUSES.has(status)) {
+    return new Response(null, { status, headers });
+  }
+
   const body = spec.body ?? {};
 
   if (typeof body === 'string') {
@@ -242,8 +263,16 @@ export function installBitbucketFetchMock(options: BitbucketFetchMockOptions = {
     if (method === 'POST' && /\/pullrequests\/\d+\/approve$/.test(url.pathname)) {
       return toResponse(options.approvePullRequestResponse ?? { status: 200, body: {} });
     }
-    if (method === 'PUT' && /\/commit\/[^/]+\/reports\/codra-review$/.test(url.pathname)) {
+    // Phase 30 (ANNO-01): widened from the literal `codra-review` to ANY reportId. Every EXISTING
+    // caller still PUTs to `codra-review`, so this is a strict, non-breaking superset.
+    if (method === 'PUT' && /\/commit\/[^/]+\/reports\/[^/]+$/.test(url.pathname)) {
       return toResponse(options.upsertCodeInsightsReportResponse ?? { status: 200, body: {} });
+    }
+    if (method === 'DELETE' && /\/commit\/[^/]+\/reports\/[^/]+$/.test(url.pathname)) {
+      return toResponse(options.deleteCodeInsightsReportResponse ?? { status: 204 });
+    }
+    if (method === 'POST' && /\/commit\/[^/]+\/reports\/[^/]+\/annotations$/.test(url.pathname)) {
+      return toResponse(options.bulkUpsertAnnotationsResponse ?? { status: 200, body: [] });
     }
     if (method === 'POST' && /\/commit\/[^/]+\/statuses\/build$/.test(url.pathname)) {
       return toResponse(options.postCommitBuildStatusResponse ?? { status: 201, body: {} });

@@ -273,6 +273,83 @@ describe('BitbucketClient', () => {
     expect(tracker.incrementSubrequests).toHaveBeenCalledTimes(1);
   });
 
+  it('upserts a NAMED report when reportId is supplied', async () => {
+    const mock = installBitbucketFetchMock();
+    const { client } = createClient();
+    const report = {
+      title: 'Codra annotations',
+      details: 'Per-line findings.',
+      report_type: 'BUG' as const,
+      result: 'PASSED' as const,
+    };
+
+    await expect(
+      client.upsertCodeInsightsReport('acme', 'backend', 'head123', report, 'codra-annotations'),
+    ).resolves.toBeUndefined();
+    expectBitbucketPut(mock.calls[0], `${repoPrefix}/commit/head123/reports/codra-annotations`);
+    expect(mock.calls[0].body).toEqual(report);
+  });
+
+  it('deleteCodeInsightsReport DELETEs the named report and resolves undefined on 204', async () => {
+    const mock = installBitbucketFetchMock();
+    const { client, tracker } = createClient();
+
+    await expect(
+      client.deleteCodeInsightsReport('acme', 'backend', 'head123', 'codra-annotations'),
+    ).resolves.toBeUndefined();
+    expect(mock.calls[0].method).toBe('DELETE');
+    expect(mock.calls[0].path).toBe(`${repoPrefix}/commit/head123/reports/codra-annotations`);
+    expectAuthenticated(mock.calls[0]);
+    expect(tracker.incrementSubrequests).toHaveBeenCalledTimes(1);
+  });
+
+  it('deleteCodeInsightsReport swallows a 404 (round 1, no prior report)', async () => {
+    installBitbucketFetchMock({
+      deleteCodeInsightsReportResponse: { status: 404, body: { error: { message: 'Not found' } } },
+    });
+    const { client } = createClient();
+
+    await expect(
+      client.deleteCodeInsightsReport('acme', 'backend', 'head123', 'codra-annotations'),
+    ).resolves.toBeUndefined();
+  });
+
+  it('deleteCodeInsightsReport rethrows a non-404 BitbucketError (500)', async () => {
+    installBitbucketFetchMock({
+      deleteCodeInsightsReportResponse: { status: 500, body: { error: { message: 'Internal error' } } },
+    });
+    const { client } = createClient();
+
+    const request = client.deleteCodeInsightsReport('acme', 'backend', 'head123', 'codra-annotations');
+    await expect(request).rejects.toBeInstanceOf(BitbucketError);
+    await expect(request).rejects.toMatchObject({ status: 500 });
+  });
+
+  it('bulkUpsertAnnotations POSTs the annotation array verbatim', async () => {
+    const mock = installBitbucketFetchMock();
+    const { client, tracker } = createClient();
+    const annotations = [
+      {
+        external_id: 'finding-1',
+        severity: 'HIGH' as const,
+        path: 'src/foo.ts',
+        line: 12,
+      },
+      {
+        external_id: 'finding-2',
+        severity: 'LOW' as const,
+      },
+    ];
+
+    await expect(
+      client.bulkUpsertAnnotations('acme', 'backend', 'head123', 'codra-annotations', annotations),
+    ).resolves.toBeUndefined();
+    expectBitbucketPost(mock.calls[0], `${repoPrefix}/commit/head123/reports/codra-annotations/annotations`);
+    expect(mock.calls[0].body).toEqual(annotations);
+    expectAuthenticated(mock.calls[0]);
+    expect(tracker.incrementSubrequests).toHaveBeenCalledTimes(1);
+  });
+
   it('posts a merge-gating commit build status', async () => {
     const mock = installBitbucketFetchMock();
     const { client, tracker } = createClient();
