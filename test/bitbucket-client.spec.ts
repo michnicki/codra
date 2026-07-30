@@ -86,6 +86,38 @@ describe('BitbucketClient', () => {
     expect(tracker.incrementSubrequests).toHaveBeenCalledTimes(1);
   });
 
+  it('lists pull request comments with links.html.href projected additively', async () => {
+    const mock = installBitbucketFetchMock({
+      listPullRequestCommentsResponse: {
+        body: {
+          values: [
+            {
+              id: 7,
+              content: { raw: 'Existing comment' },
+              links: { html: { href: 'https://bitbucket.org/acme/backend/pull-requests/42#comment-7' } },
+              user: {
+                account_id: BITBUCKET_FIXTURE_ACCOUNT_ID,
+                nickname: BITBUCKET_FIXTURE_NICKNAME,
+              },
+            },
+          ],
+        },
+      },
+    });
+    const { client } = createClient();
+
+    await expect(client.listPullRequestComments('acme', 'backend', 42)).resolves.toEqual([
+      {
+        id: 7,
+        body: 'Existing comment',
+        inline: undefined,
+        links: { html: { href: 'https://bitbucket.org/acme/backend/pull-requests/42#comment-7' } },
+        author: { id: BITBUCKET_FIXTURE_ACCOUNT_ID, login: BITBUCKET_FIXTURE_NICKNAME },
+      },
+    ]);
+    expectBitbucketGet(mock.calls[0], `${repoPrefix}/pullrequests/42/comments?pagelen=100`);
+  });
+
   it('posts an added-line comment using content.raw and inline.to', async () => {
     const mock = installBitbucketFetchMock();
     const { client, tracker } = createClient();
@@ -107,6 +139,33 @@ describe('BitbucketClient', () => {
     expect(mock.calls[0].body).not.toHaveProperty('inline.line_type');
     expectAuthenticated(mock.calls[0]);
     expect(tracker.incrementSubrequests).toHaveBeenCalledTimes(1);
+  });
+
+  it('resolves links.html.href on postPullRequestComment when the provider response includes it', async () => {
+    const mock = installBitbucketFetchMock({
+      postPullRequestCommentResponses: [
+        {
+          status: 201,
+          body: {
+            id: 8,
+            links: { html: { href: 'https://bitbucket.org/acme/backend/pull-requests/42#comment-8' } },
+          },
+        },
+      ],
+    });
+    const { client } = createClient();
+
+    await expect(client.postPullRequestComment('acme', 'backend', 42, {
+      path: 'src/foo.ts',
+      line: 12,
+      line_type: 'added',
+      content: { raw: 'Check this line.' },
+    })).resolves.toEqual({
+      id: 8,
+      links: { html: { href: 'https://bitbucket.org/acme/backend/pull-requests/42#comment-8' } },
+    });
+
+    expectBitbucketPost(mock.calls[0], `${repoPrefix}/pullrequests/42/comments`);
   });
 
   it('maps removed-line comments to the documented inline.from field', async () => {
