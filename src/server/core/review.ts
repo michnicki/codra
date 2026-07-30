@@ -83,7 +83,7 @@ import {
 } from './rounds';
 
 import { VcsService } from '../services/vcs';
-import type { VcsProvider, VcsPullRequest, VcsReviewThread, VcsUpdateStatusCheckInput } from '../vcs/types';
+import type { VcsProvider, VcsPullRequest, VcsReviewThread, VcsUpdateStatusCheckInput, VcsPostedComment } from '../vcs/types';
 import { isRetryableModelError, ModelService } from '../services/model';
 import { FormatterService } from '../services/formatter';
 import { TokenTracker } from './token-tracker';
@@ -2565,7 +2565,14 @@ async function runFinalizePhase(
   const existingReview = finalizeRetriedPastPost
     ? await vcs.findExistingReviewForCommit(job.owner, job.repo, job.prNumber, pr.headSha)
     : null;
-  const review = existingReview ?? await vcs.submitReview(job.owner, job.repo, job.prNumber, {
+  // Explicit type annotation (Rule 1 fix, Plan 30-04): without it, TS's union-reduction collapses
+  // `{ ref: string } | { ref: string; postedComments?: VcsPostedComment[] }` down to just
+  // `{ ref: string }` -- the second member is structurally a subtype of the first (an optional
+  // property's absence is always assignable), so TS drops it from the union entirely. That defeats
+  // even an `'postedComments' in review` guard below (it types the accessed property `unknown`,
+  // not `VcsPostedComment[] | undefined`). Annotating the declaration keeps postedComments visible
+  // on the inferred type without changing runtime behavior in any way.
+  const review: { ref: string; postedComments?: VcsPostedComment[] } = existingReview ?? await vcs.submitReview(job.owner, job.repo, job.prNumber, {
     commitSha: pr.headSha,
     verdict: verdictSummary.verdict,
     summaryBody: formattedSummary,
@@ -2728,6 +2735,31 @@ async function runFinalizePhase(
     // (d) Best-effort: the review is posted; a persistent walkthrough failure logs a warn and the
     // job still completes. The block MUST NOT re-throw.
     logger.warn(`Walkthrough edit failed for job ${job.id}; review is posted, leaving it best-effort`, error instanceof Error ? error : new Error(String(error)));
+  }
+
+  // Phase 30 (ANNO-01): Bitbucket Code Insights per-line annotations. Runs strictly AFTER
+  // submitReview resolves (D-11) so postedComments/links exist before buildAnnotation runs, and
+  // BEFORE completeJob so it never delays the must-not-lose write. Mirrors the vcs.labels
+  // optional-feature-detect gate below exactly -- no separate vcs.name check needed, since
+  // postAnnotations is undefined on every non-Bitbucket adapter (NREG-02 by exclusion).
+  //
+  // `review`'s declaration above is explicitly typed so `postedComments` is visible on it even
+  // on the finalizeRetriedPastPost branch (existingReview short-circuits submitReview, so
+  // postedComments is simply undefined there); buildAnnotation already omits the link rather
+  // than fabricating one when a match is absent, so this degrades safely (Pitfall 4).
+  const postedComments = review.postedComments;
+  if (config.review.bitbucket.annotations_enabled && vcs.postAnnotations) {
+    try {
+      await vcs.postAnnotations(job.owner, job.repo, job.prNumber, {
+        commitSha: pr.headSha,
+        findings: finalComments,
+        postedComments,
+      });
+    } catch (error) {
+      // Fail-open (T-30-04-02): an annotation-posting failure must never block, delay, or fail an
+      // already-successfully-posted review. logger.warn only -- never logger.error, never rethrow.
+      logger.warn(`Annotation posting failed for job ${job.id}; review is posted, leaving it best-effort`, error instanceof Error ? error : new Error(String(error)));
+    }
   }
 
   await completeJob(env, job.id, {
