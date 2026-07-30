@@ -4784,8 +4784,13 @@ dbDescribe('Review Flow Lifecycle', () => {
             // `path` is REQUIRED by crossFileSecurityFindingSchema and `confidence` is the key it
             // reads (not `confidence_score`). Without `path` the finding is dropped by the parser's
             // per-item tolerant filter and the phase persists 'skipped'/all_findings_invalid.
+            // line 5 is deliberately DIFFERENT from the per-file middleware.ts finding's line 1:
+            // FILT-03 dedup (rule1) collapses same-path/same-line/same-category findings
+            // regardless of title, which would otherwise merge this cross-file finding into the
+            // per-file finding and silently drop its cross_references before finalize — masking
+            // both the no-duplication and "Also affects" assertions below.
             path: 'src/auth/middleware.ts',
-            line: 1,
+            line: 5,
             confidence: 0.95,
             cross_references: [
               { path: 'src/routes/api.ts', line: 1, relationship: 'missing_auth_guard' },
@@ -4797,6 +4802,14 @@ dbDescribe('Review Flow Lifecycle', () => {
         inputTokens: 100,
         outputTokens: 50,
       });
+
+      // MP-02-style spy on createReview to capture what actually gets posted, so the
+      // cross-file finding's presence/uniqueness in the real posted output is proven, not
+      // inferred from the DB row alone (27-02-PLAN.md Verification Criterion #9).
+      let captured: any[] = [];
+      const createReviewSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+        async (_o: any, _r: any, _p: any, input: any) => { captured = input.comments; return { id: 456 }; },
+      );
 
       const job = await insertCrossFileJob(repo, config, 'x');
       await updateJobFileCount(env, job.id, 2);
@@ -4818,9 +4831,127 @@ dbDescribe('Review Flow Lifecycle', () => {
       expect(xfEvents.length).toBeGreaterThan(0);
       expect(xfEvents.some((e: any) => e.status === 'completed')).toBe(true);
 
+      // Verification Criterion #9: the cross-file finding appears EXACTLY ONCE in the posted
+      // review — no duplication from automatic reviews.flatMap inclusion. The per-file findings
+      // (2, one per file) plus the single cross-file finding = 3 total posted comments.
+      const crossFileFindings = captured.filter((c: any) =>
+        c.body.includes('The auth middleware does not protect the API route.'),
+      );
+      expect(crossFileFindings).toHaveLength(1);
+      expect(captured).toHaveLength(3);
+
+      // Verification Criterion #5 / 27-02-PLAN.md Task 2 step 1: the cross-file finding is
+      // posted under its primary file (src/auth/middleware.ts) with an "Also affects" link
+      // pointing at the cross-referenced file (src/routes/api.ts) — not just asserted via the
+      // pure formatter unit tests, but proven through the real finalize pipeline.
+      const crossFileComment = crossFileFindings[0];
+      expect(crossFileComment.path).toBe('src/auth/middleware.ts');
+      expect(crossFileComment.body).toContain('Also affects');
+      expect(crossFileComment.body).toContain('src/routes/api.ts');
+
       reviewSpy.mockRestore();
       getDiffSpy.mockRestore();
       verifierSpy.mockRestore();
+      createReviewSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('cross_file: true + walkthrough enabled posts a Cross-file Security section', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { ModelService } = await import('@server/services/model');
+      const repo = `test-repo-${Date.now()}-xf-walkthrough`;
+      // Same cross-file config, PLUS walkthrough.enabled so editWalkthroughComment actually
+      // runs (review.ts:2637 gates the whole walkthrough block on this). 27-02-PLAN.md Task 2
+      // step 1 requires proving the "Cross-file Security" section reaches real posted output,
+      // not just buildWalkthroughData called directly with hand-built mock data.
+      const config: RepoConfig = {
+        ...crossFileConfig(),
+        review: {
+          ...crossFileConfig().review,
+          walkthrough: { enabled: true, sequence_diagram: { enabled: false } },
+        },
+      };
+
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([
+          { path: 'src/auth/middleware.ts', content: 'export function auth() {}' },
+          { path: 'src/routes/api.ts', content: 'router.get("/data", handler)' },
+        ]),
+      );
+
+      const reviewSpy = vi.spyOn(ModelService.prototype as any, 'reviewFile').mockImplementation(async (params: any) => ({
+        parsed: {
+          comments: [{
+            path: params.file.path,
+            line: 1,
+            position: 1,
+            severity: 'P2',
+            category: 'security',
+            title: `Finding in ${params.file.path}`,
+            body: `Security issue in ${params.file.path}`,
+          }],
+          verdict: 'comment' as const,
+          fileSummary: `Reviewed ${params.file.path}`,
+          overallCorrectness: 'issues found',
+          confidenceScore: 0.8,
+        },
+        modelUsed: 'test-model',
+        provider: 'test-provider',
+        inputTokens: 10,
+        outputTokens: 5,
+        rawText: '{}',
+        userPrompt: renderFileDiff(params.file),
+      }));
+
+      const verifierSpy = vi.spyOn(ModelService.prototype as any, 'callVerifierRaw').mockResolvedValue({
+        rawText: JSON.stringify({
+          findings: [{
+            title: 'Auth bypass via middleware gap',
+            body: 'The auth middleware does not protect the API route.',
+            severity: 'P0',
+            category: 'security',
+            // line 5 (distinct from the per-file middleware.ts finding's line 1) — see the
+            // dedup-collision note in the e2e test above.
+            path: 'src/auth/middleware.ts',
+            line: 5,
+            confidence: 0.95,
+            cross_references: [
+              { path: 'src/routes/api.ts', line: 1, relationship: 'missing_auth_guard' },
+            ],
+          }],
+        }),
+        modelUsed: 'cross-file-model',
+        inputTokens: 100,
+        outputTokens: 50,
+      });
+
+      vi.spyOn(GitHubService.prototype, 'createReview').mockResolvedValue({ id: 456 } as any);
+
+      // No walkthrough placeholder ref exists on this fresh job, so editWalkthroughComment's
+      // defensive "no ref -> create" branch fires (walkthrough.ts:574), calling
+      // vcs.createPrComment -> GitHubService.createIssueComment. Spy there to capture the
+      // rendered body actually posted, proving the wiring end-to-end rather than unit-testing
+      // buildWalkthroughData/formatWalkthrough in isolation.
+      let walkthroughBody: string | undefined;
+      const createCommentSpy = vi.spyOn(GitHubService.prototype, 'createIssueComment').mockImplementation(
+        async (_o: any, _r: any, _n: any, body: string) => { walkthroughBody = body; return { id: 789 } as any; },
+      );
+
+      const job = await insertCrossFileJob(repo, config, 'w');
+      await updateJobFileCount(env, job.id, 2);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+
+      await runAndDrain({ jobId: job.id, deliveryId: 'delivery-xf-walkthrough', phase: 'review' });
+
+      expect(createCommentSpy).toHaveBeenCalled();
+      expect(walkthroughBody).toBeDefined();
+      expect(walkthroughBody).toContain('Cross-file Security');
+      expect(walkthroughBody).toContain('src/routes/api.ts');
+
+      reviewSpy.mockRestore();
+      getDiffSpy.mockRestore();
+      verifierSpy.mockRestore();
+      createCommentSpy.mockRestore();
+      vi.restoreAllMocks();
     }, REVIEW_FLOW_TIMEOUT_MS);
 
     it('cross_file: true on single-file PR skips cross-file pass', async () => {
