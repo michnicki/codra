@@ -38,6 +38,7 @@ key-files:
     - test/code-index-api.spec.ts
     - src/server/core/qa.ts
     - src/server/routes/webhook-bitbucket.ts
+    - src/server/routes/webhook.ts
 
 key-decisions:
   - "29-09: the panel fetches status itself and polls (5s) only while status is 'building' or a build press is in flight — a null delay stops the interval but keeps the mount-time read, which is exactly the use-polling runtime behavior that its type previously failed to admit"
@@ -47,6 +48,8 @@ key-decisions:
   - "29-09 Task 3 UAT: six real bugs found and fixed against a live deploy (see Deviations) — a stuck build on the deployed opencodra repository (frozen at status: building with no working instance) is what surfaced the first three; the remaining three surfaced only once opencodra's real build was pushed all the way to completion and reach's Bitbucket build was attempted"
   - "29-09 Task 3 UAT: the in-PR Q&A retrieval mechanism works correctly (confirmed on both GitHub and Bitbucket, both toggle directions), but the code-index full-text search RANKING is weak for natural-language questions — buildQueryExpression OR-joins every non-stopword term with equal weight, and near-universal code vocabulary ('function', 'return') is not in QUERY_STOPWORDS, so generic terms can outrank the one genuinely distinctive term in ts_rank_cd scoring. Cross-provider, not Bitbucket-specific; not fixed here (a real design tradeoff, not a quick patch) — logged in deferred-items.md"
   - "29-09 Task 3 UAT: Bitbucket's webhook handler unconditionally overwrote the review model strategy with the global default, silently ignoring any per-repo model override (unlike GitHub's loadRepoConfig/hasRepoModelOverride) — fixed to mirror the same override check"
+  - "29-09 Task 3 UAT, incremental-refresh test: `codeIndexInstanceId`'s stable per-repository id means Cloudflare's permanent instance-id reservation silently disabled PUSH-triggered incremental refresh (both GitHub and Bitbucket) after a repository's first-ever build, not just the dashboard rebuild button the earlier `b075e1f` fix covered — confirmed live when a real push to `reach`'s `main` branch coalesced as `instance_already_exists` and started nothing. Fixed by extracting the lease-claim + create + stale-instance-retry logic into a shared `startIndexBuild()` helper and wiring all three trigger sites (dashboard, GitHub push, Bitbucket push) to call it"
+  - "29-09 Task 3 UAT: `reach`'s Bitbucket repository had a genuine, pre-existing misconfiguration unrelated to Codra — its 'Main branch' designation (`getRepositoryMetadata().mainbranch.name`) pointed to a leftover scratch branch (`bantam-e2e-verify-mpwc2nkf`) instead of the literally-named `main`, so Codra's `non_default_branch` push-ignore logic was working exactly as designed against a misconfigured repo. The developer fixed the branch designation via Bitbucket's admin \"Advanced\" section"
 
 requirements-completed: [QA-IDX-01]
 
@@ -135,12 +138,14 @@ coverage:
         ref: "Bitbucket retrieval-backed Q&A, negative case (toggle off) — NOT YET DONE"
         status: pending
       - kind: human
-        ref: "Bitbucket webhook push-event edit, and post-edit incremental refresh — NOT YET DONE, needs a real webhook subscription edit and a real merge"
-        status: pending
+        ref: "Bitbucket webhook push-event edit, and post-edit incremental refresh — subscription confirmed to already include the push event (real repo:push deliveries observed processing throughout the UAT session); incremental refresh confirmed firing and completing correctly (mode: incremental, indexed_sha advances to the pushed commit) after fixing both the stale-instance-id bug (below) and reach's pre-existing Bitbucket main-branch misconfiguration"
+        status: pass
       - kind: human
-        ref: "A2 (real Bitbucket repo:push payload shape) — still unconfirmed; needs one real push delivery"
-        status: pending
-    human_judgment: true
+        ref: "A2 (real Bitbucket repo:push payload shape) — confirmed across multiple real deliveries: change.new.name and change.new.target.hash extract cleanly, no schema error, branch correctly identified as main once the repo's main-branch designation was corrected"
+        status: pass
+      - kind: human
+        ref: "Push-triggered incremental refresh was silently dead after a repository's first-ever index build (GitHub AND Bitbucket, not just the dashboard rebuild button) — codeIndexInstanceId's stable per-repository id plus Cloudflare's permanent instance-id reservation meant instance_already_exists was reached on every later push and treated as a benign coalesce forever. Fixed by extracting startIndexBuild() (lease-claim + create + stale-instance-retry-with-fresh-id) into a shared helper used by all three trigger sites; confirmed live: a push to reach's main after the fix produced 'retrying with fresh instance id' -> 'triggered a codebase index refresh, mode: incremental' -> code_index_state.indexed_sha matching the pushed commit"
+        status: pass
 
 # Metrics
 duration: 15min (Tasks 1-2) + ~3h (Task 3 UAT session, 2026-07-29)
@@ -150,7 +155,7 @@ status: checkpoint-pending
 
 # Phase 29 Plan 09: Dashboard code-index panel and the end-to-end human gate Summary
 
-**QA-IDX-01 now has its operator surface: a Codebase Index panel in the repository config modal that renders the three real states (disabled / never-built / built), posts one build and refetches status from the server, tells the operator what produced the index and when it is partial or failed, and — for a Bitbucket repository whose freshness path has never fired — says exactly which webhook event is missing. Tasks 1-2 shipped the panel; a same-day Task 3 UAT session deployed it, found and fixed seven real production bugs (see below), confirmed a full build completes end to end on both GitHub and Bitbucket, confirmed the retrieval-backed Q&A mechanism itself works correctly on GitHub (both toggle directions), and confirmed the Bitbucket Q&A mechanism runs correctly too but surfaced a real, cross-provider full-text-search ranking-quality issue (documented, not fixed — a design tradeoff, not a quick patch). Remaining before Task 3 can be marked fully verified: the ranking-quality follow-up decision, GitHub's post-merge incremental-refresh test, and the rest of the Bitbucket-side set (negative Q&A test, webhook edit, incremental refresh, A2) — the last three requiring write actions not yet performed.**
+**QA-IDX-01 now has its operator surface: a Codebase Index panel in the repository config modal that renders the three real states (disabled / never-built / built), posts one build and refetches status from the server, tells the operator what produced the index and when it is partial or failed, and — for a Bitbucket repository whose freshness path has never fired — says exactly which webhook event is missing. Tasks 1-2 shipped the panel; a same-day Task 3 UAT session deployed it, found and fixed nine real production bugs (see below), confirmed a full build completes end to end on both GitHub and Bitbucket, confirmed the retrieval-backed Q&A mechanism itself works correctly on GitHub (both toggle directions), confirmed the Bitbucket Q&A mechanism runs correctly too but surfaced a real, cross-provider full-text-search ranking-quality issue (documented, not fixed — a design tradeoff, not a quick patch), and — after finding and fixing a bigger-scope bug that had silently disabled push-triggered incremental refresh on BOTH providers, plus a pre-existing Bitbucket repo misconfiguration — confirmed a real push-triggered incremental refresh completes end to end on Bitbucket, resolving A2. Remaining before Task 3 can be marked fully verified: the ranking-quality follow-up decision, GitHub's post-merge incremental-refresh test (the underlying bug is already fixed, only the merge itself remains), and a conclusive Bitbucket negative Q&A (toggle-off) test.**
 
 ## Status: Tasks 1–2 complete; Task 3 substantially verified via a real UAT session, two items still open
 
@@ -158,17 +163,17 @@ This plan is `autonomous: false` and its Task 3 is `checkpoint:human-verify` wit
 
 **Task 3 UAT session (2026-07-29, same day as Tasks 1-2):** the developer deployed to the live instance (`codra.tmichnicki.workers.dev`) and worked through Task 3's checklist with the assistant driving verification via Playwright MCP and Cloudflare/wrangler CLI access. The `opencodra` (GitHub) build was found already stuck at `status: building` from an earlier attempt; investigating why led to six real bugs being found and fixed (see Deviations), after which **both** `opencodra` and `reach` (Bitbucket) completed a real, full build end to end. Once the developer authenticated the assistant's browser session on GitHub.com, the assistant posted the in-PR Q&A test itself on `michnicki/opencodra#13` (both the positive and negative case) and confirmed it works correctly. The developer then authenticated the assistant on Bitbucket.org too; testing there against a real, already-approved PR (`thomas_michnicki/reach#5`) surfaced the ranking-quality issue above plus a seventh bug (Bitbucket ignoring per-repo model overrides), both investigated and the latter fixed. See the coverage table above (id D6) for exactly which of Task 3's sub-checks are now `pass`, `partial`, or still `pending`.
 
-**Not yet done:** the ranking-quality follow-up (a design decision, deliberately not rushed), the post-merge incremental-refresh test on GitHub (needs an actual merge to `main`, not yet requested), and the negative Q&A test / webhook edit / incremental refresh / A2 confirmation on Bitbucket. STATE/ROADMAP plan-completion marking remains deliberately deferred until these close.
+**Not yet done:** the ranking-quality follow-up (a design decision, deliberately not rushed), the post-merge incremental-refresh test on GitHub (needs an actual merge to `main`; the underlying bug is already fixed), and a conclusive negative Q&A (toggle-off) test on Bitbucket. STATE/ROADMAP plan-completion marking remains deliberately deferred until these close.
 
 ## Performance
 
 - **Duration:** ~15 min (Tasks 1-2) + ~4 hours (Task 3 UAT session: investigation, seven fixes, six deploys, two full real builds, GitHub + Bitbucket Q&A testing)
 - **Started:** 2026-07-29T09:42:34Z
 - **Completed (Tasks 1–2):** 2026-07-29T09:57:19Z
-- **Task 3 UAT session:** 2026-07-29 evening into 2026-07-30 (real deploys at commits `04bd5de`, `b075e1f`+`ac49cde`, `c89b46d`, `922578e`, `86b54d1`, `a0f2ca8`, `a9a8178`)
+- **Task 3 UAT session:** 2026-07-29 evening into 2026-07-30 (real deploys at commits `04bd5de`, `b075e1f`+`ac49cde`, `c89b46d`, `922578e`, `86b54d1`, `a0f2ca8`, `a9a8178`, `a014df8`)
 - **Tasks:** 2 of 3 executed (Task 3 = human gate, substantially verified)
 - **Files modified (Tasks 1-2):** 5 (2 created, 3 modified)
-- **Files modified (Task 3 UAT fixes):** 7 (`code-index-build.ts`, `code-index.ts`, `repos.ts`, `token-tracker.ts`, `code-index-api.spec.ts`, `qa.ts`, `webhook-bitbucket.ts`)
+- **Files modified (Task 3 UAT fixes):** 8 (`code-index-build.ts`, `code-index.ts`, `repos.ts`, `token-tracker.ts`, `code-index-api.spec.ts`, `qa.ts`, `webhook-bitbucket.ts`, `webhook.ts`)
 - **Suites:** node **132 files / 1912 tests pass**; browser **19 files / 128 tests pass** (from 18 / 120: +1 file, +8 tests, exactly this plan's spec); `tsc --noEmit` clean — all reconfirmed after the Task 3 UAT fixes
 - **Real builds completed:** `michnicki/opencodra` (GitHub) — 379 files, 1909 chunks; `thomas_michnicki/reach` (Bitbucket) — 285 files, 1546 chunks. Combined `code_index_chunks` table size in production: 15 MB (well under the ~20-30 MB/500-files projection)
 
@@ -229,10 +234,36 @@ provider tree with real file content). Fixed, tested, and deployed one at a time
    Q&A quality issue below (ruled out as the actual cause here, since neither test repo has an
    override configured, but real regardless). Fixed in `a9a8178` by mirroring the same override
    check using the repo config's own `model` shape.
+8. **Push-triggered incremental refresh was silently dead after a repository's first-ever index
+   build — on BOTH GitHub and Bitbucket, not just the dashboard rebuild button `b075e1f` already
+   fixed.** `codeIndexInstanceId(repositoryId)` is deliberately stable per repository (by design, so
+   all three trigger sites can coalesce against the same live build), but Cloudflare permanently
+   reserves a Workflow instance id even after the instance completes or terminates. `b075e1f` only
+   patched the dashboard "Build index" endpoint's `instance.already_exists` catch with a
+   claim-lease -> create -> release-and-retry-with-fresh-id sequence; the GitHub `push` branch
+   (`webhook.ts`) and the Bitbucket `repo:push` branch (`webhook-bitbucket.ts`) still did a bare
+   `create` and treated ANY `instance.already_exists` as a benign coalesce. Once a repository's
+   index had been built even once — by the dashboard button, or by the very first push — every
+   subsequent push-triggered refresh for that repository would hit the reserved id, coalesce, and
+   silently do nothing, forever. Confirmed live: after fixing `reach`'s Bitbucket main-branch
+   misconfiguration (below) and pushing a real commit to `main`, the log read `"Codebase index
+   refresh coalesced: workflow instance already exists"` and `code_index_state` never advanced past
+   its stale full-rebuild content. Fixed by extracting the lease-claim + create + stale-instance-retry
+   logic out of `routes/api/repos.ts` into a shared `startIndexBuild()` helper
+   (`core/code-index-build.ts`) and wiring all three trigger sites — the dashboard endpoint, the
+   GitHub push branch, and the Bitbucket push branch — to call it. Fixed and deployed in `a014df8`.
+9. **`reach`'s Bitbucket repository had a genuine, pre-existing misconfiguration, not a Codra bug.**
+   Its "Main branch" designation (what `getRepositoryMetadata().mainbranch.name` returns) pointed to
+   a leftover scratch branch (`bantam-e2e-verify-mpwc2nkf`) instead of the literally-named `main`, so
+   every push to `main` was correctly ignored by Codra's `non_default_branch` check — working exactly
+   as designed against a misconfigured repository. Found while investigating why pushes to `main`
+   never triggered a refresh; the developer fixed it directly in Bitbucket's admin "Advanced"
+   section (not discoverable via the branching-model page's "Development branch" dropdown, which
+   this session tried first and could not get to take effect).
 
-All seven fixes were verified against the real `opencodra` and `reach` builds/Q&A calls as they
-happened (not just `npm test`), which is the strongest verification this phase's Task 3 gate could
-realistically ask for short of the still-open incremental-refresh and A2 checks.
+All nine fixes were verified against the real `opencodra` and `reach` builds/Q&A/push-refresh calls
+as they happened (not just `npm test`), which is the strongest verification this phase's Task 3 gate
+could realistically ask for.
 
 ### Retrieval-backed Q&A: confirmed working, plus one real observation (not a bug)
 
@@ -299,6 +330,7 @@ rather than a rushed patch at the tail of an already-large UAT session. Logged i
 10. **Task 3 UAT docs: record confirmed GitHub Q&A retrieval, both directions** — `9115217` (docs)
 11. **Task 3 UAT diagnostic: log Q&A index retrieval outcome (chunks found, paths)** — `a0f2ca8` (debug)
 12. **Task 3 UAT fix 6: honor per-repo model override on Bitbucket instead of always global** — `a9a8178` (fix)
+13. **Task 3 UAT fix 7: share the stale-instance-id retry across all three index-build trigger sites (dashboard + GitHub push + Bitbucket push)** — `a014df8` (fix)
 
 ## Files Created/Modified
 
@@ -355,7 +387,19 @@ silently skipped) even though answer quality there surfaced a real ranking issue
 one real-but-intentional priority-scoring observation plus one documented-not-fixed ranking-quality
 issue were found along the way (see above) and `deferred-items.md` is updated.
 
-**Still needed — three items:**
+**Done since the section above was last written:** the Bitbucket incremental-refresh checklist is now
+fully confirmed. `reach`'s webhook subscription already included the push event (proven by real
+`repo:push` deliveries processing throughout the session — no edit was actually needed there). Getting
+a real push to trigger a refresh surfaced two more real problems, both now fixed: (1) `reach`'s
+Bitbucket "Main branch" designation was pre-existing-misconfigured to a scratch branch rather than
+`main` (developer-fixed via Bitbucket's admin Advanced section), and (2) push-triggered incremental
+refresh was silently dead on BOTH providers after a repository's first-ever build, a bigger-scope
+version of the `b075e1f` dashboard-only fix (see bug #8/#9 above, fixed and deployed in `a014df8`).
+After both fixes, a real push to `main` produced `mode: incremental` and `code_index_state.indexed_sha`
+correctly advanced to the pushed commit — end-to-end confirmed. This also resolves A2 (the real
+`repo:push` payload parses cleanly across multiple real deliveries, branch/hash extract correctly).
+
+**Still needed — two items:**
 
 1. **The ranking-quality follow-up decision.** Deliberately not rushed — see "Bitbucket Q&A" above and
    the new `deferred-items.md` entry for the concrete tradeoffs (stopword-list extension vs. term
@@ -363,15 +407,15 @@ issue were found along the way (see above) and `deferred-items.md` is updated.
 2. **GitHub post-merge incremental refresh.** Merge something small to `main` on `michnicki/opencodra`
    (PR #13 itself is a scratch PR meant to be closed unmerged, per its own description — use a
    different small change); confirm the panel's indexed commit advances and the "what produced this
-   index" line flips from dashboard-rebuild to push-refresh wording.
-3. **Bitbucket negative Q&A test, webhook edit, and incremental refresh.** Toggle the index off on
-   `thomas_michnicki/reach` and confirm a diff-only refusal (mirroring the GitHub negative test).
-   Before merging PR #5 (already real and approved), edit the repository's real Bitbucket webhook
-   subscription to add the repository push event (the panel's hint — confirmed rendering correctly —
-   says exactly this is needed). Confirm the hint disappears and an incremental refresh fires after the
-   edit. This also resolves A2 (whether the real `repo:push` payload parses without a schema error) —
-   observable from the same merge (probe preserved at `scratchpad/probe-a2-bitbucket.mjs` if a scripted
-   capture is preferred instead).
+   index" line flips from dashboard-rebuild to push-refresh wording. (The underlying bug that would
+   have blocked this — GitHub push refresh dying after the first build — is now already fixed
+   alongside the Bitbucket one in `a014df8`, since both providers shared the same broken code path.)
+
+**Not conclusively re-tested:** the Bitbucket negative Q&A test (toggle index off, confirm a diff-only
+refusal, mirroring the GitHub negative test) — a later question asked during this session
+(`2026-07-30T03:19:14Z`, "what does formatBytes(0) return") got a confidently wrong file citation
+rather than a clean refusal, but whether the toggle was actually off at that point was not verified, so
+this is not counted as a completed negative-case test either way.
 
 While at it: watch the Worker logs during the Bitbucket build for the `/src` tree-walk's real page
 count and any HTTP 555 retry (A3/A4) — not yet specifically observed during the UAT session, though the
@@ -389,15 +433,15 @@ build completed without hitting the page cap (`truncated: false`).
 - `git diff --name-only fbd0ab6^..5dca68d` returns exactly the six files above; zero deletions; none of the pre-existing unrelated working-tree modifications staged
 
 **Task 3 UAT session fixes (2026-07-29 into 2026-07-30):**
-- Commits `04bd5de`, `b075e1f`, `ac49cde`, `c89b46d`, `922578e`, `86b54d1`, `5202f50`, `9115217`, `a0f2ca8`, `a9a8178` — all resolve in `git log`
+- Commits `04bd5de`, `b075e1f`, `ac49cde`, `c89b46d`, `922578e`, `86b54d1`, `5202f50`, `9115217`, `a0f2ca8`, `a9a8178`, `a014df8` — all resolve in `git log`
 - `npm run typecheck` exits 0 (re-run after every fix, and again after the final fix)
-- `npm test`: **132 files / 1912 tests passing** (re-run after every fix)
+- `npm test`: **132 files / 1912 tests passing** (re-run after every fix, including after `a014df8`'s refactor)
 - `npm run test:browser` under `nix-shell shell.nix`: **19 files / 128 tests passing**, including all 8 new cases (re-confirmed at Tasks 1-2 closeout, not re-run during the UAT session since no browser-facing code changed)
 - `.github/workflows/ci.yml` unmodified
-- Real production evidence (not just `npm test`): both `michnicki/opencodra` and `thomas_michnicki/reach` completed a real full build, confirmed via the dashboard panel, the raw status API, `wrangler workflows instances describe`, and a direct production-database query (383 + 344 file rows, 1909 + 1546 chunks, 15 MB combined `code_index_chunks` table); GitHub Q&A confirmed correct in both toggle directions on a real PR; Bitbucket Q&A mechanism confirmed running via diagnostic logging (`chunksFound: 8`, real paths) even though answer quality surfaced the ranking issue
+- Real production evidence (not just `npm test`): both `michnicki/opencodra` and `thomas_michnicki/reach` completed a real full build, confirmed via the dashboard panel, the raw status API, `wrangler workflows instances describe`, and a direct production-database query (383 + 344 file rows, 1909 + 1546 chunks, 15 MB combined `code_index_chunks` table); GitHub Q&A confirmed correct in both toggle directions on a real PR; Bitbucket Q&A mechanism confirmed running via diagnostic logging (`chunksFound: 8`, real paths) even though answer quality surfaced the ranking issue; a real push to `reach`'s `main` after fixing both the repo's main-branch misconfiguration and the stale-instance-id bug produced a real `mode: incremental` build whose `indexed_sha` matches the pushed commit, confirmed via direct production-database query
 
-**Not self-checked — genuinely open, not a gap in this check:** the ranking-quality follow-up decision, GitHub post-merge incremental refresh, and the Bitbucket negative-test/webhook-edit/incremental-refresh/A2 set. These require either a deliberate design decision or GitHub.com/Bitbucket.org write actions, and are the developer's remaining checklist (see "User Setup Required" above).
+**Not self-checked — genuinely open, not a gap in this check:** the ranking-quality follow-up decision, GitHub post-merge incremental refresh (the underlying blocker for it is already fixed in `a014df8`, but the merge itself was not performed), and a conclusive Bitbucket negative Q&A (toggle-off) test. These require either a deliberate design decision or a GitHub.com write action, and are the developer's remaining checklist (see "User Setup Required" above).
 
 ---
 *Phase: 29-qa-idx-01-codebase-index-backed-q-a*
-*Completed (Tasks 1–2): 2026-07-29. Task 3 UAT session same day into 2026-07-30: seven real bugs found and fixed, both providers' builds now complete end to end, GitHub Q&A retrieval confirmed working in both directions, Bitbucket Q&A mechanism confirmed running with a real cross-provider ranking-quality issue documented (not fixed). Task 3 checkpoint remains open pending a design decision plus developer-only write actions (see "User Setup Required").*
+*Completed (Tasks 1–2): 2026-07-29. Task 3 UAT session same day into 2026-07-30: nine real bugs found and fixed, both providers' builds now complete end to end, GitHub Q&A retrieval confirmed working in both directions, Bitbucket Q&A mechanism confirmed running with a real cross-provider ranking-quality issue documented (not fixed), and a real Bitbucket push-triggered incremental refresh confirmed end to end after fixing a bigger-scope stale-instance-id bug (both providers) plus a pre-existing Bitbucket repo misconfiguration. Task 3 checkpoint remains open pending a design decision plus one GitHub write action (see "User Setup Required").*

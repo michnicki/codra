@@ -81,7 +81,7 @@ from making forward progress, and it carries this reasoning in its comment.
 `remainingSafeBudget() >= needed`) or change the call sites to `remainingSafeBudget() >= 1`. Prefer the
 former — two call sites already assume the method exists.
 
-## RESOLVED at 29-09's Task 3 UAT (2026-07-29): confirmed real, fixed live
+## RESOLVED at 29-09's Task 3 UAT (2026-07-29, then FULLY closed 2026-07-30): confirmed real, fixed live
 
 The live check this entry calls for happened: after `opencodra`'s first build, a second dashboard
 press (and every push-triggered rebuild afterward) returned `coalesced: true` against a Workflow
@@ -90,8 +90,21 @@ Fixed in commit `b075e1f`: on `instance.already_exists`, release the stale lease
 fresh `{constantId}-{Date.now()}` instance id (the suggested commit-suffix approach was considered but
 the timestamp suffix was simpler and sufficient — freshness is about the *lease*, not identifying which
 commit a build targets). Confirmed live: pressing build again after a completed build now returns
-`coalesced: false` with a new instance id and a second Workflow instance actually appears. Original
-write-up preserved below for context.
+`coalesced: false` with a new instance id and a second Workflow instance actually appears.
+
+**Correction, 2026-07-30: the above only fixed the dashboard press, not the two push branches this
+entry itself warns about.** `b075e1f` patched only `routes/api/repos.ts`'s `instance.already_exists`
+catch; `webhook.ts` (GitHub push) and `webhook-bitbucket.ts` (Bitbucket push) still did a bare `create`
+and treated ANY `instance.already_exists` as benign coalescing — exactly the "every later push refresh
+is dropped the same way" failure this entry predicted, just not yet tested. It reproduced live: once
+`reach`'s Bitbucket main-branch misconfiguration was fixed (see the new entry below) and a real push
+finally reached the push-refresh branch, it coalesced against `reach`'s own already-completed dashboard
+build and started nothing. Fully closed in commit `a014df8` by extracting the lease-claim + create +
+stale-instance-retry logic into a shared `startIndexBuild()` helper (`core/code-index-build.ts`) and
+wiring all three sites — dashboard, GitHub push, Bitbucket push — to call it. Confirmed live: the same
+push that previously coalesced now logs `"instance already exists; retrying with fresh instance id"`
+followed by `"triggered a codebase index refresh, mode: incremental"`, and `code_index_state.indexed_sha`
+advances to the pushed commit. Original write-up preserved below for context.
 
 ## 29-08: a static per-repository Workflow instance id may permit only ONE build per repository, ever
 
@@ -160,6 +173,39 @@ creates the handoff (it is already breaking out of its loop, and the destructive
 guarded by the "no progress rows at the build sha" check, so releasing is safe), or pass the handoff the
 outgoing instance id to claim under. Pin whichever with a case that asserts the handed-off instance
 actually indexes a file.
+
+## RESOLVED at 29-09's Task 3 UAT (2026-07-30): A2 confirmed
+
+Multiple real `repo:push` deliveries were captured in production (`webhook_deliveries` rows,
+`repository_id = 18`, `event_name = 'repo:push'`) across a merge and two direct-to-`main` commits.
+`push.changes[0].new.name` and `.new.target.hash` extract cleanly every time — no schema error, no
+`repoPushPayloadSchema` mismatch. The reason this took until 2026-07-30 to observe cleanly:
+`reach`'s Bitbucket repository had its own pre-existing "Main branch" designation pointed at a
+leftover scratch branch (`bantam-e2e-verify-mpwc2nkf`) rather than `main` (see the new entry below),
+so every push to the literally-named `main` was legitimately ignored as `non_default_branch` until
+that was fixed — a repo-config problem, not a payload-shape problem. Once fixed, a push to `main`
+correctly resolved `mainBranch` from `getRepositoryMetadata()` and matched. **A2 is confirmed; no
+schema change needed.** Original write-up preserved below for context (`scratchpad/probe-a2-*` and the
+associated capture spec are stale exploratory artifacts from before this live confirmation and can be
+deleted).
+
+## NEW, resolved outside Codra: `reach`'s Bitbucket "Main branch" pointed at a scratch branch
+
+**Found during:** 29-09 Task 3 UAT, 2026-07-30, while investigating why pushes to `main` never
+triggered a refresh.
+
+Not a Codra bug. `getRepositoryMetadata().mainbranch.name` — Bitbucket's own repository-level
+designation, independent of any branch's literal name — resolved to `bantam-e2e-verify-mpwc2nkf`
+(a leftover scratch branch from earlier E2E-verify testing) rather than `main`, so Codra's
+`repo:push` handler's `change.new.name !== mainBranch` check was correctly ignoring every push to
+`main` as `non_default_branch`. Confirmed via Bitbucket's branches list UI: the scratch branch (not
+`main`) carried both the "main" and "development" tags before the fix. The developer fixed the
+designation via Bitbucket's admin **Advanced** section (`/admin`, not the branching-model page's
+"Development branch" dropdown, which this session tried first and could not get to take effect even
+after disabling "Enable inherited settings"). Confirmed fixed: the branches list now tags `main`
+correctly, and a subsequent push resolved and processed as expected. Nothing to fix or watch for in
+Codra's code — worth recording only because it caused ~15 minutes of live UAT time to be spent
+investigating what turned out to be entirely outside the application.
 
 ## 29-06: A2 (real Bitbucket `repo:push` payload shape) confirmed nowhere yet — deferred to 29-09's gate
 
