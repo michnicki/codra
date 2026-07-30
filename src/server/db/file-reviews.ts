@@ -85,15 +85,18 @@ export async function insertFileReview(
       const codeSuggestions = input.parsedComments.map(c => c.codeSuggestion ?? null);
       const confidences = input.parsedComments.map(c => c.confidence ?? null);
       const existingCodes = input.parsedComments.map(c => c.existingCode ?? null);
+      // SEC-XDIFF-01: JSON.stringify each entry (or null) rather than the array itself — UNNEST
+      // needs one jsonb value per row, not one jsonb[] shared across rows.
+      const crossReferences = input.parsedComments.map(c => c.cross_references ? JSON.stringify(c.cross_references) : null);
 
       await tx.query(
         `
           INSERT INTO review_comments (
-            file_review_id, path, line, position, severity, category, title, body, code_suggestion, confidence, existing_code
+            file_review_id, path, line, position, severity, category, title, body, code_suggestion, confidence, existing_code, cross_references
           )
-          SELECT $1::uuid, * FROM UNNEST($2::text[], $3::int[], $4::int[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], $10::real[], $11::text[])
+          SELECT $1::uuid, * FROM UNNEST($2::text[], $3::int[], $4::int[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], $10::real[], $11::text[], $12::jsonb[])
         `,
-        [review.id, paths, lines, positions, severities, categories, titles, bodies, codeSuggestions, confidences, existingCodes]
+        [review.id, paths, lines, positions, severities, categories, titles, bodies, codeSuggestions, confidences, existingCodes, crossReferences]
       );
     }
   });
@@ -211,9 +214,9 @@ export async function upsertFileReview(
       await tx.query(
         `
           INSERT INTO review_comments (
-            file_review_id, path, line, position, severity, category, title, body, code_suggestion, confidence, existing_code
+            file_review_id, path, line, position, severity, category, title, body, code_suggestion, confidence, existing_code, cross_references
           )
-          SELECT $1::uuid, * FROM UNNEST($2::text[], $3::int[], $4::int[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], $10::real[], $11::text[])
+          SELECT $1::uuid, * FROM UNNEST($2::text[], $3::int[], $4::int[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], $10::real[], $11::text[], $12::jsonb[])
         `,
         [
           review.id,
@@ -227,6 +230,8 @@ export async function upsertFileReview(
           input.parsedComments.map(c => c.codeSuggestion ?? null),
           input.parsedComments.map(c => c.confidence ?? null),
           input.parsedComments.map(c => c.existingCode ?? null),
+          // SEC-XDIFF-01: one jsonb value per row via UNNEST, not a single jsonb[] literal.
+          input.parsedComments.map(c => c.cross_references ? JSON.stringify(c.cross_references) : null),
         ],
       );
     }
@@ -360,9 +365,9 @@ export async function bulkInheritFileReviews(
       await tx.query(
         `
           INSERT INTO review_comments (
-            file_review_id, path, line, position, severity, category, title, body, code_suggestion, confidence
+            file_review_id, path, line, position, severity, category, title, body, code_suggestion, confidence, cross_references
           )
-          SELECT nw.new_id, rc.path, rc.line, rc.position, rc.severity, rc.category, rc.title, rc.body, rc.code_suggestion, rc.confidence
+          SELECT nw.new_id, rc.path, rc.line, rc.position, rc.severity, rc.category, rc.title, rc.body, rc.code_suggestion, rc.confidence, rc.cross_references
           FROM UNNEST($1::uuid[], $2::text[], $3::text[]) AS nw(new_id, file_path, pass)
           JOIN file_reviews pf ON pf.job_id = $4::uuid AND pf.file_path = nw.file_path AND pf.pass = nw.pass
           JOIN review_comments rc ON rc.file_review_id = pf.id
@@ -501,7 +506,14 @@ export async function getFileReviewsForJobs(env: Pick<AppBindings, 'HYPERDRIVE'>
         COALESCE(
           (
             SELECT JSON_AGG(
-              JSON_BUILD_OBJECT(
+              -- JSON_STRIP_NULLS: cross_references is parsedReviewCommentSchema's ONLY bare
+              -- optional() field (not nullable().optional() like line/position/confidence/
+              -- existingCode above) -- an explicit JSON null fails that schema (optional() accepts
+              -- undefined, not null), which silently broke re-validation of persisted comments
+              -- (e.g. criticResultSchema.kept) for every row that never set cross_references.
+              -- Stripping null keys turns "present with null" into "absent" (= undefined), which is
+              -- schema-legal for every field here, nullable or not.
+              JSON_STRIP_NULLS(JSON_BUILD_OBJECT(
                 'path', rc.path,
                 'line', rc.line,
                 'position', rc.position,
@@ -511,8 +523,9 @@ export async function getFileReviewsForJobs(env: Pick<AppBindings, 'HYPERDRIVE'>
                 'body', rc.body,
                 'codeSuggestion', rc.code_suggestion,
                 'confidence', rc.confidence,
-                'existingCode', rc.existing_code
-              )
+                'existingCode', rc.existing_code,
+                'cross_references', rc.cross_references
+              ))
             ORDER BY rc.id ASC
             ) FROM review_comments rc WHERE rc.file_review_id = fr.id
           ),
