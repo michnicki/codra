@@ -99,6 +99,31 @@ describe('SC3: Phase-7 reviewConfig toggles default off; the three v1.2 always-o
     expect(defaultRepoConfig.review.bitbucket.annotations_enabled).toBe(false);
   });
 
+  it('EVID-02: evidence.hard_drop defaults false and hard_drop_exempt_categories defaults to [security]', () => {
+    const cfg = repoConfigSchema.parse({});
+
+    expect(cfg.review.evidence.hard_drop).toBe(false);
+    expect(cfg.review.evidence.hard_drop_exempt_categories).toEqual(['security']);
+  });
+
+  it('EVID-02: hard_drop_exempt_categories enforces a max(20) array bound', () => {
+    const twentyItems = Array.from({ length: 20 }, (_, i) => `category-${i}`);
+    const twentyOneItems = Array.from({ length: 21 }, (_, i) => `category-${i}`);
+
+    const okResult = repoConfigSchema.safeParse({
+      review: { evidence: { hard_drop_exempt_categories: twentyItems } },
+    });
+    const overResult = repoConfigSchema.safeParse({
+      review: { evidence: { hard_drop_exempt_categories: twentyOneItems } },
+    });
+
+    expect(okResult.success).toBe(true);
+    if (okResult.success) {
+      expect(okResult.data.review.evidence.hard_drop_exempt_categories).toHaveLength(20);
+    }
+    expect(overResult.success).toBe(false);
+  });
+
   it('CMD-07: bitbucket_bot_account_id round-trips a configured value', () => {
     const cfg = repoConfigSchema.parse({
       review: { interactive: { commands: { bitbucket_bot_account_id: 'acct-xyz' } } },
