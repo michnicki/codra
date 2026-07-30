@@ -15,6 +15,7 @@ import { buildWalkthroughData, editWalkthroughComment, postWalkthroughPlaceholde
 import { FormatterService } from '@server/services/formatter';
 import { renderFileDiff } from '@server/prompts/file-review';
 import type { VcsProvider } from '@server/vcs/types';
+import { logger } from '@server/core/logger';
 
 const sha = (char: string) => char.repeat(40);
 
@@ -4074,6 +4075,157 @@ dbDescribe('Review Flow Lifecycle', () => {
       // Non-vacuous: bitbucket really went through the provider override (emoji icon, not the GitHub <img>).
       expect(gh.some((c: any) => c.body.includes('<img'))).toBe(true);
       expect(bb.some((c: any) => c.body.includes('<img'))).toBe(false);
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    // withBitbucketAnnotations mirrors securityConfig's shape while additionally opting into the
+    // ANNO-01 toggle -- kept local to this block since no other describe needs it.
+    const withBitbucketAnnotations = (enabled: boolean): RepoConfig => ({
+      ...defaultRepoConfig,
+      review: { ...defaultRepoConfig.review, bitbucket: { annotations_enabled: enabled } },
+    });
+
+    it('ANNO-01: postAnnotations is called AFTER submitReview when bitbucket.annotations_enabled is true and the provider is bitbucket', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { VcsService } = await import('@server/services/vcs');
+      const repo = `test-repo-${Date.now()}-anno01-order`;
+
+      const order: string[] = [];
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+      );
+      const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+        async () => { order.push('submitReview'); return { id: 456 }; },
+      );
+      const postAnnotationsSpy = vi.fn(async (..._args: unknown[]) => { order.push('postAnnotations'); });
+      const forRepoSpy = vi.spyOn(VcsService, 'forRepo').mockImplementation(async (e: any, j: any, t: any) => {
+        const { GithubAdapter } = await import('@server/vcs/github');
+        const adapter = new GithubAdapter(e, j.installationId ?? '', t);
+        Object.defineProperty(adapter, 'name', { value: 'bitbucket', configurable: true });
+        Object.defineProperty(adapter, 'capabilities', { value: { supportsMermaid: false }, configurable: true });
+        Object.defineProperty(adapter, 'postAnnotations', { value: postAnnotationsSpy, configurable: true });
+        return adapter;
+      });
+
+      const job = await seedReadyJob(repo, 78, {
+        config: withBitbucketAnnotations(true),
+        mainComments: [finding({ title: 'SQL injection', line: 1, position: 1 })],
+      });
+
+      await runWithDb(env, async () => {
+        const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-anno01-order', phase: 'finalize' });
+        expect(res).toEqual({ action: 'ack' });
+      });
+
+      expect(order).toEqual(['submitReview', 'postAnnotations']);
+      expect(postAnnotationsSpy).toHaveBeenCalledTimes(1);
+      const callArgs = postAnnotationsSpy.mock.calls[0] as unknown as [string, string, number, { commitSha: string; findings: unknown[] }];
+      expect(callArgs[3].commitSha).toBeTruthy();
+      expect(callArgs[3].findings).toHaveLength(1);
+
+      createSpy.mockRestore();
+      getDiffSpy.mockRestore();
+      forRepoSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('ANNO-01 (NREG-01): postAnnotations is never called when bitbucket.annotations_enabled is false (default)', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { VcsService } = await import('@server/services/vcs');
+      const repo = `test-repo-${Date.now()}-anno01-nreg01`;
+
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+      );
+      const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockResolvedValue({ id: 456 } as any);
+      const postAnnotationsSpy = vi.fn(async () => {});
+      const forRepoSpy = vi.spyOn(VcsService, 'forRepo').mockImplementation(async (e: any, j: any, t: any) => {
+        const { GithubAdapter } = await import('@server/vcs/github');
+        const adapter = new GithubAdapter(e, j.installationId ?? '', t);
+        Object.defineProperty(adapter, 'name', { value: 'bitbucket', configurable: true });
+        Object.defineProperty(adapter, 'capabilities', { value: { supportsMermaid: false }, configurable: true });
+        Object.defineProperty(adapter, 'postAnnotations', { value: postAnnotationsSpy, configurable: true });
+        return adapter;
+      });
+
+      // Plain defaultRepoConfig -- annotations_enabled defaults to false per Plan 30-01.
+      const job = await seedReadyJob(repo, 79, {
+        config: defaultRepoConfig,
+        mainComments: [finding({ title: 'SQL injection', line: 1, position: 1 })],
+      });
+
+      await runWithDb(env, async () => {
+        const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-anno01-nreg01', phase: 'finalize' });
+        expect(res).toEqual({ action: 'ack' });
+      });
+
+      expect(postAnnotationsSpy).not.toHaveBeenCalled();
+
+      createSpy.mockRestore();
+      getDiffSpy.mockRestore();
+      forRepoSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('ANNO-01 (NREG-02): a real GitHub provider never crashes finalize even if annotations_enabled is set true', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const repo = `test-repo-${Date.now()}-anno01-nreg02`;
+
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+      );
+      const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockResolvedValue({ id: 456 } as any);
+
+      // No VcsService.forRepo override -- the real, unmodified GithubAdapter path (name === 'github')
+      // is exercised, with annotations_enabled forced true anyway.
+      const job = await seedReadyJob(repo, 80, {
+        config: withBitbucketAnnotations(true),
+        mainComments: [finding({ title: 'SQL injection', line: 1, position: 1 })],
+      });
+
+      await runWithDb(env, async () => {
+        const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-anno01-nreg02', phase: 'finalize' });
+        expect(res).toEqual({ action: 'ack' });
+      });
+
+      createSpy.mockRestore();
+      getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('ANNO-01 (fail-open): a postAnnotations rejection never fails the finalize job', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { VcsService } = await import('@server/services/vcs');
+      const repo = `test-repo-${Date.now()}-anno01-failopen`;
+
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+      );
+      const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockResolvedValue({ id: 456 } as any);
+      const postAnnotationsSpy = vi.fn(async () => { throw new Error('simulated Bitbucket API failure'); });
+      const forRepoSpy = vi.spyOn(VcsService, 'forRepo').mockImplementation(async (e: any, j: any, t: any) => {
+        const { GithubAdapter } = await import('@server/vcs/github');
+        const adapter = new GithubAdapter(e, j.installationId ?? '', t);
+        Object.defineProperty(adapter, 'name', { value: 'bitbucket', configurable: true });
+        Object.defineProperty(adapter, 'capabilities', { value: { supportsMermaid: false }, configurable: true });
+        Object.defineProperty(adapter, 'postAnnotations', { value: postAnnotationsSpy, configurable: true });
+        return adapter;
+      });
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+      const job = await seedReadyJob(repo, 81, {
+        config: withBitbucketAnnotations(true),
+        mainComments: [finding({ title: 'SQL injection', line: 1, position: 1 })],
+      });
+
+      await runWithDb(env, async () => {
+        const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-anno01-failopen', phase: 'finalize' });
+        expect(res).toEqual({ action: 'ack' });
+      });
+
+      expect(postAnnotationsSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy.mock.calls.some((call) => String(call[0]).toLowerCase().includes('annotation'))).toBe(true);
+
+      warnSpy.mockRestore();
+      createSpy.mockRestore();
+      getDiffSpy.mockRestore();
+      forRepoSpy.mockRestore();
     }, REVIEW_FLOW_TIMEOUT_MS);
 
     // Phase 14 (14-03) finalize-wiring cases A-F. Each seeds a ready job and runs the finalize phase
