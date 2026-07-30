@@ -10,8 +10,14 @@ import { findRepositoryIdByIdentity, getOrCreateRepository } from '@server/db/re
 import { upsertVcsCredential } from '@server/db/vcs-credentials';
 import { encryptSecret } from '@server/core/crypto';
 import { queryTransaction } from '@server/db/client';
-import { addBitbucketRepoInputSchema, discoverBitbucketWorkspaceInputSchema, type WorkspaceRepoListItem } from '@shared/bitbucket';
+import {
+  addBitbucketRepoInputSchema,
+  addBitbucketWorkspaceInputSchema,
+  discoverBitbucketWorkspaceInputSchema,
+  type WorkspaceRepoListItem,
+} from '@shared/bitbucket';
 import { BitbucketClient } from '@server/core/bitbucket';
+import { upsertVcsWorkspaceCredential } from '@server/db/vcs-workspace-credentials';
 import { clusterRejectFeedback, synthesizeRules } from '@server/core/learned-rules';
 import { getRejectFeedbackForRepo } from '@server/db/reject-feedback';
 import { requireSession } from '@server/middleware/auth';
@@ -290,6 +296,123 @@ export function createReposRouter() {
         502,
       );
     }
+  });
+
+  // POST /bitbucket/workspaces -- WS-01 finalize endpoint (D-06/D-07). This is the endpoint the
+  // repo-selection checklist UI (Plan 31-05) submits to. It encrypts + persists the workspace
+  // credential and onboards ONLY the explicitly selected repos in ONE queryTransaction (mirroring
+  // POST /bitbucket's transactional shape), then creates the workspace webhook subscription
+  // idempotently OUTSIDE the transaction (an external HTTP call, not a DB write).
+  //
+  // D-06 ("Sync workspace") is deliberately satisfied by resubmitting THIS SAME endpoint for an
+  // existing workspace with a refreshed `selectedRepoSlugs` -- no dedicated `/sync` endpoint
+  // exists. `upsertVcsWorkspaceCredential` rotates the credential row in place;
+  // `getOrCreateRepository`'s `ON CONFLICT` rotates in place for already-onboarded slugs (a no-op)
+  // and inserts only new ones; the webhook-creation check below skips re-creation when a
+  // matching-URL hook already exists.
+  app.post('/bitbucket/workspaces', async (c) => {
+    const sessionUser = c.get('sessionUser');
+    if (!sessionUser) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    const raw = await c.req.json().catch(() => null);
+    const parsed = addBitbucketWorkspaceInputSchema.safeParse(raw);
+    if (!parsed.success) {
+      return jsonError('Invalid Bitbucket workspace payload.', 400);
+    }
+
+    const { workspace, accessToken, webhookSecret, tokenExpiresAt, selectedRepoSlugs } = parsed.data;
+
+    let credential: Awaited<ReturnType<typeof upsertVcsWorkspaceCredential>>;
+    try {
+      // Encrypt-at-boundary before the transaction (Phase 4 D-06), same convention as POST /bitbucket.
+      const encryptedAccessToken = await encryptSecret(c.env, accessToken);
+      const encryptedWebhookSecret = await encryptSecret(c.env, webhookSecret);
+
+      credential = await queryTransaction(c.env, async () => {
+        const upserted = await upsertVcsWorkspaceCredential(c.env, {
+          vcsProvider: 'bitbucket',
+          workspace,
+          encryptedAccessToken,
+          encryptedWebhookSecret,
+          tokenExpiresAt: tokenExpiresAt ?? null,
+        });
+
+        // D-07: iterate ONLY selectedRepoSlugs, NEVER the full discovery list -- selection is the
+        // source of truth for what gets onboarded at finalize time (see the module prohibition:
+        // MUST NOT silently expand review coverage beyond the operator's explicit selection).
+        for (const repoSlug of selectedRepoSlugs) {
+          await getOrCreateRepository(c.env, {
+            installationId: '',
+            vcsProvider: 'bitbucket',
+            owner: workspace,
+            repo: repoSlug,
+            workspace,
+          });
+        }
+
+        return upserted;
+      });
+    } catch (error) {
+      console.error('Failed to add Bitbucket workspace:', error);
+      return jsonError(
+        error instanceof Error ? error.message : 'Failed to add Bitbucket workspace.',
+        500,
+      );
+    }
+
+    // Webhook creation is an EXTERNAL HTTP call, not a DB write, so it deliberately lives in its
+    // OWN, SEPARATE try/catch OUTSIDE queryTransaction above (matching the existing convention
+    // that transaction bodies contain only DB operations) -- but by the time execution reaches
+    // here, the credential + repos rows are ALREADY durably committed. A failure in this block
+    // must therefore be surfaced DISTINCTLY from the 500 above, which means "nothing was
+    // persisted". No compensating-transaction rollback (deleting the just-committed rows) is
+    // performed here even though rows already exist: (1) D-06 already makes resubmission
+    // safe-by-construction -- upsertVcsWorkspaceCredential rotates in place, getOrCreateRepository's
+    // ON CONFLICT is a no-op for already-onboarded slugs, and the list-then-create-if-missing check
+    // below will simply find no matching hook and retry cleanly; (2) the partial state itself
+    // carries ZERO incorrect-behavior risk -- without a live webhook, the workspace's repos receive
+    // zero webhook deliveries, so no review job can incorrectly fire; the only symptom is "nothing
+    // happens yet," which the distinct 502 message below tells the operator directly how to
+    // resolve. See threat_model T-31-03-06 for the full disposition (mitigate via the explicit
+    // error message, not via rollback).
+    const webhookUrl = `${new URL(c.req.url).origin}/webhook/bitbucket`;
+
+    try {
+      const client = new BitbucketClient(c.env, accessToken);
+      // Concurrency: upsertVcsWorkspaceCredential above IS race-safe against two overlapping
+      // finalize submissions for the same workspace -- Postgres's UNIQUE(vcs_provider, workspace)
+      // constraint plus the ON CONFLICT DO UPDATE clause serializes concurrent writers at the
+      // row-lock level (one call's transaction blocks until the other commits, then updates in
+      // place; neither errors, neither duplicates), and the same holds for
+      // getOrCreateRepository's own ON CONFLICT. The list-then-create-if-missing block below is
+      // NOT covered by any lock: it is a read-then-write round trip against an external HTTP API
+      // (Bitbucket), not a DB statement, so two finalize calls that both start before either has
+      // created the hook can each observe "no matching hook" and each call createWorkspaceWebhook,
+      // resulting in two subscriptions for the same URL. This is an accepted risk, not a bug to
+      // silently ignore -- see threat_model T-31-03-05 for the disposition and rationale (no
+      // distributed/advisory lock is introduced; the DB rows themselves cannot duplicate, and a
+      // stray duplicate subscription only causes redundant event delivery, which the review
+      // pipeline already tolerates).
+      const existingHooks = await client.listWorkspaceWebhooks(workspace);
+      const hasMatchingHook = existingHooks.some((hook) => hook.url === webhookUrl);
+      if (!hasMatchingHook) {
+        await client.createWorkspaceWebhook(workspace, {
+          url: webhookUrl,
+          secret: webhookSecret,
+          events: ['pullrequest:created', 'pullrequest:updated', 'pullrequest:comment_created', 'repo:push'],
+        });
+      }
+    } catch (error) {
+      console.error('Failed to create Bitbucket workspace webhook after commit:', error);
+      return jsonError(
+        `Bitbucket credential and repositories were saved, but the workspace webhook could not be created (${error instanceof Error ? error.message : 'unknown error'}). Resubmit this form with the same workspace to retry webhook setup -- your saved credential and repositories will not be duplicated.`,
+        502,
+      );
+    }
+
+    return c.json({ credential, repositoryCount: selectedRepoSlugs.length }, 201);
   });
 
   // POST /bitbucket -- D-32 transactional add-repo endpoint. Reuses getOrCreateRepository's
