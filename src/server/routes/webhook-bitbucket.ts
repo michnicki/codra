@@ -5,7 +5,7 @@ import type { AppEnv } from '@server/env';
 import { jsonError } from '@server/core/http';
 import { verifyWebhookSignature } from '@server/core/verify';
 import { decryptSecret } from '@server/core/crypto';
-import { getVcsCredentialSecrets } from '@server/db/vcs-credentials';
+import { resolveBitbucketWebhookSecretCandidates } from '@server/core/bitbucket-credential-resolution';
 import { findRepositoryByBitbucketIdentity } from '@server/db/repositories';
 import { getRepoConfigByRepositoryId } from '@server/db/repo-configs';
 import { mostRecentJobForPullRequest } from '@server/db/jobs';
@@ -31,8 +31,8 @@ import type { CommentContext } from '@server/core/commands';
 //   2.  Read X-Event-Key; missing -> 400.
 //   3.  REV-M-6: parse JUST the identity-bearing projection as a small Zod projection
 //       (NOT the full payload schema) to obtain {workspace, repo_slug} for credential
-//       lookup. Order: identity-projection parse -> getVcsCredentialSecrets -> decryptSecret
-//       -> verifyWebhookSignature -> full payload parse. Phase 29 (QA-IDX-01, D-08): the
+//       lookup. Order: identity-projection parse -> resolveBitbucketWebhookSecretCandidates
+//       -> decryptSecret -> verifyWebhookSignature -> full payload parse. Phase 29 (QA-IDX-01, D-08): the
 //       projection identifies the REPOSITORY for ANY event kind — `repository.name` and
 //       `repository.workspace.slug` stay hard-required, while the pull-request half is
 //       optional so a `repo:push` delivery (which carries no `pullrequest`) can be
@@ -40,9 +40,15 @@ import type { CommentContext } from '@server/core/commands';
 //       step-8 full parse.
 //   4.  D-19: lowercase `workspace + repo_slug` defensively to match the stored
 //       credential key (Phase 4 storage normalization).
-//   5.  getVcsCredentialSecrets; null OR encryptedWebhookSecret null -> 401 (D-05 fail-closed).
-//   6.  decryptSecret; on throw -> 401.
-//   7.  Read X-Hub-Signature; verifyWebhookSignature -> 401 (D-05 fail-closed).
+//   5.  resolveBitbucketWebhookSecretCandidates (Phase 31, WS-01, D-03/Pitfall 1): resolves BOTH
+//       a per-repo AND a workspace-level candidate webhook secret (either or both may exist);
+//       zero candidates -> 401 (D-05 fail-closed).
+//   6.  decryptSecret is attempted per candidate inside the step-7 verification loop below (a
+//       decryption failure for one candidate just tries the next, rather than failing closed
+//       immediately — only exhausting every candidate fails closed).
+//   7.  Read X-Hub-Signature; verifyWebhookSignature is tried against EACH candidate secret in
+//       turn, stopping at the first match -> 401 only when none of the candidates verify
+//       (D-05 fail-closed).
 //   8.  REV-M-1: parse the FULL payload as {eventName: xEventKey, ...JSON.parse(rawBody)}
 //       and validate against pullRequestWebhookPayloadSchema.safeParse. eventName was
 //       injected from the trusted X-Event-Key header so the discriminated union matches.
@@ -118,33 +124,37 @@ export async function handleBitbucketWebhook(c: Context<AppEnv>) {
   const workspace = projectedWorkspace.toLowerCase();
   const repoSlug = projectedRepoSlug.toLowerCase();
 
-  // Step 5: per-repo secret lookup — null row OR null secret fails closed (D-05).
-  const credentials = await getVcsCredentialSecrets(c.env, {
-    vcsProvider: 'bitbucket',
-    workspace,
-    repoSlug,
-  });
-  if (!credentials?.encryptedWebhookSecret) {
+  // Step 5: widened candidate secret resolution (Phase 31, WS-01, D-03/Pitfall 1) — a repo may
+  // be covered by a per-repo webhook subscription, a workspace-level one, or both simultaneously.
+  // Zero candidates fails closed with the exact byte-identical message the route has always
+  // returned here (NREG-01 regression guard).
+  const secretCandidates = await resolveBitbucketWebhookSecretCandidates(c.env, { workspace, repoSlug });
+  if (secretCandidates.length === 0) {
     return jsonError('Webhook secret not configured.', 401);
   }
 
-  // Step 6: decrypt the stored secret. A decryption failure (wrong key, corrupted
-  // ciphertext, version mismatch) is a 401 — the HMAC cannot verify and we fail closed.
-  let decryptedSecret: string;
-  try {
-    decryptedSecret = await decryptSecret(c.env, credentials.encryptedWebhookSecret);
-  } catch {
-    return jsonError('Webhook secret could not be decrypted.', 401);
-  }
-
-  // Step 7: HMAC verify on the byte-identical raw body. Missing header or bad signature -> 401.
+  // Steps 6-7: HMAC verify on the byte-identical raw body against EACH candidate secret in turn,
+  // stopping at the first match. A decryption failure for one candidate just tries the next
+  // (`catch { /* try next candidate */ }`) rather than failing closed immediately — only
+  // exhausting every candidate without a match fails closed (D-05).
   const signature = c.req.header('x-hub-signature');
-  const verified = await verifyWebhookSignature({
-    secret: decryptedSecret,
-    signatureHeaderName: 'x-hub-signature',
-    signature,
-    rawBody,
-  });
+  let verified = false;
+  for (const encrypted of secretCandidates) {
+    try {
+      const decryptedSecret = await decryptSecret(c.env, encrypted);
+      if (await verifyWebhookSignature({
+        secret: decryptedSecret,
+        signatureHeaderName: 'x-hub-signature',
+        signature,
+        rawBody,
+      })) {
+        verified = true;
+        break;
+      }
+    } catch {
+      /* try next candidate */
+    }
+  }
   if (!verified) {
     return jsonError('Invalid webhook signature.', 401);
   }
