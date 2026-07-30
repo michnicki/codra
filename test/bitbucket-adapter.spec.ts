@@ -6,6 +6,7 @@ import {
   createBitbucketBotIdentityResolver,
 } from '@server/core/bitbucket';
 import { parseUnifiedDiff } from '@server/core/diff';
+import { logger } from '@server/core/logger';
 import { createTestEnv } from './helpers';
 import {
   BITBUCKET_FIXTURE_ACCOUNT_ID,
@@ -15,6 +16,7 @@ import {
   installBitbucketFetchMock,
 } from './bitbucket-fetch-mock';
 import type { VcsSubmitReviewInput } from '@server/vcs/types';
+import type { ParsedReviewComment } from '@shared/schema';
 
 const WORKSPACE = 'acme';
 const REPO = 'backend';
@@ -746,6 +748,196 @@ describe('BitbucketAdapter (VcsProvider mapping)', () => {
     expect(comments).toHaveLength(1);
     expect(comments[0].ref).toBe(`${PR_NUMBER}:7`);
     expect(comments.every((c) => c.author.id !== '')).toBe(true);
+  });
+});
+
+// Phase 30 (ANNO-01): BitbucketAdapter.postAnnotations — bulk-create-or-replace the dedicated
+// Code Insights annotation report mirroring the exact set of findings already posted as inline
+// comments (D-07/D-08). Every automated test here mocks the delete-then-recreate cascade as
+// given (D-09) — Assumption A1 (report-delete cascades to its annotations) is a phase-blocking
+// live-API check, tracked in this plan's Task 3 <human-check>, not exercised by these mocks.
+describe('BitbucketAdapter.postAnnotations (ANNO-01)', () => {
+  function buildFinding(overrides: Partial<ParsedReviewComment> = {}): ParsedReviewComment {
+    return {
+      path: 'src/foo.ts',
+      line: 10,
+      severity: 'P1',
+      category: 'security',
+      title: 'Missing input validation',
+      body: 'Detailed finding body',
+      ...overrides,
+    };
+  }
+
+  it('DELETEs then PUTs the dedicated report then bulk-POSTs the built annotations, in that order', async () => {
+    const mock = installBitbucketFetchMock();
+    const { adapter } = buildAdapter();
+
+    await adapter.postAnnotations(WORKSPACE, REPO, PR_NUMBER, {
+      commitSha: COMMIT_SHA,
+      findings: [buildFinding()],
+    });
+
+    const del = mock.calls.find((call) => call.method === 'DELETE' && call.path.includes('/reports/codra-annotations'));
+    const put = mock.calls.find((call) => call.method === 'PUT' && call.path.includes('/reports/codra-annotations'));
+    const post = mock.calls.find((call) => call.method === 'POST' && call.path.includes('/reports/codra-annotations/annotations'));
+    expect(del).toBeDefined();
+    expect(put).toBeDefined();
+    expect(post).toBeDefined();
+
+    const delIndex = mock.calls.indexOf(del!);
+    const putIndex = mock.calls.indexOf(put!);
+    const postIndex = mock.calls.indexOf(post!);
+    expect(delIndex).toBeLessThan(putIndex);
+    expect(putIndex).toBeLessThan(postIndex);
+
+    expect(put?.body).toMatchObject({
+      title: 'Codra Annotations',
+      report_type: 'BUG',
+      result: 'PASSED',
+    });
+  });
+
+  it('maps P0/P1/P2/P3/nit findings to CRITICAL/HIGH/MEDIUM/LOW severities', async () => {
+    const mock = installBitbucketFetchMock();
+    const { adapter } = buildAdapter();
+
+    const findings = [
+      buildFinding({ severity: 'P0', line: 1 }),
+      buildFinding({ severity: 'P1', line: 2 }),
+      buildFinding({ severity: 'P2', line: 3 }),
+      buildFinding({ severity: 'P3', line: 4 }),
+      buildFinding({ severity: 'nit', line: 5 }),
+    ];
+    await adapter.postAnnotations(WORKSPACE, REPO, PR_NUMBER, { commitSha: COMMIT_SHA, findings });
+
+    const post = mock.calls.find((call) => call.method === 'POST' && call.path.includes('/annotations'));
+    const body = post?.body as Array<{ severity: string }>;
+    expect(body.map((a) => a.severity)).toEqual(['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'LOW']);
+  });
+
+  it('the annotation report result is ALWAYS PASSED regardless of finding severity', async () => {
+    const mock = installBitbucketFetchMock();
+    const { adapter } = buildAdapter();
+
+    const findings = [
+      buildFinding({ severity: 'P0', line: 1 }),
+      buildFinding({ severity: 'P0', line: 2 }),
+    ];
+    await adapter.postAnnotations(WORKSPACE, REPO, PR_NUMBER, { commitSha: COMMIT_SHA, findings });
+
+    const put = mock.calls.find((call) => call.method === 'PUT' && call.path.includes('/reports/codra-annotations'));
+    expect(put?.body).toMatchObject({ result: 'PASSED' });
+  });
+
+  it('chunks annotations at 100 per POST', async () => {
+    const mock = installBitbucketFetchMock();
+    const { adapter } = buildAdapter();
+
+    const findings = Array.from({ length: 150 }, (_, i) => buildFinding({ line: i + 1, title: `Finding ${i}` }));
+    await adapter.postAnnotations(WORKSPACE, REPO, PR_NUMBER, { commitSha: COMMIT_SHA, findings });
+
+    const posts = mock.calls.filter((call) => call.method === 'POST' && call.path.includes('/annotations'));
+    expect(posts).toHaveLength(2);
+    expect((posts[0].body as unknown[]).length).toBe(100);
+    expect((posts[1].body as unknown[]).length).toBe(50);
+  });
+
+  it('annotation titles equal the raw finding title verbatim, with no additional metadata', async () => {
+    const mock = installBitbucketFetchMock();
+    const { adapter } = buildAdapter();
+
+    const distinctiveTitle = 'SQL injection via unsanitized query parameter `id`';
+    await adapter.postAnnotations(WORKSPACE, REPO, PR_NUMBER, {
+      commitSha: COMMIT_SHA,
+      findings: [buildFinding({ title: distinctiveTitle })],
+    });
+
+    const post = mock.calls.find((call) => call.method === 'POST' && call.path.includes('/annotations'));
+    const body = post?.body as Array<{ title: string; summary: string }>;
+    expect(body[0].title).toBe(distinctiveTitle);
+    expect(body[0].summary).toBe(distinctiveTitle);
+  });
+
+  it('a finding matching a postedComments entry gets its link; an unmatched finding omits link entirely', async () => {
+    const mock = installBitbucketFetchMock();
+    const { adapter } = buildAdapter();
+
+    await adapter.postAnnotations(WORKSPACE, REPO, PR_NUMBER, {
+      commitSha: COMMIT_SHA,
+      findings: [
+        buildFinding({ path: 'src/foo.ts', line: 10 }),
+        buildFinding({ path: 'src/bar.ts', line: 20 }),
+      ],
+      postedComments: [
+        { path: 'src/foo.ts', line: 10, body: 'first inline comment', link: 'https://bitbucket.org/acme/backend/pull-requests/42/_/diff#comment-1' },
+      ],
+    });
+
+    const post = mock.calls.find((call) => call.method === 'POST' && call.path.includes('/annotations'));
+    const body = post?.body as Array<{ path: string; link?: string }>;
+    const matched = body.find((a) => a.path === 'src/foo.ts');
+    const unmatched = body.find((a) => a.path === 'src/bar.ts');
+    expect(matched?.link).toBe('https://bitbucket.org/acme/backend/pull-requests/42/_/diff#comment-1');
+    expect(unmatched).not.toHaveProperty('link');
+  });
+
+  it('two findings sharing path+line+category but different titles get DISTINCT external_ids', async () => {
+    const mock = installBitbucketFetchMock();
+    const { adapter } = buildAdapter();
+
+    await adapter.postAnnotations(WORKSPACE, REPO, PR_NUMBER, {
+      commitSha: COMMIT_SHA,
+      findings: [
+        buildFinding({ path: 'src/foo.ts', line: 10, category: 'security', title: 'First P0 on this line' }),
+        buildFinding({ path: 'src/foo.ts', line: 10, category: 'security', title: 'Second P0 on this line' }),
+      ],
+    });
+
+    const post = mock.calls.find((call) => call.method === 'POST' && call.path.includes('/annotations'));
+    const body = post?.body as Array<{ external_id: string }>;
+    expect(body).toHaveLength(2);
+    expect(body[0].external_id).not.toBe(body[1].external_id);
+  });
+
+  it('two consecutive calls each independently delete-then-recreate (no client-side accumulation across rounds)', async () => {
+    const mock = installBitbucketFetchMock();
+    const { adapter } = buildAdapter();
+
+    await adapter.postAnnotations(WORKSPACE, REPO, PR_NUMBER, {
+      commitSha: COMMIT_SHA,
+      findings: [buildFinding({ path: 'src/round1.ts', line: 1, title: 'Round 1 finding' })],
+    });
+    await adapter.postAnnotations(WORKSPACE, REPO, PR_NUMBER, {
+      commitSha: COMMIT_SHA,
+      findings: [buildFinding({ path: 'src/round2.ts', line: 2, title: 'Round 2 finding' })],
+    });
+
+    const posts = mock.calls.filter((call) => call.method === 'POST' && call.path.includes('/annotations'));
+    expect(posts).toHaveLength(2);
+    const secondBody = posts[1].body as Array<{ path?: string; title?: string }>;
+    expect(secondBody).toHaveLength(1);
+    expect(secondBody[0].path).toBe('src/round2.ts');
+    expect(secondBody[0].title).toBe('Round 2 finding');
+  });
+
+  it('a failing chunk logs a warning naming the batch index before the error propagates', async () => {
+    installBitbucketFetchMock({
+      bulkUpsertAnnotationsResponse: { status: 500, body: { error: { message: 'boom' } } },
+    });
+    const { adapter } = buildAdapter();
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    const findings = Array.from({ length: 150 }, (_, i) => buildFinding({ line: i + 1, title: `Finding ${i}` }));
+    await expect(
+      adapter.postAnnotations(WORKSPACE, REPO, PR_NUMBER, { commitSha: COMMIT_SHA, findings }),
+    ).rejects.toBeInstanceOf(BitbucketError);
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('batch 0 of 2'),
+      expect.any(Error),
+    );
+    warnSpy.mockRestore();
   });
 });
 

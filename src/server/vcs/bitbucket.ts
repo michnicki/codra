@@ -7,11 +7,17 @@ import { getVcsCredentialSecrets } from '@server/db/vcs-credentials';
 import {
   REPORT_TYPE,
   REPORT_RESULT,
+  ANNOTATION_REPORT_ID,
+  ANNOTATION_TYPE,
+  ANNOTATION_SEVERITY_MAP,
+  ANNOTATION_BATCH_SIZE,
 } from '@server/bitbucket/constants';
-import type { RepoConfig } from '@shared/schema';
+import type { ReportAnnotation } from '@shared/bitbucket';
+import type { RepoConfig, ParsedReviewComment } from '@shared/schema';
 import type {
   VcsCapabilities,
   VcsCreateStatusCheckInput,
+  VcsPostAnnotationsInput,
   VcsPostedComment,
   VcsProvider,
   VcsPullRequest,
@@ -535,6 +541,95 @@ export class BitbucketAdapter implements VcsProvider {
   }
 
   /**
+   * ANNO-01: bulk-create-or-replace the dedicated Code Insights annotation report, mirroring the
+   * exact set of findings already posted as inline comments (D-07/D-08 -- no independent
+   * selection/cap logic here).
+   *
+   * D-09 full-replace: DELETE the report (idempotent -- 404 on round 1 is swallowed inside the
+   * client) then recreate it via PUT, THEN bulk-POST the current round's annotations. This is
+   * stateless -- no persisted external_id bookkeeping across rounds is needed, since Bitbucket's
+   * report deletion is documented (and, per this phase's blocking human-check, confirmed live) to
+   * cascade to the report's child annotations.
+   *
+   * D-11 FIFO-per-key join: `input.postedComments` and `input.findings` are assumed to be
+   * populated from the SAME underlying array in the SAME relative order upstream -- Plan 30-04's
+   * `runFinalizePhase` passes the SAME `finalComments` array to both `submitReview` and
+   * `postAnnotations`, which is what keeps the two arrays' relative ordering aligned
+   * (30-REVIEWS.md OpenCode Concern #2). A FIFO-per-key `.shift()` (not a plain `.find()`)
+   * correctly disambiguates the rare case of two findings sharing one `(path, line)` pair.
+   *
+   * Fail-open (D per RESEARCH.md Open Questions #3): this method does NOT catch its own errors --
+   * the caller (Plan 30-04's finalize wiring) wraps the whole call in its own best-effort
+   * try/catch, matching the walkthrough-edit posture elsewhere in finalize.
+   */
+  async postAnnotations(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    input: VcsPostAnnotationsInput,
+  ): Promise<void> {
+    const workspace = this.job.repositoryWorkspace;
+    const commit = input.commitSha;
+
+    // D-09: full replace every round. Delete-then-recreate; the DELETE 404-swallow (round 1, no
+    // prior report) lives inside deleteCodeInsightsReport (core/bitbucket.ts, Plan 30-02).
+    await this.client.deleteCodeInsightsReport(workspace, repo, commit, ANNOTATION_REPORT_ID);
+    await this.client.upsertCodeInsightsReport(
+      workspace,
+      repo,
+      commit,
+      {
+        title: 'Codra Annotations',
+        details: 'Per-line severity markers mirroring inline review comments.',
+        report_type: REPORT_TYPE,
+        result: REPORT_RESULT[0], // 'PASSED' — ALWAYS, per D-02 (informational only, never merge-gating).
+      },
+      ANNOTATION_REPORT_ID,
+    );
+
+    // FIFO-per-key join: findings and postedComments are matched by `${path}|${line}` and the
+    // matched queue entry is shift()'d off so a rare same-(path,line) collision consumes entries
+    // in the same relative order they were produced (see the class-level doc comment above).
+    const postedByKey = new Map<string, VcsPostedComment[]>();
+    for (const comment of input.postedComments ?? []) {
+      const key = `${comment.path}|${comment.line}`;
+      const queue = postedByKey.get(key);
+      if (queue) {
+        queue.push(comment);
+      } else {
+        postedByKey.set(key, [comment]);
+      }
+    }
+
+    const annotations = input.findings.map((finding) => {
+      const key = `${finding.path}|${finding.line}`;
+      const queue = postedByKey.get(key);
+      const matchedComment = queue?.shift();
+      return buildAnnotation(finding, matchedComment);
+    });
+
+    // Pitfall 3: chunk at Bitbucket's documented maxItems (100 per POST); log a per-batch-index
+    // warning naming the failing chunk before rethrowing (additive diagnostics only -- fail-open
+    // is preserved by the caller's own try/catch).
+    const totalChunks = Math.ceil(annotations.length / ANNOTATION_BATCH_SIZE);
+    for (let i = 0; i < annotations.length; i += ANNOTATION_BATCH_SIZE) {
+      const chunk = annotations.slice(i, i + ANNOTATION_BATCH_SIZE);
+      try {
+        await this.client.bulkUpsertAnnotations(workspace, repo, commit, ANNOTATION_REPORT_ID, chunk);
+      } catch (error) {
+        logger.warn(
+          `BitbucketAdapter.postAnnotations: batch ${i / ANNOTATION_BATCH_SIZE} of ${totalChunks} (size ${chunk.length}) failed`,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+        throw error;
+      }
+    }
+
+    void owner;
+    void prNumber;
+  }
+
+  /**
    * Standalone (issue/PR-level) comment primitives (D-01/D-02). Inert this phase — no consumer
    * (D-06). The ref is self-encoding `prId:commentId` so a persisted ref (Phase 9's
    * `walkthrough_comment_ref`) is editable with nothing else, mirroring `updateStatusCheck`'s
@@ -751,4 +846,52 @@ function buildDedupIndex(items: CommentListingItem[]) {
     map.set(deDupKey(item.inline.path, anchor, item.body), { id: item.id, link: item.links?.html?.href });
   }
   return map;
+}
+
+/**
+ * Phase 30 (ANNO-01): a small, synchronous, deterministic 32-bit FNV-1a string hash. Exists
+ * purely so two DIFFERENT finding titles at the same `(path, line, category)` never collide on
+ * `buildAnnotation`'s `external_id` (30-REVIEWS.md OpenCode Concern #4 / Suggestion #2) --
+ * non-cryptographic, not used for any security property. `Math.imul` keeps the multiplication
+ * within 32-bit semantics without needing `BigInt`; this needs no crypto import, matching this
+ * file's zero-new-dependency posture.
+ */
+function fnv1aHash(input: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+/**
+ * Phase 30 (ANNO-01): builds one Bitbucket `report_annotation` from a Codra finding.
+ *
+ * - `external_id` combines `path`/`line`/`category` AND a deterministic `fnv1aHash(finding.title)`
+ *   suffix -- two findings sharing the SAME `(path, line, category)` but DIFFERENT titles (e.g.
+ *   two P0 security issues on the same line) must never collide and silently overwrite each
+ *   other via Bitbucket's create-or-update semantics (30-REVIEWS.md OpenCode Concern #4).
+ * - `title`/`summary` are `finding.title` VERBATIM -- D-10/D-12: no redaction, no category/
+ *   confidence padding, no audit-trail metadata. Annotations are posted PR content with the same
+ *   visibility as the inline comment they mirror, NOT the `jobs.audit` operator surface AUD-01
+ *   governs (review-feedback prohibition against expanded disclosure).
+ * - `result` is the LITERAL string `'PASSED'`, never derived from `finding.severity` or any other
+ *   signal (D-02) -- this is intentionally hardcoded so the informational annotation surface can
+ *   never silently become an unexpected new merge-gating signal alongside the existing
+ *   `codra-review` summary report.
+ * - `link` is OMITTED (not fabricated) when `matchedComment` has no `link` (Pitfall 4).
+ */
+function buildAnnotation(finding: ParsedReviewComment, matchedComment: VcsPostedComment | undefined): ReportAnnotation {
+  return {
+    external_id: `codra-${finding.path}-${finding.line ?? 0}-${finding.category}-${fnv1aHash(finding.title)}`,
+    title: finding.title,
+    annotation_type: ANNOTATION_TYPE,
+    severity: ANNOTATION_SEVERITY_MAP[finding.severity],
+    summary: finding.title,
+    result: 'PASSED',
+    path: finding.path,
+    line: finding.line ?? undefined,
+    link: matchedComment?.link,
+  };
 }
