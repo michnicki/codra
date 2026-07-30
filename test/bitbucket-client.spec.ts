@@ -449,4 +449,88 @@ describe('BitbucketClient', () => {
     await expect(request).rejects.toMatchObject({ status: 400 });
     expect(mock.calls).toHaveLength(1);
   });
+
+  // Phase 31 (WS-01, D-05): workspace-level repo discovery. `responseSequence` is checked before
+  // any URL-pattern route in the shared fetch mock, so these tests script the
+  // `/repositories/{workspace}` listing directly without needing a dedicated mock route.
+  describe('listWorkspaceRepositories', () => {
+    it('single-page happy path returns the mapped {slug,name}[]', async () => {
+      const mock = installBitbucketFetchMock({
+        responseSequence: [
+          { body: { values: [{ slug: 'repo-a', name: 'Repo A' }, { slug: 'repo-b', name: 'Repo B' }] } },
+        ],
+      });
+      const { client, tracker } = createClient();
+
+      await expect(client.listWorkspaceRepositories('acme')).resolves.toEqual([
+        { slug: 'repo-a', name: 'Repo A' },
+        { slug: 'repo-b', name: 'Repo B' },
+      ]);
+      expect(mock.calls).toHaveLength(1);
+      expectBitbucketGet(mock.calls[0], '/2.0/repositories/acme?pagelen=100');
+      expectAuthenticated(mock.calls[0]);
+      expect(tracker.incrementSubrequests).toHaveBeenCalledTimes(1);
+    });
+
+    it('follows a response-supplied next link across pages, fetching BOTH pages through requestRaw', async () => {
+      const nextUrl = 'https://api.bitbucket.org/2.0/repositories/acme?pagelen=100&page=2';
+      const mock = installBitbucketFetchMock({
+        responseSequence: [
+          { body: { values: [{ slug: 'repo-a', name: 'Repo A' }], next: nextUrl } },
+          { body: { values: [{ slug: 'repo-b', name: 'Repo B' }] } },
+        ],
+      });
+      const { client, tracker } = createClient();
+
+      await expect(client.listWorkspaceRepositories('acme')).resolves.toEqual([
+        { slug: 'repo-a', name: 'Repo A' },
+        { slug: 'repo-b', name: 'Repo B' },
+      ]);
+      expect(mock.calls).toHaveLength(2);
+      expect(mock.calls.every((call) => call.authorization === `Bearer ${token}`)).toBe(true);
+      expect(tracker.incrementSubrequests).toHaveBeenCalledTimes(2);
+    });
+
+    it('rejects (never returns a partial array) when a page after the first fails', async () => {
+      const nextUrl = 'https://api.bitbucket.org/2.0/repositories/acme?pagelen=100&page=2';
+      installBitbucketFetchMock({
+        responseSequence: [
+          { body: { values: [{ slug: 'repo-a', name: 'Repo A' }], next: nextUrl } },
+          { status: 400, body: { error: { message: 'Bad request' } } },
+        ],
+      });
+      const { client } = createClient();
+
+      await expect(client.listWorkspaceRepositories('acme')).rejects.toBeInstanceOf(BitbucketError);
+    });
+
+    it('transparently retries a page-2+ 429 and still returns the full concatenated result (OpenCode review finding, HIGH)', async () => {
+      const nextUrl = 'https://api.bitbucket.org/2.0/repositories/acme?pagelen=100&page=2';
+      const mock = installBitbucketFetchMock({
+        responseSequence: [
+          { body: { values: [{ slug: 'repo-a', name: 'Repo A' }], next: nextUrl } },
+          { status: 429, body: { error: { message: 'Try again' } }, headers: { 'retry-after': '0' } },
+          { body: { values: [{ slug: 'repo-b', name: 'Repo B' }] } },
+        ],
+      });
+      const { client } = createClient();
+
+      await expect(client.listWorkspaceRepositories('acme')).resolves.toEqual([
+        { slug: 'repo-a', name: 'Repo A' },
+        { slug: 'repo-b', name: 'Repo B' },
+      ]);
+      expect(mock.calls).toHaveLength(3);
+    });
+
+    it('throws when a response-supplied next link fails the SSRF origin/path guard', async () => {
+      installBitbucketFetchMock({
+        responseSequence: [
+          { body: { values: [{ slug: 'repo-a', name: 'Repo A' }], next: 'https://evil.example.com/repositories/acme' } },
+        ],
+      });
+      const { client } = createClient();
+
+      await expect(client.listWorkspaceRepositories('acme')).rejects.toBeInstanceOf(BitbucketError);
+    });
+  });
 });

@@ -146,6 +146,12 @@ function repositoryPath(workspace: string, repoSlug: string) {
   return `/repositories/${encodeURIComponent(workspace)}/${encodeURIComponent(repoSlug)}`;
 }
 
+// Phase 31 (WS-01, D-05): the workspace-level repo listing lives at `/repositories/{workspace}`,
+// one segment shallower than `repositoryPath`'s repo-scoped path.
+function workspaceRepositoriesPath(workspace: string) {
+  return `/repositories/${encodeURIComponent(workspace)}`;
+}
+
 /**
  * Segment-wise path encoding for the `/src/{ref}/{path}` family. `encodeURIComponent` over a WHOLE
  * slash-bearing path would percent-encode the slashes and collapse `src/server/x.ts` into a single
@@ -216,6 +222,115 @@ export class BitbucketClient {
 
       return response;
     });
+  }
+
+  /**
+   * Phase 31 (WS-01): same retry/timeout/tracker machinery as `request()`, but takes a FULL,
+   * ALREADY-ABSOLUTE url instead of a relative path. `request()` always re-prefixes its argument
+   * with `BITBUCKET_API_BASE_URL`, which would double-prefix a response-supplied `next` link (that
+   * link already carries the api base). This is the ONE difference from `request()` -- every other
+   * behavior (429/5xx retry, timeout, subrequest tracking, thrown `BitbucketError` on !ok) is
+   * identical, unlike `listSrcTree`'s bare `fetchPage`.
+   *
+   * WHY THIS DIFFERS FROM `listSrcTree`'s bare `globalThis.fetch`-based `fetchPage`: `listSrcTree`
+   * deliberately tolerates a PARTIAL result on page-cap/budget exhaustion (fail-open -- a partial
+   * tree is still a usable index), so losing retry there was an already-shipped, acceptable
+   * tradeoff. `listWorkspaceRepositories` (below) instead fails CLOSED on any page failure, so
+   * silently dropping retry would turn a transient 429/5xx into an avoidable hard discovery failure
+   * -- this is the concrete fix for OpenCode's HIGH review finding (Phase 31 REVIEWS.md) that the
+   * original absolute-URL-fetch approach lost `request()`'s retry/timeout/tracker parity.
+   */
+  private async requestRaw(url: string): Promise<Response> {
+    return withRetry(`GET ${url}`, async () => {
+      this.tracker?.incrementSubrequests(1);
+      const response = await withTimeout(`Bitbucket GET ${new URL(url).pathname}`, BITBUCKET_TIMEOUT_MS, (signal) =>
+        globalThis.fetch(url, {
+          method: 'GET',
+          signal,
+          headers: {
+            Accept: 'application/json',
+            Authorization: `Bearer ${this.token}`,
+            'User-Agent': this.env.BOT_USERNAME ?? 'codra-bot',
+          },
+        }),
+      );
+
+      if (!response.ok) {
+        const errorBody = await response.text();
+        throw new BitbucketError(
+          response.status,
+          errorBody,
+          new URL(url).pathname,
+          `Bitbucket API GET ${new URL(url).pathname} failed with ${response.status}`,
+          retryAfterMs(response),
+        );
+      }
+
+      return response;
+    });
+  }
+
+  // Phase 31 (WS-01, D-05/OpenCode review, MEDIUM): named page cap mirroring
+  // `MAX_SRC_TREE_PAGES`/`MAX_THREAD_LIST_PAGES`'s convention. At `pagelen=100`, this caps workspace
+  // discovery at 5,000 repositories -- a workspace that large hits the fail-closed page-cap error
+  // below rather than silently truncating. This is a DOCUMENTED, accepted limitation for this phase
+  // (see `threat_model` T-31-01-05), not an unhandled edge case; no dedicated UI copy names the
+  // exact number because the existing generic discovery-failure copy already covers this path.
+  static readonly MAX_WORKSPACE_REPOS_PAGES = 50;
+
+  /**
+   * Phase 31 (WS-01, D-05): enumerate a workspace's repositories via the paginated
+   * `/repositories/{workspace}` listing. FAILS CLOSED -- unlike `listSrcTree`'s tolerated partial
+   * result, a partial repo list here would silently hide real repos from the onboarding picker,
+   * which is worse than a loud failure. Every page (first AND subsequent) is fetched through
+   * `requestRaw`, which is what preserves retry/timeout/tracking across the WHOLE paginated walk,
+   * not just page 1 (OpenCode review finding, HIGH).
+   */
+  async listWorkspaceRepositories(workspace: string): Promise<{ slug: string; name: string }[]> {
+    const maxPages = BitbucketClient.MAX_WORKSPACE_REPOS_PAGES;
+    const results: { slug: string; name: string }[] = [];
+    const seenNextUrls = new Set<string>();
+    let nextUrl: string | null =
+      `${BITBUCKET_API_BASE_URL}${workspaceRepositoriesPath(workspace)}?pagelen=100`;
+    let isLocallyBuiltUrl = true;
+
+    for (let page = 0; page < maxPages; page += 1) {
+      if (!isLocallyBuiltUrl && !isValidBitbucketNextUrl(nextUrl, seenNextUrls)) {
+        // A response-supplied link is untrusted INPUT, not a trusted continuation (T-17-02-03 /
+        // R-9 precedent). Off-origin, off-path, or a repeated (cyclic) link FAILS the walk closed.
+        throw new BitbucketError(
+          502,
+          `Bitbucket next-link did not pass origin/path validation`,
+          '/repositories/{workspace}',
+          `Bitbucket workspace-repositories pagination next URL failed SSRF validation`,
+        );
+      }
+
+      const response = await this.requestRaw(nextUrl as string);
+      const body = (await response.json()) as {
+        values?: Array<{ slug?: unknown; name?: unknown }>;
+        next?: string | null;
+      };
+      for (const value of body.values ?? []) {
+        if (typeof value?.slug !== 'string' || typeof value?.name !== 'string') continue;
+        results.push({ slug: value.slug, name: value.name });
+      }
+
+      if (!body.next) {
+        return results;
+      }
+      seenNextUrls.add(nextUrl as string);
+      nextUrl = body.next;
+      isLocallyBuiltUrl = false;
+    }
+
+    // Cap reached while `body.next` was still populated -- FAIL CLOSED (never a partial array).
+    throw new BitbucketError(
+      503,
+      `Bitbucket workspace-repositories pagination exceeded MAX_WORKSPACE_REPOS_PAGES (${maxPages}); aborting partial traversal`,
+      '/repositories/{workspace}',
+      `Bitbucket workspace repositories listing exceeded MAX_WORKSPACE_REPOS_PAGES=${maxPages}`,
+    );
   }
 
   async getPullRequest(workspace: string, repoSlug: string, prNumber: number): Promise<VcsPullRequest> {
