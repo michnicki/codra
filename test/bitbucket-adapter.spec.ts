@@ -264,7 +264,11 @@ describe('BitbucketAdapter (VcsProvider mapping)', () => {
   });
 
   it('submitReview skips an inline comment when a matching one already exists in the dedup set (REV-R-A dedup)', async () => {
-    // Seed listPullRequestComments with an existing comment matching the proposed one.
+    // Seed listPullRequestComments with an existing comment matching the proposed one. The
+    // existing comment's `inline: { to }` (no `from`) makes buildDedupIndex infer line_type
+    // 'added' -- the diff below is seeded so the freshly-computed anchor for position 2 (an
+    // ADDED line) matches that same inferred line_type, so the dedup match actually engages
+    // (rather than passing only because the anchor itself failed to resolve).
     const mock = installBitbucketFetchMock({
       listPullRequestCommentsResponse: {
         body: {
@@ -272,7 +276,8 @@ describe('BitbucketAdapter (VcsProvider mapping)', () => {
             {
               id: 999,
               content: { raw: 'first inline comment' },
-              inline: { path: 'src/foo.ts', to: 1 },
+              inline: { path: 'src/foo.ts', to: 2 },
+              links: { html: { href: 'https://bitbucket.org/acme/backend/pull-requests/42/_/diff#comment-999' } },
             },
           ],
         },
@@ -282,24 +287,92 @@ describe('BitbucketAdapter (VcsProvider mapping)', () => {
         { status: 201, body: { id: 200 } },
       ],
     });
-    const { adapter } = buildAdapter();
+    const { adapter, env } = buildAdapter();
+    const seededDiff = [
+      'diff --git a/src/foo.ts b/src/foo.ts',
+      'index 1234567..890abcd 100644',
+      '--- a/src/foo.ts',
+      '+++ b/src/foo.ts',
+      '@@ -1,1 +1,2 @@',
+      ' context',
+      '+added1',
+    ].join('\n');
+    await env.APP_KV.put(`diff:${(adapter as unknown as { job: { id: string } }).job.id}`, seededDiff);
 
-    const { ref } = await adapter.submitReview(WORKSPACE, REPO, PR_NUMBER, {
+    const result = await adapter.submitReview(WORKSPACE, REPO, PR_NUMBER, {
       commitSha: COMMIT_SHA,
       verdict: 'comment',
       summaryBody: 'Looks good',
       jobIdHint: 'job-bb-1',
       comments: [
-        { path: 'src/foo.ts', position: 1, body: 'first inline comment' },
+        // Position 2 = the '+added1' line (newLineNumber=2, kind='add').
+        { path: 'src/foo.ts', position: 2, body: 'first inline comment' },
       ],
     });
-    expect(ref).toBe('200');
+    expect(result.ref).toBe('200');
 
     // Only one POST: the combined marker+summary. The duplicate inline was skipped.
     const commentPosts = mock.calls.filter(
       (call) => call.method === 'POST' && call.path.includes('/comments'),
     );
     expect(commentPosts).toHaveLength(1);
+
+    // Phase 30 (ANNO-01, D-11/Pitfall 1): the dedup-matched branch still populates
+    // postedComments with a link -- proving a re-review round's already-existing comments are
+    // not silently dropped from the join postAnnotations depends on.
+    expect(result.postedComments).toEqual([
+      {
+        path: 'src/foo.ts',
+        line: 2,
+        body: 'first inline comment',
+        link: 'https://bitbucket.org/acme/backend/pull-requests/42/_/diff#comment-999',
+      },
+    ]);
+  });
+
+  it('submitReview populates postedComments with a link for a freshly-posted inline comment', async () => {
+    const mock = installBitbucketFetchMock({
+      postPullRequestCommentResponses: [
+        {
+          status: 201,
+          body: { id: 100, links: { html: { href: 'https://bitbucket.org/acme/backend/pull-requests/42/_/diff#comment-100' } } },
+        },
+        { status: 201, body: { id: 101 } }, // combined marker+summary
+      ],
+      listPullRequestCommentsResponse: { body: { values: [] } },
+    });
+    const { adapter, env } = buildAdapter();
+    const seededDiff = [
+      'diff --git a/src/foo.ts b/src/foo.ts',
+      'index 1234567..890abcd 100644',
+      '--- a/src/foo.ts',
+      '+++ b/src/foo.ts',
+      '@@ -1,1 +1,3 @@',
+      ' context',
+      '+added1',
+      '+added2',
+    ].join('\n');
+    await env.APP_KV.put(`diff:${(adapter as unknown as { job: { id: string } }).job.id}`, seededDiff);
+
+    const result = await adapter.submitReview(WORKSPACE, REPO, PR_NUMBER, {
+      commitSha: COMMIT_SHA,
+      verdict: 'comment',
+      summaryBody: 'Looks mostly good',
+      jobIdHint: 'job-bb-1',
+      comments: [
+        { path: 'src/foo.ts', position: 3, body: 'first inline comment' },
+      ],
+    });
+
+    void mock;
+    expect(result.postedComments).toEqual([
+      {
+        path: 'src/foo.ts',
+        line: 3,
+        body: 'first inline comment',
+        link: 'https://bitbucket.org/acme/backend/pull-requests/42/_/diff#comment-100',
+      },
+    ]);
   });
 
   it('submitReview calls approvePullRequest ONLY when verdict === "approve"', async () => {
