@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Deferred Candidates
-current_phase: 29
-current_phase_name: qa-idx-01-codebase-index-backed-q-a
-status: executing
-stopped_at: Completed 29-09-PLAN.md (Phase 29 complete)
-last_updated: "2026-07-30T06:10:00.000Z"
+current_phase: 31
+status: verifying
+stopped_at: Completed 31-04-PLAN.md
+last_updated: "2026-07-30T18:54:31.440Z"
 last_activity: 2026-07-30
-last_activity_desc: Phase 29 complete — 29-09 Task 3 checkpoint developer-approved after real production UAT on both providers
+last_activity_desc: Phase 31 complete
 progress:
   total_phases: 10
-  completed_phases: 8
-  total_plans: 21
-  completed_plans: 21
+  completed_phases: 10
+  total_plans: 30
+  completed_plans: 30
   percent: 100
+current_phase_name: ws-01-workspace-level-token-webhook
 ---
 
 # Project State
@@ -24,14 +24,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-25 for v1.2 closure)
 
 **Core value:** A Bitbucket Cloud PR gets the same AI review a GitHub PR gets, from one instance, without breaking GitHub — held end-to-end since v1.0, extended by v1.1 (every interactive/multi-pass capability shipped on both providers), extended by v1.2 (deterministic severity + real categories, audit-backed noise filter, priority file selection, incremental rounds, verify-fixes, critic v2, ensemble, walkthrough enrichment — all on both providers, every drop explainable from `jobs.audit`).
-**Current focus:** Phase 30 (ANNO-01) or Phase 31 (WS-01) — Phase 29 is complete, neither successor is planned yet
+**Current focus:** Phase 31 — ws-01-workspace-level-token-webhook
 
 ## Current Position
 
-Phase: 29 (qa-idx-01-codebase-index-backed-q-a) — COMPLETE
-Plan: 9 of 9 complete
-Status: Phase 29 complete; v1.4 milestone continues with Phase 30 (ANNO-01) or Phase 31 (WS-01, can run in parallel per the dependency order), neither yet planned
-Last activity: 2026-07-30 — Task 3's blocking human-verify checkpoint approved by the developer after a same-day live UAT session against the real deployed instance: 11 real bugs/gaps found and fixed (subrequest-exhaustion retry, binary NULL-byte scan, stale-instance-id retry shared across all 3 trigger sites, fresh-instance-handoff lease release, missing TokenTracker method, Bitbucket per-repo model override, a pre-existing Bitbucket repo main-branch misconfiguration, a GitHub App webhook subscription missing the push event, and a Q&A retrieval ranking-quality gap fixed with a pinned regression test); both GitHub and Bitbucket confirmed working end-to-end for full builds, push-triggered incremental refresh, and Q&A retrieval in both toggle directions
+Phase: 31
+Plan: Not started
+Status: Phase complete — ready for verification
+Last activity: 2026-07-30 — Phase 31 complete
 
 ### Phase 27 Plan 27-01 Decisions (SEC-XDIFF-01)
 
@@ -94,6 +94,7 @@ Last activity: 2026-07-30 — Task 3's blocking human-verify checkpoint approved
 | Phase 12 P03 | 6min | 2 tasks | 6 files |
 | Phase 12 P04 | 5min | 3 tasks | 4 files |
 | Phase 12 P05 | 15min | 3 tasks | 3 files |
+| Phase 31 P03 | 45min | 2 tasks | 5 files |
 
 *Updated after each plan completion*
 | Phase 13 P01 | 9m | 2 tasks | 3 files |
@@ -136,6 +137,14 @@ Last activity: 2026-07-30 — Task 3's blocking human-verify checkpoint approved
 | Phase 29 P07 | 35 min | 2 tasks | 3 files |
 | Phase 29 P05 | 22min | 3 tasks | 9 files |
 | Phase 29 P08 | 14min | 2 tasks | 2 files |
+| Phase 30 P01 | 35min | 3 tasks | 6 files |
+| Phase 30 P02 | 30min | 2 tasks | 3 files |
+| Phase Phase 30 PP03 | 20min | 3 tasks tasks | 4 files files |
+| Phase 30 P04 | 25min | 2 tasks | 2 files |
+| Phase 31 P01 | 55min | 2 tasks | 9 files |
+| Phase 31 P02 | 40min | 2 tasks | 6 files |
+| Phase 31 P04 | 35min | 2 tasks | 4 files |
+| Phase 31 P05 | 22min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -268,6 +277,27 @@ Decisions carried from v1.1 execution (still load-bearing for v1.2 — Phase 14 
 - [Phase 29]: 29-09 UAT: two real-world configuration gaps, neither a Codra bug, both discovered only by live end-to-end testing: `reach`'s Bitbucket repo had its "Main branch" designation pointed at a leftover scratch branch instead of `main`; CodraApp's GitHub App had never subscribed to the `push` webhook event at the app level (zero deliveries, ever)
 - [Phase 29]: 29-09 UAT: Q&A retrieval ranking was weak for natural-language questions — `ts_rank_cd` has no IDF-like signal, so a near-universal reserved word (`function`, `return`) surviving into the OR-joined query could outrank the chunk containing the actually-distinctive identifier. Fixed via a new `CODE_VOCABULARY_STOPWORDS` set (reserved words/literals only, deliberately excluding generic-but-distinctive nouns like `get`/`id`/`data`), pinned with a regression test, and re-verified live in production against the exact repo/file that originally failed
 - [Phase 29]: 29-09: Task 3's blocking human-verify checkpoint closed via real production UAT rather than mocks — every sub-check (full build both providers, Q&A retrieval both providers both toggle directions, push-triggered incremental refresh both providers, A2 payload confirmation) verified against the live deployed instance, not `npm test` alone
+- [Phase ?]: ANNO-01: report_id = codra-annotations, config key = review.bitbucket.annotations_enabled (confirmed at Task 1 checkpoint)
+- [Phase ?]: 30-02: deleteCodeInsightsReport swallows 404-only (not 410) -- Bitbucket's DELETE report endpoint is not documented to also return 410
+- [Phase ?]: 30-02: no accumulate-across-rounds mechanism at the client level (D-09) -- only delete-whole-report + plain bulk-POST exist
+- [Phase ?]: 30-03: buildDedupIndex widened Set->Map so both submitReview branches (fresh+dedup-matched) populate postedComments with a link (D-11 Pitfall 1 fix)
+- [Phase ?]: 30-03: postAnnotations does not catch its own errors -- fail-open is the caller's (Plan 30-04) responsibility
+- [Phase ?]: 30-03: external_id includes a fnv1aHash(finding.title) suffix so two findings sharing (path,line,category) with different titles never collide (OpenCode Concern #4)
+- [Phase ?]: 30-03: postAnnotations uses a FIFO-per-key join against postedComments, depending on Plan 30-04 passing the SAME finalComments array to both submitReview and postAnnotations
+- [Phase ?]: Phase 30 Plan 04: Explicitly typed the existingReview ?? submitReview() 'review' declaration -- TS's union-reduction silently collapses { ref } | { ref; postedComments? } to { ref }, defeating an 'in' guard (would type the property unknown)
+- [Phase ?]: Phase 30 Plan 04: no vcs.name === 'bitbucket' check at the postAnnotations call site -- mirrors the existing vcs.labels feature-detect convention exactly
+- [Phase 30]: 30 UAT Test 1: Assumption A1 (Bitbucket report-DELETE cascades to child annotations) CONFIRMED live against the connected repo (thomas_michnicki/reach), 2026-07-30. No live encryption key was available locally to decrypt the stored bot credential (local `.env` key ≠ the deployed Worker's `LLM_CONFIG_ENCRYPTION_KEY`, which the developer no longer has), so verification ran via a temporary session-gated debug route deployed to the live Worker (used the already-decrypted credential server-side, returned only status codes/booleans, removed + redeployed immediately after). Result: PUT report → POST annotation → DELETE report → GET report (404) → GET annotations (404). D-09's full-replace design is confirmed safe.
+- [Phase 31]: 31-01: listWorkspaceRepositories fails CLOSED on page-cap/later-page/SSRF-guard failure (never a partial array) — A partial repo list would silently hide real repos from the onboarding picker
+- [Phase 31]: 31-01: requestRaw preserves request()'s retry/timeout/tracker machinery for a response-supplied absolute next-link, applied to EVERY page not just the first — Closes OpenCode HIGH review finding that the prior absolute-URL-fetch approach lost retry parity
+- [Phase 31]: 31-01: alreadyOnboarded computed via a lowercased slug match against repositories.repo — Bitbucket's returned slug casing is not guaranteed lowercase (Antigravity review finding)
+- [Phase 31]: 31-02: No secondary index on vcs_workspace_credentials -- every reader filters on (vcs_provider, workspace) together, verified by grep, so the UNIQUE constraint's own index already serves every lookup
+- [Phase 31]: 31-02: resolveBitbucketBotCredential short-circuits (per-repo wins, D-03); resolveBitbucketWebhookSecretCandidates always queries both sources via Promise.all -- deliberately different control-flow shapes for different consumers
+- [Phase 31]: 31-03: webhook creation kept OUTSIDE queryTransaction (external HTTP call), distinct 502 on post-commit failure (T-31-03-06), never a compensating rollback — D-06 resubmission is safe-by-construction; partial state (credential+repos saved, no webhook) causes zero incorrect review behavior
+- [Phase 31]: 31-03: concurrent-request DB race proven safe (row-count + updated_at > created_at via SQL bool_and, not JS Date, to avoid millisecond-precision false-equality); webhook-subscription duplication under the same race is an accepted, documented risk (T-31-03-05)
+- [Phase 31]: 31-04: webhook Step 5-7 loops over ALL resolveBitbucketWebhookSecretCandidates results, decrypting+verifying each in turn (catch-and-continue on decrypt failure), stopping at the first HMAC match; zero candidates still returns the byte-identical 'Webhook secret not configured.' 401 (NREG-01)
+- [Phase 31]: 31-04: BitbucketAdapter.create's existing null/encryptedAccessToken guard and decryptSecret call needed zero changes to consume resolveBitbucketBotCredential's union return type -- both VcsCredentialSecret and VcsWorkspaceCredentialSecret share encryptedAccessToken
+- [Phase 31]: 31-05: Checkbox's Check icon must be a direct sibling of the native input (not nested inside the styled square div) -- Tailwind's peer-checked general-sibling selector only matches true DOM siblings of the peer, not descendants of another sibling
+- [Phase 31]: 31-05: selectedRepoSlugs submitted as Array.from(selectedSlugs).sort(), not raw Set insertion order, for a deterministic finalize payload regardless of check order
 
 ### Roadmap Evolution
 
@@ -281,6 +311,7 @@ Decisions carried from v1.1 execution (still load-bearing for v1.2 — Phase 14 
 
 ### Roadmap Evolution
 
+- Phase 30 complete (2026-07-30): 4/4 plans; ANNO-01 satisfied. UAT Test 1 (Assumption A1 — Bitbucket report-DELETE cascade) confirmed live against the connected repo via a temporary session-gated debug route (removed after use, two clean deploys) since the deployed Worker's encryption key is no longer known locally. Security review (`/gsd-secure-phase 30`): 17 threats registered across the 4 plans' threat models (register authored at plan time, ASVS L1), all closed — 12 by verified in-code/in-test mitigation, 5 by documented accepted risk (see 30-SECURITY.md).
 - Phase 29 complete (2026-07-30): 9/9 plans; QA-IDX-01 satisfied. Task 3's blocking human-verify checkpoint (29-09) closed via a real same-day production UAT session (deploy + real GitHub + real Bitbucket repositories) rather than mocks: full index build, push-triggered incremental refresh, and Q&A retrieval (both toggle directions) all confirmed on BOTH providers. 11 real bugs/gaps found and fixed along the way, including two that were pre-existing misconfigurations outside Codra's code (a Bitbucket repo's main-branch designation; a GitHub App's missing push-event subscription) and one cross-provider Q&A ranking-quality issue (fixed with a pinned regression test). Developer sign-off: "approved". See `.planning/phases/29-qa-idx-01-codebase-index-backed-q-a/29-09-SUMMARY.md`.
 - Phase 28 complete (2026-07-27): 4/4 plans; UAT 6/6; verification `passed` (29/29 must-haves). Tests 1/3/4/6 were closed by automation rather than manual observation at the user's request — 3 new/extended specs (27 tests), all mutation-verified. One leg is deliberately recorded as un-run, not verified: live end-to-end suppression on a real GitHub PR.
 - Phase 26 complete (landed 2026-07-26, closed out 2026-07-29): 2/2 plans; verification `passed` (10/10 must-haves, EVID-02 satisfied). Safe-resume closeout — executors never wrote SUMMARY.md files, so ROADMAP/REQUIREMENTS tracking stayed stale until the summaries were authored retroactively from commits 6c4256b..a891d02 + 26-VERIFICATION.md; no code re-executed. Includes post-plan deviation fix a891d02 (migration 015 persists existing_code for immutable finalize re-checks).
@@ -297,7 +328,7 @@ Decisions carried from v1.1 execution (still load-bearing for v1.2 — Phase 14 
 
 ### Pending Todos
 
-- WR-01 (evidence_missing ring-buffer bound) — see Deferred Items table; tracked separately at `.planning/todos/pending/wr01-evidence-missing-ring-buffer-bound.md`
+(none — WR-01 resolved by v1.3 Phases 21-23, marked completed 2026-07-31)
 
 ### Blockers/Concerns
 
@@ -306,6 +337,7 @@ Decisions carried from v1.1 execution (still load-bearing for v1.2 — Phase 14 
 - [Bookkeeping] Phase 26 (EVID-02) has 2 PLAN files and ZERO SUMMARY files, yet the code ships and `test/review-flow.spec.ts` "evidence hard-drop" passes — its ROADMAP plan boxes are still `[ ]` and it reads as `0/2 plans complete`. Phase 28 depended on it and is now closed, so the roadmap understates real progress. Needs reconciling before milestone close (surfaced during Phase 28 verification, 2026-07-27; not touched then, since inventing summaries after the fact would be worse than the gap).
 - [Bookkeeping] STATE `progress:` counters (total_phases 10 / completed_phases 6 / total_plans 12 / completed_plans 10) disagree with `progress.bar` (12/14 plans) and with v1.4's actual scope (phases 26-31 = 6 phases, 2 complete). Left as-is at the 28→29 transition rather than guessed at — the intended counting scope is ambiguous. See MEMORY.md "milestone-complete CLI undercounts".
 - [Audit] v1.2 milestone audit re-run on 2026-07-25 promoted status from `gaps_found` to `passed`; AUD-01 human acknowledgment signed (Thomas Michnicki, 2026-07-25); 13-UAT.md carries authentic signature/date pair. MILESTONES.md v1.2 shipped entry repaired after the CLI undercounted decimal Phase 20.1.
+- [Env] The `LLM_CONFIG_ENCRYPTION_KEY` set on the deployed Worker (`codra.tmichnicki.workers.dev`, via `wrangler secret put`) is no longer known locally — it differs from the value in local `.env` (dev-only) and cannot be retrieved from Cloudflare once set. Any future task needing to decrypt a stored secret (VCS credentials, LLM API keys) from OUTSIDE the Worker will hit the same wall; the workaround used for the Phase 30 UAT (a temporary session-gated debug route run server-side, then removed) is the reusable pattern.
 
 ### Quick Tasks Completed
 
@@ -339,12 +371,13 @@ Items acknowledged and carried forward:
 
 ## Session Continuity
 
-Last session: 2026-07-30T06:10:00.000Z
-Stopped at: Completed 29-09-PLAN.md (Phase 29 complete)
+Last session: 2026-07-30T17:16:03.053Z
+Stopped at: Completed 31-04-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
 
-- Phase 29 (QA-IDX-01) is complete — no further action needed on it.
-- Neither Phase 30 (ANNO-01, Bitbucket Code Insights annotations) nor Phase 31 (WS-01, workspace-level token/webhook) is planned yet (`Plans: TBD` in ROADMAP.md). Per the dependency order (`... → QA-IDX-01 → ANNO-01 ∥ WS-01`), either can be planned next — they can run in parallel. Start with `/gsd-plan-phase 30` or `/gsd-plan-phase 31`.
-- Two pre-existing bookkeeping items remain unrelated to Phase 29 (see Blockers/Concerns): LRN-01/Phase 28's stale `Planned` traceability status, and the ambiguous STATE `progress:` counter scope — both flagged for reconciliation before v1.4's milestone close, not touched here to avoid guessing at their intended semantics.
+- Phase 29 (QA-IDX-01) and Phase 30 (ANNO-01) are both complete — no further action needed on either.
+- Phase 31 (WS-01, workspace-level token/webhook) is not planned yet (`Plans: TBD` in ROADMAP.md) — the only remaining v1.4 phase. Start with `/gsd-plan-phase 31`.
+- Two pre-existing bookkeeping items remain unrelated to Phase 30 (see Blockers/Concerns): LRN-01/Phase 28's stale `Planned` traceability status, and the ambiguous STATE `progress:` counter scope — both flagged for reconciliation before v1.4's milestone close, not touched here to avoid guessing at their intended semantics.
+- [Env] If a future task needs to decrypt a stored secret from outside the deployed Worker, the local `.env`'s `LLM_CONFIG_ENCRYPTION_KEY` will NOT match — see Blockers/Concerns.
