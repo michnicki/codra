@@ -199,6 +199,139 @@ describe('D-07: fileReviewPassSchema value-set and fileReviewRecordSchema.pass d
   });
 });
 
+describe('D-07: config-default drift detection', () => {
+  // Per-field assertions for ALL leaf nodes of repoConfigSchema.parse({}). If a developer adds a
+  // new config key with a .default() at the field level but forgets to mirror it in the enclosing
+  // block .default({...}) or the top-level review.default({...}), this test catches the omission.
+
+  it('every top-level review leaf matches expected default', () => {
+    const cfg = repoConfigSchema.parse({});
+
+    // Top-level review scalars
+    expect(cfg.review.on).toEqual(['opened', 'synchronize', 'ready_for_review', 'reopened']);
+    expect(cfg.review.ignore_drafts).toBe(true);
+    expect(cfg.review.mention_trigger).toBe('@codra-app');
+    expect(cfg.review.skip_files).toEqual(['**/*.lock', 'dist/**', 'build/**', '.next/**', '*.generated.*', 'coverage/**']);
+    expect(cfg.review.max_files).toBe(150);
+    expect(cfg.review.large_file_threshold_lines).toBe(200);
+    expect(cfg.review.max_diff_lines_per_file).toBe(800);
+    expect(cfg.review.max_total_diff_chars).toBe(150_000);
+    expect(cfg.review.max_comments).toBe(10);
+    expect(cfg.review.min_severity).toBe('nit');
+    expect(cfg.review.min_confidence).toBe(0.7);
+    expect(cfg.review.focus).toEqual(['security', 'bugs', 'performance', 'correctness', 'quality']);
+    expect(cfg.review.custom_rules).toEqual([]);
+    expect(cfg.review.labels).toEqual({ p1: 'review: needs-attention', p2: 'review: approved', p3: 'review: approved' });
+  });
+
+  it('exec defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.exec.enabled).toBe(false);
+    expect(cfg.review.exec.on_file_types).toEqual(['.ts', '.tsx', '.js']);
+    expect(cfg.review.exec.command).toBe('npm run lint && npm run typecheck');
+  });
+
+  it('walkthrough defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.walkthrough.enabled).toBe(false);
+    expect(cfg.review.walkthrough.sequence_diagram.enabled).toBe(true);
+  });
+
+  it('passes.security defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.passes.security.enabled).toBe(false);
+    expect(cfg.review.passes.security.cross_file).toBe(false);
+  });
+
+  it('passes.critic defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.passes.critic.enabled).toBe(false);
+  });
+
+  it('passes.ensemble defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.passes.ensemble.runs).toBe(1);
+    expect(cfg.review.passes.ensemble.temperature).toBe(0.7);
+  });
+
+  it('interactive.commands defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.interactive.commands.enabled).toBe(false);
+    expect(cfg.review.interactive.commands.bitbucket_allowed_account_ids).toEqual([]);
+    expect(cfg.review.interactive.commands.bitbucket_bot_account_id).toBeNull();
+  });
+
+  it('interactive.qa defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.interactive.qa.enabled).toBe(false);
+    expect(cfg.review.interactive.qa.rate_limit_per_hour).toBe(10);
+  });
+
+  it('interactive.qa.index defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.interactive.qa.index.enabled).toBe(false);
+    expect(cfg.review.interactive.qa.index.max_files).toBe(500);
+    expect(cfg.review.interactive.qa.index.chunk_lines).toBe(50);
+    expect(cfg.review.interactive.qa.index.top_k).toBe(8);
+  });
+
+  it('severity_engine defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.severity_engine.enabled).toBe(true);
+  });
+
+  it('dedup defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.dedup.enabled).toBe(true);
+  });
+
+  it('file_selection defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.file_selection.enabled).toBe(true);
+  });
+
+  it('category_confidence defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.category_confidence).toEqual({});
+  });
+
+  it('threads defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.threads.verify_fixes).toBe(false);
+    expect(cfg.review.threads.auto_resolve).toBe(false);
+  });
+
+  it('rounds defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.rounds.incremental).toBe(false);
+    expect(cfg.review.rounds.escalate_floors).toBe(true);
+  });
+
+  it('evidence defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.evidence.hard_drop).toBe(false);
+    expect(cfg.review.evidence.hard_drop_exempt_categories).toEqual(['security']);
+  });
+
+  it('learning defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.learning.enabled).toBe(false);
+    expect(cfg.review.learning.learned_rules).toEqual([]);
+  });
+
+  it('bitbucket defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.bitbucket.annotations_enabled).toBe(false);
+  });
+
+  it('model defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.model.main).toBeNull();
+    expect(cfg.model.fallbacks).toEqual([]);
+    expect(cfg.model.size_overrides).toEqual([]);
+  });
+});
+
 describe('SC2 review-fix: a stray phase:"critic" message is rejected at the boundary, never run', () => {
   it('runReviewJob acks a phase:"critic" message before any DB access', async () => {
     // DB-free: resolveQueuedJob rejects requestedPhase === 'critic' (warn + return null) BEFORE
