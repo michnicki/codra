@@ -34,7 +34,7 @@ Plans:
 **Goal:** New LLM pass that sees the entire PR diff and reasons about security implications across file boundaries — e.g., auth middleware change + new unprotected route. Findings enter dedup → critic → post pipeline. Subject to subrequest budget.
 **Requirements**: SEC-XDIFF-01
 **Depends on:** Phase 26 (benefits from EVID-02 hard-drop being in place, structurally independent)
-**Plans:** 2/2 plans complete
+**Plans:** 3/3 plans complete
 
 Plans:
 
@@ -140,23 +140,23 @@ Plans:
 **Goal:** Workspace Access Token + workspace-level webhook auto-discovers repos in a Bitbucket workspace. Reduces per-repo onboarding friction to "add workspace, select repos." Dashboard workspace management UI. Bitbucket-only.
 **Requirements**: WS-01
 **Depends on:** v1.0 Bitbucket adapter (can run parallel with Phase 30)
-**Plans:** 5 plans
+**Plans:** 5/5 plans complete
 
 Plans:
 
 **Wave 1**
 
-- [ ] 31-01-PLAN.md — Tracer: live "discover a Bitbucket workspace's repos" flow end-to-end (dashboard form → new endpoint → BitbucketClient → DB-read annotation), read-only, no persistence
-- [ ] 31-02-PLAN.md — vcs_workspace_credentials table + DB module (mirrors vcs_credentials) + shared bitbucket-credential-resolution helper (D-03 precedence + webhook-candidate list)
+- [x] 31-01-PLAN.md — Tracer: live "discover a Bitbucket workspace's repos" flow end-to-end (dashboard form → new endpoint → BitbucketClient → DB-read annotation), read-only, no persistence
+- [x] 31-02-PLAN.md — vcs_workspace_credentials table + DB module (mirrors vcs_credentials) + shared bitbucket-credential-resolution helper (D-03 precedence + webhook-candidate list)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 31-03-PLAN.md — Transactional finalize endpoint: encrypt + persist workspace credential, onboard only selected repos, idempotent workspace webhook creation (D-06/D-07)
-- [ ] 31-04-PLAN.md — Webhook route credential-resolution widening (tries both candidate secrets) + BitbucketAdapter.create bot-credential resolution (D-03) + D-07 regression test
+- [x] 31-03-PLAN.md — Transactional finalize endpoint: encrypt + persist workspace credential, onboard only selected repos, idempotent workspace webhook creation (D-06/D-07)
+- [x] 31-04-PLAN.md — Webhook route credential-resolution widening (tries both candidate secrets) + BitbucketAdapter.create bot-credential resolution (D-03) + D-07 regression test
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 31-05-PLAN.md — Interactive Step 2 checklist UI (hand-rolled Checkbox, select/deselect, already-onboarded badges) wired to the finalize endpoint
+- [x] 31-05-PLAN.md — Interactive Step 2 checklist UI (hand-rolled Checkbox, select/deselect, already-onboarded badges) wired to the finalize endpoint
 
 <details>
 <summary>✅ v1.3 Bounded Evidence Audit Telemetry (Phases 21-25) — SHIPPED 2026-07-26</summary>
@@ -223,3 +223,27 @@ Plans:
 - [x] 25-01-PLAN.md — Full closeout sequence: Nyquist validation (4 phases), formal milestone audit, human sign-off checkpoint, archive v1.3, prepare v1.4
 
 </details>
+
+### Phase 32: Address v1.4 tech debt — audit viewer renderer, misleading middleware comment, hardcoded type unions, test-hygiene improvements, integration test gap, and stale planning docs
+
+**Goal:** Address v1.4 tech debt — audit viewer renderer verification, misleading middleware comment correction, hardcoded type union replacement, test-hygiene improvements, integration test gap closure, logger redaction hardening, broken migration script deletion, and stale planning doc reconciliation.
+**Requirements**: TECHDEBT-32
+**Depends on:** Phase 31
+**Plans:** 6/6 plans complete
+
+Plans:
+
+**Wave 1**
+
+- [x] 32-01-PLAN.md — Mechanical code fixes: replace hardcoded type union with FileReviewPass + correct misleading middleware comments
+- [x] 32-02-PLAN.md — Test additions: nextPhaseAfterCrossFileSecurity selector coverage + config-default drift detection
+- [x] 32-03-PLAN.md — Delete orphan migration script + logger redaction hardening + verify D-10
+
+**Wave 2**
+
+- [x] 32-04-PLAN.md — WS-01 warnings: webhook URL fix with APP_URL guard + repo-slug accepted risk + unused exports
+- [x] 32-05-PLAN.md — Verify D-01 audit viewer + mock withRetry delays in slow tests
+
+**Wave 3** *(blocked on Wave 1+2 completion)*
+
+- [x] 32-06-PLAN.md — Stale planning docs full sweep: ROADMAP, REQUIREMENTS, STATE, PROJECT, CONCERNS
