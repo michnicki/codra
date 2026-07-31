@@ -33,9 +33,9 @@
 
 ### Wave 4 — Bitbucket Differentiators
 
-- [ ] **ANNO-01**: Per-line Code Insights annotations (diff-gutter markers) on Bitbucket Cloud PRs. Mirror inline review comments as Bitbucket Code Insights `ANNOTATION` reports — gutter-level severity markers (P0=severe red, P1=orange, P2=yellow, P3/nit=blue-gray) on the affected lines. Separate from the existing `CodeInsightsReport` (summary). Bitbucket-only capability (NREG-02: GitHub doesn't need this — they have inline comments directly). Config-gated (`bitbucket.annotations_enabled`, default off).
+- [x] **ANNO-01**: Per-line Code Insights annotations (diff-gutter markers) on Bitbucket Cloud PRs. Mirror inline review comments as Bitbucket Code Insights `ANNOTATION` reports — gutter-level severity markers (P0=severe red, P1=orange, P2=yellow, P3/nit=blue-gray) on the affected lines. Separate from the existing `CodeInsightsReport` (summary). Bitbucket-only capability (NREG-02: GitHub doesn't need this — they have inline comments directly). Config-gated (`bitbucket.annotations_enabled`, default off).
 
-- [ ] **WS-01**: Workspace-level token/webhook covering many repos. Today each Bitbucket repo needs its own Repository Access Token + webhook subscription. This requirement adds a Workspace Access Token + workspace-level webhook that auto-discovers repos in the workspace — reducing per-repo onboarding friction to "add workspace, select repos." Token stored in the existing AES-GCM encrypted credential store. Dashboard workspace management UI. Bitbucket-only. Config-gated (token scoping is workspace-level by nature).
+- [x] **WS-01**: Workspace-level token/webhook covering many repos. Today each Bitbucket repo needs its own Repository Access Token + webhook subscription. This requirement adds a Workspace Access Token + workspace-level webhook that auto-discovers repos in the workspace — reducing per-repo onboarding friction to "add workspace, select repos." Token stored in the existing AES-GCM encrypted credential store. Dashboard workspace management UI. Bitbucket-only. Config-gated (token scoping is workspace-level by nature).
 
 ## Traceability
 
@@ -43,10 +43,10 @@
 |-------------|-------|--------|
 | EVID-02 | Phase 26 | Done |
 | SEC-XDIFF-01 | Phase 27 | Done |
-| LRN-01 | Phase 28 | Planned |
+| LRN-01 | Phase 28 | Done |
 | QA-IDX-01 | Phase 29 | Done |
-| ANNO-01 | Phase 30 | Planned |
-| WS-01 | Phase 31 | Planned |
+| ANNO-01 | Phase 30 | Done |
+| WS-01 | Phase 31 | Done |
 
 ## Out of Scope
 
