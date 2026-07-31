@@ -567,6 +567,8 @@ describe('ModelService', () => {
             evidence: { hard_drop: false, hard_drop_exempt_categories: ['security'] },
             learning: { enabled: false, learned_rules: [] },
             bitbucket: { annotations_enabled: false },
+            file_history: { enabled: false },
+            yaml_config: { enabled: false },
           },
           model: {
             main: '@cf/zai-org/glm-4.7-flash',
