@@ -29,6 +29,8 @@ const EMBEDDED_SECRET_PATTERNS: RegExp[] = [
   /github_pat_[A-Za-z0-9_]{20,}/g, // GitHub fine-grained PAT
   /xox[baprs]-[A-Za-z0-9-]{10,}/g, // Slack tokens
   /AKIA[0-9A-Z]{16}/g, // AWS access key id
+  /AIza[0-9A-Za-z_-]{20,}/g, // Google AI API keys
+  /ATCTT[A-Za-z0-9_=-]{20,}/g, // Bitbucket app passwords / access tokens
 ];
 
 function scrubEmbeddedSecrets(value: string): string {
@@ -78,7 +80,7 @@ export class Logger {
     const output = {
       timestamp: new Date().toISOString(),
       level,
-      message,
+      message: scrubEmbeddedSecrets(message),
       // Ambient store and logger context are attacker-influenced (they carry request/job values
       // and withContext/runWithContext data), so they must pass through the same redaction as
       // `data` — otherwise a Bearer token or key threaded into context would be logged verbatim.
