@@ -14,7 +14,7 @@ const ev = (stage: JobAuditEvent['stage'], timestamp = '2026-01-01T00:00:00Z') =
   ({ stage, timestamp } as unknown as JobAuditEvent);
 
 describe('STAGE_ORDER', () => {
-  it('is the fixed twelve-stage order including learned_rule_suppressed, rounds, threads, critic, ensemble, and walkthrough', () => {
+  it('is the fixed thirteen-stage order including learned_rule_suppressed, rounds, threads, critic, ensemble, walkthrough, and inline_comment_skipped', () => {
     expect(STAGE_ORDER).toEqual([
       'file_skipped',
       'drafted',
@@ -29,6 +29,8 @@ describe('STAGE_ORDER', () => {
       'critic',
       'ensemble',
       'walkthrough',
+      // Phase 33 (PRD-01 / FR-031, D-03/D-04) appended this at the end.
+      'inline_comment_skipped',
     ]);
   });
 });
@@ -250,5 +252,23 @@ describe('Phase 28 (LRN-01) / G-28-4 — learned_rule_suppressed is its own disp
   it('still collapses evidence_hard_dropped and evidence_missing_summary into evidence_missing', () => {
     expect(normalizeAuditDisplayStage('evidence_hard_dropped')).toBe('evidence_missing');
     expect(normalizeAuditDisplayStage('evidence_missing_summary')).toBe('evidence_missing');
+  });
+});
+
+describe('Phase 33 (PRD-01 / FR-031, D-03/D-04) — inline_comment_skipped is its own display group', () => {
+  it('normalizes inline_comment_skipped to itself (own group, appended after walkthrough)', () => {
+    expect(normalizeAuditDisplayStage('inline_comment_skipped')).toBe('inline_comment_skipped');
+  });
+
+  it('places the inline_comment_skipped group last, after walkthrough, regardless of arrival order', () => {
+    const walkthrough = ev('walkthrough.enrichment', '2026-01-01T00:00:01Z');
+    const skipped = ev('inline_comment_skipped', '2026-01-01T00:00:02Z');
+
+    const groups = groupAuditByStage([skipped, walkthrough]);
+
+    expect(groups.map((g) => g.stage)).toEqual(['walkthrough', 'inline_comment_skipped']);
+    const skipGroup = groups.find((g) => g.stage === 'inline_comment_skipped')!;
+    expect(skipGroup.count).toBe(1);
+    expect(skipGroup.events).toEqual([skipped]);
   });
 });

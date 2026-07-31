@@ -1368,6 +1368,25 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
       timestamp: dateStringSchema,
     })
     .passthrough(),
+  // Phase 33 (PRD-01 / FR-031, D-03/D-04): inline_comment_skipped audit event. AGGREGATE — one event
+  // per review round when inline comments were skipped (422 or budget exhaustion) at posting.
+  // `count` is the FULL total; the sample is capped at 20 (INLINE_COMMENT_SKIPPED_SAMPLE_CAP).
+  // Sample identifiers admit ONLY { path, line, title } (T-13-03-03) and titles route through
+  // redactFindingTitle at production time (AUD-01); never body/existingCode/codeSuggestion.
+  z
+    .object({
+      stage: z.literal('inline_comment_skipped'),
+      count: z.number().int(),
+      sample: z.array(
+        z.object({
+          path: z.string(),
+          line: z.number().nullable().optional(),
+          title: z.string().max(100),
+        }),
+      ).max(20),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
 ]);
 export type JobAuditEvent = z.infer<typeof jobAuditEventSchema>;
 

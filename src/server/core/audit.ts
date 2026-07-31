@@ -742,6 +742,56 @@ export function buildLearnedRuleSuppressedEvent(
   return event satisfies JobAuditEvent;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 33 (PRD-01 / FR-031, D-03/D-04) — bounded inline_comment_skipped audit builder.
+//
+// ONE aggregate event per review round when inline comments were skipped (per-comment 422 or
+// budget exhaustion) at posting. Consumes the `skippedComments` seam Plan 33-01 produced on
+// the widened VcsProvider.submitReview return. Follows the learned_rule_suppressed precedent.
+// ---------------------------------------------------------------------------
+
+/** Sample cap for inline_comment_skipped events — matches the other aggregate builders. */
+export const INLINE_COMMENT_SKIPPED_SAMPLE_CAP = 20;
+
+export type InlineCommentSkippedAuditEvent = Extract<JobAuditEvent, { stage: 'inline_comment_skipped' }>;
+
+/**
+ * PURE inline-comment-skipped audit builder (D-03/D-04).
+ * Derives ONE `inline_comment_skipped` event from an array of skipped-comment identifiers.
+ * Returns null when skipped is empty (no zero-count event for a clean round).
+ *
+ * count reflects the FULL total passed in, NOT the capped sample length. The sample is bounded
+ * to at most `INLINE_COMMENT_SKIPPED_SAMPLE_CAP` (20) entries.
+ *
+ * The param type is deliberately STRUCTURAL (NOT `VcsSkippedComment`) so `core/audit.ts` gains
+ * no import from `vcs/types`; `VcsSkippedComment` is structurally assignable.
+ *
+ * Privacy boundary (T-13-03-03): sample identifiers admit ONLY { path, line, title } — never
+ * body/existingCode/codeSuggestion — and titles pass through `redactFindingTitle` (AUD-01).
+ */
+export function buildInlineCommentSkippedEvent(
+  skipped: Array<{ path: string; line?: number | null; title?: string }>,
+): InlineCommentSkippedAuditEvent | null {
+  if (skipped.length === 0) return null;
+
+  const sample = skipped.slice(0, INLINE_COMMENT_SKIPPED_SAMPLE_CAP).map((s) => ({
+    path: s.path,
+    line: s.line ?? null,
+    title: redactFindingTitle(s.title),
+  }));
+
+  const event = {
+    stage: 'inline_comment_skipped' as const,
+    count: skipped.length,
+    sample,
+    timestamp: new Date().toISOString(),
+  };
+
+  // `satisfies` is a compile-time check — if the literal ever diverges from the `JobAuditEvent`
+  // union member, TypeScript rejects at compile time rather than silently widening.
+  return event satisfies JobAuditEvent;
+}
+
 /**
  * Phase 20 (D-04): bounded best-effort recorder for the `walkthrough.enrichment` audit variant.
  * Mirrors `recordEnsembleAudit` / `recordCriticAudit` EXACTLY: try/catch, defensive timestamp

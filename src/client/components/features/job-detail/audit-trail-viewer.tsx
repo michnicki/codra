@@ -25,6 +25,8 @@ const STAGE_LABELS: Record<AuditStageGroup['stage'], string> = {
   critic: 'Critic',
   ensemble: 'Ensemble',
   walkthrough: 'Walkthrough enrichment',
+  // Phase 33 (PRD-01 / FR-031, D-03/D-04): posting-boundary aggregate event.
+  inline_comment_skipped: 'Inline comments skipped',
 };
 
 // A count pill mirroring the job-findings-list / critic-panel count-badge idiom.
@@ -234,6 +236,26 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
                   <div className="text-[10px] text-muted-foreground/70 font-mono break-all">
                     rule {s.matched_rule}
                   </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </li>
+      );
+    // Phase 33 (PRD-01 / FR-031, D-03/D-04): inline_comment_skipped aggregate event — one event
+    // per review round when inline comments were skipped (per-comment 422 or budget exhaustion)
+    // at posting. `count` is the FULL total, NOT the (max-20) sample length. Mirrors the
+    // learned_rule_suppressed row layout but reports a plain count + { path, line, title } sample
+    // (T-13-03-03 identifiers only — titles already redacted at build time, AUD-01).
+    case 'inline_comment_skipped':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="skipped" value={String(event.count)} />
+          {event.sample.length > 0 && (
+            <ul className="mt-2 flex flex-col gap-1.5 border-t border-border/30 pt-2">
+              {event.sample.map((s, i) => (
+                <li key={i}>
+                  <SampleIdentifier path={s.path} line={s.line} title={s.title} />
                 </li>
               ))}
             </ul>
