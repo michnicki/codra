@@ -15,6 +15,7 @@ import { defaultRepoConfig, type RepoConfig } from '@shared/schema';
 import {
   maybeRouteToWalkthroughEnrichment,
   nextPhaseAfterCritic,
+  nextPhaseAfterCrossFileSecurity,
   nextPhaseAfterReview,
   nextPhaseAfterVerifyFixes,
 } from '@server/core/phase-routing';
@@ -148,6 +149,36 @@ describe('phase-routing: maybeRouteToWalkthroughEnrichment', () => {
   });
 });
 
+describe('phase-routing: nextPhaseAfterCrossFileSecurity', () => {
+  it('returns finalize at v1.4 defaults (NREG-01 byte-identity)', () => {
+    expect(nextPhaseAfterCrossFileSecurity(defaultRepoConfig)).toBe('finalize');
+  });
+
+  // Addresses review concern: add verify_fixes toggle test case (OpenCode LOW)
+  it('returns verify_fixes when only verify_fixes is on', () => {
+    expect(nextPhaseAfterCrossFileSecurity(verifyFixesOn(defaultRepoConfig))).toBe('verify_fixes');
+  });
+
+  it('returns critic when only critic is on', () => {
+    expect(nextPhaseAfterCrossFileSecurity(criticOn(defaultRepoConfig))).toBe('critic');
+  });
+
+  it('returns walkthrough_enrichment when only walkthrough is on', () => {
+    expect(nextPhaseAfterCrossFileSecurity(walkthroughOn(defaultRepoConfig))).toBe('walkthrough_enrichment');
+  });
+
+  it('returns verify_fixes at all-v1.4-toggles-on', () => {
+    expect(
+      nextPhaseAfterCrossFileSecurity(verifyFixesOn(criticOn(walkthroughOn(defaultRepoConfig)))),
+    ).toBe('verify_fixes');
+  });
+
+  // Addresses review concern: test the cross_file OFF + verify_fixes ON case (OpenCode LOW)
+  it('cross_file off + verify_fixes on returns verify_fixes', () => {
+    expect(nextPhaseAfterCrossFileSecurity(verifyFixesOn(defaultRepoConfig))).toBe('verify_fixes');
+  });
+});
+
 describe('phase-routing: full chain at all-v1.2-toggles-on', () => {
   // Pins the chain order: review → verify_fixes → critic → walkthrough_enrichment → finalize.
   // The walkthrough_enrichment step itself ends with an internal hand-off to finalize (handled
@@ -157,5 +188,7 @@ describe('phase-routing: full chain at all-v1.2-toggles-on', () => {
     expect(nextPhaseAfterReview(allOn)).toBe('verify_fixes');
     expect(nextPhaseAfterVerifyFixes(allOn)).toBe('critic');
     expect(nextPhaseAfterCritic(allOn)).toBe('walkthrough_enrichment');
+    // SEC-XDIFF-01: cross_file_security feeds into the same chain as review.
+    expect(nextPhaseAfterCrossFileSecurity(allOn)).toBe('verify_fixes');
   });
 });
