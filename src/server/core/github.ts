@@ -96,6 +96,7 @@ export type GitHubReviewComment = {
   path: string;
   position?: number;
   body: string;
+  title?: string;
 };
 
 type GitHubIssueLabel = {
@@ -199,7 +200,7 @@ export class GitHubClient {
       'APP_KV' | 'APP_PRIVATE_KEY' | 'GITHUB_APP_ID' | 'BOT_USERNAME' | 'GITHUB_APP_SLUG'
     >,
     private readonly installationId: string,
-    private readonly tracker?: { incrementSubrequests(count?: number): void },
+    private readonly tracker?: { incrementSubrequests(count?: number): void; hasRemainingSafeBudget?(needed?: number): boolean },
   ) {}
 
   // In-memory token cache scoped to this client instance (i.e. one Worker invocation). Without it,
@@ -840,7 +841,7 @@ export class GitHubClient {
       body: string;
       comments: GitHubReviewComment[];
     },
-  ) {
+  ): Promise<{ id: number; skippedComments?: { path: string; position: number; title?: string }[] }> {
     return withRetry(`createReview ${owner}/${repo}#${pullNumber}`, async () => {
       const body = {
         commit_id: input.commitSha,
@@ -882,6 +883,61 @@ export class GitHubClient {
             comments: [],
           }),
         });
+
+        // FR-031 (D-01): the summary-only retry is the base; when it SUCCEEDS and there were
+        // inline comments, post each positioned comment individually. Worst case N+1 subrequests
+        // (1 summary retry + N per-comment posts), all tracker-accounted via `request()`/
+        // `requestAndCheck`. The `hasRemainingSafeBudget` guard (SAFE_MARGIN = 25,
+        // core/token-tracker.ts:20) stops the loop before the invocation budget is exhausted, so
+        // the fallback can never strand an already-posted summary review behind a
+        // "too many subrequests" failure.
+        if (response.ok && body.comments.length > 0) {
+          const skipped: { path: string; position: number; title?: string }[] = [];
+          const positionedComments = input.comments.filter(
+            (comment): comment is GitHubReviewComment & { position: number } => typeof comment.position === 'number',
+          );
+          for (let i = 0; i < positionedComments.length; i++) {
+            const comment = positionedComments[i];
+            if (this.tracker?.hasRemainingSafeBudget?.(1) === false) {
+              const remaining = positionedComments.length - i;
+              logger.warn(`GitHub per-comment review comment loop stopped: subrequest budget exhausted`, {
+                owner,
+                repo,
+                pullNumber,
+                reason: 'budget_exhausted',
+                remaining,
+              });
+              skipped.push(
+                ...positionedComments
+                  .slice(i)
+                  .map((c) => ({ path: c.path, position: c.position, title: c.title })),
+              );
+              break;
+            }
+            try {
+              await this.createReviewComment(owner, repo, pullNumber, input.commitSha, comment);
+            } catch (error) {
+              if (error instanceof GitHubError && error.status === 422) {
+                logger.warn(`GitHub per-comment review comment failed with 422, skipping`, {
+                  owner,
+                  repo,
+                  pullNumber,
+                  path: comment.path,
+                  position: comment.position,
+                  title: comment.title,
+                  reason: 'unprocessable',
+                });
+                skipped.push({ path: comment.path, position: comment.position, title: comment.title });
+              } else {
+                throw error;
+              }
+            }
+          }
+          if (skipped.length > 0) {
+            const review = (await response.json()) as { id: number };
+            return { id: review.id, skippedComments: skipped };
+          }
+        }
       }
 
       if (!response.ok) {
@@ -959,6 +1015,36 @@ export class GitHubClient {
         body: JSON.stringify({ body, in_reply_to: inReplyToId }),
       });
       return (await response.json()) as { id: number; user: { id: number; login: string } };
+    });
+  }
+
+  // Per-comment POST used by createReview's batch-422 fallback (FR-031, D-01). Mirrors
+  // createReviewCommentReply EXACTLY but targets the pull comments route with the comment's own
+  // anchor. `position` is REQUIRED at the signature level (`& { position: number }`): GitHub's
+  // review-comments API rejects a payload without it, and an undefined position would itself 422.
+  // The body is a fixed 4-key literal -- `title` is NEVER on the wire (GitHub rejects unknown
+  // keys on this endpoint), and no extraneous GitHubReviewComment property can reach it either.
+  async createReviewComment(
+    owner: string,
+    repo: string,
+    pullNumber: number,
+    commitSha: string,
+    comment: GitHubReviewComment & { position: number },
+  ): Promise<{ id: number }> {
+    return withRetry(`createReviewComment ${owner}/${repo}#${pullNumber}`, async () => {
+      const response = await this.requestAndCheck(`${repoApiPath(owner, repo)}/pulls/${pullNumber}/comments`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          body: comment.body,
+          commit_id: commitSha,
+          path: comment.path,
+          position: comment.position,
+        }),
+      });
+      return (await response.json()) as { id: number };
     });
   }
 

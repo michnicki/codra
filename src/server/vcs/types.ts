@@ -62,6 +62,7 @@ export type VcsReviewComment = {
   path: string;
   position?: number;
   body: string;
+  title?: string;
 };
 
 export type VcsSubmitReviewInput = {
@@ -84,6 +85,16 @@ export type VcsSubmitReviewInput = {
  * guaranteed present on every response shape.
  */
 export type VcsPostedComment = { path: string; line: number; body: string; link?: string };
+
+/**
+ * Phase 33 (PRD-01 / FR-031, D-03/D-04): populated when an inline comment was NOT posted during
+ * `submitReview` -- a per-comment 422 skip (GitHub + Bitbucket) or budget exhaustion (GitHub's
+ * per-comment fallback loop). `line` is the provider anchor coordinate (GitHub maps the client's
+ * `position` via `s.position ?? null`); `title` is the finding title for audit identifiers only
+ * and never reaches the wire. Consumers (Plan 33-03's aggregate audit event) admit ONLY
+ * { path, line, title } -- body never crosses this seam (T-13-03-03).
+ */
+export type VcsSkippedComment = { path: string; line: number | null; title?: string };
 
 /**
  * Phase 30 (ANNO-01): input to `postAnnotations?`. `postedComments` is OPTIONAL because a
@@ -321,7 +332,7 @@ export interface VcsProvider {
    */
   updateStatusCheck(owner: string, repo: string, ref: string, input: VcsUpdateStatusCheckInput): Promise<void>;
 
-  submitReview(owner: string, repo: string, prNumber: number, input: VcsSubmitReviewInput): Promise<{ ref: string; postedComments?: VcsPostedComment[] }>;
+  submitReview(owner: string, repo: string, prNumber: number, input: VcsSubmitReviewInput): Promise<{ ref: string; postedComments?: VcsPostedComment[]; skippedComments?: VcsSkippedComment[] }>;
   findExistingReviewForCommit(owner: string, repo: string, prNumber: number, commitSha: string): Promise<{ ref: string } | null>;
 
   /**

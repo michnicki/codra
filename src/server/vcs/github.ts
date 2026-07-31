@@ -7,6 +7,7 @@ import type {
   VcsProvider,
   VcsPullRequest,
   VcsReviewThread,
+  VcsSkippedComment,
   VcsSubmitReviewInput,
   VcsTreeListing,
   VcsUpdateStatusCheckInput,
@@ -297,7 +298,7 @@ export class GithubAdapter implements VcsProvider {
     repo: string,
     prNumber: number,
     input: VcsSubmitReviewInput,
-  ): Promise<{ ref: string }> {
+  ): Promise<{ ref: string; skippedComments?: VcsSkippedComment[] }> {
     // Relocated toReviewEvent (formerly services/formatter.ts:6-8).
     // REV-M-5: `jobIdHint` is intentionally IGNORED here -- the GitHub submitReview flow composes
     // a single createReview POST that does not embed the job id in its body. The field exists on
@@ -305,7 +306,7 @@ export class GithubAdapter implements VcsProvider {
     // marker+summary comment. Reference it once so the linter doesn't flag an unused parameter.
     void input.jobIdHint;
     const event = input.verdict === 'approve' ? ('APPROVE' as const) : ('COMMENT' as const);
-    const { id } = await this.gh.createReview(owner, repo, prNumber, {
+    const { id, skippedComments } = await this.gh.createReview(owner, repo, prNumber, {
       commitSha: input.commitSha,
       event,
       body: input.summaryBody,
@@ -316,7 +317,11 @@ export class GithubAdapter implements VcsProvider {
     if (typeof id !== 'number' || !Number.isFinite(id)) {
       throw new Error(`createReview returned a non-numeric id for ${owner}/${repo}#${prNumber}: ${String(id)}`);
     }
-    return { ref: String(id) };
+    // Phase 33 (FR-031, D-01): the client's per-comment fallback skips map `position` -> `line`
+    // (null when absent). Omitted entirely on a clean run so the returned shape stays
+    // byte-identical to the pre-Phase-33 contract (REVIEWS R1).
+    const skipped = skippedComments?.map((s) => ({ path: s.path, line: s.position ?? null, title: s.title }));
+    return skipped && skipped.length > 0 ? { ref: String(id), skippedComments: skipped } : { ref: String(id) };
   }
 
   async findExistingReviewForCommit(

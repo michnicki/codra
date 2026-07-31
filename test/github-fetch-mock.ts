@@ -10,6 +10,11 @@ export type RecordedGitHubCall = {
 
 export type ReviewResponseScript = Array<{ status: number; id?: number }>;
 
+/** Scripted status sequence for successive per-comment POSTs to /pulls/{n}/comments when the
+ * batch-422 fallback (FR-031) is under test. Mirrors the reviewResponses precedent; consumed only
+ * by the commit_id-discriminated branch of the shared comments route. */
+export type ReviewCommentResponseScript = Array<{ status: number; id?: number }>;
+
 /**
  * Body for any of the new mock fixtures (content/compare). `body` is whatever the adapter
  * expects to decode — a JSON object for `/contents`, a raw string for `/compare`.
@@ -52,6 +57,12 @@ export type GitHubFetchMockFixtures = {
   diff: string;
   /** Scripted status sequence for successive POST .../reviews calls. Defaults to a single 200. */
   reviewResponses?: ReviewResponseScript;
+  /** Scripted status sequence for successive per-comment POST .../pulls/{n}/comments calls when
+   * the batch-422 fallback (FR-031) is active. When supplied, the shared comments route reads the
+   * request body and discriminates: an `in_reply_to` body returns the reply default WITHOUT
+   * consuming the script (route discrimination keeps every existing reply spec byte-identical --
+   * REVIEWS R2/R11); a `commit_id` body consumes the script (last entry reused beyond the end). */
+  reviewCommentResponses?: ReviewCommentResponseScript;
   /** Comment id the POST /issues/{n}/comments route returns (and the PATCH default id). */
   commentId?: number;
   /** Comment id the net-new POST /pulls/{n}/comments (review-comment reply) route returns.
@@ -176,6 +187,8 @@ export function installGitHubFetchMock(fixtures: GitHubFetchMockFixtures) {
   const reviewsListPath = `${repoPrefix}/pulls/${fixtures.prNumber}/reviews`;
   const reviewResponses = fixtures.reviewResponses ?? [{ status: 200, id: 5150 }];
   let reviewCallIndex = 0;
+  const reviewCommentResponses = fixtures.reviewCommentResponses ?? [];
+  let reviewCommentCallIndex = 0;
 
   // Issue-comment fixtures (net-new routes). Defaults are chosen so commentUserId != any login
   // string, letting the adapter spec prove author.id comes from the immutable numeric user id.
@@ -356,7 +369,35 @@ export function installGitHubFetchMock(fixtures: GitHubFetchMockFixtures) {
     // PULLS comments route (distinct from the ISSUES comments route above). Returns the reply's own
     // id + authoring user, mirroring the issue-comment POST shape. Without this handler the shared
     // mock 404s this route (:below), so the reply adapter test cannot exercise the endpoint (Codex MEDIUM).
+    //
+    // Phase 33 (FR-031): when `reviewCommentResponses` is supplied, the route discriminates reply
+    // vs per-comment-fallback posts by reading the request body. A body with `in_reply_to` returns
+    // the reply default WITHOUT consuming the script (reply specs stay byte-identical -- REVIEWS
+    // R2/R11); a body with `commit_id` consumes the script. The body parse is try/catch-guarded so
+    // route discrimination can never throw the mock (Antigravity LOW mitigation).
     if (method === 'POST' && url.pathname === `${repoPrefix}/pulls/${fixtures.prNumber}/comments`) {
+      if (fixtures.reviewCommentResponses) {
+        let parsedBody: any = null;
+        try {
+          parsedBody = typeof init?.body === 'string' ? JSON.parse(init.body) : null;
+        } catch {
+          parsedBody = null;
+        }
+        if (parsedBody && typeof parsedBody === 'object' && 'in_reply_to' in parsedBody) {
+          return json({ id: replyCommentId, user: { id: commentUserId, login: commentUserLogin } }, 201);
+        }
+        if (parsedBody && typeof parsedBody === 'object' && 'commit_id' in parsedBody) {
+          const script = reviewCommentResponses[Math.min(reviewCommentCallIndex, reviewCommentResponses.length - 1)];
+          reviewCommentCallIndex += 1;
+          if (script.status >= 400) {
+            return json({ message: 'Unprocessable Entity' }, script.status);
+          }
+          return json({ id: script.id ?? replyCommentId, user: { id: commentUserId, login: commentUserLogin } }, script.status);
+        }
+        // Neither discriminator present (or unparseable body): fall back to the reply default
+        // without consuming the script -- route discrimination must never throw the mock.
+        return json({ id: replyCommentId, user: { id: commentUserId, login: commentUserLogin } }, 201);
+      }
       return json({ id: replyCommentId, user: { id: commentUserId, login: commentUserLogin } }, 201);
     }
 

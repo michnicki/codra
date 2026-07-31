@@ -4,7 +4,7 @@ import type { AppBindings } from '../env';
 export class GitHubService {
   private client: GitHubClient;
 
-  constructor(env: AppBindings, installationId: string, tracker?: { incrementSubrequests(count?: number): void }) {
+  constructor(env: AppBindings, installationId: string, tracker?: { incrementSubrequests(count?: number): void; hasRemainingSafeBudget?(needed?: number): boolean }) {
     // Fail fast on a missing/blank installation id: a misconfigured (empty) value must not
     // silently reach the GitHub App auth flow and risk authenticating the wrong installation.
     // Presence-only — installation ids are opaque strings here, not necessarily numeric.
