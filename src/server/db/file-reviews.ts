@@ -474,7 +474,7 @@ export async function getFileReviewsForJobs(env: Pick<AppBindings, 'HYPERDRIVE'>
     id: string;
     job_id: string;
     file_path: string;
-    pass: 'main' | 'security' | 'cross_file_security';
+    pass: FileReviewPass;
     file_status: 'pending' | 'done' | 'skipped' | 'failed';
     model_used: string;
     diff_line_count: number;
