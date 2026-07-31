@@ -6,7 +6,7 @@ Codra is self-hosted AI code review for pull requests, running entirely on Cloud
 
 ## Current State (as of v1.4 + Phase 32)
 
-**v1.4 Deferred Candidates + Phase 32 Tech Debt Cleanup** — all 6 v1.4 feature phases (26-31) shipped, plus Phase 32 tech-debt cleanup closing audit-viewer renderer verification, misleading middleware comment correction, hardcoded type union replacement, test-hygiene improvements, integration-test gap closure, logger redaction hardening, broken migration script deletion, and stale planning doc reconciliation. Milestone closeout (`/gsd-complete-milestone`) not yet run.
+**v1.4 Deferred Candidates + Phase 32 Tech Debt Cleanup** — all 6 v1.4 feature phases (26-31) shipped, plus Phase 32 tech-debt cleanup closing audit-viewer renderer verification, misleading middleware comment correction, hardcoded type union replacement, test-hygiene improvements, integration-test gap closure, logger redaction hardening, broken migration script deletion, and stale planning doc reconciliation. Milestone archived 2026-07-31.
 
 
 
@@ -18,11 +18,11 @@ Codra is self-hosted AI code review for pull requests, running entirely on Cloud
 
 See `.planning/milestones/` for full phase-by-phase detail and closeout audits (`v1.0-*`, `v1.1-*`, `v1.2-*`).
 
-## Current Milestone: v1.4 — Deferred Candidates (Hard-Drop Evidence + Review Quality + Bitbucket Differentiators)
+## Current Milestone: v1.4 — Deferred Candidates (Hard-Drop Evidence + Review Quality + Bitbucket Differentiators) — CLOSED 2026-07-31
 
 **Scoped:** 2026-07-26
-**Scope:** All 6 deferred candidates promoted — 6 phases (26-31) ordered by dependency.
-**Status:** 6/6 phases complete (26-31 shipped) — all v1.4 phases delivered; milestone closeout (`/gsd-complete-milestone`) not yet run
+**Scope:** All 6 deferred candidates promoted — 7 phases (26-32) ordered by dependency.
+**Status:** SHIPPED — 7/7 phases complete, 33/33 plans, 6/6 requirements satisfied. Milestone archived to `.planning/milestones/v1.4-ROADMAP.md`.
 
 **Dependency-ordered phases:**
 
@@ -34,6 +34,7 @@ See `.planning/milestones/` for full phase-by-phase detail and closeout audits (
 | 29 | QA-IDX-01 | Codebase-index-backed Q&A (indexing subsystem) |
 | 30 | ANNO-01 | Bitbucket Code Insights per-line annotations |
 | 31 | WS-01 | Workspace-level token/webhook for multi-repo onboarding |
+| 32 | TECHDEBT-32 | Tech debt cleanup (type unions, middleware comments, logger redaction, test hygiene, docs) |
 
 ### v1.3 Bounded Evidence Audit Telemetry — CLOSED 2026-07-26
 
@@ -103,15 +104,14 @@ A Bitbucket Cloud pull request receives the same automated AI review — inline 
 - ✓ Dashboard surface for evidence_missing_summary audit events — v1.3 (Phase 24)
 - ✓ Nyquist compliance for all 4 deliverable phases, formal scored milestone audit, WR-01 resolved by design — v1.3 (Phase 25)
 
-<!-- Shipped in v1.4 Deferred Candidates (in flight). -->
+<!-- Shipped in v1.4 Deferred Candidates, 2026-07-31. Full archive: .planning/milestones/v1.4-ROADMAP.md, v1.4-REQUIREMENTS.md. -->
 
-- ✓ EVID-02: Hard-drop evidence gate — findings with hallucinated `existingCode` dropped from posted comments before dedup, config-gated (`evidence.hard_drop`, default off), per-category opt-out (default `security`), at-most-once `evidence_hard_dropped` audit, dashboard toggle + audit renderer — Validated in Phase 26 (10/10 must-haves)
-- ✓ ANNO-01: Per-line Bitbucket Code Insights `ANNOTATION` reports mirroring inline findings — dedicated `codra-annotations` report, config-gated (`review.bitbucket.annotations_enabled`, default off), full-replace-per-round (delete-then-recreate), fail-open in finalize, `external_id` collision-resistant, `result` always `PASSED` (never merge-gating) — Validated in Phase 30 (UAT 1/1 passed incl. live Assumption-A1 cascade confirmation; security review 17/17 threats closed)
-- ✓ WS-01: Workspace-level Bitbucket Access Token + webhook auto-discovers and onboards many repos from one workspace credential — `vcs_workspace_credentials` table + D-03 per-repo-wins credential resolution, transactional finalize endpoint (encrypt + persist + selective onboard + idempotent webhook), webhook route verifies against per-repo OR workspace secret, two-step discover/checklist dashboard UI — Validated in Phase 31 (25/25 must-haves; code review found 2 blockers — credential-fallback short-circuit, tokenExpiresAt cleared on every sync resubmission — both fixed and regression-tested before verification)
-
-### Active (v1.4 candidates)
-
-_All v1.4 candidate requirements shipped — see Validated above. Milestone closeout not yet run._
+- ✓ EVID-02: Hard-drop evidence gate — findings with hallucinated `existingCode` dropped from posted comments before dedup, config-gated (`evidence.hard_drop`, default off), per-category opt-out (default `security`), at-most-once `evidence_hard_dropped` audit, dashboard toggle + audit renderer — v1.4 (Phase 26, 10/10 must-haves)
+- ✓ SEC-XDIFF-01: Whole-diff cross-file security reasoning — new LLM pass seeing entire PR diff, findings enter dedup → critic → post pipeline, config-gated (`security.cross_file`, default off) — v1.4 (Phase 27)
+- ✓ LRN-01: Learned-rule synthesis from clustered reject feedback — similarity clustering, suppression rule synthesis, dashboard-reviewable before activation, config-gated (`learning.enabled`, default off) — v1.4 (Phase 28)
+- ✓ QA-IDX-01: Codebase-index-backed Q&A — Postgres-native full-text search index of default-branch tree, incremental push-triggered refresh, dashboard build/status panel, config-gated (`qa.index_enabled`, default off) — v1.4 (Phase 29)
+- ✓ ANNO-01: Per-line Bitbucket Code Insights `ANNOTATION` reports mirroring inline findings — dedicated `codra-annotations` report, config-gated (`review.bitbucket.annotations_enabled`, default off), full-replace-per-round (delete-then-recreate), fail-open in finalize, `external_id` collision-resistant, `result` always `PASSED` (never merge-gating) — v1.4 (Phase 30, UAT 1/1 passed incl. live Assumption-A1 cascade confirmation; security review 17/17 threats closed)
+- ✓ WS-01: Workspace-level Bitbucket Access Token + webhook auto-discovers and onboards many repos from one workspace credential — `vcs_workspace_credentials` table + D-03 per-repo-wins credential resolution, transactional finalize endpoint (encrypt + persist + selective onboard + idempotent webhook), webhook route verifies against per-repo OR workspace secret, two-step discover/checklist dashboard UI — v1.4 (Phase 31, 25/25 must-haves; code review found 2 blockers — both fixed and regression-tested before verification)
 
 ### Out of Scope
 
@@ -124,6 +124,7 @@ _All v1.4 candidate requirements shipped — see Validated above. Milestone clos
 - Upstream-contribution polish (exhaustive docs, CLA, broad config surface) — nice-to-have, not required; target is the user's own self-hosted deployment
 - **v1.1 review-quality deferrals (v2 candidates):** whole-diff cross-file security reasoning (SEC-XDIFF-01, land after per-file security proves out); learned-rule synthesis from clustered `reject` feedback + approval queue (LRN-01 — only the `reject` **capture** signal shipped, via CMD-05); codebase-index-backed Q&A (QA-IDX-01) — v1.1 Q&A uses PR + diff context only
 - **v1.2 evidence-gate v2 candidates:** hard-drop promotion of `existingCode` evidence (EVID-02, after telemetry supports it); bound per-unit `evidence_missing` ring-buffer flood (WR-01, requires a schema/design decision)
+- **v1.4 deferred:** EVID-02 per-category override UI (dashboard surface); LRN-01 automatic rule activation (rules are dashboard-reviewable before activation); QA-IDX-01 vector embedding model (Workers AI embeddings or keyword fallback — implementation detail)
 - **Broader deferrals (candidate future milestones):** codebase indexing + dependency/blast-radius graph, vulnerability monitoring + package search, GitLab / Azure DevOps / other VCS providers, AWS Bedrock + `providers.json` registry, analytics/ops dashboards, outbound Slack/Teams/webhook notifications, user management — none selected for v1.0 or v1.1 (full itemized list in `.planning/milestones/v1.1-REQUIREMENTS.md`)
 
 ## Business Context
@@ -131,7 +132,7 @@ _All v1.4 candidate requirements shipped — see Validated above. Milestone clos
 <!-- Internal/self-hosted use — not a monetized feature. -->
 
 - **Customer**: The user's own team, reviewing PRs on their Bitbucket Cloud workspace via a self-hosted Codra instance.
-- **Success metric**: Bitbucket Cloud PRs get AI review at parity with GitHub, GitHub unaffected. **Achieved and held through v1.2** — 22/22 v1.0 + 22/22 v1.1 + 31/31 v1.2 requirements satisfied; every v1.2 engine capability (deterministic severity, audit-backed noise filter, priority file selection, incremental rounds, verify-fixes, critic v2, ensemble, walkthrough enrichment) shipped on both providers; full regression suite green (1550 node + 102 browser tests) at v1.2 close; milestone audit `passed` after Phase 20.1 closure of all 5 BLOCKERs + 1 WARNING.
+- **Success metric**: Bitbucket Cloud PRs get AI review at parity with GitHub, GitHub unaffected. **Achieved and held through v1.4** — 22/22 v1.0 + 22/22 v1.1 + 31/31 v1.2 + 3/3 v1.3 + 6/6 v1.4 requirements satisfied; every v1.4 capability (hard-drop evidence, cross-file security, learned rules, codebase-index Q&A, Code Insights annotations, workspace tokens) config-gated and shipped on both providers; milestone audit `passed` for all 4 milestones.
 
 ## Context
 
@@ -141,13 +142,14 @@ _All v1.4 candidate requirements shipped — see Validated above. Milestone clos
 - **Webhook verification**: Bitbucket Cloud uses `X-Hub-Signature` HMAC via a per-repo secret (repo identified from payload before verification, fails closed) — same shape as GitHub's, generalized in `core/verify.ts`.
 - **Contract-first**: all wire/queue/DB-JSON shapes live in `src/shared/schema.ts` (Zod), now with a `provider` discriminator throughout.
 - **Resource constraints carry over**: the Cloudflare Workers 50-subrequest/invocation limit and the durable-Workflow fresh-instance handoff already shaped the GitHub pipeline; Bitbucket's diff caps (200 files/8,000 lines) and ~1,000 req/hr rate limit are budgeted the same way.
-- **Current scale (as of v1.2 close):** TypeScript across `src/server` / `src/client` / `src/shared`; full test suite 1550 node tests + 102 browser tests green under nix-shell. v1.2 added ~+29.9k/−0.4k lines across 132 source files over 164 commits (commit range `964e738`..`a876cc0`, 2026-07-21 → 2026-07-25, 5 calendar days), with **zero new npm dependencies** — additive numbered migrations (010/011/012/013), new server/core modules (severity, priority, audit-redact, ensemble, critic-v2, phase-routing, rounds, verify-fixes, walkthrough-enrichment), new client libs (audit-grouping, job-telemetry, rounds-badge, stats-metrics), and new dashboard UI surfaces only. `npm run typecheck` exit 0; node suite 113 files / 1550 tests / 0 failures; browser suite 17 files / 102 tests / 0 failures.
+- **Current scale (as of v1.4 close):** TypeScript across `src/server` / `src/client` / `src/shared`; 62,534 LOC. v1.4 added +7,804/−160 lines across 54 source files over 130 commits (2026-07-26 → 2026-07-31, 5 calendar days), with **zero new npm dependencies** — additive migrations (015/016/017/018), new server/core modules (evidence-hard-drop, cross-file-security, learned-rules, codebase-index, annotations, workspace-credentials), new client components (LearnedRulesPanel, CodebaseIndexPanel), and dashboard UI surfaces only. `npm run typecheck` exit 0.
 - **v1.1 interactive/multi-pass surfaces:** security pass + critic as budget-aware `(file, pass)` work units and a dedicated `critic` phase (`core/review.ts`); streamed walkthrough state in `jobs.walkthrough_comment_ref` (Postgres, never Workflow memory); command/Q&A dispatch at the webhook/queue layer (never the review Workflow), self-filtering the bot's own comments first; DB-backed provider-agnostic pause (`pr_review_state`).
 - **v1.2 audit trail discipline:** every engine stage (`recordUnitAudit` / `recordWalkthroughAudit` / `recordRoundAudit` / `recordVerifyFixesAudit` / `recordFileSkips` / `buildFinalizeDropEvents`) emits a per-stage event to `jobs.audit` (migration 010, JSONB ring-buffer cap 500). Title-bearing events route through `redactFindingTitle` ([title-redacted] for non-empty, [clamped:empty] for nullish); error events route through `redactErrorMessage` (5-machine-error enumeration). The audit trail is structurally a privacy-safe operator surface — readable without SQL, groupable by stage, explainable per drop.
 - **v1.2 phase routing discipline:** a single `core/phase-routing.ts` module exports `nextPhaseAfterReview`, `nextPhaseAfterVerifyFixes`, `nextPhaseAfterCritic` — every phase exit walks the canonical selector (Phase 20.1 BLOCKER-2/3/4/5 closure). Routing invariants are tested with all-toggle-combination integration tests in `test/review-flow.spec.ts`. Loop-prevention is asserted (verify_fixes never re-enters critic).
 - **Known v1.0 tech debt** (non-blocking, see `.planning/milestones/v1.0-MILESTONE-AUDIT.md`): a cosmetic vitest hoisting warning in `test/webhook-ingest.spec.ts`; `computeCredentialStatus` fails open on an unparseable expiry string (unreachable via the write path, Zod rejects malformed dates with 400); Phase 5 has no recorded Nyquist `VALIDATION.md` (process gap, not functional); SUMMARY.md frontmatter omits `requirements-completed` for AUTH-02/BB-04/REV-01/02/03 (documentation-consistency only — all independently verified in each phase's VERIFICATION.md).
 - **Known v1.1 tech debt** (non-blocking, see `.planning/milestones/v1.1-MILESTONE-AUDIT.md`): phases 08/10/11/12 carry `draft` Nyquist `VALIDATION.md` (coverage TODO, not a failure — full suite green, every phase VERIFICATION passed; promote via `/gsd-validate-phase 08 10 11 12`); `forProvider` Bitbucket jobless path uses an inert placeholder `prNumber:0`; `dispatchInteractiveMessage` prefers the carried `configSnapshot`, falling back to `loadRepoConfig` only for pre-deploy in-flight messages (deliberate Bitbucket collision guard).
 - **Known v1.2 tech debt** (non-blocking, see `.planning/v1.2-MILESTONE-AUDIT.md` `tech_debt:` frontmatter): Phase 17 deployment checkpoints A1/A2/A3/A5 are code-verified but require deployment-time verification (runbook items, not code gaps); Phase 18 dead-code fallback at `review.ts:917-918` + `selectDiffForRound` `fromSha: ''` convention (INFO); Phase 19 `recordVerifyFixesAudit` dead import in `review.ts:63` (INFO; WARNING-4 from prior review); Phase 20 W2/W3/W5 walkthrough audit edge cases (parser provenance mitigates W2; persistAndAudit helper mitigates W3; NREG-01 unaffected by W5); Phase 20.1 INFO harness LSP "unused export" warnings for `VERIFY_FIXES_FIXED_REASONS`/`VERIFY_FIXES_UNFIXED_REASONS`/`VerifyFixesWindow` in `src/server/core/verify-fixes.ts` (per-module contract surface, `tsc --noEmit` authoritative per CLAUDE.md "Codra LSP lags behind tsc" convention). Phase 16 is PARTIAL by Nyquist plan design (telemetry-payload-only, no validation prompt); Phase 20 had no Nyquist validation cycle (closure documentation-only); Phase 20.1 was a gap-closure phase that did not run a Nyquist validation cycle but inherits and exercises the structure validated in Phase 13.
+- **Known v1.4 tech debt** (non-blocking, see `.planning/v1.4-MILESTONE-AUDIT.md` `tech_debt:` frontmatter): Phase 27 minor hardcoded type union in file-reviews.ts (resolved by Phase 32); Phase 28 minor prompts/cross-file-security-review.ts does not import CROSS_FILE_DIFF_MAX_LINES from diff.ts (not needed — constant used by buildCrossFileDiff). Phase 32 resolved all items from the v1.4 milestone audit tech_debt list.
 
 ## Constraints
 
@@ -216,4 +218,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-07-30 — Phase 31 complete: WS-01 workspace-level Bitbucket token/webhook validated (25/25 must-haves; 2 code-review blockers found and fixed pre-verification) and moved to Validated; all 6 v1.4 phases now shipped, milestone closeout not yet run.*
+*Last updated: 2026-07-31 — v1.4 milestone archived: 7 phases (26-32), 33 plans, 6/6 requirements satisfied. All v1.4 deferred candidates (EVID-02, SEC-XDIFF-01, LRN-01, QA-IDX-01, ANNO-01, WS-01) + tech debt cleanup shipped.*
