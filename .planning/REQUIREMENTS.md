@@ -10,7 +10,7 @@
 
 - [x] **PRD-01**: Per-comment 422 fallback — on batch review HTTP 422 from GitHub/Bitbucket, retry each inline comment individually via the review API, skip any individual 422 with a warning log, track which comments were posted vs skipped (FR-031)
 - [ ] **PRD-02**: Title truncation to 80 chars — truncate `title` field of parsed review comments exceeding 80 characters; clear `suggestion` to null when it equals `existingCode` after trim (FR-153/154)
-- [ ] **PRD-03**: Mermaid label sanitization — repair nested double quotes in walkthrough Mermaid diagram labels (e.g. `engine["core/"engine.py""]` → `engine["core/engine.py"]`) (FR-155)
+- [x] **PRD-03**: Mermaid label sanitization — repair nested double quotes in walkthrough Mermaid diagram labels (e.g. `engine["core/"engine.py""]` → `engine["core/engine.py"]`) (FR-155)
 
 ### Context Enhancement
 
