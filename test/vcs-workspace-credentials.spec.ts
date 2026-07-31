@@ -1,10 +1,8 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { queryRows } from '@server/db/client';
 import {
-  listVcsWorkspaceCredentials,
   getVcsWorkspaceCredentialSecrets,
   upsertVcsWorkspaceCredential,
-  deleteVcsWorkspaceCredential,
 } from '@server/db/vcs-workspace-credentials';
 import { EXPIRING_SOON_THRESHOLD_MS } from '@server/db/vcs-credentials';
 import { createTestEnv, hasConfiguredTestDatabaseUrl } from './helpers';
@@ -156,30 +154,4 @@ dbDescribe('vcs-workspace-credentials DB module (D-01/D-05/D-11)', () => {
     expect(secret).toBeNull();
   });
 
-  it('listVcsWorkspaceCredentials returns a redacted DTO with no encrypted_* keys', async () => {
-    const workspace = track(uniqueWorkspace());
-    await upsertVcsWorkspaceCredential(env, {
-      vcsProvider: 'bitbucket',
-      workspace,
-      encryptedAccessToken: 'cipher-access',
-      encryptedWebhookSecret: 'cipher-webhook',
-    });
-
-    const all = await listVcsWorkspaceCredentials(env);
-    const entry = all.find((c) => c.workspace === workspace);
-    expect(entry).toBeTruthy();
-    expect(JSON.stringify(entry)).not.toContain('encrypted_');
-    expect(entry).toMatchObject({ hasToken: true, hasWebhookSecret: true });
-  });
-
-  it('deleteVcsWorkspaceCredential returns true then false on a repeat call', async () => {
-    const workspace = track(uniqueWorkspace());
-    await upsertVcsWorkspaceCredential(env, { vcsProvider: 'bitbucket', workspace });
-
-    const firstDelete = await deleteVcsWorkspaceCredential(env, { vcsProvider: 'bitbucket', workspace });
-    expect(firstDelete).toBe(true);
-
-    const secondDelete = await deleteVcsWorkspaceCredential(env, { vcsProvider: 'bitbucket', workspace });
-    expect(secondDelete).toBe(false);
-  });
 });

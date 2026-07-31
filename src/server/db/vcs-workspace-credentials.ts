@@ -65,18 +65,6 @@ const WORKSPACE_CREDENTIAL_COLUMNS = `
   updated_at
 `;
 
-export async function listVcsWorkspaceCredentials(
-  env: Pick<AppBindings, 'HYPERDRIVE'>,
-): Promise<VcsWorkspaceCredentialStatus[]> {
-  const rows = await queryRows<VcsWorkspaceCredentialRow>(
-    env,
-    `SELECT ${WORKSPACE_CREDENTIAL_COLUMNS}
-     FROM vcs_workspace_credentials
-     ORDER BY workspace ASC`,
-  );
-  return rows.map(mapWorkspaceCredentialStatus);
-}
-
 // INTERNAL-ONLY: returns the ciphertext columns for decrypt/rotate use (mirrors
 // getVcsCredentialSecrets). Never serialize the result into an HTTP response. Every keyed lookup
 // filters on (vcs_provider, workspace) TOGETHER -- never workspace alone -- so the
@@ -153,16 +141,3 @@ export async function upsertVcsWorkspaceCredential(
   return mapWorkspaceCredentialStatus(row);
 }
 
-export async function deleteVcsWorkspaceCredential(
-  env: Pick<AppBindings, 'HYPERDRIVE'>,
-  key: VcsWorkspaceCredentialKey,
-): Promise<boolean> {
-  const rows = await queryRows<{ workspace: string }>(
-    env,
-    `DELETE FROM vcs_workspace_credentials
-     WHERE vcs_provider = $1 AND workspace = $2
-     RETURNING workspace`,
-    [key.vcsProvider, key.workspace],
-  );
-  return rows.length > 0;
-}
