@@ -1,37 +1,37 @@
 ---
 gsd_state_version: 1.0
 milestone: v1.4
-milestone_name: tech debt — audit viewer renderer, misleading middleware comment, hardcoded type unions, test-hygiene improvements, integration test gap, and stale planning docs
+milestone_name: Deferred Candidates — hard-drop evidence, cross-file security, learned rules, codebase-index Q&A, Code Insights annotations, workspace tokens + tech debt cleanup
 current_phase: 32
-current_phase_name: address-v1-4-tech-debt-audit-viewer-renderer-misleading-midd
-status: complete
-stopped_at: Phase 32 plan 32-06 complete
-last_updated: "2026-07-31T12:30:00.000Z"
+status: Milestone complete
+stopped_at: v1.4 milestone archived
+last_updated: "2026-07-31T11:30:00.000Z"
 last_activity: 2026-07-31
-last_activity_desc: Phase 32 complete — v1.4 tech debt cleanup
+last_activity_desc: v1.4 milestone archived — 7 phases, 33 plans, 6/6 requirements
 progress:
-  total_phases: 7
-  completed_phases: 7
-  total_plans: 33
-  completed_plans: 33
+  total_phases: 11
+  completed_phases: 11
+  total_plans: 37
+  completed_plans: 37
   percent: 100
+current_phase_name: address-v1-4-tech-debt-audit-viewer-renderer-misleading-midd
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-07-25 for v1.2 closure)
+See: .planning/PROJECT.md (updated 2026-07-31 for v1.4 closure)
 
-**Core value:** A Bitbucket Cloud PR gets the same AI review a GitHub PR gets, from one instance, without breaking GitHub — held end-to-end since v1.0, extended by v1.1 (every interactive/multi-pass capability shipped on both providers), extended by v1.2 (deterministic severity + real categories, audit-backed noise filter, priority file selection, incremental rounds, verify-fixes, critic v2, ensemble, walkthrough enrichment — all on both providers, every drop explainable from `jobs.audit`).
-**Current focus:** Phase 32 — address-v1-4-tech-debt-audit-viewer-renderer-misleading-midd
+**Core value:** A Bitbucket Cloud PR gets the same AI review a GitHub PR gets, from one instance, without breaking GitHub — held end-to-end through v1.4 (all 4 milestones, 84/84 requirements satisfied).
+**Current focus:** Planning next milestone
 
 ## Current Position
 
-Phase: 32 (address-v1-4-tech-debt-audit-viewer-renderer-misleading-midd) — COMPLETE
-Plan: 6 of 6
-Status: Phase 32 complete — all v1.4 tech debt addressed
-Last activity: 2026-07-31 — Phase 32 plan 32-06 complete (stale planning docs reconciled)
+Phase: Milestone v1.4 complete
+Plan: —
+Status: Milestone complete — awaiting next milestone
+Last activity: 2026-07-31 — v1.4 milestone archived (7 phases, 33 plans, 6/6 requirements)
 
 ### Phase 27 Plan 27-01 Decisions (SEC-XDIFF-01)
 
@@ -378,7 +378,4 @@ Resume file: .planning/phases/32-address-v1-4-tech-debt-audit-viewer-renderer-mi
 
 ## Operator Next Steps
 
-- Phase 29 (QA-IDX-01) and Phase 30 (ANNO-01) are both complete — no further action needed on either.
-- Phase 31 (WS-01, workspace-level token/webhook) is not planned yet (`Plans: TBD` in ROADMAP.md) — the only remaining v1.4 phase. Start with `/gsd-plan-phase 31`.
-- Two pre-existing bookkeeping items remain unrelated to Phase 30 (see Blockers/Concerns): LRN-01/Phase 28's stale `Planned` traceability status, and the ambiguous STATE `progress:` counter scope — both flagged for reconciliation before v1.4's milestone close, not touched here to avoid guessing at their intended semantics.
-- [Env] If a future task needs to decrypt a stored secret from outside the deployed Worker, the local `.env`'s `LLM_CONFIG_ENCRYPTION_KEY` will NOT match — see Blockers/Concerns.
+- Start the next milestone with /gsd-new-milestone
