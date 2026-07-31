@@ -8,7 +8,7 @@
 
 | Phase | Name | Goal | Requirements | Success Criteria |
 |-------|------|------|--------------|-----------------|
-| 33 | Quality Fixes | 2/4 | In Progress|  |
+| 33 | Quality Fixes | 3/4 | In Progress|  |
 | 34 | Context Enhancement | File history and .review.yaml config | PRD-04, PRD-05 | 1. File history fetched and injected into prompts 2. .review.yaml discovered and merged with DB config |
 | 35 | Agentic Tools | read_file/grep_repo tool loop for unindexed repos | PRD-06 | 1. Tool loop runs up to 6 hops 2. Byte limits enforced 3. Falls back to single review on failure 4. Config-gated |
 | 36 | Outbound Webhooks + Blast Radius | Event delivery and cross-repo dependency tracking | PRD-07, PRD-08 | 1. Events fire on review completion/failure 2. HTTPS + SSRF guard + 5s timeout 3. Blast radius computed from manifests 4. Visibility filtering works |
