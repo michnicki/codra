@@ -252,6 +252,7 @@ export function ReviewSettingsPanel({ repo, onChange }: ReviewSettingsPanelProps
 
   // Passes
   const [securityEnabled, setSecurityEnabled] = useState(current.passes.security.enabled);
+  const [crossFileEnabled, setCrossFileEnabled] = useState(current.passes.security.cross_file);
   const [criticEnabled, setCriticEnabled] = useState(current.passes.critic.enabled);
   const [walkthroughEnabled, setWalkthroughEnabled] = useState(current.walkthrough.enabled);
   const [seqDiagramEnabled, setSeqDiagramEnabled] = useState(current.walkthrough.sequence_diagram.enabled);
@@ -303,7 +304,7 @@ export function ReviewSettingsPanel({ repo, onChange }: ReviewSettingsPanelProps
     category_confidence: draftCategoryConfidence,
     passes: {
       ...current.passes,
-      security: { ...current.passes.security, enabled: securityEnabled },
+      security: { ...current.passes.security, enabled: securityEnabled, cross_file: crossFileEnabled },
       critic: { ...current.passes.critic, enabled: criticEnabled },
       ensemble: { ...current.passes.ensemble, runs: parseNum(ensembleRuns) },
     },
@@ -348,6 +349,7 @@ export function ReviewSettingsPanel({ repo, onChange }: ReviewSettingsPanelProps
     !stringSetEqual(focus, current.focus) ||
     !categoryConfidenceEqual(draftCategoryConfidence, current.category_confidence) ||
     securityEnabled !== current.passes.security.enabled ||
+    crossFileEnabled !== current.passes.security.cross_file ||
     criticEnabled !== current.passes.critic.enabled ||
     parseNum(ensembleRuns) !== current.passes.ensemble.runs ||
     walkthroughEnabled !== current.walkthrough.enabled ||
@@ -384,6 +386,7 @@ export function ReviewSettingsPanel({ repo, onChange }: ReviewSettingsPanelProps
     customRules,
     focus,
     securityEnabled,
+    crossFileEnabled,
     criticEnabled,
     walkthroughEnabled,
     seqDiagramEnabled,
@@ -585,6 +588,13 @@ export function ReviewSettingsPanel({ repo, onChange }: ReviewSettingsPanelProps
           checked={securityEnabled}
           onCheckedChange={setSecurityEnabled}
           ariaLabel="Toggle security pass"
+        />
+        <ToggleRow
+          label="Cross-file security"
+          description="Analyze security implications across file boundaries (e.g., auth changes + unprotected routes)."
+          checked={crossFileEnabled}
+          onCheckedChange={setCrossFileEnabled}
+          ariaLabel="Toggle cross-file security"
         />
         <ToggleRow
           label="Critic pass"
