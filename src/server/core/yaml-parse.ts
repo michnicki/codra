@@ -1,0 +1,244 @@
+// Phase 34 (PRD-05, §15): minimal line-oriented recursive-descent YAML parser for the RepoConfig
+// subset, standing in for an npm YAML library (zero new dependencies — RESEARCH §3 Option C).
+// Pure string manipulation: no imports, no file system access, Cloudflare Workers-compatible.
+//
+// SUPPORTED: comment lines, empty lines, nested objects (indentation), integer/float/boolean/string
+// scalars, quoted strings, block-style string arrays (`- item`), FLOW-style arrays (`key: [a, b]` —
+// review MEDIUM-5: repoConfigSchema has legitimate flow-array shapes like skip_files), and
+// arrays-of-objects (`- key: value` with deeper `key: value` continuation lines).
+//
+// NOT SUPPORTED (must throw): multi-line block scalars (`|`, `>`), flow-style maps (`{}`),
+// anchors/aliases (`&`, `*`), tags (`!!`), complex keys (quoted keys with spaces).
+//
+// FAIL-SAFE CONTRACT: any unsupported or unparseable construct throws an Error whose message starts
+// with "YAML parse error:" — the caller (D-12) always catches, falls back to the DB config, and
+// emits a yaml_config_parse_failed audit event. Never silent misbehavior: a mis-parse would
+// otherwise silently alter review behavior via config. Users who rely on unsupported constructs get
+// the DB config + an audit event, never a wrong config.
+
+type Context =
+  | { kind: 'object'; indent: number; obj: Record<string, unknown> }
+  | { kind: 'array'; indent: number; arr: unknown[] };
+
+// Returns the index of the first `:` that terminates a key (followed by whitespace or EOL),
+// respecting quoted sections; -1 when the line has no key-value split.
+function findKeyValueColon(text: string): number {
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === "'" && !inDouble) inSingle = !inSingle;
+    else if (ch === '"' && !inSingle) inDouble = !inDouble;
+    else if (ch === ':' && !inSingle && !inDouble) {
+      const nextCh = text[i + 1];
+      if (nextCh === undefined || nextCh === ' ' || nextCh === '\t') return i;
+    }
+  }
+  return -1;
+}
+
+// Strips a trailing ` # comment` that sits outside quoted sections (YAML: `#` starts a comment
+// only when preceded by whitespace or at the start of a token).
+function stripInlineComment(value: string): string {
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < value.length; i += 1) {
+    const ch = value[i];
+    if (ch === "'" && !inDouble) inSingle = !inSingle;
+    else if (ch === '"' && !inSingle) inDouble = !inDouble;
+    else if (ch === '#' && !inSingle && !inDouble && (i === 0 || value[i - 1] === ' ' || value[i - 1] === '\t')) {
+      return value.slice(0, i).trimEnd();
+    }
+  }
+  return value;
+}
+
+function coerceScalar(raw: string): string | number | boolean {
+  const value = raw.trim();
+  if (value.length === 0) return '';
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    return value.slice(1, -1);
+  }
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  if (/^-?\d+$/.test(value)) return Number(value);
+  if (/^-?\d+\.\d+$/.test(value)) return Number(value);
+  return value;
+}
+
+// Anchors/aliases/tags are recognized only on unquoted values; a quoted string may legitimately
+// contain `&`/`*`/`!!` (e.g. `"a & b"`).
+function assertNoUnsupportedScalar(value: string): void {
+  const trimmed = value.trim();
+  if (trimmed === '' || trimmed.startsWith('"') || trimmed.startsWith("'")) return;
+  if (trimmed.startsWith('&') || trimmed.startsWith('*') || trimmed.includes('!!')) {
+    throw new Error(`YAML parse error: unsupported anchor/alias/tag construct in scalar "${trimmed}"`);
+  }
+}
+
+function parseFlowArray(rawValue: string): unknown[] {
+  if (!rawValue.endsWith(']')) {
+    throw new Error('YAML parse error: unbalanced flow-style array');
+  }
+  const inner = rawValue.slice(1, -1).trim();
+  if (inner === '') return [];
+  const items: string[] = [];
+  let depth = 0;
+  let current = '';
+  for (const ch of inner) {
+    if (ch === '[') depth += 1;
+    else if (ch === ']') depth -= 1;
+    if (ch === ',' && depth === 0) {
+      items.push(current);
+      current = '';
+    } else {
+      current += ch;
+    }
+    if (depth < 0) throw new Error('YAML parse error: unbalanced flow-style array');
+  }
+  if (depth !== 0) throw new Error('YAML parse error: unbalanced flow-style array');
+  items.push(current);
+  // Trailing comma leaves one empty element; drop it.
+  if (items[items.length - 1].trim() === '') items.pop();
+  return items.map((item) => {
+    const trimmed = item.trim();
+    if (trimmed.startsWith('{')) {
+      throw new Error('YAML parse error: flow-style maps are not supported');
+    }
+    assertNoUnsupportedScalar(trimmed);
+    return coerceScalar(trimmed);
+  });
+}
+
+function assignScalarValue(obj: Record<string, unknown>, key: string, rawValue: string): void {
+  if (rawValue.startsWith('{')) {
+    throw new Error('YAML parse error: flow-style maps are not supported');
+  }
+  if (/^[|>][-+]?$/.test(rawValue)) {
+    throw new Error('YAML parse error: multi-line block scalars are not supported');
+  }
+  if (rawValue.startsWith('[')) {
+    obj[key] = parseFlowArray(rawValue);
+    return;
+  }
+  assertNoUnsupportedScalar(rawValue);
+  obj[key] = coerceScalar(rawValue);
+}
+
+function assertValidKey(key: string): void {
+  if (key === '') {
+    throw new Error('YAML parse error: empty key');
+  }
+  if (key.includes('"') || key.includes("'")) {
+    throw new Error('YAML parse error: complex (quoted) keys are not supported');
+  }
+  if (key.includes(' ')) {
+    throw new Error('YAML parse error: complex keys with spaces are not supported');
+  }
+}
+
+export function parseYaml(raw: string): Record<string, unknown> {
+  const root: Record<string, unknown> = {};
+  const stack: Context[] = [{ kind: 'object', indent: -1, obj: root }];
+
+  // Pre-scan into significant lines, stripping comment-only lines and trailing whitespace while
+  // preserving leading indentation for depth tracking.
+  const lines: Array<{ indent: number; text: string }> = [];
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const trimmedRight = rawLine.trimEnd();
+    const trimmed = trimmedRight.trim();
+    if (trimmed.length === 0 || trimmed.startsWith('#')) continue;
+    lines.push({ indent: trimmedRight.length - trimmedRight.trimStart().length, text: trimmed });
+  }
+
+  const popTo = (indent: number): Context => {
+    while (stack.length > 1 && stack[stack.length - 1].indent > indent) stack.pop();
+    return stack[stack.length - 1];
+  };
+
+  // An array-of-objects entry continues on deeper lines; the context indent is the next line's
+  // indent so a sibling `- ` item (which sits at the entry's own indent) pops it correctly.
+  const pushEntryContext = (itemIndent: number, nextIndex: number, entry: Record<string, unknown>): void => {
+    const next = lines[nextIndex];
+    const entryIndent = next && next.indent > itemIndent ? next.indent : itemIndent + 2;
+    stack.push({ kind: 'object', indent: entryIndent, obj: entry });
+  };
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const { indent, text } = lines[i];
+    const next = lines[i + 1];
+
+    if (text.startsWith('-')) {
+      const top = popTo(indent);
+      if (top.kind !== 'array' || top.indent !== indent) {
+        throw new Error(`YAML parse error: array item at indent ${indent} without a matching parent key`);
+      }
+      const itemContent = text.slice(1).trim();
+      if (itemContent === '') {
+        const entry: Record<string, unknown> = {};
+        top.arr.push(entry);
+        if (next && next.indent > indent) pushEntryContext(indent, i + 1, entry);
+        continue;
+      }
+      const colon = findKeyValueColon(itemContent);
+      if (colon !== -1) {
+        // First key-value pair on the item line starts an array-of-objects entry.
+        const key = itemContent.slice(0, colon).trim();
+        const rawValue = stripInlineComment(itemContent.slice(colon + 1).trim());
+        assertValidKey(key);
+        const entry: Record<string, unknown> = {};
+        assignScalarValue(entry, key, rawValue);
+        top.arr.push(entry);
+        if (next && next.indent > indent) pushEntryContext(indent, i + 1, entry);
+        continue;
+      }
+      assertNoUnsupportedScalar(itemContent);
+      top.arr.push(coerceScalar(itemContent));
+      continue;
+    }
+
+    const colon = findKeyValueColon(text);
+    if (colon === -1) {
+      throw new Error(`YAML parse error: expected 'key: value' on line "${text}"`);
+    }
+    const key = text.slice(0, colon).trim();
+    assertValidKey(key);
+    const rawValue = stripInlineComment(text.slice(colon + 1).trim());
+
+    const top = popTo(indent);
+    if (top.kind !== 'object') {
+      throw new Error('YAML parse error: key-value pair inside an array');
+    }
+    // The root context (stack[0], indent -1) legitimately receives keys at indent 0; any deeper
+    // key landing on the root means the document dedented past its open blocks (inconsistent
+    // indentation).
+    if (top.indent < indent && !(stack.length === 1 && indent === 0)) {
+      throw new Error(`YAML parse error: inconsistent indentation at line "${text}"`);
+    }
+
+    if (rawValue === '') {
+      // A key with no value starts a nested block iff the next line is more indented.
+      if (next && next.indent > indent) {
+        if (next.text.startsWith('-')) {
+          const arr: unknown[] = [];
+          top.obj[key] = arr;
+          stack.push({ kind: 'array', indent: next.indent, arr });
+        } else {
+          const child: Record<string, unknown> = {};
+          top.obj[key] = child;
+          stack.push({ kind: 'object', indent: next.indent, obj: child });
+        }
+      } else {
+        top.obj[key] = '';
+      }
+      continue;
+    }
+
+    if (next && next.indent > indent) {
+      throw new Error('YAML parse error: scalar value cannot start a nested block');
+    }
+    assignScalarValue(top.obj, key, rawValue);
+  }
+
+  return root;
+}
