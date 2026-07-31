@@ -3,6 +3,7 @@ import { GithubAdapter } from '@server/vcs/github';
 import { GitHubService } from '@server/services/github';
 import { GitHubError, createGithubBotIdentityResolver } from '@server/core/github';
 import { TokenTracker } from '@server/core/token-tracker';
+import { logger } from '@server/core/logger';
 import { createTestEnv, seedInstallationToken } from './helpers';
 import { installGitHubFetchMock } from './github-fetch-mock';
 
@@ -137,6 +138,200 @@ describe('GithubAdapter (VcsProvider mapping)', () => {
         (call) => call.method === 'POST' && call.path === `/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}/reviews`,
       );
       expect(reviewPost?.body.event).toBe('COMMENT');
+    } finally {
+      restore();
+    }
+  });
+
+  // --- Phase 33 (FR-031, D-01): batch-422 per-comment fallback + skippedComments seam ---
+
+  it('clean batch 200 posts once and omits skippedComments entirely (NREG-01)', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const { calls, restore } = installGitHubFetchMock(buildFixtures({ reviewResponses: [{ status: 200, id: 777 }] }));
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      const result = await adapter.submitReview(OWNER, REPO, PR_NUMBER, {
+        commitSha: 'headsha1234567890',
+        verdict: 'comment',
+        summaryBody: 'Some notes',
+        comments: [
+          { path: 'src/a.ts', position: 2, body: 'a' },
+          { path: 'src/b.ts', position: 4, body: 'b' },
+        ],
+      });
+
+      expect(result.ref).toBe('777');
+      // Exactly ONE POST to /reviews and ZERO posts to /pulls/{n}/comments on the clean path.
+      const reviewPosts = calls.filter(
+        (call) => call.method === 'POST' && call.path === `/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}/reviews`,
+      );
+      const commentPosts = calls.filter(
+        (call) => call.method === 'POST' && call.path === `/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}/comments`,
+      );
+      expect(reviewPosts).toHaveLength(1);
+      expect(commentPosts).toHaveLength(0);
+      expect(result).not.toHaveProperty('skippedComments');
+    } finally {
+      restore();
+    }
+  });
+
+  it('batch 422 retries summary-only then posts each comment individually with a fixed 4-key body (FR-031)', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const { calls, restore } = installGitHubFetchMock(
+      buildFixtures({ reviewResponses: [{ status: 422 }, { status: 200, id: 777 }] }),
+    );
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      const result = await adapter.submitReview(OWNER, REPO, PR_NUMBER, {
+        commitSha: 'headsha1234567890',
+        verdict: 'comment',
+        summaryBody: 'Some notes',
+        comments: [
+          { path: 'src/a.ts', position: 2, body: 'a', title: 'finding a' },
+          { path: 'src/b.ts', position: 4, body: 'b', title: 'finding b' },
+        ],
+      });
+
+      const reviewPosts = calls.filter(
+        (call) => call.method === 'POST' && call.path === `/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}/reviews`,
+      );
+      expect(reviewPosts).toHaveLength(2);
+      // The summary-only retry carries an empty comments array.
+      expect(reviewPosts[1]?.body.comments).toEqual([]);
+
+      const commentPosts = calls.filter(
+        (call) => call.method === 'POST' && call.path === `/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}/comments`,
+      );
+      expect(commentPosts).toHaveLength(2);
+      // Per-comment wire body is EXACTLY { body, commit_id, path, position } -- no title key.
+      expect(commentPosts[0]?.body).toEqual({
+        body: 'a',
+        commit_id: 'headsha1234567890',
+        path: 'src/a.ts',
+        position: 2,
+      });
+      expect(commentPosts[1]?.body).toEqual({
+        body: 'b',
+        commit_id: 'headsha1234567890',
+        path: 'src/b.ts',
+        position: 4,
+      });
+      expect(commentPosts[0]?.body).not.toHaveProperty('title');
+      expect(commentPosts[1]?.body).not.toHaveProperty('title');
+
+      expect(result.ref).toBe('777');
+      // All per-comment posts succeeded -- no skips on the fallback path.
+      expect(result).not.toHaveProperty('skippedComments');
+    } finally {
+      restore();
+    }
+  });
+
+  it('per-comment 422 skips with a warning (no body in payload) and surfaces skippedComments', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const { calls, restore } = installGitHubFetchMock(
+      buildFixtures({
+        reviewResponses: [{ status: 422 }, { status: 200, id: 777 }],
+        reviewCommentResponses: [{ status: 422 }, { status: 201, id: 1 }],
+      }),
+    );
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      const result = await adapter.submitReview(OWNER, REPO, PR_NUMBER, {
+        commitSha: 'headsha1234567890',
+        verdict: 'comment',
+        summaryBody: 'Some notes',
+        comments: [
+          { path: 'src/a.ts', position: 2, body: 'a', title: 'finding a' },
+          { path: 'src/b.ts', position: 4, body: 'b', title: 'finding b' },
+        ],
+      });
+
+      // The 422'd comment (src/a.ts) is skipped; the other comment's POST still records 201.
+      expect(result).toEqual({
+        ref: '777',
+        skippedComments: [{ path: 'src/a.ts', line: 2, title: 'finding a' }],
+      });
+      const commentPosts = calls.filter(
+        (call) => call.method === 'POST' && call.path === `/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}/comments`,
+      );
+      expect(commentPosts).toHaveLength(2);
+      expect(commentPosts[1]?.body.path).toBe('src/b.ts');
+
+      // One warn for the skipped comment with path/position/title and NO body key.
+      const skipWarn = warnSpy.mock.calls.find(([message]) =>
+        String(message).includes('per-comment review comment failed with 422'),
+      );
+      expect(skipWarn).toBeDefined();
+      const payload = skipWarn?.[1] as Record<string, unknown>;
+      expect(payload).toMatchObject({
+        owner: OWNER,
+        repo: REPO,
+        pullNumber: PR_NUMBER,
+        path: 'src/a.ts',
+        position: 2,
+        title: 'finding a',
+        reason: 'unprocessable',
+      });
+      expect(payload).not.toHaveProperty('body');
+    } finally {
+      warnSpy.mockRestore();
+      restore();
+    }
+  });
+
+  it('a per-comment non-422 failure rethrows GitHubError (the review fails loudly)', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const { restore } = installGitHubFetchMock(
+      buildFixtures({
+        reviewResponses: [{ status: 422 }, { status: 200, id: 777 }],
+        reviewCommentResponses: [{ status: 403 }],
+      }),
+    );
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      await expect(
+        adapter.submitReview(OWNER, REPO, PR_NUMBER, {
+          commitSha: 'headsha1234567890',
+          verdict: 'comment',
+          summaryBody: 'Some notes',
+          comments: [{ path: 'src/a.ts', position: 2, body: 'a' }],
+        }),
+      ).rejects.toBeInstanceOf(GitHubError);
+    } finally {
+      restore();
+    }
+  });
+
+  it('reply POSTs never consume the per-comment script (route discrimination, REVIEWS R2/R11)', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const { calls, restore } = installGitHubFetchMock(
+      buildFixtures({
+        reviewResponses: [{ status: 422 }, { status: 200, id: 777 }],
+        reviewCommentResponses: [{ status: 422 }, { status: 201, id: 1 }],
+      }),
+    );
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      const reply = await adapter.replyToPrComment(OWNER, REPO, PR_NUMBER, 'a threaded reply', '1997');
+      // The reply default id is still returned -- the script was not consumed.
+      expect(reply).toEqual({ ref: '8002' });
+      const replyPost = calls.find(
+        (call) => call.method === 'POST' && call.path === `/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}/comments`,
+      );
+      expect(replyPost?.body).toEqual({ body: 'a threaded reply', in_reply_to: 1997 });
     } finally {
       restore();
     }
