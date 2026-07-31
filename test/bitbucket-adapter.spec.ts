@@ -238,8 +238,10 @@ describe('BitbucketAdapter (VcsProvider mapping)', () => {
       ],
     };
 
-    const { ref } = await adapter.submitReview(WORKSPACE, REPO, PR_NUMBER, input);
-    expect(ref).toBe('101');
+    const result = await adapter.submitReview(WORKSPACE, REPO, PR_NUMBER, input);
+    expect(result.ref).toBe('101');
+    // Phase 33 (FR-031, REVIEWS R1): clean runs omit skippedComments entirely.
+    expect(result.skippedComments).toBeUndefined();
 
     const commentPosts = mock.calls.filter(
       (call) => call.method === 'POST' && call.path.includes('/pullrequests/') && call.path.endsWith('/comments'),
@@ -412,6 +414,160 @@ describe('BitbucketAdapter (VcsProvider mapping)', () => {
     });
     const approve2 = mock2.calls.find((call) => call.method === 'POST' && call.path.endsWith('/approve'));
     expect(approve2).toBeDefined();
+  });
+
+  // --- Phase 33 (PRD-01 / FR-031, D-02): per-comment 422 skip-and-continue ---
+
+  it('submitReview skip-and-continues on an inline 422, surfacing skippedComments (FR-031, D-02)', async () => {
+    const mock = installBitbucketFetchMock({
+      postPullRequestCommentResponses: [
+        { status: 201, body: { id: 100 } }, // inline comment 1
+        { status: 422, body: {} }, // inline comment 2 — skipped
+        { status: 201, body: { id: 102 } }, // inline comment 3
+      ],
+      listPullRequestCommentsResponse: { body: { values: [] } },
+    });
+    const { adapter, env } = buildAdapter();
+    const seededDiff = [
+      'diff --git a/src/foo.ts b/src/foo.ts',
+      'index 1234567..890abcd 100644',
+      '--- a/src/foo.ts',
+      '+++ b/src/foo.ts',
+      '@@ -1,1 +1,4 @@',
+      ' context',
+      '+added1',
+      '+added2',
+      '+added3',
+    ].join('\n');
+    await env.APP_KV.put(`diff:${(adapter as unknown as { job: { id: string } }).job.id}`, seededDiff);
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    try {
+      const result = await adapter.submitReview(WORKSPACE, REPO, PR_NUMBER, {
+        commitSha: COMMIT_SHA,
+        verdict: 'comment',
+        summaryBody: 'Looks mostly good',
+        jobIdHint: 'job-bb-1',
+        comments: [
+          { path: 'src/foo.ts', position: 2, body: 'first', title: 'finding one' },
+          { path: 'src/foo.ts', position: 3, body: 'second', title: 'finding two' },
+          { path: 'src/foo.ts', position: 4, body: 'third', title: 'finding three' },
+        ],
+      });
+
+      const commentPosts = mock.calls.filter(
+        (call) => call.method === 'POST' && call.path.includes('/pullrequests/') && call.path.endsWith('/comments'),
+      );
+      // 3 inline posts + 1 summary post; the summary is the LAST post.
+      expect(commentPosts).toHaveLength(4);
+      expect(
+        (commentPosts[commentPosts.length - 1].body as { content: { raw: string } }).content.raw,
+      ).toContain('codra-review');
+
+      // The 422'd comment is skipped; the others are posted.
+      expect(result.postedComments).toHaveLength(2);
+      expect(result.skippedComments).toEqual([
+        { path: 'src/foo.ts', line: 3, title: 'finding two' },
+      ]);
+
+      // Warn fired for the skipped comment with the exact payload — no body key.
+      const skipWarn = warnSpy.mock.calls.find(([message]) => String(message).includes('rejected with 422'));
+      expect(skipWarn).toBeDefined();
+      expect(skipWarn?.[1]).toEqual({
+        workspace: WORKSPACE,
+        repo: REPO,
+        path: 'src/foo.ts',
+        line: 3,
+        title: 'finding two',
+      });
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('submitReview REJECTS when the SUMMARY post 422s — summary stays fail-hard (REVIEWS R12)', async () => {
+    const mock = installBitbucketFetchMock({
+      postPullRequestCommentResponses: [
+        { status: 201, body: { id: 100 } }, // inline comment
+        { status: 422, body: {} }, // summary post — must reject
+      ],
+      listPullRequestCommentsResponse: { body: { values: [] } },
+    });
+    const { adapter, env } = buildAdapter();
+    const seededDiff = [
+      'diff --git a/src/foo.ts b/src/foo.ts',
+      'index 1234567..890abcd 100644',
+      '--- a/src/foo.ts',
+      '+++ b/src/foo.ts',
+      '@@ -1,1 +1,2 @@',
+      ' context',
+      '+added1',
+    ].join('\n');
+    await env.APP_KV.put(`diff:${(adapter as unknown as { job: { id: string } }).job.id}`, seededDiff);
+
+    await expect(
+      adapter.submitReview(WORKSPACE, REPO, PR_NUMBER, {
+        commitSha: COMMIT_SHA,
+        verdict: 'comment',
+        summaryBody: 'Looks good',
+        jobIdHint: 'job-bb-1',
+        comments: [{ path: 'src/foo.ts', position: 2, body: 'first', title: 'finding one' }],
+      }),
+    ).rejects.toBeInstanceOf(BitbucketError);
+
+    void mock;
+  });
+
+  it('a 422-skipped comment never poisons the dedup map — an identical later comment still posts (REVIEWS R3)', async () => {
+    const mock = installBitbucketFetchMock({
+      postPullRequestCommentResponses: [
+        { status: 422, body: {} }, // identical comment 1 — skipped, NOT dedup-indexed
+        { status: 201, body: { id: 100 } }, // identical comment 2 — still posts
+        { status: 201, body: { id: 101 } }, // summary post
+      ],
+      listPullRequestCommentsResponse: { body: { values: [] } },
+    });
+    const { adapter, env } = buildAdapter();
+    const seededDiff = [
+      'diff --git a/src/foo.ts b/src/foo.ts',
+      'index 1234567..890abcd 100644',
+      '--- a/src/foo.ts',
+      '+++ b/src/foo.ts',
+      '@@ -1,1 +1,2 @@',
+      ' context',
+      '+added1',
+    ].join('\n');
+    await env.APP_KV.put(`diff:${(adapter as unknown as { job: { id: string } }).job.id}`, seededDiff);
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    try {
+      const result = await adapter.submitReview(WORKSPACE, REPO, PR_NUMBER, {
+        commitSha: COMMIT_SHA,
+        verdict: 'comment',
+        summaryBody: 'Looks good',
+        jobIdHint: 'job-bb-1',
+        comments: [
+          { path: 'src/foo.ts', position: 2, body: 'identical text', title: 'finding one' },
+          { path: 'src/foo.ts', position: 2, body: 'identical text', title: 'finding two' },
+        ],
+      });
+
+      // The 422-skipped comment never entered the dedup map, so the identical comment POSTs:
+      // three comment POSTs total (A inline 422, B identical inline 201, summary 201) — if A had
+      // been dedup-indexed, B would have been dedup-skipped and only two would have POSTed.
+      const commentPosts = mock.calls.filter(
+        (call) => call.method === 'POST' && call.path.includes('/pullrequests/') && call.path.endsWith('/comments'),
+      );
+      expect(commentPosts).toHaveLength(3);
+      // Only the identical comment B is in postedComments; A is in skippedComments.
+      expect(result.postedComments).toHaveLength(1);
+      expect(result.postedComments[0]).toMatchObject({ path: 'src/foo.ts', line: 2, body: 'identical text' });
+      expect(result.skippedComments).toEqual([
+        { path: 'src/foo.ts', line: 2, title: 'finding one' },
+      ]);
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it('findExistingReviewForCommit lists comments and filters for the codra-review footer with the commit substring', async () => {

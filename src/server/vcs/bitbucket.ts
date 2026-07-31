@@ -23,6 +23,7 @@ import type {
   VcsPullRequest,
   VcsReviewComment,
   VcsReviewThread,
+  VcsSkippedComment,
   VcsSubmitReviewInput,
   VcsTreeListing,
   VcsUpdateStatusCheckInput,
@@ -459,7 +460,7 @@ export class BitbucketAdapter implements VcsProvider {
     repo: string,
     prNumber: number,
     input: VcsSubmitReviewInput,
-  ): Promise<{ ref: string; postedComments: VcsPostedComment[] }> {
+  ): Promise<{ ref: string; postedComments: VcsPostedComment[]; skippedComments?: VcsSkippedComment[] }> {
     const workspace = this.job.repositoryWorkspace;
 
     // REV-R-A step 1: fetch existing comments to seed the dedup index BEFORE posting anything.
@@ -474,6 +475,10 @@ export class BitbucketAdapter implements VcsProvider {
     // method returns) can link every current-round finding's annotation back to its comment --
     // including findings whose comment already existed from a prior round (Pitfall 1).
     const postedComments: VcsPostedComment[] = [];
+    // Phase 33 (PRD-01 / FR-031, D-02): inline comments rejected with a 422 are skipped with a
+    // warning instead of failing the whole review. `skippedComments` is omitted from the return
+    // when empty so clean runs stay byte-identical (REVIEWS R1).
+    const skippedComments: VcsSkippedComment[] = [];
 
     // REV-R-A step 2: post inline comments (or skip if a matching comment already exists).
     for (const comment of input.comments) {
@@ -492,15 +497,35 @@ export class BitbucketAdapter implements VcsProvider {
         continue;
       }
 
-      const postedInline = await this.client.postPullRequestComment(workspace, repo, prNumber, {
-        path: comment.path,
-        line: anchor.line,
-        line_type: anchor.line_type,
-        content: { raw: comment.body },
-      });
-      postedComments.push({ path: comment.path, line: anchor.line, body: comment.body, link: postedInline.links?.html?.href });
-      // Add to the in-memory map so subsequent comments with the same key are also dedup'd.
-      dedup.set(key, { id: postedInline.id, link: postedInline.links?.html?.href });
+      // FR-031 (D-02): a per-comment 422 is SKIPPED with a warning, never rethrown -- one bad
+      // comment must not fail the whole review. The catch wraps ONLY the inline POST: the
+      // `postedComments.push` below stays on the SUCCESS path, and `dedup.set` stays inside it so
+      // a skipped comment is never dedup-indexed (REVIEWS R3). The summary post and approve call
+      // stay fail-hard (D-02) -- they are NOT wrapped in this try/catch.
+      try {
+        const postedInline = await this.client.postPullRequestComment(workspace, repo, prNumber, {
+          path: comment.path,
+          line: anchor.line,
+          line_type: anchor.line_type,
+          content: { raw: comment.body },
+        });
+        postedComments.push({ path: comment.path, line: anchor.line, body: comment.body, link: postedInline.links?.html?.href });
+        // Add to the in-memory map so subsequent comments with the same key are also dedup'd.
+        dedup.set(key, { id: postedInline.id, link: postedInline.links?.html?.href });
+      } catch (error) {
+        if (error instanceof BitbucketError && error.status === 422) {
+          logger.warn(`BitbucketAdapter: inline comment rejected with 422, skipping`, {
+            workspace,
+            repo,
+            path: comment.path,
+            line: anchor.line,
+            title: comment.title,
+          });
+          skippedComments.push({ path: comment.path, line: anchor.line, title: comment.title });
+          continue;
+        }
+        throw error;
+      }
     }
 
     // REV-R-A step 3: the summary as the SINGLE final post. The dedup anchor is a clean Bitbucket
@@ -518,7 +543,9 @@ export class BitbucketAdapter implements VcsProvider {
       await this.client.approvePullRequest(workspace, repo, prNumber);
     }
     void owner;
-    return { ref: String(posted.id), postedComments };
+    return skippedComments.length > 0
+      ? { ref: String(posted.id), postedComments, skippedComments }
+      : { ref: String(posted.id), postedComments };
   }
 
   async findExistingReviewForCommit(
