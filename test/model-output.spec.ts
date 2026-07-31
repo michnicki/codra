@@ -251,6 +251,188 @@ export function nextOwner(owner: string) {
   });
 });
 
+describe('FR-153/FR-154 parse normalization (PRD-02)', () => {
+  // Same shape as the parent describe's mockFile (hunk line 2 = the add line "new line", position
+  // 2) so a finding anchored at line 2 survives the orphan check and becomes a persisted comment.
+  const mockFile: FileDiff = {
+    path: 'test.ts',
+    previousPath: null,
+    isNew: false,
+    isDeleted: false,
+    isBinary: false,
+    lineCount: 10,
+    hunks: [
+      {
+        header: '@@ -1,5 +1,5 @@',
+        lines: [
+          { kind: 'context', content: 'older', newLineNumber: 1, position: 1 },
+          { kind: 'add', content: 'new line', newLineNumber: 2, position: 2 },
+          { kind: 'context', content: 'older', newLineNumber: 3, position: 3 },
+        ],
+      },
+    ],
+  };
+
+  const dropEvents = (r: ReturnType<typeof parseFileReviewResponse>) =>
+    r.severityAuditEvents.filter((e) => e.stage === 'suggestion_dropped');
+
+  const rawWith = (finding: Record<string, unknown>) =>
+    JSON.stringify({
+      findings: [{ ...finding, code_location: finding.code_location ?? { absolute_file_path: 'test.ts', line: 2 } }],
+      overall_correctness: 'patch is incorrect',
+      overall_explanation: 'Found an issue',
+    });
+
+  it('suggestion == existingCode clears codeSuggestion to null and strips the fence from the body (D-06)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({ title: 'finding', body: 'the issue', priority: 1, code_suggestion: 'same', existing_code: 'same' }),
+      mockFile,
+    );
+    expect(result.comments).toHaveLength(1);
+    expect(result.comments[0].codeSuggestion).toBeNull();
+    expect(result.comments[0].body).not.toContain('```suggestion');
+    expect(result.comments[0].body).toBe('the issue');
+  });
+
+  it('a FENCED suggestion identical to existingCode still clears (D-07 — the fence cannot dodge the check)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({
+        title: 'finding',
+        body: 'the issue',
+        priority: 1,
+        code_suggestion: '```suggestion\nsame\n```',
+        existing_code: 'same',
+      }),
+      mockFile,
+    );
+    expect(result.comments).toHaveLength(1);
+    expect(result.comments[0].codeSuggestion).toBeNull();
+    expect(result.comments[0].body).not.toContain('```suggestion');
+    expect(result.comments[0].body).toBe('the issue');
+  });
+
+  it('a suggestion differing from existingCode stays unchanged with the fence intact', () => {
+    const result = parseFileReviewResponse(
+      rawWith({ title: 'finding', body: 'the issue', priority: 1, code_suggestion: 'x', existing_code: 'y' }),
+      mockFile,
+    );
+    expect(result.comments).toHaveLength(1);
+    expect(result.comments[0].codeSuggestion).toBe('x');
+    expect(result.comments[0].body).toContain('```suggestion');
+  });
+
+  it('non-empty suggestion + whitespace-only body drops the comment and audits suggestion_dropped (D-05/D-08)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({ title: 'finding', body: '   ', priority: 1, code_suggestion: 'x' }),
+      mockFile,
+    );
+    expect(result.comments).toHaveLength(0);
+    const events = dropEvents(result);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ stage: 'suggestion_dropped', droppedCount: 1 });
+  });
+
+  it('code_suggestion: "" is treated as absent — the per-file parse never throws (fail-open hardening)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({ title: 'finding', body: 'the issue', priority: 1, code_suggestion: '' }),
+      mockFile,
+    );
+    expect(result.comments).toHaveLength(1);
+    expect(result.comments[0].codeSuggestion).toBeUndefined();
+  });
+
+  it('code_suggestion: "   " (whitespace-only) is also treated as absent', () => {
+    const result = parseFileReviewResponse(
+      rawWith({ title: 'finding', body: 'the issue', priority: 1, code_suggestion: '   ' }),
+      mockFile,
+    );
+    expect(result.comments).toHaveLength(1);
+    expect(result.comments[0].codeSuggestion).toBeUndefined();
+  });
+
+  it('an 81-char title truncates to exactly 80 chars; an exactly-80-char title is unchanged (D-09/D-10)', () => {
+    const longTitle = 'A'.repeat(81);
+    const result = parseFileReviewResponse(
+      rawWith({ title: longTitle, body: 'the issue', priority: 1 }),
+      mockFile,
+    );
+    expect(result.comments).toHaveLength(1);
+    expect(result.comments[0].title).toHaveLength(80);
+    expect(result.comments[0].title).toBe(longTitle.slice(0, 80));
+
+    const exactly80 = 'B'.repeat(80);
+    const result80 = parseFileReviewResponse(
+      rawWith({ title: exactly80, body: 'the issue', priority: 1 }),
+      mockFile,
+    );
+    expect(result80.comments[0].title).toBe(exactly80);
+  });
+
+  it('truncation happens AFTER the severity/category engine saw the full title (D-10)', () => {
+    const longTitle = 'A'.repeat(81);
+    const longResult = parseFileReviewResponse(
+      rawWith({ title: longTitle, body: 'the issue', priority: 1 }),
+      mockFile,
+    );
+    const shortResult = parseFileReviewResponse(
+      rawWith({ title: longTitle.slice(0, 80), body: 'the issue', priority: 1 }),
+      mockFile,
+    );
+    expect(longResult.comments[0].severity).toBe(shortResult.comments[0].severity);
+    expect(longResult.comments[0].category).toBe(shortResult.comments[0].category);
+  });
+
+  it('an off-diff 81-char title lands in the orphan bucket truncated to 80 chars (D-11)', () => {
+    const longTitle = 'A'.repeat(81);
+    const result = parseFileReviewResponse(
+      rawWith({ title: longTitle, body: 'the issue', priority: 1, code_location: { absolute_file_path: 'test.ts', line: 999 } }),
+      mockFile,
+    );
+    expect(result.comments).toHaveLength(0);
+    expect(result.fileSummary).toContain(longTitle.slice(0, 80));
+    // The 81-char full title must NOT appear — the orphan entry carries exactly the truncated form.
+    expect(result.fileSummary).not.toContain(longTitle);
+  });
+
+  it('an off-diff title with a QUALITY: prefix strips the prefix before truncation (consensus fold-in (c))', () => {
+    const result = parseFileReviewResponse(
+      rawWith({
+        title: `QUALITY: ${'A'.repeat(81)}`,
+        body: 'the issue',
+        priority: 1,
+        code_location: { absolute_file_path: 'test.ts', line: 999 },
+      }),
+      mockFile,
+    );
+    expect(result.comments).toHaveLength(0);
+    // cleanText strips the QUALITY: prefix, then slice(0, 80) applies to the cleaned title.
+    expect(result.fileSummary).toContain('A'.repeat(80));
+    expect(result.fileSummary).not.toContain('QUALITY');
+  });
+
+  it('a clean finding round-trips byte-identically (NREG-01, REVIEWS R12)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({ title: 'finding', body: 'the issue', priority: 1 }),
+      mockFile,
+    );
+    expect(result.comments).toEqual([
+      {
+        path: 'test.ts',
+        line: 2,
+        position: 2,
+        severity: 'P1',
+        category: 'correctness',
+        title: 'finding',
+        body: 'the issue',
+        codeSuggestion: undefined,
+        existingCode: null,
+        confidence: undefined,
+      },
+    ]);
+    expect(dropEvents(result)).toHaveLength(0);
+  });
+});
+
 describe('EVID-01/EVID-03 soft evidence gate (evidence_missing_summary aggregate)', () => {
   // mockFile hunk line 2 is the add line "new line" (position 2), so a finding at line 2 survives the
   // orphan check and becomes a persisted comment. Evidence is checked against the cleaned-hunk
