@@ -4,7 +4,9 @@
 
 Codra is self-hosted AI code review for pull requests, running entirely on Cloudflare (Workers, Queues, KV, Hyperdrive, Workers AI) with an external PostgreSQL database. It reviews pull requests on **both GitHub and Bitbucket Cloud** from a single deployed instance: a per-provider webhook enqueues review jobs, a durable Cloudflare Workflow runs a **multi-pass** LLM review (a main pass plus a dedicated security pass, near-duplicate suppression, a critic pass, optional ensemble majority vote, and an optional verify-fixes pass over unresolved bot threads) over the PR diff through a shared `VcsProvider` abstraction, then posts back a **streamed walkthrough** (with a deterministically clamped confidence score, effort estimate, and change groups), inline findings, a summary report, and a merge-gating status on whichever platform the PR came from. Repo members can also **drive the bot in-PR** — `review` / `review-rest` / `pause` / `resume` / `help` / `reject` / `ignore` commands and free-form Q&A via @mention, with threaded replies — on both providers. Every interactive/multi-pass capability is config-gated (default off except three documented correctness fixes — `severity_engine`, `dedup`, `file_selection` — each with a single escape hatch) and byte-identical to the base review when disabled. Every drop in the engine is now explained by a per-stage `jobs.audit` trail surfaced in the dashboard's job-detail audit-trail viewer.
 
-## Current State (as of v1.4 + Phase 32)
+## Current State (as of v1.5 — Phase 33)
+
+**v1.5 Phase 33 Quality Fixes** complete 2026-07-31 (4/4 plans, PRD-01/02/03 satisfied, 24/24 must-haves verified, code review clean). The review pipeline now: retries each inline comment individually on a batch-review 422 (GitHub summary-only retry + per-comment fallback with a budget guard), skip-and-continues on per-comment 422s (Bitbucket) with body-free warning logs, surfaces posted-vs-skipped comments via an `inline_comment_skipped` aggregate audit event per review round (dashboard-visible in its own audit-trail group), truncates parsed comment titles to 80 chars (including off-diff orphans), clears suggestions equal to `existingCode` (stripping the redundant fence), drops suggestion-only-empty-body comments behind a `suggestion_dropped` aggregate, treats `code_suggestion: ""` as absent (closing a whole-file parse throw), and repairs nested double quotes in Mermaid walkthrough diagram labels (`engine["core/"engine.py""]` → `engine["core/engine.py"]`). Zero new npm dependencies, zero migrations.
 
 **v1.4 Deferred Candidates + Phase 32 Tech Debt Cleanup** — all 6 v1.4 feature phases (26-31) shipped, plus Phase 32 tech-debt cleanup closing audit-viewer renderer verification, misleading middleware comment correction, hardcoded type union replacement, test-hygiene improvements, integration-test gap closure, logger redaction hardening, broken migration script deletion, and stale planning doc reconciliation. Milestone archived 2026-07-31.
 
@@ -18,7 +20,21 @@ Codra is self-hosted AI code review for pull requests, running entirely on Cloud
 
 See `.planning/milestones/` for full phase-by-phase detail and closeout audits (`v1.0-*`, `v1.1-*`, `v1.2-*`).
 
-## Current Milestone: v1.4 — Deferred Candidates (Hard-Drop Evidence + Review Quality + Bitbucket Differentiators) — CLOSED 2026-07-31
+## Current Milestone: v1.5 — PRD Parity (Agentic Context, Outbound Events & Quality Fixes)
+
+**Goal:** Close the remaining 8 gaps between the review-engine PRD and Codra's implementation.
+
+**Target features:**
+- Per-comment 422 fallback (FR-031) — don't drop all findings on batch validation error
+- Title truncation (80 chars) + suggestion=existingCode clearing (FR-153/154)
+- Mermaid label sanitization (FR-155)
+- File history / decision archaeology (FR-114)
+- .review.yaml per-repo configuration (§15)
+- Agentic tools — read_file/grep_repo loop for unindexed repos (FR-131/132)
+- Outbound webhook event delivery (FR-401)
+- Blast radius / cross-repo dependencies (FR-113)
+
+### v1.4 — Deferred Candidates (Hard-Drop Evidence + Review Quality + Bitbucket Differentiators) — CLOSED 2026-07-31
 
 **Scoped:** 2026-07-26
 **Scope:** All 6 deferred candidates promoted — 7 phases (26-32) ordered by dependency.
@@ -112,6 +128,19 @@ A Bitbucket Cloud pull request receives the same automated AI review — inline 
 - ✓ QA-IDX-01: Codebase-index-backed Q&A — Postgres-native full-text search index of default-branch tree, incremental push-triggered refresh, dashboard build/status panel, config-gated (`qa.index_enabled`, default off) — v1.4 (Phase 29)
 - ✓ ANNO-01: Per-line Bitbucket Code Insights `ANNOTATION` reports mirroring inline findings — dedicated `codra-annotations` report, config-gated (`review.bitbucket.annotations_enabled`, default off), full-replace-per-round (delete-then-recreate), fail-open in finalize, `external_id` collision-resistant, `result` always `PASSED` (never merge-gating) — v1.4 (Phase 30, UAT 1/1 passed incl. live Assumption-A1 cascade confirmation; security review 17/17 threats closed)
 - ✓ WS-01: Workspace-level Bitbucket Access Token + webhook auto-discovers and onboards many repos from one workspace credential — `vcs_workspace_credentials` table + D-03 per-repo-wins credential resolution, transactional finalize endpoint (encrypt + persist + selective onboard + idempotent webhook), webhook route verifies against per-repo OR workspace secret, two-step discover/checklist dashboard UI — v1.4 (Phase 31, 25/25 must-haves; code review found 2 blockers — both fixed and regression-tested before verification)
+
+<!-- Active requirements for v1.5 — PRD Parity. Full REQ-IDs will be defined in .planning/REQUIREMENTS.md. -->
+
+### Active (v1.5)
+
+- [ ] **PRD-01**: Per-comment 422 fallback — on batch review 422, retry each comment individually, skip any that still 422 with warning log (FR-031)
+- [ ] **PRD-02**: Title truncation to 80 chars + suggestion=existingCode clearing (FR-153/154)
+- [ ] **PRD-03**: Mermaid label sanitization — escape nested double quotes in walkthrough diagram labels (FR-155)
+- [ ] **PRD-04**: File history / decision archaeology — per-touched-file commit history as review context (FR-114)
+- [ ] **PRD-05**: .review.yaml per-repo configuration — YAML file discovery and merge with DB config (§15)
+- [ ] **PRD-06**: Agentic tools — read_file/grep_repo tool loop for on-demand cross-file context (FR-131/132)
+- [ ] **PRD-07**: Outbound webhook event delivery — review.completed, review.high_severity, review.failed events (FR-401)
+- [ ] **PRD-08**: Blast radius / cross-repo dependencies — compute related repos, filter by visibility (FR-113)
 
 ### Out of Scope
 
@@ -218,4 +247,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-07-31 — v1.4 milestone archived: 7 phases (26-32), 33 plans, 6/6 requirements satisfied. All v1.4 deferred candidates (EVID-02, SEC-XDIFF-01, LRN-01, QA-IDX-01, ANNO-01, WS-01) + tech debt cleanup shipped.*
+*Last updated: 2026-07-31 — v1.5 milestone in progress: Phase 33 quality fixes complete (PRD-01/02/03), 3 of 8 PRD-parity requirements shipped. Next: Phase 34 context enhancement (PRD-04/05).*
