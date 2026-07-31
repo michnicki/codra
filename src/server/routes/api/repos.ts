@@ -372,6 +372,14 @@ export function createReposRouter() {
         // D-07: iterate ONLY selectedRepoSlugs, NEVER the full discovery list -- selection is the
         // source of truth for what gets onboarded at finalize time (see the module prohibition:
         // MUST NOT silently expand review coverage beyond the operator's explicit selection).
+        //
+        // Accepted risk (WS-01 review consensus, both reviewers MEDIUM): the submitted
+        // selectedRepoSlugs are NOT re-validated against Bitbucket's current repo list at finalize
+        // time. If a slug doesn't exist, the webhook creation below will fail with a 502 at the
+        // catch block, and the error message already tells the operator to resubmit. The only cost
+        // of a spurious slug is a `repositories` row that will never receive webhooks. Adding a
+        // Bitbucket API call at finalize time would add latency and complexity for minimal safety
+        // benefit -- deferred to a future validation pass if needed.
         for (const repoSlug of selectedRepoSlugs) {
           await getOrCreateRepository(c.env, {
             installationId: '',
@@ -407,7 +415,10 @@ export function createReposRouter() {
     // happens yet," which the distinct 502 message below tells the operator directly how to
     // resolve. See threat_model T-31-03-06 for the full disposition (mitigate via the explicit
     // error message, not via rollback).
-    const webhookUrl = `${new URL(c.req.url).origin}/webhook/bitbucket`;
+    if (!c.env.APP_URL) {
+      throw new Error('APP_URL env var is not configured — cannot construct webhook URL');
+    }
+    const webhookUrl = `${c.env.APP_URL}/webhook/bitbucket`;
 
     try {
       const client = new BitbucketClient(c.env, accessToken);
