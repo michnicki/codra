@@ -316,14 +316,22 @@ describe('BitbucketClient', () => {
   });
 
   it('deleteCodeInsightsReport rethrows a non-404 BitbucketError (500)', async () => {
-    installBitbucketFetchMock({
-      deleteCodeInsightsReportResponse: { status: 500, body: { error: { message: 'Internal error' } } },
-    });
-    const { client } = createClient();
+    // Exercises withRetry exponential backoff (2s + 4s) — use fake timers to avoid real delays.
+    vi.useFakeTimers();
+    try {
+      installBitbucketFetchMock({
+        deleteCodeInsightsReportResponse: { status: 500, body: { error: { message: 'Internal error' } } },
+      });
+      const { client } = createClient();
 
-    const request = client.deleteCodeInsightsReport('acme', 'backend', 'head123', 'codra-annotations');
-    await expect(request).rejects.toBeInstanceOf(BitbucketError);
-    await expect(request).rejects.toMatchObject({ status: 500 });
+      const request = client.deleteCodeInsightsReport('acme', 'backend', 'head123', 'codra-annotations');
+      request.catch(() => {});
+      await vi.runAllTimersAsync();
+      await expect(request).rejects.toBeInstanceOf(BitbucketError);
+      await expect(request).rejects.toMatchObject({ status: 500 });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('bulkUpsertAnnotations POSTs the annotation array verbatim', async () => {
