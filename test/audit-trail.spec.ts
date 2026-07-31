@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { insertJob, getJobDetail, appendJobAuditEvents } from '@server/db/jobs';
 import * as jobsModule from '@server/db/jobs';
-import { buildFileSkipEvents, recordFileSkips, recordUnitAudit, buildEvidenceMissingSummary } from '@server/core/audit';
+import { buildFileSkipEvents, recordFileSkips, recordUnitAudit, buildEvidenceMissingSummary, buildInlineCommentSkippedEvent } from '@server/core/audit';
 import type { FileDiff } from '@server/core/diff';
 import { queryRows } from '@server/db/client';
 import { defaultRepoConfig, type JobAuditEvent } from '@shared/schema';
@@ -382,6 +382,55 @@ describe('buildEvidenceMissingSummary (EVID-03, D-05/D-06/D-07)', () => {
     const event = buildEvidenceMissingSummary('src/test.ts', 'main', [
       { path: 'src/a.ts', line: 10, title: 'first', reason: 'absent' },
       { path: 'src/b.ts', line: null, title: 'second', reason: 'not_in_hunk' },
+    ])!;
+
+    const result = jobAuditEventSchema.safeParse(event);
+    expect(result.success).toBe(true);
+  });
+});
+
+describe('buildInlineCommentSkippedEvent (PRD-01, D-03/D-04)', () => {
+  it('empty input returns null (no zero-count event for a clean round)', () => {
+    expect(buildInlineCommentSkippedEvent([])).toBeNull();
+  });
+
+  it('single skipped comment produces one aggregate with count 1 and the skipped identifier', () => {
+    const event = buildInlineCommentSkippedEvent([{ path: 'src/a.ts', line: 4, title: 'finding one' }])!;
+
+    expect(event.stage).toBe('inline_comment_skipped');
+    expect(event.count).toBe(1);
+    expect(event.sample).toEqual([{ path: 'src/a.ts', line: 4, title: '[title-redacted]' }]);
+  });
+
+  it('sample titles are redacted via redactFindingTitle (AUD-01)', () => {
+    const event = buildInlineCommentSkippedEvent([{ path: 'src/x.ts', line: 10, title: 'secret-finding' }])!;
+
+    expect(event.sample[0].title).toBe('[title-redacted]');
+  });
+
+  it('absent line normalizes to null', () => {
+    const event = buildInlineCommentSkippedEvent([{ path: 'src/x.ts', title: 'finding' }])!;
+
+    expect(event.sample[0].line).toBeNull();
+  });
+
+  it('count reflects the full total while the sample is capped at 20', () => {
+    const skipped = Array.from({ length: 25 }, (_, i) => ({
+      path: `src/x/${i}.ts`,
+      line: i,
+      title: `finding ${i}`,
+    }));
+
+    const event = buildInlineCommentSkippedEvent(skipped)!;
+
+    expect(event.count).toBe(25);
+    expect(event.sample).toHaveLength(20);
+  });
+
+  it('builder output round-trips through jobAuditEventSchema', () => {
+    const event = buildInlineCommentSkippedEvent([
+      { path: 'src/a.ts', line: 4, title: 'finding one' },
+      { path: 'src/b.ts', line: null, title: 'finding two' },
     ])!;
 
     const result = jobAuditEventSchema.safeParse(event);

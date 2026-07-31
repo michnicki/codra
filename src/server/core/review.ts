@@ -59,6 +59,7 @@ import { updateFileReviewEnsembleResult } from '@server/db/file-reviews';
 import {
   buildFileSkipEvents,
   buildFinalizeDropEvents,
+  buildInlineCommentSkippedEvent,
   recordFileSkips,
   recordFinalizeDrops,
   recordRoundAudit,
@@ -83,7 +84,7 @@ import {
 } from './rounds';
 
 import { VcsService } from '../services/vcs';
-import type { VcsProvider, VcsPullRequest, VcsReviewThread, VcsUpdateStatusCheckInput, VcsPostedComment } from '../vcs/types';
+import type { VcsProvider, VcsPullRequest, VcsReviewThread, VcsUpdateStatusCheckInput, VcsPostedComment, VcsSkippedComment } from '../vcs/types';
 import { isRetryableModelError, ModelService } from '../services/model';
 import { FormatterService } from '../services/formatter';
 import { TokenTracker } from './token-tracker';
@@ -2572,7 +2573,7 @@ async function runFinalizePhase(
   // even an `'postedComments' in review` guard below (it types the accessed property `unknown`,
   // not `VcsPostedComment[] | undefined`). Annotating the declaration keeps postedComments visible
   // on the inferred type without changing runtime behavior in any way.
-  const review: { ref: string; postedComments?: VcsPostedComment[] } = existingReview ?? await vcs.submitReview(job.owner, job.repo, job.prNumber, {
+  const review: { ref: string; postedComments?: VcsPostedComment[]; skippedComments?: VcsSkippedComment[] } = existingReview ?? await vcs.submitReview(job.owner, job.repo, job.prNumber, {
     commitSha: pr.headSha,
     verdict: verdictSummary.verdict,
     summaryBody: formattedSummary,
@@ -2580,9 +2581,19 @@ async function runFinalizePhase(
     comments: finalComments.map(comment => ({
       path: comment.path,
       position: comment.position ?? undefined,
+      title: comment.title,
       body: formatter.formatInlineComment(comment, { provider: vcs.name }),
     })),
   });
+
+  // Phase 33 (PRD-01 / FR-031, D-03/D-04): ONE aggregate inline_comment_skipped event per review
+  // round, recorded immediately after the review assignment and BEFORE the suppression audit and
+  // walkthrough edit (REVIEWS R9). A clean round (no skips) records nothing; the existingReview
+  // branch never carries skippedComments, so a finalize retry past posting emits no skip event.
+  if (review.skippedComments?.length) {
+    const skipEvent = buildInlineCommentSkippedEvent(review.skippedComments);
+    if (skipEvent) await recordRoundAudit(env, job.id, [skipEvent]);
+  }
 
   // Emit rounds.suppressed only after a successful posting boundary and at most once. A finalize
   // retry that already entered Completing reuses the posted review and skips this append, matching

@@ -24,6 +24,9 @@ export const STAGE_ORDER = [
   'critic',
   'ensemble',
   'walkthrough',
+  // Phase 33 (PRD-01 / FR-031, D-03/D-04): posting-boundary aggregate event; its own display
+  // group (learned_rule_suppressed precedent — a DIFFERENT gate than the parse-drop groups).
+  'inline_comment_skipped',
 ] as const;
 
 /**

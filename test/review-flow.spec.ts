@@ -2948,6 +2948,74 @@ dbDescribe('Review Flow Lifecycle', () => {
     getDiffSpy.mockRestore();
   }, REVIEW_FLOW_TIMEOUT_MS);
 
+  it('records an inline_comment_skipped aggregate audit event when submitReview returns skippedComments (PRD-01, D-03/D-04)', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const repo = `test-repo-${Date.now()}-skipped`;
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+    );
+    const findSpy = vi.spyOn(GitHubService.prototype, 'findBotReviewForCommit');
+    // The CLIENT shape: `position` (the coordinate createReview posts by), which GithubAdapter
+    // submitReview maps to `line` via s.position ?? null. A `line`-keyed fixture would sample null.
+    const createSpy = vi
+      .spyOn(GitHubService.prototype, 'createReview')
+      .mockResolvedValue({ id: 456, skippedComments: [{ path: 'src/foo.ts', position: 3, title: 'my finding' }] } as any);
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 10,
+      prTitle: 'Skipped Comments Test',
+      prAuthor: 'author',
+      commitSha: sha('e1'),
+      baseSha: sha('f1'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: defaultRepoConfig,
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+    await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+    await upsertFileReview(env, job.id, {
+      filePath: 'src/app.ts',
+      fileStatus: 'done',
+      modelUsed: 'test-model',
+      modelProvider: 'test-provider',
+      diffLineCount: 1,
+      diffInput: 'diff',
+      rawAiOutput: '{}',
+      parsedComments: [],
+      inputTokens: 1,
+      outputTokens: 1,
+      durationMs: 1,
+      verdict: 'approve',
+      fileSummary: 'ok',
+      errorMessage: null,
+    });
+
+    await runWithDb(env, async () => {
+      const result = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-skipped', phase: 'finalize' });
+      expect(result).toEqual({ action: 'ack' });
+    });
+
+    expect(createSpy).toHaveBeenCalledTimes(1);
+    const finalJob = await getJobForProcessing(env, job.id);
+    expect(finalJob?.status).toBe('done');
+
+    const detail = await getJobDetail(env, job.id);
+    const skipEvents: any[] = (detail?.audit ?? []).filter((e: any) => e.stage === 'inline_comment_skipped');
+    expect(skipEvents).toHaveLength(1);
+    expect(skipEvents[0]).toMatchObject({ stage: 'inline_comment_skipped', count: 1 });
+    // The adapter mapped client `position` -> `line` (3), and the sample title is redacted (AUD-01).
+    expect(skipEvents[0].sample).toEqual([{ path: 'src/foo.ts', line: 3, title: '[title-redacted]' }]);
+
+    findSpy.mockRestore();
+    createSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
+
   // --- Phase 9 streaming walkthrough (WT-01/WT-02/WT-05, NREG-01/02) ------------------------------
   describe('streaming walkthrough', () => {
     const walkthroughConfig = (): RepoConfig => ({
