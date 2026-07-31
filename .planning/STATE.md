@@ -1,20 +1,20 @@
 ---
 gsd_state_version: 1.0
 milestone: v1.4
-milestone_name: Deferred Candidates
-current_phase: 31
-status: verifying
-stopped_at: Completed 31-04-PLAN.md
-last_updated: "2026-07-30T18:54:31.440Z"
-last_activity: 2026-07-30
-last_activity_desc: Phase 31 complete
+milestone_name: tech debt — audit viewer renderer, misleading middleware comment, hardcoded type unions, test-hygiene improvements, integration test gap, and stale planning docs
+current_phase: 28
+current_phase_name: LRN-01 Learned-rule synthesis from reject feedback
+status: executing
+stopped_at: Phase 32 context gathered
+last_updated: "2026-07-31T08:13:09.862Z"
+last_activity: 2026-07-31
+last_activity_desc: Phase 27 complete, transitioned to Phase 28
 progress:
-  total_phases: 10
+  total_phases: 11
   completed_phases: 10
-  total_plans: 30
-  completed_plans: 30
-  percent: 100
-current_phase_name: ws-01-workspace-level-token-webhook
+  total_plans: 31
+  completed_plans: 31
+  percent: 91
 ---
 
 # Project State
@@ -24,14 +24,14 @@ current_phase_name: ws-01-workspace-level-token-webhook
 See: .planning/PROJECT.md (updated 2026-07-25 for v1.2 closure)
 
 **Core value:** A Bitbucket Cloud PR gets the same AI review a GitHub PR gets, from one instance, without breaking GitHub — held end-to-end since v1.0, extended by v1.1 (every interactive/multi-pass capability shipped on both providers), extended by v1.2 (deterministic severity + real categories, audit-backed noise filter, priority file selection, incremental rounds, verify-fixes, critic v2, ensemble, walkthrough enrichment — all on both providers, every drop explainable from `jobs.audit`).
-**Current focus:** Phase 31 — ws-01-workspace-level-token-webhook
+**Current focus:** Phase 27 — sec-xdiff-01-whole-diff-cross-file-security-reasoning
 
 ## Current Position
 
-Phase: 31
+Phase: 28 — LRN-01 Learned-rule synthesis from reject feedback
 Plan: Not started
-Status: Phase complete — ready for verification
-Last activity: 2026-07-30 — Phase 31 complete
+Status: Executing Phase 27
+Last activity: 2026-07-31 — Phase 27 complete, transitioned to Phase 28
 
 ### Phase 27 Plan 27-01 Decisions (SEC-XDIFF-01)
 
@@ -311,6 +311,7 @@ Decisions carried from v1.1 execution (still load-bearing for v1.2 — Phase 14 
 
 ### Roadmap Evolution
 
+- Phase 32 added (2026-07-31): Address v1.4 tech debt — audit viewer renderer (W-1), misleading middleware comment (W-2), hardcoded type unions, test-hygiene improvements, integration test gap (nextPhaseAfterCrossFileSecurity selector), and stale planning docs. From v1.4 milestone audit.
 - Phase 30 complete (2026-07-30): 4/4 plans; ANNO-01 satisfied. UAT Test 1 (Assumption A1 — Bitbucket report-DELETE cascade) confirmed live against the connected repo via a temporary session-gated debug route (removed after use, two clean deploys) since the deployed Worker's encryption key is no longer known locally. Security review (`/gsd-secure-phase 30`): 17 threats registered across the 4 plans' threat models (register authored at plan time, ASVS L1), all closed — 12 by verified in-code/in-test mitigation, 5 by documented accepted risk (see 30-SECURITY.md).
 - Phase 29 complete (2026-07-30): 9/9 plans; QA-IDX-01 satisfied. Task 3's blocking human-verify checkpoint (29-09) closed via a real same-day production UAT session (deploy + real GitHub + real Bitbucket repositories) rather than mocks: full index build, push-triggered incremental refresh, and Q&A retrieval (both toggle directions) all confirmed on BOTH providers. 11 real bugs/gaps found and fixed along the way, including two that were pre-existing misconfigurations outside Codra's code (a Bitbucket repo's main-branch designation; a GitHub App's missing push-event subscription) and one cross-provider Q&A ranking-quality issue (fixed with a pinned regression test). Developer sign-off: "approved". See `.planning/phases/29-qa-idx-01-codebase-index-backed-q-a/29-09-SUMMARY.md`.
 - Phase 28 complete (2026-07-27): 4/4 plans; UAT 6/6; verification `passed` (29/29 must-haves). Tests 1/3/4/6 were closed by automation rather than manual observation at the user's request — 3 new/extended specs (27 tests), all mutation-verified. One leg is deliberately recorded as un-run, not verified: live end-to-end suppression on a real GitHub PR.
@@ -371,9 +372,9 @@ Items acknowledged and carried forward:
 
 ## Session Continuity
 
-Last session: 2026-07-30T17:16:03.053Z
-Stopped at: Completed 31-04-PLAN.md
-Resume file: None
+Last session: 2026-07-31T08:13:09.849Z
+Stopped at: Phase 32 context gathered
+Resume file: .planning/phases/32-address-v1-4-tech-debt-audit-viewer-renderer-misleading-midd/32-CONTEXT.md
 
 ## Operator Next Steps
 
