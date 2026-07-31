@@ -692,7 +692,60 @@ export function buildEvidenceHardDroppedEvent(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 28 (LRN-01) — bounded learned_rule_suppressed audit builder.
+// Phase 33 (PRD-02 / FR-153, D-08) — bounded suggestion_dropped audit builder.
+//
+// ONE aggregate event per (file, pass) when the FR-153 drop clause removed
+// >=1 finding from the parse output. Follows the evidence_hard_dropped
+// precedent for the per-(file, pass) aggregate shape.
+// ---------------------------------------------------------------------------
+
+/** Sample cap for suggestion_dropped events — matches the other aggregate builders. */
+export const SUGGESTION_DROP_SAMPLE_CAP = 20;
+
+/** One FR-153-dropped finding identifier: { path, line, title } only (T-13-03-03). */
+export type SuggestionDropEntry = { path: string; line: number | null; title: string };
+
+/**
+ * PURE suggestion-dropped audit builder (FR-153 / D-08).
+ * Derives ONE `suggestion_dropped` event from an array of `SuggestionDropEntry`
+ * objects. Returns null when entries is empty (no zero-count event for empty input).
+ *
+ * droppedCount reflects the FULL total passed in, NOT the capped sample length.
+ * The sample array is bounded to at most `SUGGESTION_DROP_SAMPLE_CAP` (20) entries.
+ *
+ * Privacy boundary: every sample entry's title passes through `redactFindingTitle`
+ * before storage. The builder never includes body/existingCode/codeSuggestion in
+ * the event payload.
+ *
+ * Precedent: follows `buildEvidenceHardDroppedEvent` pattern — pure function, no
+ * I/O, never throws, returns typed event via `satisfies`.
+ */
+export function buildSuggestionDroppedEvent(
+  file: string,
+  pass: FileReviewPass,
+  entries: SuggestionDropEntry[],
+): JobAuditEvent | null {
+  if (entries.length === 0) return null;
+
+  const sample = entries.slice(0, SUGGESTION_DROP_SAMPLE_CAP).map((e) => ({
+    path: e.path,
+    line: e.line,
+    title: redactFindingTitle(e.title),
+  }));
+
+  const event = {
+    stage: 'suggestion_dropped' as const,
+    file,
+    pass,
+    droppedCount: entries.length,
+    sample,
+    timestamp: new Date().toISOString(),
+  };
+
+  // `satisfies` is a compile-time check — if the literal ever diverges from
+  // the `JobAuditEvent` union member, TypeScript rejects at compile time.
+  return event satisfies JobAuditEvent;
+}
 //
 // One aggregate event per (file, pass) when learned-rule suppression removed >=1
 // finding from the finalize pass output. Follows the evidence_hard_dropped

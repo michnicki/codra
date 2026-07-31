@@ -1141,6 +1141,27 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
       timestamp: dateStringSchema,
     })
     .passthrough(),
+  // Phase 33 (PRD-02 / FR-153, D-08): suggestion_dropped audit event. AGGREGATE — one event per
+  // (file, pass) when the FR-153 drop clause removed >=1 finding from the parse output (non-empty
+  // suggestion + empty body). droppedCount reflects the FULL total, NOT the capped sample length.
+  // Sample identifiers admit ONLY { path, line, title } (T-13-03-03) and titles route through
+  // redactFindingTitle at production time (AUD-01); never body/existingCode/codeSuggestion.
+  z
+    .object({
+      stage: z.literal('suggestion_dropped'),
+      file: z.string(),
+      pass: fileReviewPassSchema,
+      droppedCount: z.number().int().min(0),
+      sample: z.array(
+        z.object({
+          path: z.string(),
+          line: z.number().nullable().optional(),
+          title: z.string().max(100),
+        }),
+      ).max(20),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
   // Phase 18 round/anchor audit events (RND-01 / RND-02 / RND-03 / RND-05). All five variants share
   // the `rounds.` stage prefix; the client-side AuditDisplayStage normalization (see audit-grouping.ts)
   // collapses them to the single `rounds` display group while preserving the original event stage

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { insertJob, getJobDetail, appendJobAuditEvents } from '@server/db/jobs';
 import * as jobsModule from '@server/db/jobs';
-import { buildFileSkipEvents, recordFileSkips, recordUnitAudit, buildEvidenceMissingSummary, buildInlineCommentSkippedEvent } from '@server/core/audit';
+import { buildFileSkipEvents, recordFileSkips, recordUnitAudit, buildEvidenceMissingSummary, buildInlineCommentSkippedEvent, buildSuggestionDroppedEvent } from '@server/core/audit';
 import type { FileDiff } from '@server/core/diff';
 import { queryRows } from '@server/db/client';
 import { defaultRepoConfig, type JobAuditEvent } from '@shared/schema';
@@ -435,6 +435,58 @@ describe('buildInlineCommentSkippedEvent (PRD-01, D-03/D-04)', () => {
 
     const result = jobAuditEventSchema.safeParse(event);
     expect(result.success).toBe(true);
+  });
+});
+
+describe('buildSuggestionDroppedEvent (PRD-02, D-08)', () => {
+  it('empty input returns null (no zero-count event)', () => {
+    expect(buildSuggestionDroppedEvent('src/a.ts', 'main', [])).toBeNull();
+  });
+
+  it('single entry produces one aggregate with stage/file/pass/droppedCount and a redacted sample title', () => {
+    const event = buildSuggestionDroppedEvent('src/a.ts', 'main', [
+      { path: 'src/a.ts', line: 3, title: 'finding one' },
+    ])!;
+
+    expect(event.stage).toBe('suggestion_dropped');
+    expect(event.file).toBe('src/a.ts');
+    expect(event.pass).toBe('main');
+    expect(event.droppedCount).toBe(1);
+    expect(event.sample).toEqual([{ path: 'src/a.ts', line: 3, title: '[title-redacted]' }]);
+  });
+
+  it('count reflects the full total while the sample is capped at 20', () => {
+    const entries = Array.from({ length: 25 }, (_, i) => ({
+      path: `src/x/${i}.ts`,
+      line: i,
+      title: `finding ${i}`,
+    }));
+
+    const event = buildSuggestionDroppedEvent('src/a.ts', 'main', entries)!;
+
+    expect(event.droppedCount).toBe(25);
+    expect(event.sample).toHaveLength(20);
+  });
+
+  it('builder output round-trips through jobAuditEventSchema', () => {
+    const event = buildSuggestionDroppedEvent('src/a.ts', 'security', [
+      { path: 'src/a.ts', line: 3, title: 'finding one' },
+    ])!;
+
+    const result = jobAuditEventSchema.safeParse(event);
+    expect(result.success).toBe(true);
+  });
+
+  it('schema rejects a negative droppedCount (z.number().int().min(0))', () => {
+    const negative = {
+      stage: 'suggestion_dropped',
+      file: 'src/a.ts',
+      pass: 'main',
+      droppedCount: -1,
+      sample: [],
+      timestamp: '2026-01-01T00:00:00.000Z',
+    };
+    expect(jobAuditEventSchema.safeParse(negative).success).toBe(false);
   });
 });
 
