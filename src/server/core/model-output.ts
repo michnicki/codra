@@ -16,8 +16,8 @@ import {
 import { z } from 'zod';
 import { logger } from './logger';
 import { applySeverityRules } from './severity';
-import { buildEvidenceMissingSummary } from './audit';
-import type { EvidenceMissingEntry } from './audit';
+import { buildEvidenceMissingSummary, buildSuggestionDroppedEvent } from './audit';
+import type { EvidenceMissingEntry, SuggestionDropEntry } from './audit';
 import { checkEvidence, normalizeForEvidence, stripLeadingDiffMarkers } from './evidence';
 import { findClosestValidLine, findPositionForLine, getValidNewLines, getValidPositions } from './diff';
 import type { FileDiff } from './diff';
@@ -404,6 +404,26 @@ export function parseFileReviewResponse(
   const severityAuditEvents: JobAuditEvent[] = [];
   // EVID-03: accumulate evidence-missing entries per (file, pass); builder call after .filter(Boolean).
   const evidenceMissingEntries: EvidenceMissingEntry[] = [];
+  // Phase 33 (FR-153, D-08): accumulate FR-153-drop entries (non-empty suggestion + empty body);
+  // the buildSuggestionDroppedEvent call sits next to buildEvidenceMissingSummary after the map.
+  const suggestionDropEntries: SuggestionDropEntry[] = [];
+
+  // Phase 33 (FR-153, consensus fold-in (c)): HOISTED out of the map callback so the orphan bucket
+  // can apply the same cleanText normalization as inline titles before the 80-char truncation
+  // (D-11). Behavior-neutral for inline comments — same pure parameter-only function, same call
+  // sites, now closure-scoped.
+  const cleanText = (text: string) => {
+    let current = text.trim();
+    let prev = '';
+    while (current !== prev) {
+      prev = current;
+      current = current
+        .replace(/^(?:[^\w\s]+|(?:QUALITY|SECURITY|BUG|PERFORMANCE|CORRECTNESS|P[0-3]|NIT)\b)+/giu, '')
+        .replace(/\n\s*/g, ' ') // Flatten newlines in titles/snippets
+        .trim();
+    }
+    return current;
+  };
 
   const comments = (parsed.findings || [])
     .map((finding) => {
@@ -434,7 +454,10 @@ export function parseFileReviewResponse(
 
       // Final validation
       if (position === undefined || !validPositions.has(position)) {
-        orphanedComments.push(`- **${finding.title}:** ${finding.body}`);
+        // Phase 33 (FR-154, D-11 + consensus fold-in (c)): orphan titles get the SAME cleanText
+        // normalization as inline titles before the 80-char truncation — closing the reviewers'
+        // flagged raw-vs-cleaned asymmetry. The orphan body stays raw, matching pre-existing behavior.
+        orphanedComments.push(`- **${cleanText(finding.title).slice(0, COMMENT_TITLE_MAX)}:** ${finding.body}`);
         return null;
       }
 
@@ -447,19 +470,6 @@ export function parseFileReviewResponse(
       };
       const severity = finding.priority !== undefined ? priorityMap[finding.priority] || 'P2' : 'P2';
 
-      const cleanText = (text: string) => {
-        let current = text.trim();
-        let prev = '';
-        while (current !== prev) {
-          prev = current;
-          current = current
-            .replace(/^(?:[^\w\s]+|(?:QUALITY|SECURITY|BUG|PERFORMANCE|CORRECTNESS|P[0-3]|NIT)\b)+/giu, '')
-            .replace(/\n\s*/g, ' ') // Flatten newlines in titles/snippets
-            .trim();
-        }
-        return current;
-      };
-
       const title = cleanText(finding.title);
       let body = cleanText(finding.body);
 
@@ -467,6 +477,33 @@ export function parseFileReviewResponse(
       const bodyPrefix = cleanText(body.split('\n')[0]);
       if (bodyPrefix.toLowerCase().startsWith(title.toLowerCase()) || title.toLowerCase().startsWith(bodyPrefix.toLowerCase())) {
         body = cleanText(body.slice(body.split('\n')[0].length));
+      }
+
+      // Phase 33 (FR-153, REVIEWS R6 HIGH): FR-153 logic runs AFTER the body-prefix strip and
+      // BEFORE the severity engine, in this exact order — drop first (evaluates the ORIGINAL
+      // pre-clearing suggestion + the CLEANED body), then clear (D-07: drop happens BEFORE clear).
+      const rawSuggestion = finding.code_suggestion;
+      const hasSuggestion = typeof rawSuggestion === 'string' && rawSuggestion.trim().length > 0;
+
+      // Drop clause (D-05): a comment with a non-empty suggestion but an EMPTY body is dropped and
+      // audit-tracked. `line` is resolved/non-null here (the orphan check passed above).
+      if (hasSuggestion && body.length === 0) {
+        suggestionDropEntries.push({ path: file.path, line: line ?? null, title });
+        return null;
+      }
+
+      // Clear clause (D-06/D-07): when the CLEANED suggestion equals the trimmed existingCode, the
+      // suggestion is cleared to null AND any redundant ```suggestion fence is stripped from the
+      // posted body. `''`-suggestions are treated as absent (fail-open hardening — the
+      // z.string().min(1) at schema.ts:50 no longer throws the whole per-file parse).
+      let codeSuggestion: string | null | undefined = hasSuggestion ? rawSuggestion : undefined;
+      let commentBody = body;
+      if (hasSuggestion) {
+        const cleanSuggestion = rawSuggestion.replace(/```suggestion\n?|```/g, '').trim();
+        if (cleanSuggestion === (finding.existing_code ?? '').trim()) {
+          codeSuggestion = null;
+          commentBody = body.split('```suggestion')[0].trim();
+        }
       }
 
       // Apply the deterministic severity/category engine (SEV-01/02/03/04). Category resolution is
@@ -512,15 +549,24 @@ export function parseFileReviewResponse(
         evidenceMissingEntries.push({ path: file.path, line: originalLine ?? null, title, reason: 'not_in_hunk' });
       }
 
+      // Phase 33 (FR-154, D-10): truncation runs LAST in the parse pipeline — after cleanText, the
+      // body-prefix strip, the severity engine, and the EVID-01 evidence gate; immediately before
+      // the schema parse. The severity/category engine already saw the FULL title above.
+      const truncatedTitle = title.slice(0, COMMENT_TITLE_MAX);
+
       return parsedReviewCommentSchema.parse({
         path: file.path,
         line: line,
         position,
         severity: ruled.severity,
         category: ruled.category,
-        title,
-        body: withSuggestion(body, finding.code_suggestion),
-        codeSuggestion: finding.code_suggestion,
+        title: truncatedTitle,
+        // Phase 33 (FR-153, REVIEWS R6 HIGH): pass the resolved LOCAL codeSuggestion
+        // (null/undefined/string), NOT `finding.code_suggestion` directly — the `?? undefined`
+        // collapses the cleared-null to a falsy suggestion so `withSuggestion` returns the
+        // fence-stripped commentBody unchanged.
+        body: withSuggestion(commentBody, codeSuggestion ?? undefined),
+        codeSuggestion,
         // EVID-01 (D-15): map the model-emitted evidence into the parsed comment's existingCode field.
         // `?? null` because parsedReviewCommentSchema.existingCode is nullable().optional().
         existingCode: finding.existing_code ?? null,
@@ -538,6 +584,14 @@ export function parseFileReviewResponse(
   const evidenceSummary = buildEvidenceMissingSummary(file.path, opts.pass ?? 'main', evidenceMissingEntries);
   if (evidenceSummary) {
     severityAuditEvents.push(evidenceSummary);
+  }
+
+  // Phase 33 (FR-153, D-08): one suggestion_dropped aggregate per (file, pass) when the FR-153
+  // drop clause removed >=1 finding. Rides the existing severityAuditEvents channel into
+  // recordUnitAudit (review.ts:1651/:1749) — no new recorder. Null when nothing was dropped.
+  const suggestionDropSummary = buildSuggestionDroppedEvent(file.path, opts.pass ?? 'main', suggestionDropEntries);
+  if (suggestionDropSummary) {
+    severityAuditEvents.push(suggestionDropSummary);
   }
 
   const verdict = parsed.overall_correctness.toLowerCase().includes('patch is correct') ? 'approve' : 'comment';
@@ -561,6 +615,11 @@ export function parseFileReviewResponse(
 // blowing the walkthrough comment-size budget (the formatter fences it under WALKTHROUGH_BODY_MAX);
 // over-length source is rejected (returns null -> diagram omitted).
 const DIAGRAM_SOURCE_MAX = 20_000;
+
+// FR-154 (D-09/D-10/D-11): plain substring truncation, no ellipsis marker, applied producer-side
+// LAST in the parse pipeline (the schema title has no max). EXPORTED because the orphan bucket
+// AND the map callback both consume it (REVIEWS R8, MEDIUM).
+export const COMMENT_TITLE_MAX = 80;
 
 // FR-155 (D-12/D-13): label tokens open at `["` and close at the first `"` immediately followed by
 // `]`; interior quotes inside the span are REMOVED (the PRD's canonical rewrite
