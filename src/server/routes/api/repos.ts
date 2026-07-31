@@ -506,8 +506,8 @@ export function createReposRouter() {
 
   // POST /api/repos/:id/learned-rules/synthesize — LRN-01 on-demand synthesis trigger (D-10/D-11).
   // Clusters reject_feedback rows by (category, file_path), produces new pending rules, appends
-  // to existing config. Gated on learning.enabled (NREG-01). Uses explicit requireSession +
-  // requireCsrfHeader middleware (C6 — defense-in-depth, same as group-level /api/* guards).
+  // to existing config. Gated on learning.enabled (NREG-01). Protected by the group-level
+  // requireSession + requireCsrfHeader middleware applied to /api/* in app.ts.
   app.post('/:owner/:repo/learned-rules/synthesize', async (c) => {
     const { owner, repo } = c.req.param();
     const providerQuery = c.req.query('provider');
@@ -573,7 +573,8 @@ export function createReposRouter() {
 
   // PATCH /api/repos/:id/learned-rules/:ruleId — LRN-01 rule status transition (D-08).
   // Transitions: pending->active, active->disabled, disabled->active. Rejects invalid
-  // transitions with 400. Uses explicit requireSession + requireCsrfHeader middleware (C6).
+  // transitions with 400. Protected by the group-level requireSession + requireCsrfHeader
+  // middleware applied to /api/* in app.ts.
   app.patch('/:owner/:repo/learned-rules/:ruleId', async (c) => {
     const { owner, repo, ruleId } = c.req.param();
     const providerQuery = c.req.query('provider');
