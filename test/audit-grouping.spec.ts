@@ -14,7 +14,7 @@ const ev = (stage: JobAuditEvent['stage'], timestamp = '2026-01-01T00:00:00Z') =
   ({ stage, timestamp } as unknown as JobAuditEvent);
 
 describe('STAGE_ORDER', () => {
-  it('is the fixed thirteen-stage order including learned_rule_suppressed, rounds, threads, critic, ensemble, walkthrough, and inline_comment_skipped', () => {
+  it('is the fixed fourteen-stage order including learned_rule_suppressed, suggestion_dropped, rounds, threads, critic, ensemble, walkthrough, and inline_comment_skipped', () => {
     expect(STAGE_ORDER).toEqual([
       'file_skipped',
       'drafted',
@@ -24,6 +24,8 @@ describe('STAGE_ORDER', () => {
       'evidence_missing',
       // Phase 28 (LRN-01) inserted this between evidence_missing and rounds.
       'learned_rule_suppressed',
+      // Phase 33 (PRD-02 / FR-153, D-08) inserted this after learned_rule_suppressed (index 7).
+      'suggestion_dropped',
       'rounds',
       'threads',
       'critic',
@@ -270,5 +272,24 @@ describe('Phase 33 (PRD-01 / FR-031, D-03/D-04) — inline_comment_skipped is it
     const skipGroup = groups.find((g) => g.stage === 'inline_comment_skipped')!;
     expect(skipGroup.count).toBe(1);
     expect(skipGroup.events).toEqual([skipped]);
+  });
+});
+
+describe('Phase 33 (PRD-02 / FR-153, D-08) — suggestion_dropped is its own display group', () => {
+  it('normalizes suggestion_dropped to itself (own group between learned_rule_suppressed and rounds)', () => {
+    expect(normalizeAuditDisplayStage('suggestion_dropped')).toBe('suggestion_dropped');
+  });
+
+  it('orders the suggestion_dropped group between learned_rule_suppressed and rounds regardless of arrival order', () => {
+    const suppressed = ev('learned_rule_suppressed', '2026-01-01T00:00:01Z');
+    const dropped = ev('suggestion_dropped', '2026-01-01T00:00:02Z');
+    const rounds = ev('rounds.detected', '2026-01-01T00:00:03Z');
+
+    const groups = groupAuditByStage([rounds, dropped, suppressed]);
+
+    expect(groups.map((g) => g.stage)).toEqual(['learned_rule_suppressed', 'suggestion_dropped', 'rounds']);
+    const dropGroup = groups.find((g) => g.stage === 'suggestion_dropped')!;
+    expect(dropGroup.count).toBe(1);
+    expect(dropGroup.events).toEqual([dropped]);
   });
 });

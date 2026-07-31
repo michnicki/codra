@@ -19,6 +19,10 @@ export const STAGE_ORDER = [
   'deduped',
   'evidence_missing',
   'learned_rule_suppressed',
+  // Phase 33 (PRD-02 / FR-153, D-08): FR-153 parse-drop aggregate; its own display group
+  // (learned_rule_suppressed precedent — a DIFFERENT gate than the evidence/learned-rule
+  // groups; sample shape is { path, line, title } without reason/matched_rule).
+  'suggestion_dropped',
   'rounds',
   'threads',
   'critic',

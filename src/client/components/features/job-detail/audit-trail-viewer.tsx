@@ -20,6 +20,8 @@ const STAGE_LABELS: Record<AuditStageGroup['stage'], string> = {
   deduped: 'Deduped',
   evidence_missing: 'Evidence missing',
   learned_rule_suppressed: 'Learned rule suppressed',
+  // Phase 33 (PRD-02 / FR-153, D-08): FR-153 parse-drop aggregate event.
+  suggestion_dropped: 'Suggestions dropped',
   rounds: 'Rounds',
   threads: 'Threads',
   critic: 'Critic',
@@ -236,6 +238,28 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
                   <div className="text-[10px] text-muted-foreground/70 font-mono break-all">
                     rule {s.matched_rule}
                   </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </li>
+      );
+    // Phase 33 (PRD-02 / FR-153, D-08): suggestion_dropped aggregate event — one event per
+    // (file, pass) when the FR-153 drop clause removed >=1 finding from the parse output.
+    // `droppedCount` is the FULL total, NOT the (max-20) sample length. Mirrors the
+    // learned_rule_suppressed row layout with a { path, line, title } sample (T-13-03-03
+    // identifiers only — titles already redacted at build time, AUD-01).
+    case 'suggestion_dropped':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="file" value={event.file} />
+          <MetricLine label="pass" value={event.pass} />
+          <MetricLine label="dropped" value={String(event.droppedCount)} />
+          {event.sample.length > 0 && (
+            <ul className="mt-2 flex flex-col gap-1.5 border-t border-border/30 pt-2">
+              {event.sample.map((s, i) => (
+                <li key={i}>
+                  <SampleIdentifier path={s.path} line={s.line} title={s.title} />
                 </li>
               ))}
             </ul>
