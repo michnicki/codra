@@ -648,6 +648,64 @@ describe('parseWalkthroughDiagram (WT-04)', () => {
     expect(parseWalkthroughDiagram('{"foo": "bar"}')).toBeNull();
     expect(parseWalkthroughDiagram('graph TD; A-->B;')).toBeNull();
   });
+
+  // --- Phase 33 (FR-155, PRD-03): sanitizeMermaidLabels nested-quote repair ---
+
+  it('repairs the canonical nested-quote label in a bare payload (FR-155, D-12)', () => {
+    const out = parseWalkthroughDiagram('sequenceDiagram\n  participant engine["core/"engine.py""]\n  A->>B: hi');
+    noFence(out);
+    expect(out).toBe('sequenceDiagram\n  participant engine["core/engine.py"]\n  A->>B: hi');
+  });
+
+  it('repairs the canonical nested-quote label inside a ```mermaid fence (fence unwrap runs first)', () => {
+    const out = parseWalkthroughDiagram(
+      '```mermaid\nsequenceDiagram\n  participant engine["core/"engine.py""]\n  A->>B: hi\n```',
+    );
+    noFence(out);
+    expect(out).toBe('sequenceDiagram\n  participant engine["core/engine.py"]\n  A->>B: hi');
+  });
+
+  it('returns a repaired broken-label-only diagram instead of omitting it (D-14)', () => {
+    const out = parseWalkthroughDiagram('sequenceDiagram\n  participant engine["core/"engine.py""]');
+    noFence(out);
+    expect(out).toContain('engine["core/engine.py"]');
+  });
+
+  it('leaves message-quote text untouched (NREG-01, D-13)', () => {
+    const out = parseWalkthroughDiagram('sequenceDiagram\n  A->>B: say "hi"');
+    noFence(out);
+    expect(out).toBe('sequenceDiagram\n  A->>B: say "hi"');
+  });
+
+  it('round-trips a clean multi-label line byte-identically (NREG-01, REVIEWS R7)', () => {
+    const out = parseWalkthroughDiagram('sequenceDiagram\n  A["x"]->>B["y"]');
+    noFence(out);
+    expect(out).toBe('sequenceDiagram\n  A["x"]->>B["y"]');
+  });
+
+  it('strips interior quotes inside a label token (A["x"y"z"] -> A["xyz"])', () => {
+    const out = parseWalkthroughDiagram('sequenceDiagram\n  A["x"y"z"]->>B');
+    noFence(out);
+    expect(out).toBe('sequenceDiagram\n  A["xyz"]->>B');
+  });
+
+  it('copies an unterminated label token verbatim without hanging or crashing (REVIEWS R7)', () => {
+    const out = parseWalkthroughDiagram('sequenceDiagram\n  A["unterminated');
+    noFence(out);
+    expect(out).toBe('sequenceDiagram\n  A["unterminated');
+  });
+
+  it('does not close a label token on a ] inside the label text (consensus fold-in (b))', () => {
+    const out = parseWalkthroughDiagram('sequenceDiagram\n  A["file]name"]');
+    noFence(out);
+    expect(out).toBe('sequenceDiagram\n  A["file]name"]');
+  });
+
+  it('strips an interior quote while keeping an interior ] (A["x"y]z"] -> A["xy]z"])', () => {
+    const out = parseWalkthroughDiagram('sequenceDiagram\n  A["x"y]z"]');
+    noFence(out);
+    expect(out).toBe('sequenceDiagram\n  A["xy]z"]');
+  });
 });
 
 describe('parseCriticPruneResponse (D-05 ID-based prune contract)', () => {
