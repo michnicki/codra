@@ -562,6 +562,35 @@ export function parseFileReviewResponse(
 // over-length source is rejected (returns null -> diagram omitted).
 const DIAGRAM_SOURCE_MAX = 20_000;
 
+// FR-155 (D-12/D-13): label tokens open at `["` and close at the first `"` immediately followed by
+// `]`; interior quotes inside the span are REMOVED (the PRD's canonical rewrite
+// `engine["core/"engine.py""]` → `engine["core/engine.py"]`). Everything outside `["…"]` spans is
+// copied verbatim so message/note text is never touched; a token with no valid close is copied
+// verbatim. A single-pass scan that ALWAYS advances `i` — an unterminated token like `A["unterminated`
+// advances one character per step, so it can never infinite-loop (REVIEWS R7, MEDIUM).
+function sanitizeMermaidLabels(source: string): string {
+  let out = '';
+  for (let i = 0; i < source.length; ) {
+    if (source[i] === '[' && source[i + 1] === '"') {
+      let close = -1;
+      for (let j = i + 2; j < source.length - 1; j++) {
+        if (source[j] === '"' && source[j + 1] === ']') {
+          close = j;
+          break;
+        }
+      }
+      if (close >= 0) {
+        out += '["' + source.slice(i + 2, close).replace(/"/g, '') + '"]';
+        i = close + 2;
+        continue;
+      }
+    }
+    out += source[i];
+    i += 1;
+  }
+  return out;
+}
+
 /**
  * Best-effort, tolerant parse of a model's Mermaid sequence-diagram output for the walkthrough
  * (WT-04, D-04a, Pitfall #6). Returns the trimmed RAW diagram source WITHOUT any ```mermaid fence
@@ -591,6 +620,12 @@ export function parseWalkthroughDiagram(raw: string): string | null {
     if (fenceMatch) {
       text = fenceMatch[1];
     }
+
+    // (2.5) FR-155 (D-14): repair nested double quotes inside `["…"]` label tokens BEFORE the
+    // first-token validation and the length cap — a diagram whose only defect is a broken label
+    // survives instead of being omitted. Operates on `text` (not `source`) so both the fenced and
+    // unfenced paths are covered by the single call.
+    text = sanitizeMermaidLabels(text);
 
     const source = text.trim();
     if (source.length === 0) return null;
