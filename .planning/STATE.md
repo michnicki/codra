@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: tech debt — audit viewer renderer, misleading middleware comment, hardcoded type unions, test-hygiene improvements, integration test gap, and stale planning docs
-current_phase: 28
-current_phase_name: LRN-01 Learned-rule synthesis from reject feedback
-status: executing
-stopped_at: Phase 32 context gathered
-last_updated: "2026-07-31T08:13:09.862Z"
+current_phase: 32
+current_phase_name: address-v1-4-tech-debt-audit-viewer-renderer-misleading-midd
+status: complete
+stopped_at: Phase 32 plan 32-06 complete
+last_updated: "2026-07-31T12:30:00.000Z"
 last_activity: 2026-07-31
-last_activity_desc: Phase 27 complete, transitioned to Phase 28
+last_activity_desc: Phase 32 complete — v1.4 tech debt cleanup
 progress:
-  total_phases: 11
-  completed_phases: 10
-  total_plans: 31
-  completed_plans: 31
-  percent: 91
+  total_phases: 7
+  completed_phases: 7
+  total_plans: 33
+  completed_plans: 33
+  percent: 100
 ---
 
 # Project State
@@ -24,14 +24,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-25 for v1.2 closure)
 
 **Core value:** A Bitbucket Cloud PR gets the same AI review a GitHub PR gets, from one instance, without breaking GitHub — held end-to-end since v1.0, extended by v1.1 (every interactive/multi-pass capability shipped on both providers), extended by v1.2 (deterministic severity + real categories, audit-backed noise filter, priority file selection, incremental rounds, verify-fixes, critic v2, ensemble, walkthrough enrichment — all on both providers, every drop explainable from `jobs.audit`).
-**Current focus:** Phase 27 — sec-xdiff-01-whole-diff-cross-file-security-reasoning
+**Current focus:** Phase 32 — address-v1-4-tech-debt-audit-viewer-renderer-misleading-midd
 
 ## Current Position
 
-Phase: 28 — LRN-01 Learned-rule synthesis from reject feedback
-Plan: Not started
-Status: Executing Phase 27
-Last activity: 2026-07-31 — Phase 27 complete, transitioned to Phase 28
+Phase: 32 (address-v1-4-tech-debt-audit-viewer-renderer-misleading-midd) — COMPLETE
+Plan: 6 of 6
+Status: Phase 32 complete — all v1.4 tech debt addressed
+Last activity: 2026-07-31 — Phase 32 plan 32-06 complete (stale planning docs reconciled)
 
 ### Phase 27 Plan 27-01 Decisions (SEC-XDIFF-01)
 
