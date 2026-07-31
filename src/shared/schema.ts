@@ -115,6 +115,21 @@ export const labelsSchema = z.union([
   }),
 ]);
 
+// Phase 34 (PRD-04 / FR-114): per-touched-file commit history entry consumed by the file-review
+// prompt builder. `files` is the list of OTHER files modified in the same commit; `filesAvailable`
+// distinguishes GitHub (the REST commit endpoint returns files[]) from Bitbucket (the commit-list
+// endpoint omits the file manifest — files is always [] by provider limitation, review LOW-10).
+// When filesAvailable is false the prompt builder renders a distinct message so the model can tell
+// "commit only touched this one file" from "provider didn't tell us." Defaults to true — set to
+// false only by the Bitbucket provider.
+export const vcsCommitEntrySchema = z.object({
+  hash: z.string().min(7).max(7),
+  message: z.string().min(1),
+  files: z.array(z.string()),
+  filesAvailable: z.boolean().default(true),
+});
+export type VcsCommitEntry = z.infer<typeof vcsCommitEntrySchema>;
+
 export const reviewConfigSchema = z.object({
   on: z.array(z.enum(['opened', 'synchronize', 'ready_for_review', 'reopened', 'closed'])).default(['opened', 'synchronize', 'ready_for_review', 'reopened']),
   ignore_drafts: z.boolean().default(true),
@@ -369,6 +384,20 @@ export const reviewConfigSchema = z.object({
         .default([]),
     })
     .default({ enabled: false, learned_rules: [] }),
+  // Phase 34 (PRD-04 / PRD-05): context-enhancement feature toggles. `file_history` (FR-114)
+  // gates the per-touched-file commit-history appendix in the review prompt; `yaml_config` (§15)
+  // gates .review.yaml discovery + merge. Both default false for NREG-01 inertness — when off,
+  // zero subrequests and zero behavior change.
+  file_history: z
+    .object({
+      enabled: z.boolean().default(false),
+    })
+    .default({ enabled: false }),
+  yaml_config: z
+    .object({
+      enabled: z.boolean().default(false),
+    })
+    .default({ enabled: false }),
   // Phase 30 (ANNO-01, D-01/D-06): Bitbucket Code Insights annotations toggle. This is the FIRST
   // purely Bitbucket-only capability toggle — no GitHub equivalent (NREG-02 by exclusion: GitHub
   // already has native inline PR comments, so this capability only makes sense for Bitbucket).
@@ -436,6 +465,11 @@ export const repoConfigSchema = z.object({
     evidence: { hard_drop: false, hard_drop_exempt_categories: ['security'] },
     learning: { enabled: false, learned_rules: [] },
     bitbucket: { annotations_enabled: false },
+    // Phase 34 (PRD-04 / PRD-05): mirror the toggle blocks in the inline literal default too, so
+    // repoConfigSchema.parse({}) yields each at its documented default regardless of Zod default
+    // short-circuit semantics for the nested `review` object (same reasoning as :409-412 above).
+    file_history: { enabled: false },
+    yaml_config: { enabled: false },
   }),
   model: z
     .object({
@@ -1405,6 +1439,16 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
           title: z.string().max(100),
         }),
       ).max(20),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // Phase 34 (PRD-05, D-12): .review.yaml parse/validation failure → DB config fallback + this
+  // audit event. `reason` carries the parse/validation error message, bounded to 500 chars (the
+  // 34-03 builder slices to 500). The review always proceeds — the YAML file is advisory.
+  z
+    .object({
+      stage: z.literal('yaml_config_parse_failed'),
+      reason: z.string().min(1).max(500),
       timestamp: dateStringSchema,
     })
     .passthrough(),
