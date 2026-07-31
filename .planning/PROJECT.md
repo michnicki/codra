@@ -4,7 +4,11 @@
 
 Codra is self-hosted AI code review for pull requests, running entirely on Cloudflare (Workers, Queues, KV, Hyperdrive, Workers AI) with an external PostgreSQL database. It reviews pull requests on **both GitHub and Bitbucket Cloud** from a single deployed instance: a per-provider webhook enqueues review jobs, a durable Cloudflare Workflow runs a **multi-pass** LLM review (a main pass plus a dedicated security pass, near-duplicate suppression, a critic pass, optional ensemble majority vote, and an optional verify-fixes pass over unresolved bot threads) over the PR diff through a shared `VcsProvider` abstraction, then posts back a **streamed walkthrough** (with a deterministically clamped confidence score, effort estimate, and change groups), inline findings, a summary report, and a merge-gating status on whichever platform the PR came from. Repo members can also **drive the bot in-PR** — `review` / `review-rest` / `pause` / `resume` / `help` / `reject` / `ignore` commands and free-form Q&A via @mention, with threaded replies — on both providers. Every interactive/multi-pass capability is config-gated (default off except three documented correctness fixes — `severity_engine`, `dedup`, `file_selection` — each with a single escape hatch) and byte-identical to the base review when disabled. Every drop in the engine is now explained by a per-stage `jobs.audit` trail surfaced in the dashboard's job-detail audit-trail viewer.
 
-## Current State (as of v1.2)
+## Current State (as of v1.4 + Phase 32)
+
+**v1.4 Deferred Candidates + Phase 32 Tech Debt Cleanup** — all 6 v1.4 feature phases (26-31) shipped, plus Phase 32 tech-debt cleanup closing audit-viewer renderer verification, misleading middleware comment correction, hardcoded type union replacement, test-hygiene improvements, integration-test gap closure, logger redaction hardening, broken migration script deletion, and stale planning doc reconciliation. Milestone closeout (`/gsd-complete-milestone`) not yet run.
+
+
 
 **v1.2 Review Engine Quality & Re-review Lifecycle** closed 2026-07-25 (Phases 13-20 + 20.1, 49 plans, 31/31 requirements satisfied). On top of the v1.0 dual-provider foundation and v1.1 interactive/multi-pass surface, the review engine now has deterministic severity classification (exploit-keyword promotion to P0, security-category cap at P2, style downgrade to nit), real model-assigned categories (the hardcoded `'quality'` is gone), a severity-tiered noise filter with always-on composite dedup, priority-ordered file selection with content-based generated detection, a soft `existingCode` evidence gate (audit-only, hard-drop deferred to v2/EVID-02), an incremental round-2+ re-review with round-escalated floors and open-thread suppression, verify-fixes (windowed file content, ≤500 lines full / 50-line windows), critic v2 (evidence-graded proven/plausible/unsupported verdicts), ensemble majority vote (1-5 runs, partial-failure tolerant, runs-aware subrequest budget), walkthrough enrichment (clamped confidence + effort + change groups), and an audit-trail viewer in job detail — all config-gated, byte-identical when disabled, across both GitHub and Bitbucket, with **zero new npm dependencies**. NREG-01 (defaults byte-identical) and NREG-02 (GitHub+Bitbucket parity) held continuously; full suite green at 1550 node tests + 102 browser tests under nix-shell; AUD-01 human signature/date pair signed 2026-07-25 (Thomas Michnicki); milestone audit `passed` after Phase 20.1 closure of all 5 BLOCKERs + 1 WARNING.
 
@@ -18,7 +22,7 @@ See `.planning/milestones/` for full phase-by-phase detail and closeout audits (
 
 **Scoped:** 2026-07-26
 **Scope:** All 6 deferred candidates promoted — 6 phases (26-31) ordered by dependency.
-**Status:** Scoped, ready for `/gsd-discuss-phase 26`
+**Status:** 6/6 phases complete (26-31 shipped) — all v1.4 phases delivered; milestone closeout (`/gsd-complete-milestone`) not yet run
 
 **Dependency-ordered phases:**
 
@@ -102,14 +106,12 @@ A Bitbucket Cloud pull request receives the same automated AI review — inline 
 <!-- Shipped in v1.4 Deferred Candidates (in flight). -->
 
 - ✓ EVID-02: Hard-drop evidence gate — findings with hallucinated `existingCode` dropped from posted comments before dedup, config-gated (`evidence.hard_drop`, default off), per-category opt-out (default `security`), at-most-once `evidence_hard_dropped` audit, dashboard toggle + audit renderer — Validated in Phase 26 (10/10 must-haves)
+- ✓ ANNO-01: Per-line Bitbucket Code Insights `ANNOTATION` reports mirroring inline findings — dedicated `codra-annotations` report, config-gated (`review.bitbucket.annotations_enabled`, default off), full-replace-per-round (delete-then-recreate), fail-open in finalize, `external_id` collision-resistant, `result` always `PASSED` (never merge-gating) — Validated in Phase 30 (UAT 1/1 passed incl. live Assumption-A1 cascade confirmation; security review 17/17 threats closed)
+- ✓ WS-01: Workspace-level Bitbucket Access Token + webhook auto-discovers and onboards many repos from one workspace credential — `vcs_workspace_credentials` table + D-03 per-repo-wins credential resolution, transactional finalize endpoint (encrypt + persist + selective onboard + idempotent webhook), webhook route verifies against per-repo OR workspace secret, two-step discover/checklist dashboard UI — Validated in Phase 31 (25/25 must-haves; code review found 2 blockers — credential-fallback short-circuit, tokenExpiresAt cleared on every sync resubmission — both fixed and regression-tested before verification)
 
 ### Active (v1.4 candidates)
 
-- [ ] **SEC-XDIFF-01**: Whole-diff cross-file security reasoning (carried from v1.1)
-- [ ] **LRN-01**: Learned-rule synthesis from `reject` feedback + approval queue (carried from v1.1)
-- [ ] **QA-IDX-01**: Codebase-index-backed Q&A (carried from v1.1)
-- [ ] **ANNO-01**: Per-line Code Insights annotations (diff-gutter markers) — carried from v1.0
-- [ ] **WS-01**: Workspace-level token/webhook covering many repos — carried from v1.0
+_All v1.4 candidate requirements shipped — see Validated above. Milestone closeout not yet run._
 
 ### Out of Scope
 
@@ -214,4 +216,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-07-29 — Phase 26 complete: EVID-02 hard-drop evidence gate validated (10/10 must-haves) and moved to Validated; v1.4 in flight (Phase 29 executing).*
+*Last updated: 2026-07-30 — Phase 31 complete: WS-01 workspace-level Bitbucket token/webhook validated (25/25 must-haves; 2 code-review blockers found and fixed pre-verification) and moved to Validated; all 6 v1.4 phases now shipped, milestone closeout not yet run.*
