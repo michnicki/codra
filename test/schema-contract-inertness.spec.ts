@@ -5,6 +5,8 @@ import {
   criticResultSchema,
   fileReviewPassSchema,
   fileReviewRecordSchema,
+  jobAuditEventSchema,
+  vcsCommitEntrySchema,
   defaultRepoConfig,
 } from '@shared/schema';
 import { runReviewJob } from '@server/core/review';
@@ -151,6 +153,95 @@ describe('SC3: Phase-7 reviewConfig toggles default off; the three v1.2 always-o
     expect(cfg.review.dedup.enabled).toBe(true);
     expect(cfg.review.file_selection.enabled).toBe(true);
     expect(cfg.review.learning.enabled).toBe(false);
+  });
+});
+
+describe('Phase 34 (PRD-04/PRD-05): vcsCommitEntrySchema contract', () => {
+  it('validates a well-formed commit entry with filesAvailable defaulting to true', () => {
+    const result = vcsCommitEntrySchema.safeParse({
+      hash: 'abc1234',
+      message: 'fix: resolve race',
+      files: ['src/locks.ts'],
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.filesAvailable).toBe(true);
+    }
+  });
+
+  it('rejects a hash that is not exactly 7 characters', () => {
+    const result = vcsCommitEntrySchema.safeParse({
+      hash: 'ab',
+      message: 'fix',
+      files: [],
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts filesAvailable: false set explicitly by the Bitbucket provider', () => {
+    const result = vcsCommitEntrySchema.safeParse({
+      hash: 'def5678',
+      message: 'feat: add retry logic',
+      files: [],
+      filesAvailable: false,
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.filesAvailable).toBe(false);
+    }
+  });
+});
+
+describe('Phase 34 (PRD-05): review.yaml_config + review.file_history toggles default off (NREG-01 inertness)', () => {
+  it('repoConfigSchema.parse({}) yields both toggles at { enabled: false }', () => {
+    const cfg = repoConfigSchema.parse({});
+
+    expect(cfg.review.file_history.enabled).toBe(false);
+    expect(cfg.review.yaml_config.enabled).toBe(false);
+  });
+
+  it('the exported defaultRepoConfig mirrors both toggle defaults', () => {
+    expect(defaultRepoConfig.review.file_history.enabled).toBe(false);
+    expect(defaultRepoConfig.review.yaml_config.enabled).toBe(false);
+  });
+});
+
+describe('Phase 34 (PRD-05): yaml_config_parse_failed audit event arm', () => {
+  it('validates a hand-crafted yaml_config_parse_failed event against jobAuditEventSchema', () => {
+    const event = {
+      stage: 'yaml_config_parse_failed',
+      reason: 'Invalid YAML syntax',
+      timestamp: '2026-07-31T00:00:00.000Z',
+    };
+
+    const parsed = jobAuditEventSchema.safeParse(event);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.reason).toBe('Invalid YAML syntax');
+    }
+  });
+
+  it('rejects a reason longer than the 500-char bound', () => {
+    const event = {
+      stage: 'yaml_config_parse_failed',
+      reason: 'x'.repeat(501),
+      timestamp: '2026-07-31T00:00:00.000Z',
+    };
+
+    expect(jobAuditEventSchema.safeParse(event).success).toBe(false);
+  });
+
+  it('still rejects an unknown stage value (closed union vocabulary)', () => {
+    const event = {
+      stage: 'bogus',
+      reason: 'Invalid YAML syntax',
+      timestamp: '2026-07-31T00:00:00.000Z',
+    };
+
+    expect(jobAuditEventSchema.safeParse(event).success).toBe(false);
   });
 });
 
