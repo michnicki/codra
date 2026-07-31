@@ -1,37 +1,37 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.4
-milestone_name: Deferred Candidates — hard-drop evidence, cross-file security, learned rules, codebase-index Q&A, Code Insights annotations, workspace tokens + tech debt cleanup
-current_phase: 32
-status: Milestone complete
-stopped_at: v1.4 milestone archived
-last_updated: "2026-07-31T11:30:00.000Z"
+milestone: v1.5
+milestone_name: — PRD Parity
+current_phase: 33
+current_phase_name: quality-fixes
+status: executing
+stopped_at: Phase 33 context gathered
+last_updated: "2026-07-31T14:03:28.331Z"
 last_activity: 2026-07-31
-last_activity_desc: v1.4 milestone archived — 7 phases, 33 plans, 6/6 requirements
+last_activity_desc: Phase 33 execution started
 progress:
-  total_phases: 11
-  completed_phases: 11
-  total_plans: 37
-  completed_plans: 37
-  percent: 100
-current_phase_name: address-v1-4-tech-debt-audit-viewer-renderer-misleading-midd
+  total_phases: 4
+  completed_phases: 0
+  total_plans: 4
+  completed_plans: 1
+  percent: 0
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-07-31 for v1.4 closure)
+See: .planning/PROJECT.md (updated 2026-07-31 for v1.5 start)
 
 **Core value:** A Bitbucket Cloud PR gets the same AI review a GitHub PR gets, from one instance, without breaking GitHub — held end-to-end through v1.4 (all 4 milestones, 84/84 requirements satisfied).
-**Current focus:** Planning next milestone
+**Current focus:** Phase 33 — quality-fixes
 
 ## Current Position
 
-Phase: Milestone v1.4 complete
-Plan: —
-Status: Milestone complete — awaiting next milestone
-Last activity: 2026-07-31 — v1.4 milestone archived (7 phases, 33 plans, 6/6 requirements)
+Phase: 33 (quality-fixes) — EXECUTING
+Plan: 2 of 4
+Status: Ready to execute
+Last activity: 2026-07-31 — Phase 33 execution started
 
 ### Phase 27 Plan 27-01 Decisions (SEC-XDIFF-01)
 
@@ -372,9 +372,9 @@ Items acknowledged and carried forward:
 
 ## Session Continuity
 
-Last session: 2026-07-31T08:13:09.849Z
-Stopped at: Phase 32 context gathered
-Resume file: .planning/phases/32-address-v1-4-tech-debt-audit-viewer-renderer-misleading-midd/32-CONTEXT.md
+Last session: 2026-07-31T11:52:59.796Z
+Stopped at: Phase 33 context gathered
+Resume file: .planning/phases/33-quality-fixes/33-CONTEXT.md
 
 ## Operator Next Steps
 
