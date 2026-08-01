@@ -77,7 +77,41 @@ afterEach(() => {
 });
 
 describe('GitHubAdapter.getFileHistory', () => {
-  it('returns commit entries for a file with history', async () => {
+  // CR-01 (34-REVIEW): this is the SHAPE GITHUB ACTUALLY RETURNS from the list-commits endpoint —
+  // no `files[]`, no `stats`. The previous fixture fabricated `files` and so proved only that the
+  // mapper works against a response GitHub never sends, hiding the hardcoded `filesAvailable: true`.
+  it('reports filesAvailable: false when the list-commits response carries no files[] (real GitHub shape)', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const { restore } = installGitHubFetchMock(
+      buildGitHubFixtures({
+        fileHistoryResponses: {
+          body: [
+            { sha: 'abc1234567890abcdef', commit: { message: 'fix: resolve race\n\nbody' } },
+            { sha: 'def4567abcdef1234567', commit: { message: 'feat: add retry' } },
+          ],
+        },
+      }),
+    );
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      const history = await adapter.getFileHistory?.(OWNER, REPO, 'src/main.ts', 'main', 5);
+
+      // filesAvailable MUST be false so buildFileHistoryBlock renders "(files list not available)"
+      // instead of falsely claiming the commit touched only this file.
+      expect(history).toEqual([
+        { hash: 'abc1234', message: 'fix: resolve race', files: [], filesAvailable: false },
+        { hash: 'def4567', message: 'feat: add retry', files: [], filesAvailable: false },
+      ]);
+    } finally {
+      restore();
+    }
+  });
+
+  // The manifest-present branch stays covered for the day a caller feeds this mapper a
+  // single-commit / compare payload (which DO carry files[]); it is not the list-commits shape.
+  it('reports filesAvailable: true and filters the queried path when a manifest IS present', async () => {
     const env = createTestEnv();
     await seedInstallationToken(env, INSTALLATION_ID);
     const { restore } = installGitHubFetchMock(
@@ -99,6 +133,7 @@ describe('GitHubAdapter.getFileHistory', () => {
       expect(history).toEqual([
         { hash: 'abc1234', message: 'fix: resolve race', files: ['src/locks.ts'], filesAvailable: true },
         { hash: 'def4567', message: 'feat: add retry', files: [], filesAvailable: true },
+        // An EMPTY manifest is still a manifest: the commit genuinely touched only this file.
         { hash: 'ghi9012', message: 'refactor: extract validator', files: [], filesAvailable: true },
       ]);
       // The queried path is excluded from every entry's other-files list.

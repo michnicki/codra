@@ -522,10 +522,19 @@ export class GitHubClient {
   }
 
   // PRD-04 (FR-114): per-touched-file commit history for decision-archaeology context. One
-  // subrequest per file. The response carries the file manifest (`files[].filename`), so every
-  // entry reports `filesAvailable: true` (review LOW-10) — the queried path itself is filtered
-  // out of the other-files list. Any non-2xx (including 404 for a path with no commits on this
-  // ref) throws GitHubError; the caller catches and skips that file's history (fail-open, D-06).
+  // subrequest per file. Any non-2xx (including 404 for a path with no commits on this ref)
+  // throws GitHubError; the caller catches and skips that file's history (fail-open, D-06).
+  //
+  // CR-01 (34-REVIEW): `filesAvailable` is DERIVED from the response, never asserted. GitHub's
+  // LIST-commits endpoint (`GET /repos/{o}/{r}/commits`) does NOT return `files[]` or `stats` —
+  // only the single-commit (`GET /commits/{ref}`) and compare endpoints do. The earlier
+  // hardcoded `filesAvailable: true` therefore made every production entry claim "this commit
+  // touched only this file" (`buildFileHistoryBlock` renders `(none — only this file)` for an
+  // empty list when the flag is true), which is exactly the misdirection `filesAvailable: false`
+  // was introduced for on Bitbucket (T-34-02-03). Deriving the flag makes GitHub render the
+  // honest "(files list not available)". Populating the manifest for real would cost one extra
+  // `GET /commits/{sha}` subrequest PER COMMIT and must be budget-gated — a feature decision,
+  // deliberately not taken here.
   async getFileHistory(owner: string, repo: string, path: string, ref: string, maxCommits: number): Promise<VcsCommitEntry[]> {
     const query = `path=${encodeURIComponent(path)}&sha=${encodeURIComponent(ref)}&per_page=${maxCommits}`;
     return withRetry(`getFileHistory ${owner}/${repo} ${path}@${ref}`, async () => {
@@ -537,12 +546,18 @@ export class GitHubClient {
         commit: { message: string };
         files?: Array<{ filename: string }>;
       }>;
-      return commits.map((c) => ({
-        hash: c.sha.slice(0, 7),
-        message: c.commit.message.split('\n')[0] ?? '',
-        files: (c.files ?? []).map((f) => f.filename).filter((f) => f !== path),
-        filesAvailable: true, // GitHub's commits endpoint returns the file manifest (review LOW-10)
-      }));
+      return commits.map((c) => {
+        // `null` = the response carried no manifest at all (the list endpoint's real shape);
+        // `[]` = the response carried an EMPTY manifest (a commit that genuinely touched
+        // nothing else, only reachable via a response shape that does include `files`).
+        const manifest = Array.isArray(c.files) ? c.files : null;
+        return {
+          hash: c.sha.slice(0, 7),
+          message: c.commit.message.split('\n')[0] ?? '',
+          files: (manifest ?? []).map((f) => f.filename).filter((f) => f !== path),
+          filesAvailable: manifest !== null,
+        };
+      });
     });
   }
 

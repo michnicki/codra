@@ -175,8 +175,13 @@ export type GitHubFetchMockFixtures = {
   };
   /**
    * PRD-04 (FR-114): response for GET /repos/{owner}/{repo}/commits?path=...&sha=...&per_page=...
-   * (per-touched-file commit history). `status` defaults to 200; `body` is the commit array, each
-   * entry shaped `{ sha, commit: { message }, files?: [{ filename }] }`.
+   * (per-touched-file commit history). `status` defaults to 200; `body` is the commit array.
+   *
+   * CR-01 (34-REVIEW): the REAL list-commits response entry is `{ sha, commit: { message }, ... }`
+   * with **NO `files[]` and no `stats`** — those fields exist only on the single-commit
+   * (`GET /commits/{ref}`) and compare endpoints. Fixtures MUST NOT fabricate `files` on this
+   * route unless the spec is deliberately exercising the "manifest present" branch; doing so
+   * hid the hardcoded `filesAvailable: true` defect in `GitHubClient.getFileHistory`.
    *
    * Registered ONLY when supplied, so every other spec's route table is byte-identical (NREG-01).
    */
