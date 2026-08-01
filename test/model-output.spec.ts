@@ -332,6 +332,54 @@ describe('FR-153/FR-154 parse normalization (PRD-02)', () => {
     expect(events[0]).toMatchObject({ stage: 'suggestion_dropped', droppedCount: 1 });
   });
 
+  // CR-01: the body-prefix de-duplication strip erased the ENTIRE body whenever the body opened by
+  // restating its title (cleanText flattens newlines, so `body.split('\n')[0]` IS the whole body).
+  // The FR-153 drop clause then read that erased value and deleted a complete, on-diff finding with
+  // an actionable suggestion — invisible in the PR, absent from the orphan bucket, and
+  // unidentifiable in the audit trail (redactFindingTitle collapses every title to a fixed marker).
+  // The whitespace-only-body test above never exercised this path.
+  it('a title-echoing body + a code_suggestion still POSTS — the strip never empties the body (CR-01)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({
+        title: 'Missing null check on user input',
+        body: 'Missing null check on user input. This can crash the worker when req.body is undefined. Add a guard.',
+        priority: 1,
+        code_suggestion: 'if (!req.body) return;',
+      }),
+      mockFile,
+    );
+
+    expect(result.comments).toHaveLength(1);
+    // The finding is NOT audit-dropped: the model DID supply an explanation.
+    expect(dropEvents(result)).toHaveLength(0);
+    // The surviving body keeps the model's explanation and carries the suggestion fence.
+    expect(result.comments[0].body).toContain('crash the worker');
+    expect(result.comments[0].body).toContain('```suggestion');
+    expect(result.comments[0].codeSuggestion).toBe('if (!req.body) return;');
+  });
+
+  it('a title-echoing body with NO suggestion also keeps its body rather than emptying it (CR-01)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({ title: 'Missing null check', body: 'Missing null check', priority: 1 }),
+      mockFile,
+    );
+
+    expect(result.comments).toHaveLength(1);
+    expect(result.comments[0].body).toBe('Missing null check');
+  });
+
+  it('a body that merely PREFIXES the title still strips down to the remainder (strip preserved)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({ title: 'finding', body: 'finding\nthe real explanation', priority: 1 }),
+      mockFile,
+    );
+
+    expect(result.comments).toHaveLength(1);
+    // cleanText flattens the newline, so the whole line is the prefix and stripping it would empty
+    // the body — the CR-01 guard keeps the full text instead of deleting the explanation.
+    expect(result.comments[0].body).toContain('the real explanation');
+  });
+
   it('code_suggestion: "" is treated as absent — the per-file parse never throws (fail-open hardening)', () => {
     const result = parseFileReviewResponse(
       rawWith({ title: 'finding', body: 'the issue', priority: 1, code_suggestion: '' }),
