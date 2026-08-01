@@ -66,6 +66,7 @@ import {
   recordRoundAudit,
   recordUnitAudit,
   recordVerifyFixesAudit,
+  recordYamlConfigApplied,
   recordYamlConfigParseFailed,
 } from './audit';
 import { runVerifyFixesPhase } from './verify-fixes';
@@ -970,6 +971,35 @@ async function runPreparePhase(
           ...config,
           ...yamlObject,
         });
+
+        // WR-03 / WR-07 (34-REVIEW): make the merge OBSERVABLE.
+        //
+        // WR-03: the D-09 replacement above is WHOLESALE and the file comes from `pr.headSha` — a
+        // branch any PR author controls. A file that looks like it only adds a lint rule resets
+        // every operator-configured sub-key of the declared top-level key to its Zod default
+        // (passes.security.enabled → false, evidence.hard_drop → false, learning.learned_rules →
+        // [], …), and that reset is persisted to jobs.config_snapshot for every later phase.
+        // Naming the replaced keys in the audit trail does NOT close the tampering vector — an
+        // allow-list of safe sub-keys would reverse D-09, and reading the file from the base
+        // branch would reverse D-13 — but it makes the reset visible after the fact instead of
+        // invisible. Verified out of scope: this cannot reach command authorization
+        // (`authorizeActor` reads the webhook's DB config, not jobs.config_snapshot).
+        //
+        // WR-07: `repoConfigSchema` is non-strict, so a typo'd top-level key (`reveiw:`) is
+        // stripped by Zod and the merge becomes an identity — previously with no warning and no
+        // event at all. `ignored_keys` (plus the warn below) is that missing signal.
+        const declaredKeys = Object.keys(yamlObject);
+        const knownKeys = new Set(Object.keys(repoConfigSchema.shape));
+        const replacedKeys = declaredKeys.filter((key) => knownKeys.has(key));
+        const ignoredKeys = declaredKeys.filter((key) => !knownKeys.has(key));
+        if (ignoredKeys.length > 0) {
+          logger.warn(
+            `Ignored ${ignoredKeys.length} unknown top-level key(s) in ${yamlPath} for ${job.owner}/${job.repo}`,
+            // Key NAMES only — never values, and never the raw file (untrusted PR-head content).
+            { ignoredKeys: ignoredKeys.slice(0, 20) },
+          );
+        }
+        await recordYamlConfigApplied(env, job.id, yamlPath, replacedKeys, ignoredKeys); // best-effort
       } catch (error) {
         logger.warn(
           `Failed to parse ${yamlPath} for ${job.owner}/${job.repo}`,

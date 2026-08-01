@@ -15,7 +15,12 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import { parseYaml } from '@server/core/yaml-parse';
-import { buildYamlConfigParseFailedEvent, recordYamlConfigParseFailed } from '@server/core/audit';
+import {
+  buildYamlConfigAppliedEvent,
+  buildYamlConfigParseFailedEvent,
+  recordYamlConfigApplied,
+  recordYamlConfigParseFailed,
+} from '@server/core/audit';
 import * as jobsModule from '@server/db/jobs';
 import { logger } from '@server/core/logger';
 import { repoConfigSchema, jobAuditEventSchema, defaultRepoConfig, type RepoConfig } from '@shared/schema';
@@ -312,6 +317,42 @@ describe('Phase 34 (34-03): YAML config audit builder/recorder', () => {
     expect(String(event.reason).length).toBeLessThanOrEqual(500);
   });
 
+  // WR-03 / WR-07 (34-REVIEW): the success-path event that makes the D-09 wholesale replacement
+  // (and Zod's silent unknown-key strip) observable.
+  it('builds a valid yaml_config_applied event naming the replaced and ignored top-level keys', () => {
+    const event = buildYamlConfigAppliedEvent('.review.yaml', ['review'], ['reveiw']);
+    const parsed = jobAuditEventSchema.parse(event);
+    expect(parsed.stage).toBe('yaml_config_applied');
+    expect(parsed).toMatchObject({ source: '.review.yaml', replaced_keys: ['review'], ignored_keys: ['reveiw'] });
+  });
+
+  it('bounds untrusted key names to 20 entries of at most 64 chars each (schema bound)', () => {
+    const many = Array.from({ length: 30 }, (_, i) => `k${i}`.padEnd(90, 'x'));
+    const event = buildYamlConfigAppliedEvent('.review.yaml', many, many);
+    expect(jobAuditEventSchema.safeParse(event).success).toBe(true);
+    expect((event as unknown as { replaced_keys: string[] }).replaced_keys).toHaveLength(20);
+    expect((event as unknown as { ignored_keys: string[] }).ignored_keys.every((k) => k.length <= 64)).toBe(true);
+  });
+
+  it('recordYamlConfigApplied appends the builder-shaped event and never throws on a rejected write', async () => {
+    const env = { HYPERDRIVE: { connectionString: 'postgres://test' } } as any;
+    const appendSpy = vi
+      .spyOn(jobsModule, 'appendJobAuditEvents')
+      .mockRejectedValue(new Error('simulated audit-write failure'));
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    await expect(recordYamlConfigApplied(env, 'job-id', '.review.yml', ['model'], [])).resolves.toBeUndefined();
+    expect(appendSpy).toHaveBeenCalledTimes(1);
+    expect(appendSpy.mock.calls[0][2][0]).toMatchObject({
+      stage: 'yaml_config_applied',
+      source: '.review.yml',
+      replaced_keys: ['model'],
+      ignored_keys: [],
+    });
+    expect(warnSpy).toHaveBeenCalled();
+    appendSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
   it('recordYamlConfigParseFailed appends via appendJobAuditEvents and never throws on a rejected write', async () => {
     const env = { HYPERDRIVE: { connectionString: 'postgres://test' } } as any;
     const jobId = 'job-id';
@@ -434,6 +475,67 @@ dbDescribe('Phase 34 (34-03): prepare-phase YAML config integration', () => {
     expect(job!.configSnapshot!.review.max_files).toBe(150);
     // Undeclared top-level keys keep their DB values.
     expect(job!.configSnapshot!.review.file_history.enabled).toBe(false);
+  });
+
+  // WR-03 (34-REVIEW): the D-09 merge is a WHOLESALE top-level replacement driven by a file read
+  // from the PR HEAD, so an innocuous-looking two-line .review.yaml resets every operator-
+  // configured sub-key of `review` (here: the security pass) to its Zod default, and that reset is
+  // persisted to jobs.config_snapshot. Closing the vector fully would reverse D-09 (allow-list) or
+  // D-13 (read from base) — see 34-REVIEW-FIX.md. What this test pins is that the reset is now
+  // OBSERVABLE: a yaml_config_applied event names the top-level keys the YAML replaced.
+  it('WR-03: a head-branch YAML that resets the security pass records which top-level keys it replaced', async () => {
+    const repo = `repo-yaml-wr03-${Date.now()}`;
+    await getOrCreateRepository(env, { installationId: INSTALLATION_ID, owner: OWNER, repo, vcsProvider: 'github' });
+    const parsedJson = structuredClone(defaultRepoConfig) as RepoConfig;
+    parsedJson.review.yaml_config = { enabled: true };
+    parsedJson.review.passes.security.enabled = true; // operator turned the security pass ON
+    await upsertRepoConfig(env, { installationId: INSTALLATION_ID, owner: OWNER, repo, parsedJson });
+
+    // Looks like it only adds a lint rule.
+    mocks.getRepoFileContent.mockImplementation(async (_o: string, _r: string, path: string) =>
+      path === '.review.yaml' ? 'review:\n  custom_rules:\n    - prefer const' : null,
+    );
+
+    await runPrepare(repo);
+    const job = await jobFor(repo);
+
+    // The documented D-09 consequence, unchanged: the operator's security pass is now off.
+    expect(job!.configSnapshot!.review.passes.security.enabled).toBe(false);
+
+    // ...and the audit trail now SAYS SO instead of staying silent.
+    const rows = await queryRows<{ audit: unknown }>(env, `SELECT audit FROM jobs WHERE id = $1`, [job!.id]);
+    const applied = ((rows[0]?.audit as Array<Record<string, unknown>>) ?? []).find(
+      (event) => event.stage === 'yaml_config_applied',
+    );
+    expect(applied).toBeDefined();
+    expect(applied).toMatchObject({ source: '.review.yaml', replaced_keys: ['review'], ignored_keys: [] });
+  });
+
+  // WR-07 (34-REVIEW): repoConfigSchema is non-strict, so a typo'd top-level key is stripped by Zod
+  // and the merge is an identity — previously with NO warning and NO event, leaving the operator
+  // with no signal that their file did nothing.
+  it('WR-07: a typo\'d top-level key is reported as ignored rather than being a silent no-op', async () => {
+    const repo = `repo-yaml-wr07-${Date.now()}`;
+    await seedRepoWithYamlToggle(repo, true, 10, 100);
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    mocks.getRepoFileContent.mockImplementation(async (_o: string, _r: string, path: string) =>
+      path === '.review.yaml' ? 'reveiw:\n  max_files: 5' : null,
+    );
+
+    await runPrepare(repo);
+    const job = await jobFor(repo);
+
+    // Identity merge: the DB config still governs.
+    expect(job!.configSnapshot!.review.max_files).toBe(100);
+
+    const rows = await queryRows<{ audit: unknown }>(env, `SELECT audit FROM jobs WHERE id = $1`, [job!.id]);
+    const applied = ((rows[0]?.audit as Array<Record<string, unknown>>) ?? []).find(
+      (event) => event.stage === 'yaml_config_applied',
+    );
+    expect(applied).toMatchObject({ replaced_keys: [], ignored_keys: ['reveiw'] });
+    expect(
+      warnSpy.mock.calls.some(([message]) => String(message).includes('Ignored 1 unknown top-level key')),
+    ).toBe(true);
   });
 
   // WR-01 (34-REVIEW): a transient provider failure on the .review.yaml probe must NOT be recorded

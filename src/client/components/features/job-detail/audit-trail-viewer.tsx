@@ -15,6 +15,9 @@ interface AuditTrailViewerProps {
 const STAGE_LABELS: Record<AuditStageGroup['stage'], string> = {
   // WR-03: these two schema stages previously had no STAGE_ORDER entry and were never rendered.
   yaml_config_parse_failed: 'Config parse failed',
+  // Phase 34 WR-03/WR-07: which top-level config keys a repo's .review.yaml replaced (a WHOLESALE
+  // D-09 replacement from a PR-head-controlled file) and which it declared but the schema ignored.
+  yaml_config_applied: 'Repo config applied',
   file_skipped: 'Files skipped',
   drafted: 'Drafted',
   severity_adjusted: 'Severity adjusted',
@@ -485,6 +488,22 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
       return (
         <li className="rounded-md border border-border/40 bg-card/40 p-3">
           <MetricLine label="reason" value={event.reason} />
+        </li>
+      );
+    // Phase 34 WR-03/WR-07: `replaced` is the operator-visible record of which top-level config
+    // keys the head-branch YAML overrode wholesale; `ignored` names keys the schema stripped, so a
+    // typo'd `reveiw:` no longer produces a silent no-op.
+    case 'yaml_config_applied':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="source" value={event.source} />
+          <MetricLine
+            label="replaced"
+            value={event.replaced_keys.length > 0 ? event.replaced_keys.join(', ') : '(none)'}
+          />
+          {event.ignored_keys.length > 0 ? (
+            <MetricLine label="ignored" value={event.ignored_keys.join(', ')} />
+          ) : null}
         </li>
       );
     default: {

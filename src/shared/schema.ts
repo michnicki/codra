@@ -1483,6 +1483,30 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
       timestamp: dateStringSchema,
     })
     .passthrough(),
+  // Phase 34 WR-03 / WR-07 (34-REVIEW): a `.review.yaml` was found, parsed and MERGED. This event
+  // exists because the D-09 merge is a WHOLESALE top-level replacement driven by a file read from
+  // `pr.headSha` — a branch any PR author controls. A two-line file declaring `review:` resets
+  // EVERY operator-configured sub-key to its Zod default (passes.security.enabled → false,
+  // evidence.hard_drop → false, learning.learned_rules → [], max_files → 150, …) and that reset is
+  // then persisted to jobs.config_snapshot, where every later phase observes it. Nothing in the
+  // audit trail said so. `replaced_keys` names the top-level keys the YAML overrode, so the reset
+  // is OBSERVABLE after the fact.
+  //
+  // `ignored_keys` covers WR-07: `repoConfigSchema` is non-strict, so a typo'd top-level key
+  // (`reveiw:`) is silently stripped by Zod, the merge becomes an identity, and the operator gets
+  // NO signal that their file did nothing. Naming the stripped keys here is that signal.
+  //
+  // This event is NOT a failure — it is emitted on the success path. Bounds mirror the other
+  // sampled arms: at most 20 key names, each at most 64 chars.
+  z
+    .object({
+      stage: z.literal('yaml_config_applied'),
+      source: z.string().min(1).max(64),
+      replaced_keys: z.array(z.string().max(64)).max(20),
+      ignored_keys: z.array(z.string().max(64)).max(20),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
 ]);
 export type JobAuditEvent = z.infer<typeof jobAuditEventSchema>;
 

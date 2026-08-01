@@ -15,6 +15,10 @@ export const STAGE_ORDER = [
   // WR-03: `yaml_config_parse_failed` (Phase 34) had NO display group, so `groupAuditByStage`
   // dropped it silently. Config resolution runs before file selection, hence first.
   'yaml_config_parse_failed',
+  // Phase 34 WR-03/WR-07 (34-REVIEW): the success-path counterpart — a .review.yaml was found and
+  // merged. Sits next to its failure sibling because both belong to config resolution, which runs
+  // before file selection.
+  'yaml_config_applied',
   'file_skipped',
   'drafted',
   'severity_adjusted',
