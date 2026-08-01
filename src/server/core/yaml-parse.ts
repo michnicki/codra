@@ -3,9 +3,12 @@
 // Pure string manipulation: no imports, no file system access, Cloudflare Workers-compatible.
 //
 // SUPPORTED: comment lines, empty lines, nested objects (indentation), integer/float/boolean/string
-// scalars, quoted strings, block-style string arrays (`- item`), FLOW-style arrays (`key: [a, b]` —
-// review MEDIUM-5: repoConfigSchema has legitimate flow-array shapes like skip_files), and
-// arrays-of-objects (`- key: value` with deeper `key: value` continuation lines).
+// scalars, quoted strings, block-style string arrays (`- item`) at EITHER a deeper indent than
+// their key or the SAME indent as their key (WR-03/WR-06 — the same-indent form is what most YAML
+// documentation shows, and rejecting it discarded an otherwise-valid config file), FLOW-style
+// arrays (`key: [a, b]` — review MEDIUM-5: repoConfigSchema has legitimate flow-array shapes like
+// skip_files), and arrays-of-objects (`- key: value` with deeper `key: value` continuation lines).
+// A leading UTF-8 BOM is tolerated (WR-06).
 //
 // NOT SUPPORTED (must throw): multi-line block scalars (`|`, `>`), flow-style maps (`{}`),
 // anchors/aliases (`&`, `*`), tags (`!!`), complex keys (quoted keys with spaces).
@@ -168,7 +171,10 @@ export function parseYaml(raw: string): Record<string, unknown> {
   // preserving leading indentation for depth tracking. `line` is the 1-based ORIGINAL source line
   // number (blank/comment lines are dropped from `lines` but still counted), so WR-02 error
   // messages can point the operator at their file without echoing its content.
-  const sourceLines = raw.split(/\r?\n/);
+  // WR-06 (34-REVIEW): strip a leading UTF-8 BOM. `String.prototype.trim` treats U+FEFF as
+  // whitespace, so a BOM-saved file reported `indent === 1` on its first line and died with a
+  // misleading "inconsistent indentation" — an editor default silently discarding the whole config.
+  const sourceLines = (raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw).split(/\r?\n/);
   const lines: Array<{ indent: number; text: string; line: number }> = [];
   for (let sourceIndex = 0; sourceIndex < sourceLines.length; sourceIndex += 1) {
     const trimmedRight = sourceLines[sourceIndex].trimEnd();
@@ -243,7 +249,14 @@ export function parseYaml(raw: string): Record<string, unknown> {
     assertValidKey(key);
     const rawValue = stripInlineComment(text.slice(colon + 1).trim());
 
-    const top = popTo(indent);
+    let top = popTo(indent);
+    // WR-06: a SAME-INDENT block sequence keeps its array context AT the parent key's indent (see
+    // the rawValue === '' branch below), and `popTo` only pops contexts that are strictly deeper.
+    // A sibling key arriving at that same indent is what closes the sequence.
+    if (top.kind === 'array' && top.indent === indent) {
+      stack.pop();
+      top = stack[stack.length - 1];
+    }
     if (top.kind !== 'object') {
       throw new Error('YAML parse error: key-value pair inside an array');
     }
@@ -255,7 +268,18 @@ export function parseYaml(raw: string): Record<string, unknown> {
     }
 
     if (rawValue === '') {
-      // A key with no value starts a nested block iff the next line is more indented.
+      // A key with no value starts a nested block iff the next line is more indented — OR, for a
+      // block sequence only, sits at the SAME indent (WR-06):
+      //
+      //   review:
+      //     skip_files:
+      //     - "dist/**"        <- indent 2, same as its key; the style most YAML docs use
+      //
+      // The array context is opened AT the key's own indent so `- ` items at that indent match
+      // `top.indent === indent` in the sequence branch above, and the sibling-key pop added there
+      // is what closes it. Rejecting this form threw "array item at indent N without a matching
+      // parent key" and discarded the operator's entire config file.
+      const sameIndentSequence = Boolean(next && next.indent === indent && next.text.startsWith('-'));
       if (next && next.indent > indent) {
         if (next.text.startsWith('-')) {
           const arr: unknown[] = [];
@@ -266,6 +290,10 @@ export function parseYaml(raw: string): Record<string, unknown> {
           top.obj[key] = child;
           stack.push({ kind: 'object', indent: next.indent, obj: child });
         }
+      } else if (sameIndentSequence) {
+        const arr: unknown[] = [];
+        top.obj[key] = arr;
+        stack.push({ kind: 'array', indent, arr });
       } else {
         top.obj[key] = '';
       }
