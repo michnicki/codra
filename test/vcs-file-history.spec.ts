@@ -1,0 +1,127 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { GithubAdapter } from '@server/vcs/github';
+import { BitbucketAdapter } from '@server/vcs/bitbucket';
+import { BitbucketClient } from '@server/core/bitbucket';
+import { createTestEnv, seedInstallationToken } from './helpers';
+import { installGitHubFetchMock } from './github-fetch-mock';
+import { installBitbucketFetchMock } from './bitbucket-fetch-mock';
+
+const OWNER = 'test-owner';
+const REPO = 'test-repo';
+const PR_NUMBER = 42;
+const INSTALLATION_ID = '123456';
+
+function buildGitHubFixtures(overrides: Partial<Parameters<typeof installGitHubFetchMock>[0]> = {}) {
+  return {
+    owner: OWNER,
+    repo: REPO,
+    prNumber: PR_NUMBER,
+    pull: {
+      number: PR_NUMBER,
+      title: 'Test PR',
+      body: 'Test body',
+      draft: false,
+      head: { sha: 'headsha1234567890', ref: 'feature-branch' },
+      base: { sha: 'basesha1234567890', ref: 'main' },
+      user: { login: 'author-login' },
+    },
+    diff: 'diff --git a/file.ts b/file.ts\n@@ -1 +1 @@\n-old\n+new\n',
+    ...overrides,
+  };
+}
+
+// Bitbucket adapter is constructed with a stubbed client via the private-constructor shape,
+// mirroring test/bitbucket-adapter.spec.ts (the credential-read path is covered elsewhere).
+type AdapterHandle = {
+  adapter: BitbucketAdapter;
+  client: BitbucketClient;
+  env: ReturnType<typeof createTestEnv>;
+};
+
+function buildBitbucketAdapter(env: ReturnType<typeof createTestEnv> = createTestEnv()): AdapterHandle {
+  const client = new BitbucketClient(env, 'test-token-bearer');
+  const job = {
+    id: 'job-bb-1',
+    owner: OWNER,
+    repo: REPO,
+    prNumber: PR_NUMBER,
+    commitSha: 'head123',
+    headSha: 'head123',
+    installationId: null,
+    repositoryVcsProvider: 'bitbucket',
+    repositoryWorkspace: OWNER,
+  } as const;
+  const adapter = new (BitbucketAdapter as unknown as new (
+    env: ReturnType<typeof createTestEnv>,
+    client: BitbucketClient,
+    job: typeof job,
+    tracker?: { incrementSubrequests: ReturnType<typeof vi.fn> },
+  ) => BitbucketAdapter)(env, client, job);
+  return { adapter, client, env };
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe('GitHubAdapter.getFileHistory', () => {
+  it('returns commit entries for a file with history', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const { restore } = installGitHubFetchMock(
+      buildGitHubFixtures({
+        fileHistoryResponses: {
+          body: [
+            { sha: 'abc1234567890abcdef', commit: { message: 'fix: resolve race\n\nbody' }, files: [{ filename: 'src/main.ts' }, { filename: 'src/locks.ts' }] },
+            { sha: 'def4567abcdef1234567', commit: { message: 'feat: add retry' }, files: [{ filename: 'src/main.ts' }] },
+            { sha: 'ghi9012abcdef3456789', commit: { message: 'refactor: extract validator' }, files: [] },
+          ],
+        },
+      }),
+    );
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      const history = await adapter.getFileHistory?.(OWNER, REPO, 'src/main.ts', 'main', 5);
+
+      expect(history).toEqual([
+        { hash: 'abc1234', message: 'fix: resolve race', files: ['src/locks.ts'], filesAvailable: true },
+        { hash: 'def4567', message: 'feat: add retry', files: [], filesAvailable: true },
+        { hash: 'ghi9012', message: 'refactor: extract validator', files: [], filesAvailable: true },
+      ]);
+      // The queried path is excluded from every entry's other-files list.
+      expect(history?.[0].files).not.toContain('src/main.ts');
+    } finally {
+      restore();
+    }
+  });
+
+  it('returns empty array for a new file', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const { restore } = installGitHubFetchMock(buildGitHubFixtures({ fileHistoryResponses: { body: [] } }));
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      const history = await adapter.getFileHistory?.(OWNER, REPO, 'src/main.ts', 'main', 5);
+      expect(history).toEqual([]);
+    } finally {
+      restore();
+    }
+  });
+
+  it('throws on non-2xx response', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const { restore } = installGitHubFetchMock(
+      buildGitHubFixtures({ fileHistoryResponses: { status: 500, body: { message: 'boom' } } }),
+    );
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      await expect(adapter.getFileHistory?.(OWNER, REPO, 'src/main.ts', 'main', 5)).rejects.toThrow();
+    } finally {
+      restore();
+    }
+  });
+});
