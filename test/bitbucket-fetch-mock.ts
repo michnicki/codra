@@ -68,6 +68,14 @@ export type BitbucketFetchMockOptions = {
    * Repository Access Token. Use to verify the configured bot id SHORT-CIRCUITS that call.
    */
   blockResolveBotUserIdentity?: boolean;
+  /**
+   * PRD-04 (FR-114): response for GET /repositories/{workspace}/{repo}/commits/{ref}?path=...
+   * (per-touched-file commit history). `status` defaults to 200; `body` carries
+   * `{ values: [{ hash, message }] }` — Bitbucket's commit-list endpoint omits the file
+   * manifest. Registered ONLY when supplied, so every other spec's route table is
+   * byte-identical (NREG-01).
+   */
+  fileHistoryResponses?: BitbucketMockResponse;
 };
 
 // Concrete author fixtures for the comment-primitive specs (review F6). Three DISTINCT string
@@ -197,6 +205,13 @@ export function installBitbucketFetchMock(options: BitbucketFetchMockOptions = {
         headers: { 'content-type': 'text/plain' },
       };
       return toResponse(fixture);
+    }
+    // PRD-04 (FR-114): GET /repositories/{w}/{r}/commits/{ref} (file history). The
+    // path/pagelen operands ride the query string (the recorder preserves pathname + search).
+    // Registered ONLY when the fixture is supplied so every other spec's route table is
+    // byte-identical (NREG-01); the terminal 404 covers the unregistered case.
+    if (method === 'GET' && options.fileHistoryResponses && /\/2\.0\/repositories\/[^/]+\/[^/]+\/commits\/[^/]+$/.test(url.pathname)) {
+      return toResponse(options.fileHistoryResponses);
     }
     // PROV-02 (R-4): raw multi-page listRawPullRequestComments. MUST be checked BEFORE the existing
     // `listPullRequestComments` route below because the raw consumer wants control over the page
