@@ -1,6 +1,8 @@
 
 ## RESOLVED (2026-07-30): code-index Q&A retrieval ranking weakness fixed via option (a)
 
+status: resolved
+
 **Decision made and implemented same day.** Of the three suggested fix directions below, (a) —
 extend the stopword filter with code-vocabulary reserved words — was chosen over (b) (a two-tier
 required/optional query) and (c) (an IDF-like per-term rarity signal), because it is the smallest,
@@ -36,6 +38,8 @@ proves to matter in practice; not pursued now because the reproduced case is fix
 ranking signal is materially more design and test surface for a problem not yet observed to recur.
 
 ## ORIGINAL WRITE-UP (superseded by the resolution above, preserved for context)
+
+status: resolved — superseded by the RESOLVED (2026-07-30) section directly above.
 
 ### code-index Q&A retrieval ranking is weak for natural-language questions (cross-provider, not fixed)
 
@@ -87,6 +91,8 @@ assert the relevant one ranks first.
 
 ## RESOLVED at 29-09's Task 3 UAT (2026-07-29): `hasRemainingSafeBudget` fixed live
 
+status: resolved
+
 Confirmed exactly as predicted below: `reach`'s real Bitbucket build stalled repeatedly at a fixed
 continuation with "too many subrequests", and diagnostic logging (path + remaining budget logged
 before every file fetch, commit `922578e`) showed the failing continuation had **zero** `fetching
@@ -98,6 +104,8 @@ step against the currently-deployed code, not a pinned version) and completed su
 1546 chunks. Original write-up preserved below for context.
 
 ## 29-05: `hasRemainingSafeBudget` is not a `TokenTracker` method (out of scope, pre-existing)
+
+status: resolved — fixed live in commit 86b54d1; see the RESOLVED section directly above.
 
 **Found during:** plan 29-05 Task 2, while reasoning about whether tree enumeration can starve the file loop.
 
@@ -120,6 +128,8 @@ from making forward progress, and it carries this reasoning in its comment.
 former — two call sites already assume the method exists.
 
 ## RESOLVED at 29-09's Task 3 UAT (2026-07-29, then FULLY closed 2026-07-30): confirmed real, fixed live
+
+status: resolved
 
 The live check this entry calls for happened: after `opencodra`'s first build, a second dashboard
 press (and every push-triggered rebuild afterward) returned `coalesced: true` against a Workflow
@@ -145,6 +155,8 @@ followed by `"triggered a codebase index refresh, mode: incremental"`, and `code
 advances to the pushed commit. Original write-up preserved below for context.
 
 ## 29-08: a static per-repository Workflow instance id may permit only ONE build per repository, ever
+
+status: resolved — fixed in commits b075e1f then fully in a014df8; see the RESOLVED section directly above.
 
 **Found during:** plan 29-08 Task 2, while modelling what Cloudflare actually does on a duplicate
 `create` in order to write the double-press case honestly.
@@ -179,6 +191,8 @@ while letting a later build for a different commit through.
 
 ## RESOLVED at 29-09's Task 3 UAT (2026-07-29): confirmed real, fixed live
 
+status: resolved
+
 `reach`'s Bitbucket build hit `MAX_INDEX_CONTINUATIONS` for real and handed off exactly as predicted:
 the outgoing instance completed gracefully, the fresh handoff instance also completed within 2 seconds
 having done no real work, and the build was left permanently stuck at `status: building`. Fixed in
@@ -188,6 +202,8 @@ The "no progress rows at the build sha" guard already made this safe, as predict
 preserved below for context.
 
 ## 29-08: a fresh-instance handoff appears to coalesce itself away against the lease it inherited
+
+status: resolved — fixed in commit c89b46d; see the RESOLVED section directly above.
 
 **Found during:** plan 29-08 Task 1, while verifying that this endpoint's lease claim and
 `IndexWorkflow`'s own claim use the same `workflow_instance_id` (they must, or the endpoint would
@@ -214,6 +230,8 @@ actually indexes a file.
 
 ## RESOLVED at 29-09's Task 3 UAT (2026-07-30): A2 confirmed
 
+status: resolved
+
 Multiple real `repo:push` deliveries were captured in production (`webhook_deliveries` rows,
 `repository_id = 18`, `event_name = 'repo:push'`) across a merge and two direct-to-`main` commits.
 `push.changes[0].new.name` and `.new.target.hash` extract cleanly every time — no schema error, no
@@ -228,6 +246,8 @@ associated capture spec are stale exploratory artifacts from before this live co
 deleted).
 
 ## NEW, resolved outside Codra: `reach`'s Bitbucket "Main branch" pointed at a scratch branch
+
+status: resolved — settled outside Codra's codebase (the Bitbucket repository's own main-branch designation was corrected). Nothing to change in Codra.
 
 **Found during:** 29-09 Task 3 UAT, 2026-07-30, while investigating why pushes to `main` never
 triggered a refresh.
@@ -246,6 +266,8 @@ Codra's code — worth recording only because it caused ~15 minutes of live UAT 
 investigating what turned out to be entirely outside the application.
 
 ## RESOLVED, outside Codra: CodraApp's GitHub App had never subscribed to the `push` webhook event
+
+status: resolved — settled outside Codra's codebase (the GitHub App's push event subscription was added). Nothing to change in Codra.
 
 **Found during:** 29-09 Task 3 UAT, 2026-07-30, while running the GitHub post-merge
 incremental-refresh test.
@@ -273,6 +295,8 @@ misconfiguration — it could otherwise be misdiagnosed as a code defect in `web
 never even reachable here until this subscription was added).
 
 ## 29-06: A2 (real Bitbucket `repo:push` payload shape) confirmed nowhere yet — deferred to 29-09's gate
+
+status: resolved — A2 confirmed live 2026-07-30 on real `repo:push` deliveries; see the RESOLVED (2026-07-30) A2 section directly above.
 
 **Deferred at:** plan 29-06 closeout, 2026-07-29, with developer approval.
 
