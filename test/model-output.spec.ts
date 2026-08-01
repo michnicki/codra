@@ -888,6 +888,18 @@ describe('parseWalkthroughDiagram (WT-04)', () => {
     noFence(out);
     expect(out).toBe('sequenceDiagram\n  A["xy]z"]');
   });
+
+  // WR-02: the close-scan must stop at the end of the current line. Before the fix an
+  // unterminated `["` in note/message prose consumed everything up to the NEXT line's `"]`
+  // and rewrote a previously-VALID label (A["alpha"] -> A[alpha"]), turning a repairable
+  // diagram into a broken one -- the opposite of FR-155's purpose.
+  it('does not let an unterminated token on one line corrupt a valid label on the next (WR-02)', () => {
+    const out = parseWalkthroughDiagram(
+      'sequenceDiagram\n  Note over A: see cfg["key\n  A["alpha"] ->> B["beta"]: go',
+    );
+    noFence(out);
+    expect(out).toBe('sequenceDiagram\n  Note over A: see cfg["key\n  A["alpha"] ->> B["beta"]: go');
+  });
 });
 
 describe('parseCriticPruneResponse (D-05 ID-based prune contract)', () => {
