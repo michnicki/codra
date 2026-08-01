@@ -14,6 +14,7 @@ import {
   reviewSeverities,
 } from '@shared/schema';
 import { z } from 'zod';
+import { agenticActionSchema, type AgenticToolAction } from './agentic-tools';
 import { logger } from './logger';
 import { applySeverityRules } from './severity';
 import { buildEvidenceMissingSummary, buildSuggestionDroppedEvent } from './audit';
@@ -1163,5 +1164,89 @@ export function parseCrossFileSecurityResponse(raw: string): ParsedCrossFileSecu
   }
 
   return { kind: 'parsed', findings };
+}
+
+export type ParsedAgenticToolCall =
+  | { kind: 'action'; action: AgenticToolAction }
+  | { kind: 'done' }
+  | { kind: 'unparseable'; reason: string };
+
+/**
+ * PRD-06 (FR-131, D-01/D-03): tolerant parse of ONE agentic-context model turn into ONE tool action.
+ *
+ * Lives in THIS module, not in `core/agentic-tools.ts`, because the recovery ladder's helpers
+ * (`extractJson`, `preprocessJson`) are private here and the module header at :809-813 states the
+ * ladder MUST NOT be forked. Follows `parseCrossFileSecurityResponse`'s ladder exactly: reject empty →
+ * strip `<think>` (including an unterminated trailing one) → extractJson → jsonrepair(preprocessJson)
+ * with a fall-through to the raw extracted text → JSON.parse → reject non-object/array → one
+ * `agenticActionSchema.safeParse`.
+ *
+ * Every `reason` is a MACHINE TOKEN from this module's existing vocabulary — never provider text and
+ * never file content, so a reason can be logged or (from 35-06) written to the audit trail without a
+ * redaction pass.
+ *
+ * The array pre-check is deliberate and is a protocol rule, not a nicety: `extractJson` happily digs
+ * the FIRST object out of `[{...},{...}]`, so without it a model that emits a LIST of actions would
+ * have its first element silently executed while the rest were dropped. D-03's protocol is exactly one
+ * action per turn, so a list is rejected and costs the one corrective hop.
+ */
+export function parseAgenticToolCall(raw: string): ParsedAgenticToolCall {
+  if (typeof raw !== 'string' || raw.trim().length === 0) {
+    return { kind: 'unparseable', reason: 'empty_response' };
+  }
+
+  const stripped = raw
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<think>[\s\S]*$/i, '');
+
+  const trimmed = stripped.trim();
+  if (trimmed.length === 0) {
+    return { kind: 'unparseable', reason: 'empty_response' };
+  }
+  if (trimmed.startsWith('[')) {
+    try {
+      if (Array.isArray(JSON.parse(trimmed))) {
+        return { kind: 'unparseable', reason: 'json_not_object' };
+      }
+    } catch {
+      // Not a parseable array either; fall through to the normal ladder.
+    }
+  }
+
+  let extracted: string;
+  try {
+    extracted = extractJson(stripped);
+  } catch {
+    return { kind: 'unparseable', reason: 'json_extract_failed' };
+  }
+
+  let repaired = extracted;
+  try {
+    repaired = jsonrepair(preprocessJson(extracted));
+  } catch {
+    // Fall back to the raw extracted text; the JSON.parse below is the final gate.
+  }
+
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(repaired);
+  } catch {
+    return { kind: 'unparseable', reason: 'json_parse_failed' };
+  }
+
+  if (!parsedJson || typeof parsedJson !== 'object' || Array.isArray(parsedJson)) {
+    return { kind: 'unparseable', reason: 'json_not_object' };
+  }
+
+  const validated = agenticActionSchema.safeParse(parsedJson);
+  if (!validated.success) {
+    return { kind: 'unparseable', reason: 'schema_rejected' };
+  }
+
+  if (validated.data.action === 'done') {
+    return { kind: 'done' };
+  }
+
+  return { kind: 'action', action: validated.data };
 }
 

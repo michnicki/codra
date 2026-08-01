@@ -182,6 +182,28 @@ export type VcsTreeListing = {
 };
 
 /**
+ * PRD-06 (FR-131): one provider code-search match, as returned by `VcsProvider.searchCode?`.
+ *
+ * `fragment` is the provider's match text UNTRUNCATED. The FR-132 240-byte-per-hit bound is applied
+ * exactly once, in `core/agentic-tools.ts`'s executor, so the bound lives in ONE testable place
+ * instead of being re-implemented per adapter.
+ *
+ * `line` is `number | null`: GitHub's `text_matches[].fragment` carries NO line number, and a
+ * fabricated one would be worse than an absent one (the model would cite a line the provider never
+ * reported). Never guess it.
+ *
+ * `ref` is the ref the hit came from — a LABEL for the prompt, not a fetchable pin. Both providers
+ * index the DEFAULT BRANCH (D-07), so a hit can be stale relative to the pull-request head; the
+ * prompt discloses that and the model re-reads at head with `read_file` when it needs exact content.
+ */
+export type VcsCodeSearchHit = {
+  path: string;
+  fragment: string;
+  line: number | null;
+  ref: string;
+};
+
+/**
  * Per-adapter capability flags (D-03/D-04). The block is the single extension point for future
  * capability flags (Phase 8 D-09). `supportsThreadListing` and `supportsThreadResolution` are
  * both `static: true` for GitHub and `static: true` for Bitbucket today, but Bitbucket's
@@ -251,6 +273,41 @@ export interface VcsProvider {
     ref: string,
     maxCommits: number,
   ): Promise<VcsCommitEntry[]>;
+
+  /**
+   * PRD-06 (FR-131, D-05): literal keyword code search across the repository, backing the
+   * `grep_repo` tool of the bounded agentic-context pass. Returns at most `maxHits` matches.
+   *
+   * OPTIONAL, following the `getFileHistory?` / `getRepositoryMetadata?` / `postAnnotations?`
+   * feature-detect pattern. Callers write `vcs.searchCode?.(...) ?? null`.
+   *
+   * THE RETURN IS THREE-VALUED, and the distinction is load-bearing:
+   *   - `null`  = the capability is UNAVAILABLE for this repository or credential. That covers a
+   *               missing method, an auth-class refusal (401/403), a 404 "search not enabled for this
+   *               repository", and a rate-limit refusal. The caller degrades to `read_file`-only and
+   *               STATES the degradation to the model rather than pretending zero matches (the
+   *               `transparency` prohibition of PRD-06).
+   *   - `[]`    = search RAN and found nothing. A real result, not a failure — same convention as
+   *               `getCompareDiff`'s empty-string return (D-09).
+   *   - entries = matches, newest-provider-order, `fragment` untruncated.
+   *
+   * Throws ONLY on transport failures and 5xx, so a genuine provider outage is never masked as
+   * "unsupported".
+   *
+   * D-07 REF SEMANTICS: both providers index the repository's DEFAULT BRANCH, never the pull-request
+   * head. `VcsCodeSearchHit.ref` is therefore a disclosure label; the agentic prompt says so and the
+   * model re-reads a file at head via `getFileContent` before asserting anything about exact content.
+   *
+   * There is deliberately NO `supportsCodeSearch` flag on `VcsCapabilities`: the optional method plus
+   * the `null` return already express both the static capability and its runtime downgrade, and a flag
+   * no consumer branches on is exactly what that type's doc comment warns against.
+   */
+  searchCode?(
+    owner: string,
+    repo: string,
+    query: string,
+    maxHits: number,
+  ): Promise<VcsCodeSearchHit[] | null>;
 
   /**
    * List the blob paths of the repository's DEFAULT branch (QA-IDX-01, D-09).

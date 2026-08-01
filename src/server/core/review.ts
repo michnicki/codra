@@ -99,6 +99,17 @@ import { runWalkthroughEnrichmentPhase } from './walkthrough-enrichment';
 import { getWebhookDelivery } from '@server/db/webhook-deliveries';
 import { getReviewSettings } from '@server/db/app-settings';
 import { REVIEW_CONCURRENCY_LIMITS } from '@shared/schema';
+// PRD-06 (FR-131/FR-132): the pure agentic-context executor and its bounds. The D-14 index gate reads
+// the same two accessors `core/qa.ts` uses — findRepositoryIdByIdentity (a SELECT; NEVER
+// getOrCreateRepository, whose every branch INSERTs) and getCodeIndexState.
+import {
+  AGENTIC_BUDGET_RESERVE,
+  AGENTIC_MAX_GREP_HITS,
+  agenticContextBlobSchema,
+  executeAgenticLoop,
+} from './agentic-tools';
+import { findRepositoryIdByIdentity } from '@server/db/repositories';
+import { getCodeIndexState } from '@server/db/code-index';
 
 type PersistedReviewJob = ReturnType<typeof mapJob>;
 
@@ -119,7 +130,11 @@ export type ReviewJobRunResult =
   // hand off exactly like every other phase. The verify_fixes phase runs as its OWN fresh-budget
   // step between critic and finalize (or review and finalize when critic is off) — see
   // nextPhaseAfterCritic / nextPhaseAfterVerifyFixes below.
-  | { action: 'next_phase'; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' | 'cross_file_security'; delaySeconds: number; jobId?: string; freshInstance?: boolean };
+  //
+  // Phase 35 (PRD-06, D-09) widens it again with 'agentic_context', the bounded tool-loop phase that
+  // sits between prepare and review. It also runs on its OWN fresh budget: six model calls plus their
+  // provider fetches do not fit alongside the prepare phase's own spend.
+  | { action: 'next_phase'; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' | 'cross_file_security' | 'agentic_context'; delaySeconds: number; jobId?: string; freshInstance?: boolean };
 
 const REVIEW_CHUNK_WALL_CLOCK_MS = 12 * 60 * 1000;
 const JOB_LEASE_SECONDS = 15 * 60;
@@ -563,6 +578,13 @@ export async function runReviewJob(env: AppBindings, message: ReviewJobMessage):
       // event and hand off to the next phase.
       const configForCrossFile = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
       await runCrossFileSecurityPhase(env, job, configForCrossFile, model);
+    } else if (phase === 'agentic_context') {
+      // ROUTING ANCHOR 3. PRD-06 (FR-131, D-09): the bounded agentic-context phase. Runs up to
+      // AGENTIC_MAX_HOPS tool-calling model turns on its own fresh-budget step between prepare and
+      // review. Fail-open in every branch (D-11): a disabled toggle, an existing KV blob, a repository
+      // that already has a code index, a model failure and an exhausted budget all hand off to review.
+      const configForAgentic = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
+      await runAgenticContextPhase(env, job, configForAgentic, vcs, model, tracker);
     } else {
       await runReviewPhase(env, job, leaseOwner, vcs, model, tracker);
     }
@@ -584,8 +606,14 @@ export async function runReviewJob(env: AppBindings, message: ReviewJobMessage):
       // subrequests at once), critic makes its single whole-set model call on its OWN budget (D-07),
       // verify_fixes runs an unbounded number of file-content fetches + model calls on its OWN budget,
       // walkthrough_enrichment makes its single whole-set enrichment call on its OWN budget (D-13),
-      // and cross_file_security makes its single whole-diff model call on its OWN budget (SEC-XDIFF-01).
-      const freshInstance = error.phase === 'finalize' || error.phase === 'critic' || error.phase === 'verify_fixes' || error.phase === 'walkthrough_enrichment' || error.phase === 'cross_file_security';
+      // and cross_file_security makes its single whole-diff model call on its OWN budget (SEC-XDIFF-01),
+      // and agentic_context runs up to AGENTIC_MAX_HOPS model calls plus their provider fetches on its
+      // OWN budget (PRD-06, D-09).
+      //
+      // ROUTING ANCHOR 4 — NOT a `tsc` site. This is a plain boolean disjunction: omitting
+      // 'agentic_context' compiles cleanly and then runs the phase on an already-spent budget, where it
+      // trips "Too many subrequests" instead of gathering anything.
+      const freshInstance = error.phase === 'finalize' || error.phase === 'critic' || error.phase === 'verify_fixes' || error.phase === 'walkthrough_enrichment' || error.phase === 'cross_file_security' || error.phase === 'agentic_context';
       return { action: 'next_phase', phase: error.phase, delaySeconds: error.delaySeconds, jobId: job.id, freshInstance };
     }
 
@@ -637,7 +665,7 @@ async function continueOrFailWedgedJob(
   job: PersistedReviewJob,
   vcs: VcsProvider,
   leaseOwner: string,
-  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' | 'cross_file_security',
+  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' | 'cross_file_security' | 'agentic_context',
   delaySeconds: number,
   reason: string,
 ): Promise<ReviewJobRunResult> {
@@ -649,7 +677,11 @@ async function continueOrFailWedgedJob(
   // review keeps the generous ceiling because it makes real per-file progress. (Critic and
   // verify_fixes never terminal-fail on exceed — they fail OPEN to finalize in the branches
   // below — but they still use the low ceiling to bound their fresh-instance retries.)
-  const ceiling = phase === 'finalize' || phase === 'critic' || phase === 'verify_fixes' || phase === 'walkthrough_enrichment' || phase === 'cross_file_security'
+  //
+  // ROUTING ANCHOR 6 — NOT a `tsc` site. Omitting 'agentic_context' from this list compiles cleanly
+  // and then gives a wedged ADVISORY phase the generous review-sized ceiling, so it grinds for ~20
+  // minutes on fresh-instance retries instead of failing over in a few.
+  const ceiling = phase === 'finalize' || phase === 'critic' || phase === 'verify_fixes' || phase === 'walkthrough_enrichment' || phase === 'cross_file_security' || phase === 'agentic_context'
     ? MAX_FINALIZE_CONTINUATIONS
     : MAX_JOB_CONTINUATIONS;
 
@@ -749,6 +781,22 @@ async function continueOrFailWedgedJob(
       await resetJobContinuationCount(env, job.id);
       await releaseJobLease(env, job.id, leaseOwner);
       return { action: 'next_phase', phase: nextPhaseAfterCrossFileSecurity(configFromCrossFile), delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
+    } else if (phase === 'agentic_context') {
+      // ROUTING ANCHOR 7. PRD-06 FAIL-OPEN (D-11): a wedged agentic_context phase must NEVER
+      // terminal-fail the job. Reset the continuation counter and route through
+      // nextPhaseAfterAgenticContext so the review that does the actual work still runs. The agentic
+      // pass is purely advisory — its gathered context enriches the review prompt but is never
+      // required, and FR-131's own fallback is "review the diff alone".
+      const configFromAgentic = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
+      logger.error(`agentic_context phase exceeded the continuation ceiling; failing OPEN to review (no gathered context applied): ${job.owner}/${job.repo} PR #${job.prNumber}`, {
+        phase,
+        continuationCount,
+        reason,
+        successor: nextPhaseAfterAgenticContext(configFromAgentic),
+      });
+      await resetJobContinuationCount(env, job.id);
+      await releaseJobLease(env, job.id, leaseOwner);
+      return { action: 'next_phase', phase: nextPhaseAfterAgenticContext(configFromAgentic), delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
     } else {
       const message = `Review could not make progress after ${continuationCount} continuation attempts (${reason}). Failing the job to avoid an endless retry loop; re-run it once the underlying provider issue clears.`;
       logger.error(`Review job exceeded the continuation ceiling; failing terminally: ${job.owner}/${job.repo} PR #${job.prNumber}`, {
@@ -773,7 +821,10 @@ async function continueOrFailWedgedJob(
 async function resolveQueuedJob(
   env: AppBindings,
   message: ReviewJobMessage,
-): Promise<{ job: PersistedReviewJob; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' | 'cross_file_security' } | null> {
+// ROUTING ANCHOR 8 — the widened return union below belongs to THIS function, `resolveQueuedJob`
+// (declared immediately above). 35-RESEARCH.md's site table called it `resolveJobForPhase`; that name
+// does not exist anywhere in the tree, so do not go looking for it.
+): Promise<{ job: PersistedReviewJob; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' | 'cross_file_security' | 'agentic_context' } | null> {
   // The WIRE contract (reviewJobMessageSchema.phase) includes 'critic' (D-07). Phase 10 DISPATCHES it
   // — but ONLY for a jobId-bearing message. A critic phase is only ever reached AFTER a job exists
   // (review→critic hands off keyed on the resolved jobId), so a phase:'critic' message WITHOUT a jobId
@@ -807,6 +858,16 @@ async function resolveQueuedJob(
     // verify_fixes / walkthrough_enrichment. A phase:'cross_file_security' message WITHOUT a
     // jobId is a spoof / premature delivery — REJECT it here.
     logger.warn('Queue message ignored: phase "cross_file_security" requires a jobId (a jobId-less cross_file_security message is treated as a spoof).');
+    return null;
+  }
+  if (requestedPhase === 'agentic_context' && !message.jobId) {
+    // ROUTING ANCHOR 9 (PRD-06, T-35-06) — NOT a `tsc` site. agentic_context is a jobId-only phase,
+    // same posture as critic / verify_fixes / walkthrough_enrichment / cross_file_security: it is only
+    // ever reached AFTER prepare created the job row and handed off keyed on the resolved jobId, so a
+    // phase:'agentic_context' message WITHOUT a jobId is a spoof or a premature delivery. REJECT it
+    // here — omitting this guard compiles cleanly and lets a stray message resolve a job by webhook
+    // payload and run a tool loop against it.
+    logger.warn('Queue message ignored: phase "agentic_context" requires a jobId (a jobId-less agentic_context message is treated as a spoof).');
     return null;
   }
 
@@ -1498,7 +1559,12 @@ async function runPreparePhase(
       logger.warn(`Failed to update initial progress check run for job ${job.id}; continuing to the review phase anyway`, error instanceof Error ? error : new Error(String(error)));
     }
   }
-  await enqueueJobPhase(env, job.id, 'review');
+  // ROUTING ANCHOR 10. PRD-06 (D-09): the prepare hand-off is no longer hard-coded to 'review' — the
+  // selector inserts the agentic_context hop when `review.agentic_tools.enabled` is on, and returns
+  // 'review' at defaults so this line stays byte-identical in behavior (NREG-01). The zero-reviewable-
+  // files early return above deliberately still goes STRAIGHT to 'finalize': there is nothing to gather
+  // context for.
+  await enqueueJobPhase(env, job.id, nextPhaseAfterPrepare(config));
 }
 
 async function runReviewPhase(
@@ -1551,6 +1617,32 @@ async function runReviewPhase(
       }
     } catch {
       // best-effort: no history on KV failure (fail-open, D-06)
+    }
+  }
+  // Phase 35 (PRD-06, D-10): load the context blob the agentic_context phase persisted.
+  //
+  // Gated on the SAME toggle the phase itself uses, for the WR-05 reason spelled out above: an ungated
+  // read can only ever MISS when the feature is off, and it would be paid once per chunk, per
+  // fresh-instance handoff and per retry — invisibly to the TokenTracker — contradicting NREG-01's
+  // "when off, zero subrequests, zero behavior change".
+  //
+  // Parsed with safeParse, never cast (WR-09): a blob written by an earlier deploy is still live for its
+  // 1-hour TTL, and a shape drift must be dropped fail-open here rather than throwing inside the prompt
+  // builder mid-review.
+  let agenticContext: string | undefined;
+  if (config.review.agentic_tools?.enabled === true) {
+    try {
+      const raw = await env.APP_KV.get(agenticContextCacheKey(job.id), 'text');
+      if (raw) {
+        const parsedBlob = agenticContextBlobSchema.safeParse(JSON.parse(raw));
+        if (parsedBlob.success && parsedBlob.data.context.length > 0) {
+          agenticContext = parsedBlob.data.context;
+        } else if (!parsedBlob.success) {
+          logger.warn(`Persisted agentic context for job ${job.id} does not match the current contract; reviewing diff-only`);
+        }
+      }
+    } catch {
+      // best-effort: no gathered context on KV/JSON failure (fail-open, D-11)
     }
   }
   const totalLineCount = files.reduce((sum, file) => sum + file.lineCount, 0);
@@ -1684,7 +1776,7 @@ async function runReviewPhase(
           logger.warn(`Async batch poll failed for ${file.path}; falling back to synchronous review`, {
             error: poll.error instanceof Error ? poll.error.message : String(poll.error),
           });
-          await reviewAndPersistFile(env, job, file, pr, config, totalLineCount, model, resolveFailureModelProvider, existingReview, pass, fileHistory);
+          await reviewAndPersistFile(env, job, file, pr, config, totalLineCount, model, resolveFailureModelProvider, existingReview, pass, fileHistory, agenticContext);
           terminalProgress += 1;
           return;
         }
@@ -1705,6 +1797,7 @@ async function runReviewPhase(
             config,
             totalLineCount,
             fileHistory,
+            agenticContext,
             compactPrompt: (existingReview?.transient_error_count ?? 0) > 0,
           });
           if (submitted) {
@@ -1751,20 +1844,21 @@ async function runReviewPhase(
               resolveFailureModelProvider,
               existingReview,
               fileHistory,
+              agenticContext,
               { runs: ensembleConfig.runs, temperature: ensembleConfig.temperature ?? 0.7 },
             );
             terminalProgress += 1;
             return;
           }
         }
-        await reviewAndPersistFile(env, job, file, pr, config, totalLineCount, model, resolveFailureModelProvider, existingReview, pass, fileHistory);
+        await reviewAndPersistFile(env, job, file, pr, config, totalLineCount, model, resolveFailureModelProvider, existingReview, pass, fileHistory, agenticContext);
         terminalProgress += 1;
         return;
       }
 
       if (!canInheritParentFileReview(config, inherited)) {
         logger.info(`Ignoring inherited review for ${file.path} (${pass}); parent model ${inherited.model_used} is not in the current model strategy`);
-        await reviewAndPersistFile(env, job, file, pr, config, totalLineCount, model, resolveFailureModelProvider, existingReview, pass, fileHistory);
+        await reviewAndPersistFile(env, job, file, pr, config, totalLineCount, model, resolveFailureModelProvider, existingReview, pass, fileHistory, agenticContext);
         terminalProgress += 1;
       } else {
         await upsertFileReview(env, job.id, {
@@ -2031,6 +2125,10 @@ async function reviewAndPersistFile(
   // intentionally ignores it (D-04 — file history is main-pass only; the model layer comments
   // the same). undefined = no history available; [] = new file (D-08 block renders).
   fileHistory?: VcsCommitEntry[],
+  // Phase 35 (PRD-06, D-10): the job-scoped agentic-context blob. ONE string for every file (the blob
+  // is job-scoped, not per-path). undefined = never gathered → the prompt is byte-identical to today.
+  // Like fileHistory, the security pass ignores it: buildSecurityReviewPrompts does not consume it.
+  agenticContext?: string,
 ) {
   const startedAt = Date.now();
   const compactPrompt = (previousReview?.transient_error_count ?? 0) > 0;
@@ -2044,6 +2142,7 @@ async function reviewAndPersistFile(
       compactPrompt,
       pass,
       fileHistory,
+      agenticContext,
     });
 
     await upsertFileReview(env, job.id, {
@@ -2191,6 +2290,9 @@ async function reviewAndPersistFileWithEnsemble(
   // Phase 34 (PRD-04): per-file commit history for the main-review prompt (D-04 — file history
   // is main-pass only; undefined = no history, [] = new file D-08 block).
   fileHistory: VcsCommitEntry[] | undefined,
+  // Phase 35 (PRD-06, D-10): the job-scoped agentic-context blob, threaded to every ensemble sample so
+  // all runs see the same gathered context (undefined = never gathered, prompt byte-identical).
+  agenticContext: string | undefined,
   // The ensemble config drives the fan-out; defaults to runs:1 to keep the function safe for
   // any unexpected caller (the main scheduling site is the only writer).
   ensembleConfig: { runs: number; temperature: number },
@@ -2212,6 +2314,7 @@ async function reviewAndPersistFileWithEnsemble(
       compactPrompt,
       pass: 'main',
       fileHistory,
+      agenticContext,
       runs: ensembleConfig.runs,
       ensembleTemperature: ensembleConfig.temperature,
     });
@@ -3731,6 +3834,155 @@ async function runCrossFileSecurityPhase(
   throw new NextPhaseError(nextPhaseAfterCrossFileSecurity(config), FRESH_INVOCATION_YIELD_SECONDS);
 }
 
+// PRD-06 (FR-131/FR-132, D-06/D-09/D-11/D-12/D-14): the bounded agentic-context phase.
+//
+// A structural clone of runCrossFileSecurityPhase above, in that function's EXACT gate order —
+// toggle gate → idempotency gate → input gate → drive the model → persist → hand off. Deviating from
+// the order is how this phase would re-acquire the Phase 27 bugs the clone exists to avoid.
+//
+// Phase routing: prepare → agentic_context → review. The nextPhaseAfterAgenticContext selector hands
+// off UNCONDITIONALLY without re-checking the agentic_tools toggle (a re-check would strand a job whose
+// config was toggled off mid-flight).
+//
+// EVERY exit is a NextPhaseError to 'review' (D-11). There is no other throw out of this phase and no
+// terminal failure path: the pass is advisory, and FR-131's own documented fallback is "review the diff
+// alone". A model failure, an exhausted budget, an unparseable model, a missing repository row and a
+// KV failure all land on the same hand-off.
+//
+// NREG-01: with the toggle off (the default, D-13) gate 1 hits FIRST and does nothing at all — no audit
+// row, no KV touch, no model call, no extra subrequest — so an instance that has not opted in behaves
+// byte-identically to the previous release.
+async function runAgenticContextPhase(
+  env: AppBindings,
+  job: PersistedReviewJob,
+  config: RepoConfig,
+  vcs: VcsProvider,
+  model: ModelService,
+  tracker: TokenTracker,
+): Promise<void> {
+  // GATE 1 (NREG-01 / D-13): disabled toggle — fail open SILENTLY. This branch is what makes the
+  // default state byte-identical, so nothing observable may be added to it.
+  if (config.review.agentic_tools?.enabled !== true) {
+    logger.info(`Agentic-context phase reached for job ${job.id} but review.agentic_tools.enabled is off; failing open.`);
+    throw new NextPhaseError(nextPhaseAfterAgenticContext(config), FRESH_INVOCATION_YIELD_SECONDS);
+  }
+
+  // GATE 2 (D-12): idempotent re-entry. An existing blob means a prior invocation already ran this
+  // phase for this job (a lease-recovery retry, a fresh-instance handoff, a redelivered queue message),
+  // so hand off without a single model call or provider fetch.
+  try {
+    const existing = await env.APP_KV.get(agenticContextCacheKey(job.id), 'text');
+    if (existing) {
+      logger.info(`Agentic context already gathered for job ${job.id}; skipping the loop and transitioning onward.`);
+      throw new NextPhaseError(nextPhaseAfterAgenticContext(config), FRESH_INVOCATION_YIELD_SECONDS);
+    }
+  } catch (error) {
+    // A NextPhaseError from the idempotent branch above is control flow, not a KV failure — rethrow it.
+    if (error instanceof NextPhaseError) throw error;
+    // Best-effort KV read: on a real KV failure fall through and gather. Re-gathering costs model
+    // calls but is harmless; refusing to gather because KV blinked would silently disable the feature.
+    logger.warn(`Failed to read the gathered agentic context for job ${job.id}; gathering again`, error instanceof Error ? error : new Error(String(error)));
+  }
+
+  // GATE 3 (D-14): a repository that already has a READY code index does not need this pass — the
+  // index-backed retrieval path is cheaper and broader, so spending six model calls to re-derive a
+  // subset of it would be pure waste. Read-only, and shaped exactly like the qa.ts precedent:
+  // findRepositoryIdByIdentity is a SELECT (getOrCreateRepository's every branch INSERTs, so merely
+  // routing a review must never call it), a null repositoryId is a NORMAL absence, and 'ready' is the
+  // ONLY status that means a queryable index — 'building', 'failed' and a missing row all mean no
+  // index, so the loop RUNS.
+  try {
+    const repositoryId = await findRepositoryIdByIdentity(env, {
+      vcsProvider: (job.repositoryVcsProvider ?? 'github') as 'github' | 'bitbucket',
+      ownerOrWorkspace: job.repositoryWorkspace ?? job.owner,
+      repo: job.repo,
+    });
+    if (repositoryId !== null) {
+      const indexState = await getCodeIndexState(env, { repositoryId });
+      if (indexState !== null && indexState.status === 'ready') {
+        logger.info(`Job ${job.id} targets a repository with a ready code index; skipping the agentic-context pass (D-14).`);
+        throw new NextPhaseError(nextPhaseAfterAgenticContext(config), FRESH_INVOCATION_YIELD_SECONDS);
+      }
+    }
+  } catch (error) {
+    if (error instanceof NextPhaseError) throw error;
+    // A database failure on an advisory gate degrades to "no index" and lets the loop run, rather than
+    // failing a phase that is not allowed to fail.
+    logger.warn(`Failed to resolve the code-index state for job ${job.id}; treating the repository as unindexed`, error instanceof Error ? error : new Error(String(error)));
+  }
+
+  // Seed: the pull request and its touched paths. Two subrequests, spent before the loop so the
+  // reserve guard sees their cost.
+  const pr = await vcs.getPullRequest(job.owner, job.repo, job.prNumber);
+  const files = await getJobDiffFiles(env, job, vcs, config);
+  const touchedPaths = files.map((file) => file.path);
+
+  const outcome = await executeAgenticLoop(
+    {
+      // The four real callbacks and nothing else — this is the whole I/O surface of the loop.
+      callModel: async (systemPrompt, userPrompt) => {
+        // NO `temperature` IS PASSED, AND THAT IS A DECISION, NOT AN OVERSIGHT (35-REVIEWS.md,
+        // OpenCode Concern #2 + Suggestion #3, which proposed forwarding `temperature: 0` for
+        // deterministic tool use). Both existing raw-call sites — runCrossFileSecurityPhase above and
+        // verify-fixes.ts — omit it and let each provider's own default stand; the parameter is
+        // genuinely optional on callVerifierRaw; and forwarding an explicit 0 through callResolvedModel
+        // to four heterogeneous adapters (Workers AI the weakest) is an unvalidated behaviour change on
+        // every provider at once, for a loop whose non-determinism D-03's corrective hop already
+        // absorbs. REMEDY IF NEEDED, so the next maintainer does not have to re-derive it: if the
+        // flywheel ever shows `unparseable_action` clustering on one model id, adding `temperature: 0`
+        // to this one call is the one-line fix, behind this same seam.
+        const response = await model.callVerifierRaw({ systemPrompt, userPrompt, config });
+        return response.rawText;
+      },
+      // D-06: read at the PULL REQUEST HEAD SHA. This is deliberately NOT the base-branch rule quick
+      // task k31 applied to `.review.yaml` — that rule protects config a pull request must not be able
+      // to rewrite, whereas reading the pull request's OWN head content is precisely the feature here.
+      // Do not "fix" this to match k31.
+      readFile: async (path) => vcs.getFileContent(job.owner, job.repo, path, pr.headSha),
+      // D-05: no adapter implements searchCode yet, so this resolves to undefined, is coerced to null,
+      // and grep_repo reports itself unavailable to the model. That is the DESIGNED degradation path
+      // (and the expected steady state on Bitbucket), exercised end-to-end from wave 1 — not a stub.
+      searchCode: async (query) => (await vcs.searchCode?.(job.owner, job.repo, query, AGENTIC_MAX_GREP_HITS)) ?? null,
+      // The provider clients self-increment the tracker per request, so the reserve check is the
+      // correct AND only guard — never call tracker.incrementSubrequests() from the loop.
+      hasBudget: (reserve) => tracker.hasRemainingSafeBudget(reserve),
+    },
+    {
+      prTitle: job.prTitle ?? pr.title ?? null,
+      touchedPaths,
+      headSha: pr.headSha,
+      // G-11: the repository's own exclusion globs are the privacy refusal list.
+      skipFiles: config.review.skip_files,
+    },
+  );
+
+  logger.info(`Agentic-context phase completed for job ${job.id}`, {
+    hopsUsed: outcome.hopsUsed,
+    filesRead: outcome.filesRead,
+    grepsRun: outcome.grepsRun,
+    bytesGathered: outcome.bytesGathered,
+    truncated: outcome.truncated,
+    grepSupported: outcome.grepSupported,
+    stopReason: outcome.stopReason,
+  });
+
+  // Persist only a non-empty outcome: an empty blob would satisfy gate 2 on re-entry while carrying
+  // nothing, turning a transient failure into a permanently context-free review for this job.
+  if (outcome.context.length > 0) {
+    try {
+      await env.APP_KV.put(agenticContextCacheKey(job.id), JSON.stringify(outcome), {
+        expirationTtl: 3600, // 1-hour TTL — the gathered context is bounded to this job's lifespan
+      });
+    } catch (error) {
+      logger.warn(`Failed to persist the gathered agentic context to KV for job ${job.id}`, error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  // The ONLY exit (D-11). Note what is deliberately absent: no upsertFileReview, no file_reviews row,
+  // and no migration — see agenticContextCacheKey for why (migration 017's recorded regression).
+  throw new NextPhaseError(nextPhaseAfterAgenticContext(config), FRESH_INVOCATION_YIELD_SECONDS);
+}
+
 export { NextPhaseError } from './next-phase-error';
 
 // Phase 20.1 (BLOCKER 2 + BLOCKER 3): the four phase selectors live in `./phase-routing` so
@@ -3738,16 +3990,21 @@ export { NextPhaseError } from './next-phase-error';
 // (review.ts → verify-fixes.ts already exists, so the cycle is broken by hoisting the selectors).
 import {
   maybeRouteToWalkthroughEnrichment,
+  nextPhaseAfterAgenticContext,
   nextPhaseAfterCritic,
   nextPhaseAfterCrossFileSecurity,
+  nextPhaseAfterPrepare,
   nextPhaseAfterReview,
   nextPhaseAfterVerifyFixes,
 } from './phase-routing';
 
+// ROUTING ANCHOR 11 — the phase parameter union below, plus BOTH new selectors imported above
+// (`nextPhaseAfterPrepare`, which is the only thing that can route a job into agentic_context, and
+// `nextPhaseAfterAgenticContext`, which unconditionally hands off to review).
 async function enqueueJobPhase(
   env: AppBindings,
   jobId: string,
-  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' | 'cross_file_security',
+  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' | 'cross_file_security' | 'agentic_context',
   delaySeconds = 0,
 ) {
   await markJobContinuationQueued(env, jobId, delaySeconds);
@@ -3760,6 +4017,15 @@ function hasCompletedStep(job: PersistedReviewJob, stepName: string) {
 
 function diffCacheKey(jobId: string) {
   return `diff:${jobId}`;
+}
+
+// PRD-06 (D-12): the gathered-context blob's KV key, following the same `<domain>:<jobId>` convention
+// as diffCacheKey above and `file-history:${jobId}`. KV, deliberately NOT a file_reviews row: migration
+// 017_cross_file_security_pass.sql:9-12 records that exactly such a fail-open write violated
+// `file_reviews_pass_check` and terminal-failed a phase designed to degrade gracefully. This phase adds
+// ZERO migrations.
+export function agenticContextCacheKey(jobId: string) {
+  return `agentic-context:${jobId}`;
 }
 
 /**

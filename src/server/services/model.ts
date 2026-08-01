@@ -331,6 +331,10 @@ export class ModelService {
     // security pass ignores it (D-04 — file history is main-pass only). undefined = no history
     // available; [] = new file (D-08 block renders). Propagated via the existing ...params spreads.
     fileHistory?: VcsCommitEntry[];
+    // Phase 35 (PRD-06, D-10): the job-scoped agentic-context blob, propagated to
+    // buildFileReviewPrompts via the existing ...params spreads. The security pass ignores it
+    // (buildSecurityReviewPrompts does not consume it), exactly like fileHistory.
+    agenticContext?: string;
     temperature?: number;
   }) {
     const configuredLineCap = params.config.review.max_diff_lines_per_file;
@@ -480,6 +484,10 @@ export class ModelService {
     // Phase 34 (PRD-04): threaded to the main-review prompt builder via the inner reviewFile
     // calls (the ...params spread in the fan-out loop carries it to every sample).
     fileHistory?: VcsCommitEntry[];
+    // Phase 35 (PRD-06, D-10): the job-scoped agentic-context blob, propagated to
+    // buildFileReviewPrompts via the existing ...params spreads. The security pass ignores it
+    // (buildSecurityReviewPrompts does not consume it), exactly like fileHistory.
+    agenticContext?: string;
     runs: number;
     ensembleTemperature?: number;
     // Internal: when an inner reviewFile call returns, this method may need to know the
@@ -607,6 +615,10 @@ export class ModelService {
     config: RepoConfig;
     totalLineCount: number;
     fileHistory?: VcsCommitEntry[];
+    // Phase 35 (PRD-06, D-10): the job-scoped agentic-context blob, propagated to
+    // buildFileReviewPrompts via the existing ...params spreads. The security pass ignores it
+    // (buildSecurityReviewPrompts does not consume it), exactly like fileHistory.
+    agenticContext?: string;
     compactPrompt?: boolean;
   }): Promise<{ requestId: string; model: string; modelLineCap: number } | null> {
     const { primary } = this.selectModel({ totalLineCount: params.totalLineCount, config: params.config });
@@ -731,6 +743,10 @@ export class ModelService {
     pass?: 'main' | 'security';
     // Phase 34 (PRD-04): threaded to buildFileReviewPrompts below.
     fileHistory?: VcsCommitEntry[];
+    // Phase 35 (PRD-06, D-10): the job-scoped agentic-context blob, propagated to
+    // buildFileReviewPrompts via the existing ...params spreads. The security pass ignores it
+    // (buildSecurityReviewPrompts does not consume it), exactly like fileHistory.
+    agenticContext?: string;
     temperature?: number;
   }) {
     // The security pass swaps in buildSecurityReviewPrompts (same input shape, identical findings
