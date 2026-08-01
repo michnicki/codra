@@ -281,6 +281,43 @@ export async function recordFileSkips(
 }
 
 /**
+ * Phase 34 (PRD-05 / D-12): PURE builder for the `yaml_config_parse_failed` audit variant.
+ * Produces the shape locked by 34-01's jobAuditEventSchema arm (stage literal, reason
+ * bounded at 500 chars, timestamp). The reason is the parse/validation error message,
+ * sliced to the schema bound — the schema REJECTS a longer reason, so the slice is the
+ * producer's obligation. No I/O, never throws. Mirrors the buildFileSkipEvents pure-builder
+ * family — this codebase has NO emitAuditEvent; the builder + best-effort recorder pair is
+ * the established pattern.
+ */
+export function buildYamlConfigParseFailedEvent(reason: string): JobAuditEvent {
+  return {
+    stage: 'yaml_config_parse_failed',
+    reason: reason.slice(0, 500),
+    timestamp: new Date().toISOString(),
+  };
+}
+
+/**
+ * Phase 34 (PRD-05 / D-12): job-level best-effort recorder for `yaml_config_parse_failed`.
+ * A VERBATIM clone of `recordFileSkips`: wraps a SINGLE `appendJobAuditEvents` in try/catch,
+ * defensively stamps a timestamp on an event that arrived without one, logs a failure via
+ * `logger.warn`, and NEVER rethrows — a broken audit write must never fail the prepare phase
+ * (T-34-03-01 / D-12 fail-open: YAML parse failure falls back to DB config, review proceeds
+ * unaffected).
+ */
+export async function recordYamlConfigParseFailed(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  reason: string,
+): Promise<void> {
+  try {
+    await appendJobAuditEvents(env, jobId, [buildYamlConfigParseFailedEvent(reason)]);
+  } catch (error) {
+    logger.warn(`Failed to record yaml_config_parse_failed audit event for job ${jobId}`, error);
+  }
+}
+
+/**
  * Phase 18 (RND-01..05): bounded best-effort recorder for the `rounds.*` audit variants.
  * `core/rounds.ts` builds typed events via the locked builder helpers (buildRoundsDetectedEvent
  * etc.) and the caller batches them into ONE `appendJobAuditEvents` call here. Mirrors

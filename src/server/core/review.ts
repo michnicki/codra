@@ -1,6 +1,6 @@
 import { logger } from './logger';
 import { isSupportedGitHubWebhookEvent, type GitHubWebhookEventName, type GitHubWebhookPayload, type IssueCommentWebhookPayload, type PullRequestWebhookPayload } from '@shared/github';
-import { defaultRepoConfig, normalizeModelId, reviewUnitKey, type CriticResult, type FileReviewPass, type JobAuditEvent, type ParsedReviewComment, type RepoConfig, type ReviewJobMessage } from '@shared/schema';
+import { defaultRepoConfig, normalizeModelId, repoConfigSchema, reviewUnitKey, type CriticResult, type FileReviewPass, type JobAuditEvent, type ParsedReviewComment, type RepoConfig, type ReviewJobMessage } from '@shared/schema';
 import { isTimeoutMessage, matchesAnyTransientSubstring } from '@shared/transient-errors';
 import type { AppBindings } from '@server/env';
 import { bulkInheritFileReviews, bulkMarkFilesFailed, getFileReviewsForJobs, recordRetryableFileReviewFailure, upsertFileReview } from '@server/db/file-reviews';
@@ -26,6 +26,7 @@ import {
   setJobWorkflowInstance,
   supersedeOlderJobs,
   updateJobCheckRun,
+  updateJobConfigSnapshot,
   updateJobCriticResult,
   updateJobStatusCheckRef,
   updateJobStep,
@@ -65,8 +66,10 @@ import {
   recordRoundAudit,
   recordUnitAudit,
   recordVerifyFixesAudit,
+  recordYamlConfigParseFailed,
 } from './audit';
 import { runVerifyFixesPhase } from './verify-fixes';
+import { parseYaml } from './yaml-parse';
 import {
   buildRoundInputsFromConfig,
   buildRoundsAnchorSkippedEvent,
@@ -919,7 +922,67 @@ async function runPreparePhase(
 ) {
   await updateJobStep(env, job.id, 'Preparation', { status: 'running' });
   const pr = await vcs.getPullRequest(job.owner, job.repo, job.prNumber);
-  const config = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
+  let config = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
+
+  // Phase 34 (PRD-05): .review.yaml per-repo configuration discovery.
+  // Gated on review.yaml_config.enabled (D-15, default false). When on, fetches
+  // .review.yaml (then .review.yml — first found wins) from the PR head, parses
+  // with the inline YAML parser, validates against the existing Zod schema, and
+  // merges at top-level key boundaries (D-09). Parse/validation failures fall
+  // back to the DB config + record a yaml_config_parse_failed audit event (D-12).
+  // No file found → no action (D-14). When the toggle is off, zero subrequests,
+  // zero behavior change (NREG-01).
+  let mergedConfig = config;
+  if (config.review.yaml_config?.enabled === true && pr.headSha) {
+    for (const yamlPath of ['.review.yaml', '.review.yml']) {
+      try {
+        const rawYaml = await vcs.getFileContent(job.owner, job.repo, yamlPath, pr.headSha);
+        if (rawYaml !== null) {
+          const yamlObject = parseYaml(rawYaml); // plain JS object — ONLY the keys the file declares
+          repoConfigSchema.parse(yamlObject); // D-10 standalone validation: type-checks + fills defaults; throws on bad YAML
+          // Merge at top-level key boundaries (D-09, contract locked by 34-01 Task 3):
+          // overlay ONLY the top-level keys the YAML actually declares onto the DB config,
+          // then re-validate. A declared key replaces the DB key WHOLESALE — its sub-keys
+          // revert to Zod schema defaults (e.g. review.max_files → 150, never the DB's
+          // value); top-level keys the YAML does not declare keep their DB values.
+          // NOTE: overlay `yamlObject` (the raw declared keys), NOT the fully-defaulted
+          // parse() result — spreading the latter would clobber undeclared top-level
+          // keys (e.g. model) with Zod defaults.
+          mergedConfig = repoConfigSchema.parse({
+            ...config,
+            ...yamlObject,
+          });
+          break; // first file found wins (D-13)
+        }
+      } catch (error) {
+        logger.warn(
+          `Failed to parse .review.yaml for ${job.owner}/${job.repo}`,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+        const reasonText = error instanceof Error ? error.message : String(error);
+        await recordYamlConfigParseFailed(env, job.id, reasonText); // best-effort, never throws (D-12)
+        break; // don't try the other filename on parse/validation failure
+      }
+    }
+  }
+  const yamlMerged = mergedConfig !== config; // captured BEFORE the reassignment below
+  config = mergedConfig;
+  if (yamlMerged) {
+    // review HIGH-2: persist the merged config so review/finalize/critic/verify-fixes all
+    // observe YAML overrides (every downstream phase reloads config from the job row).
+    // Mirror it in-memory so THIS invocation's remaining code observes it. The DB write is
+    // fail-open (D-12 posture): a persistence failure logs + continues — the in-memory
+    // merged config still governs the current invocation.
+    job.configSnapshot = mergedConfig;
+    try {
+      await updateJobConfigSnapshot(env, job.id, mergedConfig);
+    } catch (error) {
+      logger.warn(
+        `Failed to persist merged YAML config snapshot for job ${job.id}; in-memory merged config governs this invocation`,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+  }
 
   // Refresh the cached PR title/author from the live PR: these are snapshotted at job creation and
   // copied onto retries, so a title edited on GitHub afterwards would otherwise stay stale.
