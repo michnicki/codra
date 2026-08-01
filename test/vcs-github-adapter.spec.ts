@@ -192,8 +192,8 @@ describe('GithubAdapter (VcsProvider mapping)', () => {
         verdict: 'comment',
         summaryBody: 'Some notes',
         comments: [
-          { path: 'src/a.ts', position: 2, body: 'a', title: 'finding a' },
-          { path: 'src/b.ts', position: 4, body: 'b', title: 'finding b' },
+          { path: 'src/a.ts', position: 2, body: 'a', commentId: '901' },
+          { path: 'src/b.ts', position: 4, body: 'b', commentId: '902' },
         ],
       });
 
@@ -250,8 +250,8 @@ describe('GithubAdapter (VcsProvider mapping)', () => {
         verdict: 'comment',
         summaryBody: 'Some notes',
         comments: [
-          { path: 'src/a.ts', position: 2, body: 'a', title: 'finding a' },
-          { path: 'src/b.ts', position: 4, body: 'b', title: 'finding b' },
+          { path: 'src/a.ts', position: 2, body: 'a', commentId: '901' },
+          { path: 'src/b.ts', position: 4, body: 'b', commentId: '902' },
         ],
       });
 
@@ -260,7 +260,7 @@ describe('GithubAdapter (VcsProvider mapping)', () => {
       // as `line: 2` made the audit trail claim a head-side line the finding was never on (G-28-3).
       expect(result).toEqual({
         ref: '777',
-        skippedComments: [{ path: 'src/a.ts', line: null, position: 2, title: 'finding a' }],
+        skippedComments: [{ path: 'src/a.ts', line: null, position: 2, commentId: '901' }],
       });
       const commentPosts = calls.filter(
         (call) => call.method === 'POST' && call.path === `/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}/comments`,
@@ -280,14 +280,13 @@ describe('GithubAdapter (VcsProvider mapping)', () => {
         pullNumber: PR_NUMBER,
         path: 'src/a.ts',
         position: 2,
-        // WR-05: the RAW model-supplied title must never reach the log sink. redactFindingTitle
-        // exists because jobs.audit can never retain title content, and the logger's redaction
-        // list does not cover `title` -- so logging it verbatim put exactly the value the audit
-        // trail is forbidden to store into the logs.
-        title: '[title-redacted]',
+        // WR-05/WR-06: the payload identifies the comment by its persisted review_comments.id.
+        // No model-supplied title is carried at all any more, so there is nothing here for the
+        // logger (whose redaction list does not cover `title`) to leak.
+        commentId: '901',
         reason: 'unprocessable',
       });
-      expect(payload.title).not.toBe('finding a');
+      expect(payload).not.toHaveProperty('title');
       expect(payload).not.toHaveProperty('body');
     } finally {
       warnSpy.mockRestore();
@@ -322,8 +321,8 @@ describe('GithubAdapter (VcsProvider mapping)', () => {
           verdict: 'comment',
           summaryBody: 'Some notes',
           comments: [
-            { path: 'src/a.ts', position: 2, body: 'a', title: 'finding a' },
-            { path: 'src/b.ts', position: 4, body: 'b', title: 'finding b' },
+            { path: 'src/a.ts', position: 2, body: 'a', commentId: '901' },
+            { path: 'src/b.ts', position: 4, body: 'b', commentId: '902' },
           ],
         }),
       ).rejects.toThrow();
@@ -383,9 +382,9 @@ describe('GithubAdapter (VcsProvider mapping)', () => {
         verdict: 'comment',
         summaryBody: 'Some notes',
         comments: [
-          { path: 'src/a.ts', position: 2, body: 'a', title: 'finding a' },
-          { path: 'src/b.ts', position: 4, body: 'b', title: 'finding b' },
-          { path: 'src/c.ts', position: 6, body: 'c', title: 'finding c' },
+          { path: 'src/a.ts', position: 2, body: 'a', commentId: '901' },
+          { path: 'src/b.ts', position: 4, body: 'b', commentId: '902' },
+          { path: 'src/c.ts', position: 6, body: 'c', commentId: '903' },
         ],
       });
 
@@ -397,8 +396,8 @@ describe('GithubAdapter (VcsProvider mapping)', () => {
 
       // The whole remainder is reported, so the audit trail can answer for every un-posted finding.
       expect(result.skippedComments).toEqual([
-        { path: 'src/b.ts', line: null, position: 4, title: 'finding b' },
-        { path: 'src/c.ts', line: null, position: 6, title: 'finding c' },
+        { path: 'src/b.ts', line: null, position: 4, commentId: '902' },
+        { path: 'src/c.ts', line: null, position: 6, commentId: '903' },
       ]);
 
       const budgetWarn = warnSpy.mock.calls.find(([message]) =>
@@ -428,11 +427,11 @@ describe('GithubAdapter (VcsProvider mapping)', () => {
         verdict: 'comment',
         summaryBody: 'Some notes',
         comments: [
-          { path: 'src/a.ts', position: 2, body: 'a', title: 'finding a' },
+          { path: 'src/a.ts', position: 2, body: 'a', commentId: '901' },
           // position 0 is not a valid GitHub anchor (positions are 1-based) -- the two former
           // predicates disagreed on exactly this value.
-          { path: 'src/zero.ts', position: 0, body: 'zero', title: 'finding zero' },
-          { path: 'src/none.ts', body: 'none', title: 'finding none' },
+          { path: 'src/zero.ts', position: 0, body: 'zero', commentId: '904' },
+          { path: 'src/none.ts', body: 'none', commentId: '905' },
         ],
       });
 
@@ -445,8 +444,8 @@ describe('GithubAdapter (VcsProvider mapping)', () => {
 
       // Both un-anchorable comments are surfaced rather than vanishing.
       expect(result.skippedComments).toEqual([
-        { path: 'src/zero.ts', line: null, position: null, title: 'finding zero' },
-        { path: 'src/none.ts', line: null, position: null, title: 'finding none' },
+        { path: 'src/zero.ts', line: null, position: null, commentId: '904' },
+        { path: 'src/none.ts', line: null, position: null, commentId: '905' },
       ]);
     } finally {
       restore();

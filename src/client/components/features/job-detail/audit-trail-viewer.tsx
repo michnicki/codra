@@ -57,11 +57,16 @@ function SampleIdentifier({
   line,
   position,
   title,
+  commentId,
 }: {
   path: string;
   line?: number | null;
   position?: number | null;
   title?: string | null;
+  // WR-06: the persisted review_comments.id, rendered as `#id` so an operator can join a skipped
+  // entry straight back to its row. Only the inline_comment_skipped sample supplies it; the other
+  // aggregate samples still carry a (redacted) title.
+  commentId?: string | null;
 }) {
   return (
     <div className="text-xs leading-relaxed">
@@ -70,6 +75,7 @@ function SampleIdentifier({
         {line != null ? `:${line}` : ''}
         {line == null && position != null ? ` @pos ${position}` : ''}
       </span>
+      {commentId ? <span className="font-mono text-muted-foreground"> #{commentId}</span> : null}
       {title ? <span className="text-muted-foreground"> — {title}</span> : null}
     </div>
   );
@@ -282,11 +288,11 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
     // per review round when inline comments were skipped (per-comment 422, budget exhaustion, or
     // no usable anchor) at posting. `count` is the FULL total, NOT the (max-20) sample length.
     // Mirrors the learned_rule_suppressed row layout but reports a plain count +
-    // { path, line, position, title } sample (T-13-03-03 identifiers only). WR-01: `position` is
-    // passed through separately so a GitHub diff offset is never rendered as a head-side line
-    // number. WR-06: `title` is ALWAYS the fixed `[title-redacted]` marker — `redactFindingTitle`
-    // maps every non-empty title to it — so the identifying content here is { path, line, position },
-    // not the title. Do not describe the title as a finding identifier.
+    // { path, line, position, commentId } sample (T-13-03-03 identifiers only). WR-01: `position`
+    // is passed through separately so a GitHub diff offset is never rendered as a head-side line
+    // number. WR-06: the sample carries the persisted `review_comments.id` instead of a title —
+    // the old title was always the fixed `[title-redacted]` marker, so it identified nothing. The
+    // id is what an operator joins on: SELECT * FROM review_comments WHERE id = <commentId>.
     case 'inline_comment_skipped':
       return (
         <li className="rounded-md border border-border/40 bg-card/40 p-3">
@@ -295,7 +301,12 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
             <ul className="mt-2 flex flex-col gap-1.5 border-t border-border/30 pt-2">
               {event.sample.map((s, i) => (
                 <li key={i}>
-                  <SampleIdentifier path={s.path} line={s.line} position={s.position} title={s.title} />
+                  <SampleIdentifier
+                    path={s.path}
+                    line={s.line}
+                    position={s.position}
+                    commentId={s.commentId}
+                  />
                 </li>
               ))}
             </ul>

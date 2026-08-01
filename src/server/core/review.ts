@@ -2724,7 +2724,11 @@ async function runFinalizePhase(
     comments: finalComments.map(comment => ({
       path: comment.path,
       position: comment.position ?? undefined,
-      title: comment.title,
+      // WR-06: the persisted review_comments.id, threaded so a comment the provider refuses to post
+      // can be joined back to its row from the audit trail. `finalComments` originates from
+      // `getFileReviewsForJobs`' parsed_comments projection, which now selects `rc.id::text`, so the
+      // id is present on every finalize read. It is NEVER sent to the provider.
+      commentId: comment.commentId,
       body: formatter.formatInlineComment(comment, { provider: vcs.name }),
     })),
   });

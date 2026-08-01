@@ -395,37 +395,59 @@ describe('buildInlineCommentSkippedEvent (PRD-01, D-03/D-04)', () => {
   });
 
   it('single skipped comment produces one aggregate with count 1 and the skipped identifier', () => {
-    const event = buildInlineCommentSkippedEvent([{ path: 'src/a.ts', line: 4, title: 'finding one' }])!;
+    const event = buildInlineCommentSkippedEvent([{ path: 'src/a.ts', line: 4, commentId: '77' }])!;
 
     expect(event.stage).toBe('inline_comment_skipped');
     expect(event.count).toBe(1);
     // WR-01: `position` rides alongside `line` (null here — this entry carries a line, not a
     // diff offset) so the two coordinates are never conflated.
-    expect(event.sample).toEqual([{ path: 'src/a.ts', line: 4, position: null, title: '[title-redacted]' }]);
+    expect(event.sample).toEqual([{ path: 'src/a.ts', line: 4, position: null, commentId: '77' }]);
   });
 
   it('carries a GitHub diff position separately from line, with line null (WR-01)', () => {
     const event = buildInlineCommentSkippedEvent([
-      { path: 'src/a.ts', line: null, position: 3, title: 'finding one' },
+      { path: 'src/a.ts', line: null, position: 3, commentId: '77' },
     ])!;
 
-    expect(event.sample).toEqual([{ path: 'src/a.ts', line: null, position: 3, title: '[title-redacted]' }]);
+    expect(event.sample).toEqual([{ path: 'src/a.ts', line: null, position: 3, commentId: '77' }]);
   });
 
   it('absent position normalizes to null', () => {
-    const event = buildInlineCommentSkippedEvent([{ path: 'src/x.ts', line: 2, title: 'finding' }])!;
+    const event = buildInlineCommentSkippedEvent([{ path: 'src/x.ts', line: 2, commentId: '77' }])!;
 
     expect(event.sample[0].position).toBeNull();
   });
 
-  it('sample titles are redacted via redactFindingTitle (AUD-01)', () => {
-    const event = buildInlineCommentSkippedEvent([{ path: 'src/x.ts', line: 10, title: 'secret-finding' }])!;
+  // WR-06: the sample now identifies a skipped comment by its persisted review_comments.id. It
+  // previously carried a title routed through redactFindingTitle, which maps EVERY non-empty title
+  // to one fixed marker — so the sample always read '[title-redacted]' and identified nothing.
+  it('carries the persisted review_comments id and NO title (WR-06)', () => {
+    const event = buildInlineCommentSkippedEvent([
+      { path: 'src/x.ts', line: 10, commentId: '4242' },
+    ])!;
 
-    expect(event.sample[0].title).toBe('[title-redacted]');
+    expect(event.sample[0].commentId).toBe('4242');
+    expect(event.sample[0]).not.toHaveProperty('title');
+  });
+
+  it('a bigint-range id survives as an exact string (WR-06)', () => {
+    // review_comments.id is BIGSERIAL. 2^53+1 is the first value a JSON number cannot represent —
+    // as a number it would come back as ...992 and point at a DIFFERENT comment.
+    const event = buildInlineCommentSkippedEvent([
+      { path: 'src/x.ts', line: 1, commentId: '9007199254740993' },
+    ])!;
+
+    expect(event.sample[0].commentId).toBe('9007199254740993');
+  });
+
+  it('absent commentId normalizes to null', () => {
+    const event = buildInlineCommentSkippedEvent([{ path: 'src/x.ts', line: 1 }])!;
+
+    expect(event.sample[0].commentId).toBeNull();
   });
 
   it('absent line normalizes to null', () => {
-    const event = buildInlineCommentSkippedEvent([{ path: 'src/x.ts', title: 'finding' }])!;
+    const event = buildInlineCommentSkippedEvent([{ path: 'src/x.ts', commentId: '77' }])!;
 
     expect(event.sample[0].line).toBeNull();
   });
@@ -434,7 +456,7 @@ describe('buildInlineCommentSkippedEvent (PRD-01, D-03/D-04)', () => {
     const skipped = Array.from({ length: 25 }, (_, i) => ({
       path: `src/x/${i}.ts`,
       line: i,
-      title: `finding ${i}`,
+      commentId: String(i),
     }));
 
     const event = buildInlineCommentSkippedEvent(skipped)!;
@@ -445,11 +467,25 @@ describe('buildInlineCommentSkippedEvent (PRD-01, D-03/D-04)', () => {
 
   it('builder output round-trips through jobAuditEventSchema', () => {
     const event = buildInlineCommentSkippedEvent([
-      { path: 'src/a.ts', line: 4, title: 'finding one' },
-      { path: 'src/b.ts', line: null, title: 'finding two' },
+      { path: 'src/a.ts', line: 4, commentId: '77' },
+      { path: 'src/b.ts', line: null, commentId: null },
     ])!;
 
     const result = jobAuditEventSchema.safeParse(event);
+    expect(result.success).toBe(true);
+  });
+
+  // WR-06 back-compat: audit rows persisted BEFORE this change carry `title` and no `commentId`.
+  // They must still parse — the nested sample object drops the now-unknown key rather than failing.
+  it('a pre-existing persisted row carrying `title` still parses (WR-06 back-compat)', () => {
+    const legacy = {
+      stage: 'inline_comment_skipped',
+      count: 1,
+      sample: [{ path: 'src/a.ts', line: 4, title: '[title-redacted]' }],
+      timestamp: '2026-01-01T00:00:00.000Z',
+    };
+
+    const result = jobAuditEventSchema.safeParse(legacy);
     expect(result.success).toBe(true);
   });
 

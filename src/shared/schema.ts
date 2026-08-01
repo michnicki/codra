@@ -63,6 +63,19 @@ export const parsedReviewCommentSchema = z.object({
     line: z.number().int().positive().optional(),
     relationship: z.string().min(1),
   })).optional(),
+  // WR-06: the persisted `review_comments.id` for this finding, projected back by
+  // `getFileReviewsForJobs`. This is the stable identifier `criticPruneOutputSchema`'s comment
+  // below calls out as missing ("the index-assigned ids close the gap that
+  // parsedReviewCommentSchema has no stable id") -- it is now available on the finalize read path.
+  //
+  // A STRING, not a number: `review_comments.id` is BIGSERIAL (64-bit), and a JSON number loses
+  // precision above 2^53 -- verified against Postgres, where 9007199254740993 projects back as
+  // ...992. An audit identifier that is silently off by one points at a DIFFERENT comment, which is
+  // worse than no identifier at all, so the projection casts to text.
+  //
+  // Optional because the PRODUCER side has no id: `parseFileReviewResponse` builds findings before
+  // they are persisted, and the id is only assigned by the INSERT. Present on every read-back.
+  commentId: z.string().min(1).nullable().optional(),
 });
 
 export const fileReviewModelOutputSchema = z.object({
@@ -1426,13 +1439,23 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
   // Phase 33 (PRD-01 / FR-031, D-03/D-04): inline_comment_skipped audit event. AGGREGATE — one event
   // per review round when inline comments were skipped (422 or budget exhaustion) at posting.
   // `count` is the FULL total; the sample is capped at 20 (INLINE_COMMENT_SKIPPED_SAMPLE_CAP).
-  // Sample identifiers admit ONLY { path, line, position, title } (T-13-03-03) and titles route
-  // through redactFindingTitle at production time (AUD-01); never body/existingCode/codeSuggestion.
+  // Sample identifiers admit ONLY { path, line, position, commentId } (T-13-03-03) —
+  // never body/title/existingCode/codeSuggestion.
   //
   // WR-01: `line` (head-side line number) and `position` (diff offset) are SEPARATE fields because
   // they are not the same quantity and are not comparable across providers (G-28-3) — Bitbucket
   // fills `line`, GitHub fills `position`. Collapsing them made the viewer render a fabricated line
   // number for every GitHub skip. `position` is optional so pre-existing persisted rows still parse.
+  //
+  // WR-06: `title` is GONE, replaced by `commentId` (the persisted `review_comments.id`). The
+  // sample used to carry a title routed through `redactFindingTitle`, which maps EVERY non-empty
+  // title to one fixed marker — so the field was inert and an operator could not join a skipped
+  // entry back to a finding. A digest of the title was rejected deliberately: `redactFindingTitle`'s
+  // own contract forbids retaining a "source-derived prefix, digest, length, or other title
+  // content", and formulaic finding titles are dictionary-attackable over a small plausible-title
+  // space. The row id carries ZERO title content, so it restores operator value at no privacy cost.
+  // `commentId` is optional so pre-existing persisted audit rows (which have `title` instead) still
+  // parse; their now-unknown `title` key is simply stripped by this nested object.
   z
     .object({
       stage: z.literal('inline_comment_skipped'),
@@ -1444,7 +1467,7 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
           path: z.string(),
           line: z.number().nullable().optional(),
           position: z.number().nullable().optional(),
-          title: z.string().max(100),
+          commentId: z.string().max(64).nullable().optional(),
         }),
       ).max(20),
       timestamp: dateStringSchema,

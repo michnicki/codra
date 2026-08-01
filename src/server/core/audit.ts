@@ -869,16 +869,23 @@ export type InlineCommentSkippedAuditEvent = Extract<JobAuditEvent, { stage: 'in
  * The param type is deliberately STRUCTURAL (NOT `VcsSkippedComment`) so `core/audit.ts` gains
  * no import from `vcs/types`; `VcsSkippedComment` is structurally assignable.
  *
- * Privacy boundary (T-13-03-03): sample identifiers admit ONLY { path, line, position, title } —
- * never body/existingCode/codeSuggestion — and titles pass through `redactFindingTitle` (AUD-01).
+ * Privacy boundary (T-13-03-03): sample identifiers admit ONLY
+ * { path, line, position, commentId } — never body/title/existingCode/codeSuggestion.
  *
  * WR-01: `line` (head-side line) and `position` (diff offset) are carried SEPARATELY because they
  * are not the same quantity and are not comparable across providers (G-28-3). Bitbucket supplies
  * `line`, GitHub supplies `position`; whichever is absent stays null rather than being filled from
  * the other.
+ *
+ * WR-06: the sample carries `commentId` (the persisted `review_comments.id`) instead of a title.
+ * The old `title` field ran through `redactFindingTitle`, which maps EVERY non-empty title to one
+ * fixed marker — so the sample always read `[title-redacted]` and an operator could not tell WHICH
+ * finding was skipped. The row id is not derived from the title in any way, so it identifies the
+ * finding without reintroducing the content AUD-01 keeps out of `jobs.audit`. This builder no
+ * longer needs `redactFindingTitle` at all: no title reaches it.
  */
 export function buildInlineCommentSkippedEvent(
-  skipped: Array<{ path: string; line?: number | null; position?: number | null; title?: string }>,
+  skipped: Array<{ path: string; line?: number | null; position?: number | null; commentId?: string | null }>,
 ): InlineCommentSkippedAuditEvent | null {
   if (skipped.length === 0) return null;
 
@@ -886,7 +893,7 @@ export function buildInlineCommentSkippedEvent(
     path: s.path,
     line: s.line ?? null,
     position: s.position ?? null,
-    title: redactFindingTitle(s.title),
+    commentId: s.commentId ?? null,
   }));
 
   const event = {
