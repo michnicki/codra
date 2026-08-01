@@ -296,6 +296,22 @@ describe('Phase 34 (34-03): YAML config audit builder/recorder', () => {
     expect(jobAuditEventSchema.safeParse(event).success).toBe(true);
   });
 
+  // WR-02 (34-REVIEW): the reason derives from an error raised over UNTRUSTED PR-head content and
+  // is persisted to jobs.audit + rendered in the dashboard. parseYaml no longer echoes source text
+  // (see yaml-parse.spec.ts); this is the builder-level second layer for reasons it does not
+  // control (Zod messages, future producers).
+  it('scrubs credential-shaped tokens out of the reason before persisting it', () => {
+    const event = buildYamlConfigParseFailedEvent('bad value near ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA here');
+    expect(event.reason).toBe('bad value near [REDACTED] here');
+  });
+
+  it('scrubs BEFORE slicing so a token straddling the 500-char bound cannot survive as a partial', () => {
+    const filler = 'y'.repeat(490);
+    const event = buildYamlConfigParseFailedEvent(`${filler} sk-AAAAAAAAAAAAAAAAAAAAAAAA`);
+    expect(event.reason).not.toContain('sk-');
+    expect(String(event.reason).length).toBeLessThanOrEqual(500);
+  });
+
   it('recordYamlConfigParseFailed appends via appendJobAuditEvents and never throws on a rejected write', async () => {
     const env = { HYPERDRIVE: { connectionString: 'postgres://test' } } as any;
     const jobId = 'job-id';
