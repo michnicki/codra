@@ -399,7 +399,23 @@ describe('buildInlineCommentSkippedEvent (PRD-01, D-03/D-04)', () => {
 
     expect(event.stage).toBe('inline_comment_skipped');
     expect(event.count).toBe(1);
-    expect(event.sample).toEqual([{ path: 'src/a.ts', line: 4, title: '[title-redacted]' }]);
+    // WR-01: `position` rides alongside `line` (null here — this entry carries a line, not a
+    // diff offset) so the two coordinates are never conflated.
+    expect(event.sample).toEqual([{ path: 'src/a.ts', line: 4, position: null, title: '[title-redacted]' }]);
+  });
+
+  it('carries a GitHub diff position separately from line, with line null (WR-01)', () => {
+    const event = buildInlineCommentSkippedEvent([
+      { path: 'src/a.ts', line: null, position: 3, title: 'finding one' },
+    ])!;
+
+    expect(event.sample).toEqual([{ path: 'src/a.ts', line: null, position: 3, title: '[title-redacted]' }]);
+  });
+
+  it('absent position normalizes to null', () => {
+    const event = buildInlineCommentSkippedEvent([{ path: 'src/x.ts', line: 2, title: 'finding' }])!;
+
+    expect(event.sample[0].position).toBeNull();
   });
 
   it('sample titles are redacted via redactFindingTitle (AUD-01)', () => {

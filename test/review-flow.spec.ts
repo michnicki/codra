@@ -2955,8 +2955,10 @@ dbDescribe('Review Flow Lifecycle', () => {
       generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
     );
     const findSpy = vi.spyOn(GitHubService.prototype, 'findBotReviewForCommit');
-    // The CLIENT shape: `position` (the coordinate createReview posts by), which GithubAdapter
-    // submitReview maps to `line` via s.position ?? null. A `line`-keyed fixture would sample null.
+    // The CLIENT shape: `position` (the coordinate createReview posts by). WR-01: GithubAdapter
+    // submitReview keeps it in `position` and leaves `line` null — a GitHub diff offset is NOT a
+    // head-side line number, and writing it into `line` made the audit trail (and the viewer)
+    // report a fabricated line for every GitHub skip (G-28-3).
     const createSpy = vi
       .spyOn(GitHubService.prototype, 'createReview')
       .mockResolvedValue({ id: 456, skippedComments: [{ path: 'src/foo.ts', position: 3, title: 'my finding' }] } as any);
@@ -3008,8 +3010,11 @@ dbDescribe('Review Flow Lifecycle', () => {
     const skipEvents: any[] = (detail?.audit ?? []).filter((e: any) => e.stage === 'inline_comment_skipped');
     expect(skipEvents).toHaveLength(1);
     expect(skipEvents[0]).toMatchObject({ stage: 'inline_comment_skipped', count: 1 });
-    // The adapter mapped client `position` -> `line` (3), and the sample title is redacted (AUD-01).
-    expect(skipEvents[0].sample).toEqual([{ path: 'src/foo.ts', line: 3, title: '[title-redacted]' }]);
+    // WR-01: the diff offset lands in `position` (3) with `line` null — NOT `line: 3`, which would
+    // be a line number the finding was never on. The sample title is redacted (AUD-01).
+    expect(skipEvents[0].sample).toEqual([
+      { path: 'src/foo.ts', line: null, position: 3, title: '[title-redacted]' },
+    ]);
 
     findSpy.mockRestore();
     createSpy.mockRestore();

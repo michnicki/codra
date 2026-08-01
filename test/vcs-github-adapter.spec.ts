@@ -256,9 +256,11 @@ describe('GithubAdapter (VcsProvider mapping)', () => {
       });
 
       // The 422'd comment (src/a.ts) is skipped; the other comment's POST still records 201.
+      // WR-01: 2 is a DIFF POSITION, so it lands in `position` and `line` stays null. Reporting it
+      // as `line: 2` made the audit trail claim a head-side line the finding was never on (G-28-3).
       expect(result).toEqual({
         ref: '777',
-        skippedComments: [{ path: 'src/a.ts', line: 2, title: 'finding a' }],
+        skippedComments: [{ path: 'src/a.ts', line: null, position: 2, title: 'finding a' }],
       });
       const commentPosts = calls.filter(
         (call) => call.method === 'POST' && call.path === `/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}/comments`,
@@ -278,12 +280,175 @@ describe('GithubAdapter (VcsProvider mapping)', () => {
         pullNumber: PR_NUMBER,
         path: 'src/a.ts',
         position: 2,
-        title: 'finding a',
+        // WR-05: the RAW model-supplied title must never reach the log sink. redactFindingTitle
+        // exists because jobs.audit can never retain title content, and the logger's redaction
+        // list does not cover `title` -- so logging it verbatim put exactly the value the audit
+        // trail is forbidden to store into the logs.
+        title: '[title-redacted]',
         reason: 'unprocessable',
       });
+      expect(payload.title).not.toBe('finding a');
       expect(payload).not.toHaveProperty('body');
     } finally {
       warnSpy.mockRestore();
+      restore();
+    }
+  });
+
+  // CR-02: the per-comment fallback loop used to live INSIDE createReview's withRetry, so one
+  // transient 5xx on the k-th per-comment POST replayed the whole operation -- a duplicate summary
+  // review on the PR plus k-1 duplicate inline comments. Nothing in that replay is idempotent: the
+  // GitHub path has no dedup index and the loop has no cursor. The retried unit must stay the
+  // single /reviews POST.
+  it('a transient 5xx on a per-comment POST does not replay the review or the already-posted comments (CR-02)', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const { calls, restore } = installGitHubFetchMock(
+      buildFixtures({
+        // Enough scripted responses that a replay WOULD get a second 422 -> second summary post,
+        // i.e. the bug would be plainly visible in the call log rather than masked by clamping.
+        reviewResponses: [{ status: 422 }, { status: 200, id: 777 }, { status: 422 }, { status: 200, id: 778 }],
+        reviewCommentResponses: [{ status: 201, id: 1 }, { status: 500 }],
+      }),
+    );
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      // A non-422 per-comment failure still fails loud (D-01) -- it just must not be retried here.
+      await expect(
+        adapter.submitReview(OWNER, REPO, PR_NUMBER, {
+          commitSha: 'headsha1234567890',
+          verdict: 'comment',
+          summaryBody: 'Some notes',
+          comments: [
+            { path: 'src/a.ts', position: 2, body: 'a', title: 'finding a' },
+            { path: 'src/b.ts', position: 4, body: 'b', title: 'finding b' },
+          ],
+        }),
+      ).rejects.toThrow();
+
+      // EXACTLY two /reviews POSTs: the 422'd batch and the summary-only retry. A third would be
+      // a duplicate summary review posted to the PR.
+      const reviewPosts = calls.filter(
+        (call) => call.method === 'POST' && call.path === `/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}/reviews`,
+      );
+      expect(reviewPosts).toHaveLength(2);
+
+      // src/a.ts posted exactly once. A second POST would be a duplicate inline comment.
+      const aPosts = calls.filter(
+        (call) =>
+          call.method === 'POST' &&
+          call.path === `/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}/comments` &&
+          (call.body as { path?: string })?.path === 'src/a.ts',
+      );
+      expect(aPosts).toHaveLength(1);
+    } finally {
+      warnSpy.mockRestore();
+      restore();
+    }
+    // createReviewComment keeps its OWN inner retry (2 backoffs on a 5xx), which is safe because it
+    // retries a single un-acknowledged POST -- but it makes this test wall-clock slow.
+  }, 30_000);
+
+  // WR-07: nothing exercised the SAFE_MARGIN budget guard in createReview's fallback loop, and the
+  // VcsService factory signatures were too narrow to even carry `hasRemainingSafeBudget` into the
+  // adapter -- so the guard could be dropped with no compile error and no failing test, leaving
+  // `undefined === false` (i.e. the loop never stopping).
+  it('the fallback loop stops on budget exhaustion and reports the remainder as skipped (WR-07)', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const { calls, restore } = installGitHubFetchMock(
+      buildFixtures({
+        reviewResponses: [{ status: 422 }, { status: 200, id: 777 }],
+        reviewCommentResponses: [{ status: 201, id: 1 }],
+      }),
+    );
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    try {
+      // Budget runs out after the FIRST per-comment post.
+      let budgetCalls = 0;
+      const tracker = {
+        incrementSubrequests: () => {},
+        hasRemainingSafeBudget: () => {
+          budgetCalls += 1;
+          return budgetCalls < 2;
+        },
+      };
+
+      const adapter = new GithubAdapter(env, INSTALLATION_ID, tracker);
+      const result = await adapter.submitReview(OWNER, REPO, PR_NUMBER, {
+        commitSha: 'headsha1234567890',
+        verdict: 'comment',
+        summaryBody: 'Some notes',
+        comments: [
+          { path: 'src/a.ts', position: 2, body: 'a', title: 'finding a' },
+          { path: 'src/b.ts', position: 4, body: 'b', title: 'finding b' },
+          { path: 'src/c.ts', position: 6, body: 'c', title: 'finding c' },
+        ],
+      });
+
+      // Only the first comment posted; the loop stopped rather than exhausting the invocation.
+      const commentPosts = calls.filter(
+        (call) => call.method === 'POST' && call.path === `/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}/comments`,
+      );
+      expect(commentPosts).toHaveLength(1);
+
+      // The whole remainder is reported, so the audit trail can answer for every un-posted finding.
+      expect(result.skippedComments).toEqual([
+        { path: 'src/b.ts', line: null, position: 4, title: 'finding b' },
+        { path: 'src/c.ts', line: null, position: 6, title: 'finding c' },
+      ]);
+
+      const budgetWarn = warnSpy.mock.calls.find(([message]) =>
+        String(message).includes('subrequest budget exhausted'),
+      );
+      expect(budgetWarn).toBeDefined();
+      expect(budgetWarn?.[1]).toMatchObject({ reason: 'budget_exhausted', remaining: 2 });
+    } finally {
+      warnSpy.mockRestore();
+      restore();
+    }
+  });
+
+  // WR-04: the batch body filtered position-less comments with `.filter((c) => c.position)` while
+  // the fallback used `typeof c.position === 'number'` -- two predicates for one concept, in
+  // disagreement on `position === 0`. Neither path recorded the dropped comments anywhere, so a
+  // finding that never reached GitHub was unanswerable from the audit trail.
+  it('a comment with no usable diff position is reported through skippedComments (WR-04)', async () => {
+    const env = createTestEnv();
+    await seedInstallationToken(env, INSTALLATION_ID);
+    const { calls, restore } = installGitHubFetchMock(buildFixtures({ reviewResponses: [{ status: 200, id: 777 }] }));
+
+    try {
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+      const result = await adapter.submitReview(OWNER, REPO, PR_NUMBER, {
+        commitSha: 'headsha1234567890',
+        verdict: 'comment',
+        summaryBody: 'Some notes',
+        comments: [
+          { path: 'src/a.ts', position: 2, body: 'a', title: 'finding a' },
+          // position 0 is not a valid GitHub anchor (positions are 1-based) -- the two former
+          // predicates disagreed on exactly this value.
+          { path: 'src/zero.ts', position: 0, body: 'zero', title: 'finding zero' },
+          { path: 'src/none.ts', body: 'none', title: 'finding none' },
+        ],
+      });
+
+      expect(result.ref).toBe('777');
+      // Only the positioned comment reaches the wire.
+      const reviewPost = calls.find(
+        (call) => call.method === 'POST' && call.path === `/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}/reviews`,
+      );
+      expect(reviewPost?.body.comments).toEqual([{ path: 'src/a.ts', position: 2, body: 'a' }]);
+
+      // Both un-anchorable comments are surfaced rather than vanishing.
+      expect(result.skippedComments).toEqual([
+        { path: 'src/zero.ts', line: null, position: null, title: 'finding zero' },
+        { path: 'src/none.ts', line: null, position: null, title: 'finding none' },
+      ]);
+    } finally {
       restore();
     }
   });

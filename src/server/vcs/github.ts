@@ -332,10 +332,18 @@ export class GithubAdapter implements VcsProvider {
     if (typeof id !== 'number' || !Number.isFinite(id)) {
       throw new Error(`createReview returned a non-numeric id for ${owner}/${repo}#${prNumber}: ${String(id)}`);
     }
-    // Phase 33 (FR-031, D-01): the client's per-comment fallback skips map `position` -> `line`
-    // (null when absent). Omitted entirely on a clean run so the returned shape stays
-    // byte-identical to the pre-Phase-33 contract (REVIEWS R1).
-    const skipped = skippedComments?.map((s) => ({ path: s.path, line: s.position ?? null, title: s.title }));
+    // Phase 33 (FR-031, D-01): the client's per-comment fallback skips carry a DIFF POSITION.
+    // WR-01: it stays in `position`, and `line` is null. Writing the position into `line` made the
+    // audit trail render a fabricated head-side line number ("src/foo.ts:3" for a finding at
+    // POSITION 3) -- the exact G-28-3 defect documented on `VcsSkippedComment` and on
+    // `getInlineCommentDetails` in vcs/types.ts. Omitted entirely on a clean run so the returned
+    // shape stays byte-identical to the pre-Phase-33 contract (REVIEWS R1).
+    const skipped = skippedComments?.map((s) => ({
+      path: s.path,
+      line: null,
+      position: s.position,
+      title: s.title,
+    }));
     return skipped && skipped.length > 0 ? { ref: String(id), skippedComments: skipped } : { ref: String(id) };
   }
 

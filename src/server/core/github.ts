@@ -1,6 +1,9 @@
 import type { AppBindings } from '@server/env';
 import { withTimeout } from '@server/core/timeout';
 import { logger } from '@server/core/logger';
+// WR-05: the same redaction the audit boundary applies, reused so a skipped comment's title is
+// never emitted verbatim to the log sink.
+import { redactFindingTitle } from '@server/core/audit-redact';
 import type { BotIdentityResolver } from '@server/core/bot-identity';
 // Phase 34 (PRD-04 / FR-114): Wave-1 contract from @shared/schema (34-01). Imported, never
 // re-defined — the shape is shared with the prompt builder and both providers' adapters.
@@ -101,6 +104,26 @@ export type GitHubReviewComment = {
   body: string;
   title?: string;
 };
+
+/**
+ * FR-031 (D-01) skip record. `position` is the comment's DIFF OFFSET, null when the comment had no
+ * usable position at all (WR-04's batch-filter drop path). It is deliberately NOT called `line`:
+ * a GitHub diff position is not a head-side line number, and conflating the two is the exact
+ * defect G-28-3 documents (see the COORDINATE SYSTEMS note on `vcs/types.ts::getInlineCommentDetails`).
+ */
+export type GitHubSkippedComment = { path: string; position: number | null; title?: string };
+
+/**
+ * WR-04: THE predicate for "GitHub can anchor this comment", shared by the batch body and the
+ * per-comment fallback. GitHub diff positions are 1-based, so 0 is not a valid anchor and the
+ * `> 0` check makes the two former predicates (`comment.position` truthiness vs.
+ * `typeof comment.position === 'number'`) agree on every input.
+ */
+function hasReviewPosition(
+  comment: GitHubReviewComment,
+): comment is GitHubReviewComment & { position: number } {
+  return typeof comment.position === 'number' && comment.position > 0;
+}
 
 type GitHubIssueLabel = {
   name?: string;
@@ -869,22 +892,48 @@ export class GitHubClient {
       body: string;
       comments: GitHubReviewComment[];
     },
-  ): Promise<{ id: number; skippedComments?: { path: string; position: number; title?: string }[] }> {
-    return withRetry(`createReview ${owner}/${repo}#${pullNumber}`, async () => {
+  ): Promise<{ id: number; skippedComments?: GitHubSkippedComment[] }> {
+    // WR-04: ONE predicate for "this comment can be posted", used by BOTH the batch body and the
+    // per-comment fallback. The two sites previously disagreed on `position === 0` -- truthiness
+    // excluded it from the batch while `typeof === 'number'` included it in the fallback -- so the
+    // same comment was simultaneously un-postable and postable depending on which path ran.
+    const positionedComments = input.comments.filter(hasReviewPosition);
+    // WR-04: comments GitHub can never anchor were silently filtered out of the batch body and
+    // never recorded anywhere. They are findings that did not post, which is exactly what the
+    // `skippedComments` seam exists to answer, so they are surfaced with `position: null`.
+    const unpositionedSkips: GitHubSkippedComment[] = input.comments
+      .filter((comment) => !hasReviewPosition(comment))
+      .map((comment) => ({ path: comment.path, position: null, title: comment.title }));
+    if (unpositionedSkips.length > 0) {
+      logger.warn(`GitHub review comments dropped: no usable diff position`, {
+        owner,
+        repo,
+        pullNumber,
+        reason: 'no_position',
+        count: unpositionedSkips.length,
+      });
+    }
+
+    const reviewPath = `${repoApiPath(owner, repo)}/pulls/${pullNumber}/reviews`;
+
+    // CR-02: the RETRIED unit is ONLY the idempotent `/reviews` POST(s). The per-comment fallback
+    // loop used to live inside this closure, so one transient 5xx/timeout on the k-th per-comment
+    // POST replayed the ENTIRE operation: a duplicate summary review on the PR plus k-1 duplicate
+    // inline comments. Nothing in that replay was idempotent -- the GitHub path has no dedup index
+    // (unlike Bitbucket's buildDedupIndex) and the loop has no persisted cursor. Hoisting the loop
+    // out keeps the retry semantics the endpoint actually supports.
+    const { id, needsFallback } = await withRetry(`createReview ${owner}/${repo}#${pullNumber}`, async () => {
       const body = {
         commit_id: input.commitSha,
         event: input.event,
         body: input.body,
-        comments: input.comments
-          .filter((comment) => comment.position)
-          .map((comment) => ({
-            path: comment.path,
-            position: comment.position,
-            body: comment.body,
-          })),
+        comments: positionedComments.map((comment) => ({
+          path: comment.path,
+          position: comment.position,
+          body: comment.body,
+        })),
       };
 
-      const reviewPath = `${repoApiPath(owner, repo)}/pulls/${pullNumber}/reviews`;
       let response = await this.request(reviewPath, {
         method: 'POST',
         headers: {
@@ -893,7 +942,9 @@ export class GitHubClient {
         body: JSON.stringify(body),
       });
 
+      let batchWas422 = false;
       if (response.status === 422 && body.comments.length > 0) {
+        batchWas422 = true;
         logger.warn(`GitHub review creation failed with 422, retrying without inline comments`, {
           owner,
           repo,
@@ -911,61 +962,6 @@ export class GitHubClient {
             comments: [],
           }),
         });
-
-        // FR-031 (D-01): the summary-only retry is the base; when it SUCCEEDS and there were
-        // inline comments, post each positioned comment individually. Worst case N+1 subrequests
-        // (1 summary retry + N per-comment posts), all tracker-accounted via `request()`/
-        // `requestAndCheck`. The `hasRemainingSafeBudget` guard (SAFE_MARGIN = 25,
-        // core/token-tracker.ts:20) stops the loop before the invocation budget is exhausted, so
-        // the fallback can never strand an already-posted summary review behind a
-        // "too many subrequests" failure.
-        if (response.ok && body.comments.length > 0) {
-          const skipped: { path: string; position: number; title?: string }[] = [];
-          const positionedComments = input.comments.filter(
-            (comment): comment is GitHubReviewComment & { position: number } => typeof comment.position === 'number',
-          );
-          for (let i = 0; i < positionedComments.length; i++) {
-            const comment = positionedComments[i];
-            if (this.tracker?.hasRemainingSafeBudget?.(1) === false) {
-              const remaining = positionedComments.length - i;
-              logger.warn(`GitHub per-comment review comment loop stopped: subrequest budget exhausted`, {
-                owner,
-                repo,
-                pullNumber,
-                reason: 'budget_exhausted',
-                remaining,
-              });
-              skipped.push(
-                ...positionedComments
-                  .slice(i)
-                  .map((c) => ({ path: c.path, position: c.position, title: c.title })),
-              );
-              break;
-            }
-            try {
-              await this.createReviewComment(owner, repo, pullNumber, input.commitSha, comment);
-            } catch (error) {
-              if (error instanceof GitHubError && error.status === 422) {
-                logger.warn(`GitHub per-comment review comment failed with 422, skipping`, {
-                  owner,
-                  repo,
-                  pullNumber,
-                  path: comment.path,
-                  position: comment.position,
-                  title: comment.title,
-                  reason: 'unprocessable',
-                });
-                skipped.push({ path: comment.path, position: comment.position, title: comment.title });
-              } else {
-                throw error;
-              }
-            }
-          }
-          if (skipped.length > 0) {
-            const review = (await response.json()) as { id: number };
-            return { id: review.id, skippedComments: skipped };
-          }
-        }
       }
 
       if (!response.ok) {
@@ -978,8 +974,84 @@ export class GitHubClient {
         );
       }
 
-      return (await response.json()) as { id: number };
+      const review = (await response.json()) as { id: number };
+      return { id: review.id, needsFallback: batchWas422 };
     });
+
+    // FR-031 (D-01): the summary-only retry is the base; when it SUCCEEDS and there were inline
+    // comments, post each positioned comment individually. Worst case N+1 subrequests (1 summary
+    // retry + N per-comment posts), all tracker-accounted via `request()`/`requestAndCheck`.
+    const skipped = needsFallback
+      ? await this.postCommentsIndividually(owner, repo, pullNumber, input.commitSha, positionedComments)
+      : [];
+    const allSkipped = [...unpositionedSkips, ...skipped];
+
+    return allSkipped.length > 0 ? { id, skippedComments: allSkipped } : { id };
+  }
+
+  /**
+   * FR-031 (D-01) batch-422 fallback: post each positioned comment on its own.
+   *
+   * CR-02: deliberately NOT wrapped in `withRetry`. Every iteration is a side-effecting POST with
+   * no dedup key and no cursor, so replaying the loop double-posts everything that already
+   * succeeded. `createReviewComment` keeps its OWN inner retry, which is safe because that retries
+   * a single un-acknowledged POST rather than a partially-applied sequence.
+   *
+   * The `hasRemainingSafeBudget` guard (SAFE_MARGIN = 25, core/token-tracker.ts:20) stops the loop
+   * before the invocation budget is exhausted, so the fallback can never strand an already-posted
+   * summary review behind a "too many subrequests" failure.
+   */
+  private async postCommentsIndividually(
+    owner: string,
+    repo: string,
+    pullNumber: number,
+    commitSha: string,
+    positionedComments: (GitHubReviewComment & { position: number })[],
+  ): Promise<GitHubSkippedComment[]> {
+    const skipped: GitHubSkippedComment[] = [];
+    for (let i = 0; i < positionedComments.length; i++) {
+      const comment = positionedComments[i];
+      if (this.tracker?.hasRemainingSafeBudget?.(1) === false) {
+        const remaining = positionedComments.length - i;
+        logger.warn(`GitHub per-comment review comment loop stopped: subrequest budget exhausted`, {
+          owner,
+          repo,
+          pullNumber,
+          reason: 'budget_exhausted',
+          remaining,
+        });
+        skipped.push(
+          ...positionedComments
+            .slice(i)
+            .map((c) => ({ path: c.path, position: c.position, title: c.title })),
+        );
+        break;
+      }
+      try {
+        await this.createReviewComment(owner, repo, pullNumber, commitSha, comment);
+      } catch (error) {
+        if (error instanceof GitHubError && error.status === 422) {
+          logger.warn(`GitHub per-comment review comment failed with 422, skipping`, {
+            owner,
+            repo,
+            pullNumber,
+            path: comment.path,
+            position: comment.position,
+            // WR-05: the redacted form, matching the audit boundary. `redactFindingTitle` exists
+            // because jobs.audit can never retain model-supplied title content, and the logger's
+            // redaction list does not cover `title` -- so logging it raw emitted exactly the value
+            // the audit trail is forbidden to store. Finding titles routinely quote identifiers
+            // and code fragments from a private repository.
+            title: redactFindingTitle(comment.title),
+            reason: 'unprocessable',
+          });
+          skipped.push({ path: comment.path, position: comment.position, title: comment.title });
+        } else {
+          throw error;
+        }
+      }
+    }
+    return skipped;
   }
 
   // Returns a review this app already posted on the given commit, if one exists. Used by finalize

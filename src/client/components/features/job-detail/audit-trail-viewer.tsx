@@ -49,13 +49,18 @@ function CountBadge({ count }: { count: number }) {
 // A single producer-bounded sample identifier: { path, line?, title? }. Paths render mono + break-all
 // so a long file path wraps within the row instead of stretching the viewer (E6 long-text backstop).
 // All fields are plain React text nodes — auto-escaped, never dangerouslySetInnerHTML (T-16-06-01).
+// WR-01: `position` is a DIFF OFFSET, not a head-side line number, and the two are not
+// interchangeable (G-28-3). It renders as ` @pos N` — never as `:N` — so a GitHub skip is never
+// read as a line number the finding was not on. `line` still renders as `:N`.
 function SampleIdentifier({
   path,
   line,
+  position,
   title,
 }: {
   path: string;
   line?: number | null;
+  position?: number | null;
   title?: string | null;
 }) {
   return (
@@ -63,6 +68,7 @@ function SampleIdentifier({
       <span className="font-mono break-all text-foreground/90">
         {path}
         {line != null ? `:${line}` : ''}
+        {line == null && position != null ? ` @pos ${position}` : ''}
       </span>
       {title ? <span className="text-muted-foreground"> — {title}</span> : null}
     </div>
@@ -273,10 +279,14 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
         </li>
       );
     // Phase 33 (PRD-01 / FR-031, D-03/D-04): inline_comment_skipped aggregate event — one event
-    // per review round when inline comments were skipped (per-comment 422 or budget exhaustion)
-    // at posting. `count` is the FULL total, NOT the (max-20) sample length. Mirrors the
-    // learned_rule_suppressed row layout but reports a plain count + { path, line, title } sample
-    // (T-13-03-03 identifiers only — titles already redacted at build time, AUD-01).
+    // per review round when inline comments were skipped (per-comment 422, budget exhaustion, or
+    // no usable anchor) at posting. `count` is the FULL total, NOT the (max-20) sample length.
+    // Mirrors the learned_rule_suppressed row layout but reports a plain count +
+    // { path, line, position, title } sample (T-13-03-03 identifiers only). WR-01: `position` is
+    // passed through separately so a GitHub diff offset is never rendered as a head-side line
+    // number. WR-06: `title` is ALWAYS the fixed `[title-redacted]` marker — `redactFindingTitle`
+    // maps every non-empty title to it — so the identifying content here is { path, line, position },
+    // not the title. Do not describe the title as a finding identifier.
     case 'inline_comment_skipped':
       return (
         <li className="rounded-md border border-border/40 bg-card/40 p-3">
@@ -285,7 +295,7 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
             <ul className="mt-2 flex flex-col gap-1.5 border-t border-border/30 pt-2">
               {event.sample.map((s, i) => (
                 <li key={i}>
-                  <SampleIdentifier path={s.path} line={s.line} title={s.title} />
+                  <SampleIdentifier path={s.path} line={s.line} position={s.position} title={s.title} />
                 </li>
               ))}
             </ul>

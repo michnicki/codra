@@ -869,17 +869,23 @@ export type InlineCommentSkippedAuditEvent = Extract<JobAuditEvent, { stage: 'in
  * The param type is deliberately STRUCTURAL (NOT `VcsSkippedComment`) so `core/audit.ts` gains
  * no import from `vcs/types`; `VcsSkippedComment` is structurally assignable.
  *
- * Privacy boundary (T-13-03-03): sample identifiers admit ONLY { path, line, title } — never
- * body/existingCode/codeSuggestion — and titles pass through `redactFindingTitle` (AUD-01).
+ * Privacy boundary (T-13-03-03): sample identifiers admit ONLY { path, line, position, title } —
+ * never body/existingCode/codeSuggestion — and titles pass through `redactFindingTitle` (AUD-01).
+ *
+ * WR-01: `line` (head-side line) and `position` (diff offset) are carried SEPARATELY because they
+ * are not the same quantity and are not comparable across providers (G-28-3). Bitbucket supplies
+ * `line`, GitHub supplies `position`; whichever is absent stays null rather than being filled from
+ * the other.
  */
 export function buildInlineCommentSkippedEvent(
-  skipped: Array<{ path: string; line?: number | null; title?: string }>,
+  skipped: Array<{ path: string; line?: number | null; position?: number | null; title?: string }>,
 ): InlineCommentSkippedAuditEvent | null {
   if (skipped.length === 0) return null;
 
   const sample = skipped.slice(0, INLINE_COMMENT_SKIPPED_SAMPLE_CAP).map((s) => ({
     path: s.path,
     line: s.line ?? null,
+    position: s.position ?? null,
     title: redactFindingTitle(s.title),
   }));
 
