@@ -137,3 +137,44 @@ describe('GitHubAdapter.getFileHistory', () => {
     }
   });
 });
+
+describe('BitbucketAdapter.getFileHistory', () => {
+  it('returns commit entries with empty files list', async () => {
+    const mock = installBitbucketFetchMock({
+      fileHistoryResponses: {
+        body: {
+          values: [
+            { hash: 'abc1234567890abcdef', message: 'fix: resolve race\n\nbody' },
+            { hash: 'def4567abcdef1234567', message: 'feat: add retry' },
+          ],
+        },
+      },
+    });
+    const { adapter } = buildBitbucketAdapter();
+
+    const history = await adapter.getFileHistory?.(OWNER, REPO, 'src/main.ts', 'main', 5);
+
+    expect(history).toEqual([
+      { hash: 'abc1234', message: 'fix: resolve race', files: [], filesAvailable: false },
+      { hash: 'def4567', message: 'feat: add retry', files: [], filesAvailable: false },
+    ]);
+    // The commit-list endpoint is path-filtered via query params on the commits/{ref} path.
+    expect(mock.calls[0].path).toBe(`/2.0/repositories/${OWNER}/${REPO}/commits/main?path=src/main.ts&pagelen=5`);
+  });
+
+  it('returns empty array for an empty values response', async () => {
+    installBitbucketFetchMock({ fileHistoryResponses: { body: { values: [] } } });
+    const { adapter } = buildBitbucketAdapter();
+
+    const history = await adapter.getFileHistory?.(OWNER, REPO, 'src/main.ts', 'main', 5);
+
+    expect(history).toEqual([]);
+  });
+
+  it('throws on non-2xx response', async () => {
+    installBitbucketFetchMock({ fileHistoryResponses: { status: 500, body: { error: { message: 'boom' } } } });
+    const { adapter } = buildBitbucketAdapter();
+
+    await expect(adapter.getFileHistory?.(OWNER, REPO, 'src/main.ts', 'main', 5)).rejects.toThrow();
+  });
+});
