@@ -90,12 +90,47 @@ describe('buildFileHistoryBlock', () => {
     expect(result).not.toContain('x'.repeat(201));
   });
 
-  it('truncates when over 4000 chars total', () => {
-    const longFileList = Array.from({ length: 30 }, () => 'src/very-long-file-name-that-exceeds-typical-length.ts');
-    const entries = Array.from({ length: 5 }, () => entry({ message: 'fix', files: longFileList }));
+  // WR-08 (34-REVIEW): a per-entry file-list cap plus skip-don't-break, so one wide-refactor commit
+  // can no longer swallow the whole appendix.
+  it('WR-08: caps the per-entry other-files list at 10 paths and reports the overflow', () => {
+    const files = Array.from({ length: 25 }, (_, i) => `src/f${i}.ts`);
+    const result = buildFileHistoryBlock([entry({ message: 'wide refactor', files })]);
+    expect(result).toContain('src/f9.ts, +15 more');
+    expect(result).not.toContain('src/f10.ts');
+  });
+
+  it('WR-08: an oversized entry is SKIPPED, not `break`ed on — later entries that fit still render', () => {
+    // 10 paths of 500 chars each: past the per-entry cap in length, so this ONE line blows the
+    // 4,000-char total on the first iteration. Before the fix the loop `break`ed here and the whole
+    // block degenerated to nothing but the truncation note.
+    const hugeFiles = Array.from({ length: 10 }, (_, i) => `src/${'d'.repeat(500)}/${i}.ts`);
+    const result = buildFileHistoryBlock([
+      entry({ hash: 'aaa1111', message: 'wide refactor', files: hugeFiles }),
+      entry({ hash: 'bbb2222', message: 'small fix', files: ['src/a.ts'] }),
+      entry({ hash: 'ccc3333', message: 'another small fix', files: ['src/b.ts'] }),
+    ]);
+
+    expect(result).not.toContain('aaa1111');
+    expect(result).toContain('2. bbb2222 — small fix — Other files changed: src/a.ts');
+    expect(result).toContain('3. ccc3333 — another small fix — Other files changed: src/b.ts');
+    expect(result).toContain('[NOTE: File history truncated — some entries omitted for length.]');
+  });
+
+  it('WR-08: emits the truncation note at most once and honors the 4000-char cap including newlines', () => {
+    const hugeFiles = Array.from({ length: 10 }, (_, i) => `src/${'d'.repeat(500)}/${i}.ts`);
+    const entries = Array.from({ length: 5 }, (_, i) =>
+      entry({ hash: `hash${i}00`, message: 'fix', files: hugeFiles }),
+    );
     const result = buildFileHistoryBlock(entries);
-    expect(result).toContain('[NOTE: File history truncated — remaining entries omitted for length.]');
-    expect(result.split('\n').length).toBeLessThanOrEqual(6);
+    expect(result).toBe('[NOTE: File history truncated — some entries omitted for length.]');
+    expect(result.length).toBeLessThanOrEqual(4_000);
+  });
+
+  it('WR-08: a full block stays within the 4000-char cap once the joining newlines are counted', () => {
+    const files = Array.from({ length: 10 }, (_, i) => `src/${'p'.repeat(60)}/${i}.ts`);
+    const entries = Array.from({ length: 12 }, (_, i) => entry({ hash: `hash${i}00`, message: 'fix', files }));
+    const result = buildFileHistoryBlock(entries);
+    expect(result.length).toBeLessThanOrEqual(4_000);
   });
 
   it('sanitizes control characters in message', () => {
