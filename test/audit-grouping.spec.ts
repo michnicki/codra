@@ -14,7 +14,7 @@ const ev = (stage: JobAuditEvent['stage'], timestamp = '2026-01-01T00:00:00Z') =
   ({ stage, timestamp } as unknown as JobAuditEvent);
 
 describe('STAGE_ORDER', () => {
-  it('is the fixed fourteen-stage order including learned_rule_suppressed, suggestion_dropped, rounds, threads, critic, ensemble, walkthrough, and inline_comment_skipped', () => {
+  it('is the fixed seventeen-stage order including learned_rule_suppressed, suggestion_dropped, rounds, threads, critic, ensemble, walkthrough, cross_file_security, inline_comment_skipped, and the `other` catch-all', () => {
     expect(STAGE_ORDER).toEqual([
       // WR-03 gave these two previously-homeless schema stages a display group.
       'yaml_config_parse_failed',
