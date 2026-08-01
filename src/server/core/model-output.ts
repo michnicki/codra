@@ -633,6 +633,12 @@ function sanitizeMermaidLabels(source: string): string {
     if (source[i] === '[' && source[i + 1] === '"') {
       let close = -1;
       for (let j = i + 2; j < source.length - 1; j++) {
+        // WR-02: a Mermaid label token NEVER spans lines. Without this bound the close-scan ran to
+        // the end of the whole document, so an unterminated `["` anywhere (including in prose that
+        // Mermaid treats as message/note text) swallowed everything up to the NEXT line's `"]` and
+        // rewrote a previously-valid label -- violating the "outside a span is copied verbatim" /
+        // "a token with no valid close is copied verbatim" invariants documented above.
+        if (source[j] === '\n') break;
         if (source[j] === '"' && source[j + 1] === ']') {
           close = j;
           break;
