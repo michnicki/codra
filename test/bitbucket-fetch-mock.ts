@@ -76,6 +76,18 @@ export type BitbucketFetchMockOptions = {
    * byte-identical (NREG-01).
    */
   fileHistoryResponses?: BitbucketMockResponse;
+  /**
+   * PRD-06 (FR-131): response for GET /2.0/workspaces/{workspace}/search/code (the workspace-scoped
+   * code search backing `grep_repo`). `status` defaults to 200; `body` carries the swagger's
+   * `{ values: [{ file: { path }, content_matches: [{ lines: [{ line, segments: [{ text }] }] }] }] }`
+   * shape. Use `status: 401 | 403 | 404 | 429` to drive the `null` capability-unavailable branches,
+   * `400` for the empty-array malformed-query branch, and `500` for the rethrow branch.
+   *
+   * Registered ONLY when supplied, so every other spec's route table is byte-identical (NREG-01) —
+   * the same discipline `fileHistoryResponses` uses. Without the fixture the terminal 404 answers,
+   * which would look like "search not enabled for this workspace" rather than an unrouted call.
+   */
+  codeSearchResponses?: BitbucketMockResponse;
 };
 
 // Concrete author fixtures for the comment-primitive specs (review F6). Three DISTINCT string
@@ -212,6 +224,14 @@ export function installBitbucketFetchMock(options: BitbucketFetchMockOptions = {
     // byte-identical (NREG-01); the terminal 404 covers the unregistered case.
     if (method === 'GET' && options.fileHistoryResponses && /\/2\.0\/repositories\/[^/]+\/[^/]+\/commits\/[^/]+$/.test(url.pathname)) {
       return toResponse(options.fileHistoryResponses);
+    }
+    // PRD-06 (FR-131): GET /2.0/workspaces/{workspace}/search/code. The `search_query`/`pagelen`
+    // operands ride the query string (the recorder preserves pathname + search, so a spec can assert
+    // the URL-encoded query and the clamped pagelen). Registered ONLY when the fixture is supplied so
+    // every other spec's route table is byte-identical (NREG-01); the terminal 404 covers the
+    // unregistered case. Anchored with `$` so no other /workspaces/ route can be shadowed.
+    if (method === 'GET' && options.codeSearchResponses && /^\/2\.0\/workspaces\/[^/]+\/search\/code$/.test(url.pathname)) {
+      return toResponse(options.codeSearchResponses);
     }
     // PROV-02 (R-4): raw multi-page listRawPullRequestComments. MUST be checked BEFORE the existing
     // `listPullRequestComments` route below because the raw consumer wants control over the page

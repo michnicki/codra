@@ -7,7 +7,9 @@ import type {
   PrComment,
   ReportAnnotation,
 } from '@shared/bitbucket';
-import type { VcsPullRequest } from '@server/vcs/types';
+// PRD-06 (FR-131): `VcsCodeSearchHit` is imported, never re-declared — `searchCode`'s return type IS
+// the seam's return type (vcs/types.ts) rather than a parallel shape that could drift from it.
+import type { VcsCodeSearchHit, VcsPullRequest } from '@server/vcs/types';
 import type { BotIdentityResolver } from '@server/core/bot-identity';
 // Phase 34 (PRD-04 / FR-114): Wave-1 contract from @shared/schema (34-01). Imported, never
 // re-defined — the shape is shared with the prompt builder and both providers' adapters.
@@ -161,6 +163,22 @@ function workspaceHooksPath(workspace: string) {
   return `/workspaces/${encodeURIComponent(workspace)}/hooks`;
 }
 
+// PRD-06 (FR-131): the WORKSPACE-scoped code-search collection. Bitbucket's code search is scoped to
+// a workspace, not a repository — the repository is narrowed with a `repo:` qualifier inside
+// `search_query` instead. Atlassian's changelog also names a repo-scoped
+// `/repositories/{workspace}/{repo_slug}/search/code`, but it is ABSENT from the public swagger and
+// is deprecated on the same schedule, so it is deliberately not wired (35-RESEARCH.md R-6).
+function workspaceSearchCodePath(workspace: string) {
+  return `/workspaces/${encodeURIComponent(workspace)}/search/code`;
+}
+
+// PRD-06 (D-07): the ref LABEL every code-search hit carries. A fixed string, not a resolved branch
+// name: Bitbucket indexes the workspace's default-branch content, and resolving the real branch name
+// would cost a second subrequest per grep for a string the model only uses as a staleness warning.
+// The executor renders it as `repository default branch (default branch)`. Symmetric with
+// `GITHUB_CODE_SEARCH_REF_LABEL` in core/github.ts — do not "improve" either into an extra API call.
+const BITBUCKET_CODE_SEARCH_REF_LABEL = 'default branch';
+
 /**
  * Segment-wise path encoding for the `/src/{ref}/{path}` family. `encodeURIComponent` over a WHOLE
  * slash-bearing path would percent-encode the slashes and collapse `src/server/x.ts` into a single
@@ -202,35 +220,59 @@ export class BitbucketClient {
     body?: unknown,
     accept = 'application/json',
   ): Promise<Response> {
-    return withRetry(`${method} ${path}`, async () => {
-      this.tracker?.incrementSubrequests(1);
-      const response = await withTimeout(`Bitbucket ${method} ${path}`, BITBUCKET_TIMEOUT_MS, (signal) =>
-        globalThis.fetch(`${BITBUCKET_API_BASE_URL}${path}`, {
-          method,
-          signal,
-          headers: {
-            Accept: accept,
-            Authorization: `Bearer ${this.token}`,
-            'User-Agent': this.env.BOT_USERNAME ?? 'codra-bot',
-            ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
-          },
-          body: body === undefined ? undefined : JSON.stringify(body),
-        }),
+    return withRetry(`${method} ${path}`, () => this.requestOnce(method, path, body, accept));
+  }
+
+  /**
+   * PRD-06 (FR-131): exactly ONE attempt of `request()` — byte-identical headers, timeout,
+   * subrequest tracking and `BitbucketError`-on-any-non-2xx behavior, with the `withRetry` wrapper
+   * lifted out. `request()` is now this method wrapped in `withRetry`, so every existing caller's
+   * behavior is unchanged; this is a pure extraction, not a new transport path.
+   *
+   * WHY IT EXISTS: `searchCode` must NOT retry (see its own doc block). `withRetry` retries a 429
+   * and any 5xx with a 2s/4s backoff, which on a DEPRECATED endpoint with no documented numeric
+   * rate limit would spend the invocation's remaining subrequest budget on a refusal that cannot
+   * clear inside one job (T-35-12). Keeping `request()` intact for the ~40 methods that DO want
+   * retry, and opting out here, is the Bitbucket equivalent of `GitHubClient.searchCode`'s
+   * documented `withRetry` omission — on that client `request()` is already retry-free and each
+   * method opts IN, so the opt-out has to be explicit on this one.
+   *
+   * Do NOT route ordinary reads through this method: a transient 429/5xx on a normal call SHOULD be
+   * retried, and this method deliberately gives that up.
+   */
+  private async requestOnce(
+    method: string,
+    path: string,
+    body?: unknown,
+    accept = 'application/json',
+  ): Promise<Response> {
+    this.tracker?.incrementSubrequests(1);
+    const response = await withTimeout(`Bitbucket ${method} ${path}`, BITBUCKET_TIMEOUT_MS, (signal) =>
+      globalThis.fetch(`${BITBUCKET_API_BASE_URL}${path}`, {
+        method,
+        signal,
+        headers: {
+          Accept: accept,
+          Authorization: `Bearer ${this.token}`,
+          'User-Agent': this.env.BOT_USERNAME ?? 'codra-bot',
+          ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      }),
+    );
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new BitbucketError(
+        response.status,
+        errorBody,
+        path,
+        `Bitbucket API ${method} ${path} failed with ${response.status}`,
+        retryAfterMs(response),
       );
+    }
 
-      if (!response.ok) {
-        const errorBody = await response.text();
-        throw new BitbucketError(
-          response.status,
-          errorBody,
-          path,
-          `Bitbucket API ${method} ${path} failed with ${response.status}`,
-          retryAfterMs(response),
-        );
-      }
-
-      return response;
-    });
+    return response;
   }
 
   /**
@@ -448,6 +490,153 @@ export class BitbucketClient {
       files: [], // Bitbucket Cloud commit-list endpoint omits the file manifest
       filesAvailable: false, // Tells prompt builder to render "(files list not available)"
     }));
+  }
+
+  /**
+   * PRD-06 (FR-131, D-05): Bitbucket workspace code search, backing the agentic `grep_repo` tool.
+   *
+   * LOAD-BEARING CAVEAT, not a footnote — read this before assuming the method works:
+   *
+   *  1. **The endpoint is DEPRECATED with a REMOVAL DATE OF 2026-11-01.** Atlassian's live swagger
+   *     marks it `"deprecated": true` ("This API will be deprecated on November 1, 2026"), the
+   *     changelog gives deprecation 2026-05-01 and removal 2026-11-01, and NO replacement API has
+   *     been published. After that date this method will start returning 404 or 410, which this code
+   *     already maps to `null` — so the failure mode on removal day is a silent, correct degradation
+   *     rather than a broken job. If you are reading this after 2026-11-01, that is why `grep_repo`
+   *     is unavailable on Bitbucket, and the replacement API is the work item.
+   *  2. **Atlassian has confirmed it does NOT accept Workspace or Repository Access Tokens**
+   *     (feature request BCLOUD-22586: "We currently don't support WAT for code search"). That is
+   *     precisely and only the credential class Codra stores and sends — `resolveBitbucketBotCredential`
+   *     resolves a per-repo or per-workspace Access Token and this client sends it as a bearer token.
+   *     OAuth 2, Basic-with-app-password and `api_token` credentials DO work, so an operator using
+   *     one of those gets real matches.
+   *
+   * In practice this method is therefore expected to return `null` on most installs, and `null` is
+   * the DESIGNED degradation (D-05), not a bug: the executor flips `grepSupported` false, TELLS the
+   * model that repository-wide search is unavailable for this repository, stops offering the tool,
+   * and `read_file` carries the phase. `grep_supported: false` on a Bitbucket job is a pre-declared
+   * expected outcome of Phase 35, not a regression.
+   *
+   * Status mapping — four DISTINCT capability answers plus a rethrow, deliberately not merged:
+   *   - 401 / 403 -> `null`. The BCLOUD-22586 credential refusal.
+   *   - 404       -> `null`. The DOCUMENTED "search is not enabled for the requested workspace",
+   *                  which is a capability answer and not an error. (Also what removal will look like.)
+   *   - 429       -> `null`. Rate limiting. The capability stands DOWN for the rest of the invocation
+   *                  instead of retrying an endpoint with no documented numeric limit (T-35-12).
+   *   - 400       -> `[]`. A malformed query (reason key at `error.data.key`) is a QUERY problem, not
+   *                  a capability problem; returning `null` would kill grep_repo for the whole run
+   *                  over one bad query.
+   *   - anything else, INCLUDING 5xx -> rethrow, so a genuine Bitbucket outage is never reported to
+   *                  an operator (or to the model) as "search unavailable for this workspace" (T-35-13).
+   *
+   * Issued through `requestOnce`, NOT `request`: no retry (see `requestOnce`'s own doc block). One
+   * subrequest per call, self-incremented there — never increment the tracker here as well.
+   */
+  async searchCode(
+    workspace: string,
+    repo: string,
+    query: string,
+    maxHits: number,
+  ): Promise<VcsCodeSearchHit[] | null> {
+    // T-35-07: the repository-scoping qualifier is built from the PINNED repo slug the job already
+    // resolved and is NEVER model-supplied. `query` is the only model-supplied part, and it arrives
+    // already length-clamped and newline-stripped by the executor (AGENTIC_MAX_QUERY_CHARS = 120).
+    const searchQuery = `${query} repo:${repo}`;
+    // Bitbucket's `pagelen` is a closed 1..100 range. Sent EXPLICITLY because the provider default is
+    // 10 — omitting it would silently cap every grep at 10 hits regardless of AGENTIC_MAX_GREP_HITS.
+    const pagelen = Math.min(Math.max(maxHits, 1), 100);
+    const path =
+      `${workspaceSearchCodePath(workspace)}` +
+      `?search_query=${encodeURIComponent(searchQuery)}&pagelen=${pagelen}`;
+
+    let response: Response;
+    try {
+      response = await this.requestOnce('GET', path);
+    } catch (error) {
+      // `requestOnce` throws BitbucketError on ANY non-2xx, so the status branches have to be
+      // resolved HERE, before the error escapes into the executor's fail-open path.
+      if (!(error instanceof BitbucketError)) {
+        // A timeout or a transport failure. Not a capability answer — let it propagate.
+        throw error;
+      }
+      if (error.status === 401 || error.status === 403) {
+        // BCLOUD-22586: the stored Access Token cannot call this endpoint at all. The expected
+        // steady state on this deployment.
+        return null;
+      }
+      if (error.status === 404) {
+        // Documented: "Search is not enabled for the requested workspace." Also what the
+        // 2026-11-01 removal will look like on the wire.
+        return null;
+      }
+      if (error.status === 429) {
+        // Rate limited with no documented numeric limit to back off against. Stand the capability
+        // down for the invocation rather than spending more subrequests on it (T-35-12).
+        return null;
+      }
+      if (error.status === 400) {
+        // A malformed query, reason key at `error.data.key`. `[]` keeps the capability INTACT so the
+        // model can try a different query — this branch must never be merged into the `null` ones.
+        return [];
+      }
+      throw error;
+    }
+
+    // T-35-11: an untrusted provider payload is being flattened into a type that reaches a prompt.
+    // Only `file.path`, `line` and the `segments` text values are read, every one of them is
+    // type-checked before use, and a malformed entry is SKIPPED rather than trusted — no provider
+    // payload shape escapes this method into `core/`. `segments` is declared `unknown` on purpose so
+    // `tsc` itself forces the array guard below rather than letting a lying type erase it.
+    const data = (await response.json()) as {
+      values?: Array<{
+        file?: { path?: unknown };
+        content_matches?: Array<{ lines?: Array<{ line?: unknown; segments?: unknown }> }>;
+      }>;
+    };
+
+    const hits: VcsCodeSearchHit[] = [];
+    for (const value of data.values ?? []) {
+      const path = value?.file?.path;
+      if (typeof path !== 'string') continue;
+      for (const contentMatch of value.content_matches ?? []) {
+        for (const matchedLine of contentMatch?.lines ?? []) {
+          // Checked BEFORE the reassembly and BEFORE the push, so a `maxHits` of 0 returns an empty
+          // array rather than one hit — the `pagelen` clamp above is a REQUEST-operand clamp and
+          // must not leak into the returned array length.
+          if (hits.length >= maxHits) return hits;
+          // Bitbucket splits each matched line into segments; `match: true` marks the highlighted
+          // span, which is a UI concern the model does not need. Reassembling the plain text is all
+          // it wants. Every level of this walk is guarded (35-REVIEWS.md, Antigravity Suggestion #3):
+          // the `segments` array access is optional-chained AND array-checked (a non-array `segments`
+          // would make `.map` throw), and each segment's `text` is coalesced to '' when it is
+          // missing or not a string — otherwise `undefined` would stringify into the fragment. This
+          // matters because the agentic phase is FAIL-OPEN: a provider payload-shape change must
+          // degrade to fewer hits, never to an exception.
+          const rawSegments: unknown[] = Array.isArray(matchedLine?.segments) ? matchedLine.segments : [];
+          const fragment = rawSegments
+            .map((segment) => {
+              const text = (segment as { text?: unknown } | null)?.text;
+              return typeof text === 'string' ? text : '';
+            })
+            .join('');
+          if (fragment.trim() === '') continue;
+          hits.push({
+            path,
+            // UNTRUNCATED ON PURPOSE. The FR-132 240-bytes-per-hit bound is applied exactly once, in
+            // `core/agentic-tools.ts`'s executor, so the bound lives in ONE testable place instead of
+            // being re-implemented per adapter. Do not slice here.
+            fragment,
+            // The provider's own line number when it supplied one, `null` otherwise. A fabricated
+            // line would be worse than an absent one — the model would cite a line Bitbucket never
+            // reported. Never guess it.
+            line: typeof matchedLine?.line === 'number' ? matchedLine.line : null,
+            // D-07: the default-branch label, never a SHA and never the pull-request head.
+            ref: BITBUCKET_CODE_SEARCH_REF_LABEL,
+          });
+        }
+      }
+    }
+    return hits;
   }
 
   // QA-IDX-01 (D-09): repository metadata read, used ONLY to resolve the default branch for the index
