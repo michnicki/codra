@@ -15,7 +15,12 @@ import {
   expectBitbucketPut,
   installBitbucketFetchMock,
 } from './bitbucket-fetch-mock';
-import type { VcsSubmitReviewInput } from '@server/vcs/types';
+import {
+  AGENTIC_MAX_GREP_HITS,
+  executeAgenticLoop,
+  type AgenticLoopDeps,
+} from '@server/core/agentic-tools';
+import type { VcsCodeSearchHit, VcsSubmitReviewInput } from '@server/vcs/types';
 import type { ParsedReviewComment } from '@shared/schema';
 
 const WORKSPACE = 'acme';
@@ -1220,5 +1225,154 @@ describe('BitbucketAdapter.getInlineCommentDetails (LRN-01 coordinate contract)'
     const { adapter } = buildAdapter();
 
     expect(await adapter.getInlineCommentDetails(WORKSPACE, REPO, PR_NUMBER, '79')).toBeNull();
+  });
+});
+
+/**
+ * PRD-06 (FR-131, D-05) — `BitbucketAdapter.searchCode?()` and its per-invocation observed downgrade.
+ *
+ * The interesting behaviour here is the DOWNGRADE, because on this deployment it is the expected
+ * steady state: Bitbucket's workspace code-search endpoint does not accept the Access Token class
+ * Codra stores (BCLOUD-22586) and is removed on 2026-11-01. The flag turns that refusal from "one
+ * wasted subrequest per grep attempt" into "one wasted subrequest per job, at most".
+ */
+describe('BitbucketAdapter.searchCode (D-05 observed downgrade)', () => {
+  const hit: VcsCodeSearchHit = {
+    path: 'src/server/auth.ts',
+    fragment: 'const ALPHA = 1;',
+    line: 12,
+    ref: 'default branch',
+  };
+
+  it('is DEFINED, so optional-call feature detection resolves to a function and not undefined', () => {
+    const { adapter } = buildAdapter();
+    // This is the single assertion separating "the Bitbucket adapter implements the seam" from the
+    // wave-1 state, where `vcs.searchCode?.(...)` resolved to undefined and was coerced to null.
+    expect(typeof adapter.searchCode).toBe('function');
+  });
+
+  it('leaves the capability optimistic after a successful search — a second call reaches the client again', async () => {
+    const { adapter } = buildAdapter();
+    const clientSpy = vi
+      .spyOn(BitbucketClient.prototype, 'searchCode')
+      .mockResolvedValue([hit]);
+    try {
+      await expect(adapter.searchCode?.(WORKSPACE, REPO, 'ALPHA', 30)).resolves.toEqual([hit]);
+      await expect(adapter.searchCode?.(WORKSPACE, REPO, 'BETA', 30)).resolves.toEqual([hit]);
+
+      expect(clientSpy).toHaveBeenCalledTimes(2);
+      expect(clientSpy).toHaveBeenLastCalledWith(WORKSPACE, REPO, 'BETA', 30);
+    } finally {
+      clientSpy.mockRestore();
+    }
+  });
+
+  it('downgrades PERMANENTLY on the first null: the second call returns null WITHOUT invoking the client', async () => {
+    const { adapter } = buildAdapter();
+    const clientSpy = vi.spyOn(BitbucketClient.prototype, 'searchCode').mockResolvedValue(null);
+    try {
+      await expect(adapter.searchCode?.(WORKSPACE, REPO, 'ALPHA', 30)).resolves.toBeNull();
+      await expect(adapter.searchCode?.(WORKSPACE, REPO, 'BETA', 30)).resolves.toBeNull();
+
+      // The whole point of the flag: at most ONE subrequest is spent on an unavailable capability
+      // per invocation, not one per grep attempt (T-35-12).
+      expect(clientSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      clientSpy.mockRestore();
+    }
+  });
+
+  it('an EMPTY ARRAY does not flip the flag — zero matches is a real result, not a capability answer', async () => {
+    const { adapter } = buildAdapter();
+    const clientSpy = vi.spyOn(BitbucketClient.prototype, 'searchCode').mockResolvedValue([]);
+    try {
+      await expect(adapter.searchCode?.(WORKSPACE, REPO, 'ALPHA', 30)).resolves.toEqual([]);
+      await expect(adapter.searchCode?.(WORKSPACE, REPO, 'BETA', 30)).resolves.toEqual([]);
+
+      expect(clientSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      clientSpy.mockRestore();
+    }
+  });
+
+  it('a THROW propagates and does not flip the flag — a transport failure is not a capability answer', async () => {
+    const { adapter } = buildAdapter();
+    const clientSpy = vi
+      .spyOn(BitbucketClient.prototype, 'searchCode')
+      .mockRejectedValueOnce(new BitbucketError(500, 'boom', '/workspaces/acme/search/code', 'outage'))
+      .mockResolvedValueOnce([hit]);
+    try {
+      await expect(adapter.searchCode?.(WORKSPACE, REPO, 'ALPHA', 30)).rejects.toBeInstanceOf(BitbucketError);
+      // Still optimistic: a 5xx must not be latched as "search unavailable for this workspace".
+      await expect(adapter.searchCode?.(WORKSPACE, REPO, 'BETA', 30)).resolves.toEqual([hit]);
+
+      expect(clientSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      clientSpy.mockRestore();
+    }
+  });
+
+  it('adds NO capability flag: VcsCapabilities has the same field set as before this plan', () => {
+    const { adapter } = buildAdapter();
+    // The optional method plus the `null` return already express both the static capability and its
+    // runtime downgrade, and the executor already branches on the null. Two flags would be two
+    // sources of truth — see the `VcsCapabilities` note in vcs/types.ts.
+    expect(Object.keys(adapter.capabilities).sort()).toEqual([
+      'supportsMermaid',
+      'supportsThreadListing',
+      'supportsThreadResolution',
+    ]);
+    expect(adapter.capabilities).not.toHaveProperty('supportsCodeSearch');
+  });
+
+  /**
+   * The documented Bitbucket steady state, driven through the REAL client and the REAL executor.
+   * This case is an EXPECTED PASS, not a failure: `grep_supported: false` on a Bitbucket job is a
+   * pre-declared outcome of Phase 35 (ROADMAP success criterion 4), so a phase-gate verifier reading
+   * that value must find it declared rather than treat it as a regression.
+   */
+  it('read_file carries the phase when Bitbucket refuses search: grepSupported false, the model is told, no second attempt', async () => {
+    const mock = installBitbucketFetchMock({
+      // 403 = the BCLOUD-22586 credential refusal, the realistic live answer for a stored
+      // Workspace/Repository Access Token.
+      codeSearchResponses: { status: 403, body: { error: { message: 'search refused' } } },
+      fileContentResponses: { status: 200, body: 'export const a = 1;\n', headers: { 'content-type': 'text/plain' } },
+    });
+    const { adapter } = buildAdapter();
+
+    const turns = [
+      JSON.stringify({ action: 'grep_repo', query: 'authenticate' }),
+      JSON.stringify({ action: 'grep_repo', query: 'authorize' }),
+      JSON.stringify({ action: 'read_file', path: 'src/server/app.ts' }),
+      JSON.stringify({ action: 'done', reason: 'enough_context' }),
+    ];
+    let modelCalls = 0;
+    // Wired EXACTLY as `runAgenticContextPhase` wires it (review.ts), including the `?? null`
+    // coercion — so a chain that was never wired at all cannot satisfy this case.
+    const deps: AgenticLoopDeps = {
+      callModel: async () => turns[Math.min(modelCalls++, turns.length - 1)],
+      readFile: async (path) => adapter.getFileContent(WORKSPACE, REPO, path, HEAD_SHA),
+      searchCode: async (query) => (await adapter.searchCode?.(WORKSPACE, REPO, query, AGENTIC_MAX_GREP_HITS)) ?? null,
+      hasBudget: () => true,
+    };
+
+    const outcome = await executeAgenticLoop(deps, {
+      prTitle: 'Add auth middleware',
+      touchedPaths: ['src/server/app.ts'],
+      headSha: HEAD_SHA,
+      skipFiles: ['**/*.lock', 'dist/**'],
+    });
+
+    expect(outcome.grepSupported).toBe(false);
+    // The degradation is STATED to the model, never hidden as "zero matches" (D-05 transparency).
+    expect(outcome.context).toContain('unavailable');
+    // read_file carried the phase.
+    expect(outcome.filesRead).toBeGreaterThanOrEqual(1);
+    expect(outcome.context).toContain('export const a = 1;');
+    expect(outcome.stopReason).toBe('done');
+    // Exactly ONE search request on the wire despite two grep hops: the adapter short-circuited the
+    // second one without spending a subrequest.
+    const searchCalls = mock.calls.filter((call) => call.path.startsWith('/2.0/workspaces/'));
+    expect(searchCalls).toHaveLength(1);
   });
 });

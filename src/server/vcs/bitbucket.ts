@@ -16,6 +16,7 @@ import type { ReportAnnotation } from '@shared/bitbucket';
 import type { RepoConfig, ParsedReviewComment } from '@shared/schema';
 import type {
   VcsCapabilities,
+  VcsCodeSearchHit,
   VcsCommitEntry,
   VcsCreateStatusCheckInput,
   VcsPostAnnotationsInput,
@@ -145,6 +146,17 @@ export class BitbucketAdapter implements VcsProvider {
   // class getter so the mutable field can be read through the immutable interface shape. Plan
   // 17-02 wires the real POST /resolve plumbing behind the neutral stub.
   private threadResolutionSupported = true;
+  // PRD-06 (FR-131, D-05): the code-search capability's OBSERVED-DOWNGRADE backing field, the same
+  // mechanic as `threadResolutionSupported` above. Starts optimistic (true) and flips to false the
+  // first time the client answers `null`, after which every later call short-circuits WITHOUT
+  // spending a subrequest.
+  //
+  // Deliberately NOT exposed on `capabilities` (unlike `threadResolutionSupported`): the executor
+  // already branches on the `null` return — it sets its own `grepSupported` false, tells the model
+  // once that `grep_repo` is unavailable for this repository, and stops offering the tool. A second
+  // flag no consumer reads would be a second source of truth, which is exactly what the
+  // `VcsCapabilities` doc comment in ./types warns against.
+  private codeSearchSupported = true;
   get capabilities(): VcsCapabilities {
     return {
       supportsMermaid: false,
@@ -235,6 +247,46 @@ export class BitbucketAdapter implements VcsProvider {
     maxCommits: number,
   ): Promise<VcsCommitEntry[]> {
     return this.client.getFileHistory(owner, repo, path, ref, maxCommits);
+  }
+
+  /**
+   * PRD-06 (FR-131, D-05): repository code search backing `grep_repo`. Delegation plus ONE piece of
+   * adapter-local state — the per-invocation observed downgrade.
+   *
+   * WHY THE DOWNGRADE IS LOAD-BEARING HERE AND NOT ON GITHUB: Bitbucket's workspace code-search
+   * endpoint is DEPRECATED WITH REMOVAL ON 2026-11-01, and Atlassian has confirmed it does not
+   * accept Workspace or Repository Access Tokens (BCLOUD-22586) — the only credential class Codra
+   * stores. A `null` answer is therefore the EXPECTED STEADY STATE on this provider, not a rare
+   * refusal, so short-circuiting after the first one turns "one wasted subrequest per grep attempt"
+   * into "one wasted subrequest per job, at most" (T-35-12). The client's own doc block carries the
+   * full caveat; it is restated here so a maintainer reading the adapter does not have to open the
+   * client to learn why this method is expected to degrade.
+   *
+   * ONLY a `null` return flips the flag. An empty array is a REAL result (search ran, zero matches)
+   * and leaves the capability intact; a thrown error is a transport/5xx failure, which propagates
+   * untouched and must never be latched as "search unavailable for this workspace" (T-35-13). This
+   * is the same discipline as `resolveThread`, where only 403/404/501 flip the resolution flag.
+   *
+   * Declared with the OPTIONAL class-method form `async searchCode?(`, the shape `getFileHistory?`
+   * above uses, so it satisfies `VcsProvider.searchCode?` exactly and callers keep feature-detecting
+   * with `vcs.searchCode?.(...) ?? null`. Its PRESENCE — not a capability flag — is what tells the
+   * executor that grep_repo exists on this provider.
+   */
+  async searchCode?(
+    owner: string,
+    repo: string,
+    query: string,
+    maxHits: number,
+  ): Promise<VcsCodeSearchHit[] | null> {
+    // Downgrade short-circuit: once the capability has answered `null` once, every later call in this
+    // invocation returns `null` without a request.
+    if (!this.codeSearchSupported) return null;
+    const hits = await this.client.searchCode(owner, repo, query, maxHits);
+    if (hits === null) {
+      this.codeSearchSupported = false;
+      return null;
+    }
+    return hits;
   }
 
   // QA-IDX-01 (D-09): default-branch blob listing. Thin delegation -- three client reads, no walk
