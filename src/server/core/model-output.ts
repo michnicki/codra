@@ -279,14 +279,28 @@ function preprocessJson(json: string): string {
   return result;
 }
 
+// IN-04: the two fence operations below were re-implemented inline in the FR-153 clear clause,
+// duplicating logic `withSuggestion` already owned. Both sites now call these helpers so the two
+// copies cannot drift.
+
+/** Strip any ```suggestion / ``` fence the model wrapped around a suggestion, then trim. */
+function stripSuggestionFence(codeSuggestion: string) {
+  return codeSuggestion.replace(/```suggestion\n?|```/g, '').trim();
+}
+
+/** The prose portion of a body, dropping any redundant suggestion block the model double-output. */
+function bodyBeforeSuggestion(body: string) {
+  return body.split('```suggestion')[0].trim();
+}
+
 function withSuggestion(body: string, codeSuggestion?: string) {
   if (!codeSuggestion) return body;
 
   // Clean suggestion: remove existing fences if model added them, and trim
-  const cleanSuggestion = codeSuggestion.replace(/```suggestion\n?|```/g, '').trim();
+  const cleanSuggestion = stripSuggestionFence(codeSuggestion);
 
   // Clean body: remove any trailing redundant suggestion blocks if the model double-outputted
-  const cleanBody = body.split('```suggestion')[0].trim();
+  const cleanBody = bodyBeforeSuggestion(body);
 
   return `${cleanBody}\n\n\`\`\`suggestion\n${cleanSuggestion}\n\`\`\``;
 }
@@ -500,7 +514,10 @@ export function parseFileReviewResponse(
       // title first" was indistinguishable from "the model gave no explanation", and complete
       // findings were deleted with no user-visible trace.
       if (hasSuggestion && cleanedBody.length === 0) {
-        suggestionDropEntries.push({ path: file.path, line: line ?? null, title });
+        // IN-03: record the model's CITED line (pre-`findClosestValidLine` remap), matching the
+        // adjacent evidence accumulators' EVID-04 convention at :560/:574 — downstream analysis
+        // wants to see what the model claimed, not where the orphan remap moved it.
+        suggestionDropEntries.push({ path: file.path, line: originalLine ?? null, title });
         return null;
       }
 
@@ -511,11 +528,20 @@ export function parseFileReviewResponse(
       let codeSuggestion: string | null | undefined = hasSuggestion ? rawSuggestion : undefined;
       let commentBody = body;
       if (hasSuggestion) {
-        const cleanSuggestion = rawSuggestion.replace(/```suggestion\n?|```/g, '').trim();
+        // IN-04: shared helpers, not re-implemented regexes — `withSuggestion` owns the same logic.
+        const cleanSuggestion = stripSuggestionFence(rawSuggestion);
         if (cleanSuggestion === (finding.existing_code ?? '').trim()) {
           codeSuggestion = null;
-          commentBody = body.split('```suggestion')[0].trim();
+          commentBody = bodyBeforeSuggestion(body);
         }
+      }
+      // WR-09: the clear clause can zero the body when its leading content IS the suggestion fence.
+      // `withSuggestion('', undefined)` then returns '', which `parsedReviewCommentSchema.body`
+      // (z.string().min(1)) rejects — and that .parse() sits inside .map() with no try/catch, so a
+      // single bad finding would throw out of parseFileReviewResponse and fail the WHOLE file's
+      // review. Fall back to the title so a comment body is never empty.
+      if (commentBody.trim().length === 0) {
+        commentBody = title;
       }
 
       // Apply the deterministic severity/category engine (SEV-01/02/03/04). Category resolution is
@@ -566,26 +592,41 @@ export function parseFileReviewResponse(
       // the schema parse. The severity/category engine already saw the FULL title above.
       const truncatedTitle = title.slice(0, COMMENT_TITLE_MAX);
 
-      return parsedReviewCommentSchema.parse({
-        path: file.path,
-        line: line,
-        position,
-        severity: ruled.severity,
-        category: ruled.category,
-        title: truncatedTitle,
-        // Phase 33 (FR-153, REVIEWS R6 HIGH): pass the resolved LOCAL codeSuggestion
-        // (null/undefined/string), NOT `finding.code_suggestion` directly — the `?? undefined`
-        // collapses the cleared-null to a falsy suggestion so `withSuggestion` returns the
-        // fence-stripped commentBody unchanged.
-        body: withSuggestion(commentBody, codeSuggestion ?? undefined),
-        codeSuggestion,
-        // EVID-01 (D-15): map the model-emitted evidence into the parsed comment's existingCode field.
-        // `?? null` because parsedReviewCommentSchema.existingCode is nullable().optional().
-        existingCode: finding.existing_code ?? null,
-        // Already validated/clamped by fileReviewModelOutputSchema + normalizeFinding.
-        // Absent -> undefined, which parsedReviewCommentSchema accepts (fail-open at finalize).
-        confidence: finding.confidence_score,
-      });
+      // WR-09: fail SOFT, consistent with this module's tolerant-parse posture. This .parse() sits
+      // inside .map(), and `parseFileReviewResponse`'s only try/catch (:307-395) covers JSON
+      // extraction — so before this guard a single finding that violated
+      // parsedReviewCommentSchema threw out of the whole function and failed the ENTIRE file's
+      // review instead of dropping one comment.
+      try {
+        return parsedReviewCommentSchema.parse({
+          path: file.path,
+          line: line,
+          position,
+          severity: ruled.severity,
+          category: ruled.category,
+          title: truncatedTitle,
+          // Phase 33 (FR-153, REVIEWS R6 HIGH): pass the resolved LOCAL codeSuggestion
+          // (null/undefined/string), NOT `finding.code_suggestion` directly — the `?? undefined`
+          // collapses the cleared-null to a falsy suggestion so `withSuggestion` returns the
+          // fence-stripped commentBody unchanged.
+          body: withSuggestion(commentBody, codeSuggestion ?? undefined),
+          codeSuggestion,
+          // EVID-01 (D-15): map the model-emitted evidence into the parsed comment's existingCode field.
+          // `?? null` because parsedReviewCommentSchema.existingCode is nullable().optional().
+          existingCode: finding.existing_code ?? null,
+          // Already validated/clamped by fileReviewModelOutputSchema + normalizeFinding.
+          // Absent -> undefined, which parsedReviewCommentSchema accepts (fail-open at finalize).
+          confidence: finding.confidence_score,
+        });
+      } catch (error) {
+        // Identifiers only — never the body/suggestion/evidence (privacy posture, T-15-04-01).
+        logger.warn('Dropping a finding that failed parsedReviewCommentSchema', {
+          path: file.path,
+          line: line ?? null,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return null;
+      }
     })
     .filter((comment): comment is ParsedReviewComment => Boolean(comment));
 
