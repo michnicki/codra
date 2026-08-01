@@ -5,6 +5,11 @@ import type { BotIdentityResolver } from '@server/core/bot-identity';
 // Phase 34 (PRD-04 / FR-114): Wave-1 contract from @shared/schema (34-01). Imported, never
 // re-defined — the shape is shared with the prompt builder and both providers' adapters.
 import type { VcsCommitEntry } from '@shared/schema';
+// Phase 35 (PRD-06 / FR-131): the code-search hit shape, declared on the provider seam by 35-01.
+// Imported, never re-defined, so `searchCode`'s return type IS the seam's return type. Type-only and
+// therefore erased at runtime -- and `vcs/types.ts` has no import back from here, so the module graph
+// stays acyclic (`vcs/github.ts` -> `core/github.ts` remains the only edge between these two areas).
+import type { VcsCodeSearchHit } from '@server/vcs/types';
 
 export class GitHubError extends Error {
   constructor(
@@ -74,6 +79,18 @@ const GITHUB_TIMEOUT_MS = 30_000;
 const GITHUB_APP_INSTALL_URL_CACHE_KEY = 'github:app_installation_url';
 const GITHUB_REPOSITORIES_PER_PAGE = 100;
 const GITHUB_REPOSITORY_PAGE_LIMIT = 100;
+/** PRD-06 (FR-131): the code-search endpoint. Global, NOT under `/repos/{owner}/{repo}` -- the
+ * repository is pinned by the `repo:owner/name` qualifier inside `q` (see `GitHubClient.searchCode`). */
+const GITHUB_CODE_SEARCH_PATH = '/search/code';
+/**
+ * D-07 disclosure label carried on every code-search hit's `ref`.
+ *
+ * A LABEL, deliberately not a resolvable ref and never a SHA: GitHub indexes only the repository's
+ * DEFAULT BRANCH, so a hit can be stale relative to the pull-request head. Resolving the real
+ * default-branch name would cost a second subrequest per grep for a string the model only uses as a
+ * staleness warning, and the model re-reads at head via `read_file` when it needs exact content.
+ */
+const GITHUB_CODE_SEARCH_REF_LABEL = 'default branch';
 
 type InstallationTokenCacheRecord = {
   token: string;
@@ -559,6 +576,113 @@ export class GitHubClient {
         };
       });
     });
+  }
+
+  // PRD-06 (FR-131, D-05): repository code search backing the agentic `grep_repo` tool. ONE
+  // subrequest per call regardless of repository size -- that fixed cost is the whole reason grep_repo
+  // is API-backed rather than a fetch-and-scan, which would cost one subrequest PER FILE SCANNED and
+  // could consume the entire 50-per-invocation Cloudflare budget in a single grep.
+  //
+  // NOT WRAPPED IN `withRetry`, DELIBERATELY, unlike every sibling method on this client.
+  // `/search/code` is rate-limited to 10 requests per MINUTE per installation (a third of every other
+  // GitHub search endpoint). `withRetry` retries a 429 and any 5xx with a 2s/4s backoff, which on this
+  // endpoint would spend the invocation's remaining budget hammering a limit that cannot be cleared
+  // inside one job, and several concurrent jobs on one installation would compound it (T-35-12). A
+  // failed search degrades one tool call; it is never worth a retry storm.
+  //
+  // Uses `this.request` (NOT `requestAndCheck`) so the status is a CONTROL-FLOW SIGNAL -- the third
+  // instance of that idiom on this client, after `getRepoFileOrNull` and `updateIssueComment`.
+  // Do NOT call `tracker.incrementSubrequests` here: `request` already self-increments (:406).
+  //
+  // GITHUB-SIDE LIMITATIONS, stated here because a caller cannot infer them from the return shape:
+  //   - only the repository's DEFAULT BRANCH is indexed, so a hit can be stale relative to the
+  //     pull-request head. Every hit is labelled accordingly (D-07) and never as head content.
+  //   - only files under 384 KB are searchable at all; a larger file simply never matches.
+  //   - the 10-requests-per-minute limit is per INSTALLATION, not per repository or per job.
+  //   - the query is KEYWORD-plus-qualifier, not a regex, and is capped at 256 characters and five
+  //     boolean operators.
+  async searchCode(
+    owner: string,
+    repo: string,
+    query: string,
+    maxHits: number,
+  ): Promise<VcsCodeSearchHit[] | null> {
+    // T-35-07: the repository-scoping qualifier is built from the pinned owner/repo the job already
+    // resolved and is NEVER model-supplied; `query` is the only model-supplied part, and it arrives
+    // already length-clamped and newline-stripped by the executor (AGENTIC_MAX_QUERY_CHARS).
+    const q = `${query} repo:${owner}/${repo}`;
+    // GitHub's `per_page` is a closed 1..100 range; anything outside it is a 422.
+    const perPage = Math.min(Math.max(maxHits, 1), 100);
+    const response = await this.request(
+      `${GITHUB_CODE_SEARCH_PATH}?q=${encodeURIComponent(q)}&per_page=${perPage}`,
+      {},
+      // REQUIRED, not an optimisation: without this media type the response carries no `text_matches`
+      // key at all, so there is no fragment to show the model and the call returns nothing useful.
+      'application/vnd.github.text-match+json',
+    );
+
+    if (response.status === 403 || response.status === 429) {
+      // Rate limiting on a 10-per-minute-per-installation endpoint. `null` stands the capability DOWN
+      // for the rest of the invocation (the executor flips `grepSupported` false and tells the model),
+      // which is strictly better than spending more subrequests on a limit this job cannot clear.
+      return null;
+    }
+    if (response.status === 422) {
+      // A QUERY problem, not a capability problem: over 256 characters, more than five boolean
+      // operators, no search TERM at all (a bare `repo:o/n language:ts` is invalid), or a repository
+      // qualifier the installation token cannot access. Returning `null` here would wrongly kill
+      // grep_repo for the whole run over one bad query, so this branch returns `[]` -- capability intact.
+      //
+      // THIS IS ALSO THE DOCUMENTED BACKSTOP for the one case `AGENTIC_MAX_QUERY_CHARS = 120` cannot
+      // cover by arithmetic: 120 leaves 130 characters of owner+repo headroom under the 256-character
+      // `q` limit once ` repo:{owner}/{repo}` is appended (6 characters plus owner plus repo), and a
+      // pathological 39-character owner with a 100-character repository name exceeds that. If a future
+      // maintainer raises that constant, this branch absorbs the overflow as one degraded query rather
+      // than as a production capability outage (35-REVIEWS.md, OpenCode Suggestion #6).
+      return [];
+    }
+    if (!response.ok) {
+      // Everything else -- including 5xx -- THROWS, so a genuine GitHub outage is never reported to the
+      // operator (or to the model) as "search unavailable for this repository" (T-35-13).
+      const errText = await response.text();
+      throw new GitHubError(
+        response.status,
+        errText,
+        GITHUB_CODE_SEARCH_PATH,
+        `GitHub code search failed with ${response.status}: ${errText}`,
+      );
+    }
+
+    // T-35-11: an untrusted provider payload is being mapped into a type that reaches a prompt. Only
+    // `path` and `fragment` are read, both are type-checked before use, and a malformed entry is
+    // SKIPPED rather than trusted -- no provider payload shape escapes this method into core/.
+    const data = (await response.json()) as {
+      items?: Array<{ path?: unknown; text_matches?: Array<{ fragment?: unknown }> }>;
+    };
+    const hits: VcsCodeSearchHit[] = [];
+    for (const item of data.items ?? []) {
+      if (hits.length >= maxHits) break;
+      if (typeof item.path !== 'string') continue;
+      for (const match of item.text_matches ?? []) {
+        // Checked BEFORE the push, not after, so a `maxHits` of 0 returns an empty array rather than
+        // one hit -- the returned array never exceeds maxHits even though `per_page` clamps up to 1.
+        if (hits.length >= maxHits) break;
+        if (typeof match.fragment !== 'string') continue;
+        hits.push({
+          path: item.path,
+          // UNTRUNCATED ON PURPOSE. The FR-132 240-bytes-per-hit bound is applied exactly once, in
+          // `core/agentic-tools.ts`'s executor, so the bound lives in ONE testable place instead of
+          // being re-implemented per adapter. Do not slice here.
+          fragment: match.fragment,
+          // GitHub's text-match fragments carry NO line number. A fabricated one would be worse than
+          // an absent one -- the model would cite a line the provider never reported. Never guess it.
+          line: null,
+          // D-07: a LABEL for the prompt, not a fetchable pin, and never the pull-request head SHA.
+          ref: GITHUB_CODE_SEARCH_REF_LABEL,
+        });
+      }
+    }
+    return hits;
   }
 
   // QA-IDX-01 (D-09): repository metadata read, used ONLY to resolve the default branch for the

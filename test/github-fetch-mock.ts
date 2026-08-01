@@ -186,6 +186,19 @@ export type GitHubFetchMockFixtures = {
    * Registered ONLY when supplied, so every other spec's route table is byte-identical (NREG-01).
    */
   fileHistoryResponses?: BitbucketLikeMockResponse;
+  /**
+   * PRD-06 (FR-131): response for GET /search/code?q=...&per_page=... — the code-search endpoint
+   * backing `grep_repo`. `status` defaults to 200; `body` is the search envelope
+   * (`{ total_count, incomplete_results, items }`), returned verbatim so a spec can exercise the
+   * defensive mapping (an item with no `path`, a text match with no `fragment`, no `items` key at all).
+   *
+   * Supply `status: 403`/`429` for the rate-limit stand-down branch, `422` for the query-problem
+   * branch and `500` for the must-throw branch — the client treats those three as DISTINCT results,
+   * so a fixture that collapses them proves nothing.
+   *
+   * Registered ONLY when supplied, so every other spec's route table is byte-identical (NREG-01).
+   */
+  codeSearchResponses?: BitbucketLikeMockResponse;
 };
 
 /**
@@ -310,6 +323,20 @@ export function installGitHubFetchMock(fixtures: GitHubFetchMockFixtures) {
         return json({ message: `File history error ${status}` }, status);
       }
       return json(fixture.body ?? [], status);
+    }
+
+    // --- PRD-06 (FR-131): GET /search/code (code search backing grep_repo) ---
+    // This path lives OUTSIDE repoPrefix -- /search/code is a global endpoint that is repository-scoped
+    // only through the `repo:owner/name` qualifier inside `q` -- so it cannot collide with any
+    // repo-scoped route and its placement here is order-insensitive. Registered ONLY when the fixture
+    // is supplied, so every other spec falls through to the terminal 404 exactly as before (NREG-01).
+    if (method === 'GET' && fixtures.codeSearchResponses && url.pathname === '/search/code') {
+      const fixture = fixtures.codeSearchResponses;
+      const status = fixture.status ?? 200;
+      if (status >= 400) {
+        return json({ message: `Code search error ${status}` }, status);
+      }
+      return json(fixture.body ?? { total_count: 0, incomplete_results: false, items: [] }, status);
     }
 
     if (method === 'GET' && fixtures.branchResponse && url.pathname.startsWith(`${repoPrefix}/branches/`)) {
