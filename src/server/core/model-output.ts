@@ -30,6 +30,27 @@ function truncateJsonForLog(value: string) {
   return `${value.slice(0, MAX_LOGGED_JSON_CHARS)}... [truncated ${value.length - MAX_LOGGED_JSON_CHARS} chars]`;
 }
 
+// Model output quotes identifiers and code from a PRIVATE repo, and `logger.redact()` scrubs only by
+// key name (`api_key`, `secret`, `token`, …) plus a set of embedded-credential regexes — neither of
+// the two keys guarded with this helper (`extracted`, `parsedJson`) matches any of them, so their
+// values would otherwise be emitted to the log sink in full.
+//
+// The stringify is guarded because the sole caller sits inside a `catch` that is already reporting a
+// schema-validation failure. A throw there (circular reference, BigInt, a hostile `toJSON`) would
+// replace a useful schema error with an unrelated serialization error.
+//
+// EXPORTED purely so a test can pin the unserializable branch: it is unreachable through any public
+// entry point (the caller's `parsedJson` always comes from `JSON.parse`, which cannot produce a
+// circular reference or a BigInt). Same test-only-export rationale as `COMMENT_TITLE_MAX` below.
+export function stringifyJsonForLog(value: unknown): string {
+  try {
+    // `JSON.stringify(undefined)` returns undefined, not a string — coalesce so a string is returned.
+    return truncateJsonForLog(JSON.stringify(value) ?? String(value));
+  } catch {
+    return '[unserializable]';
+  }
+}
+
 function hasReviewKeys(input: string) {
   return /"(findings|overall_explanation|overall_correctness|overall_confidence_score|summary)"\s*:/.test(input);
 }
@@ -338,7 +359,10 @@ export function parseFileReviewResponse(
   try {
     preprocessed = preprocessJson(extracted);
   } catch (e) {
-    logger.warn('JSON preprocessing partially failed, continuing...', { extracted, error: e });
+    // `extracted` is the raw extracted model JSON — private-repo code that `logger.redact()` does
+    // not cover (it is key-name based and `extracted` is not a sensitive key). Bound it like the
+    // `preprocessed`/`repaired` sites below.
+    logger.warn('JSON preprocessing partially failed, continuing...', { extracted: truncateJsonForLog(extracted), error: e });
     preprocessed = extracted;
   }
 
@@ -404,7 +428,11 @@ export function parseFileReviewResponse(
 
     parsed = fileReviewModelOutputSchema.parse(data);
   } catch (e) {
-    logger.error('Model response failed schema validation', { parsedJson, error: e });
+    // `parsedJson` is the ENTIRE parsed model output — every finding title, body, existing_code and
+    // code_suggestion, i.e. private-repo content that `logger.redact()` does not cover by key name.
+    // `stringifyJsonForLog` is failure-safe so a serialization throw can never replace the schema
+    // error below. The key stays `parsedJson`; its logged VALUE is now a bounded string, not an object.
+    logger.error('Model response failed schema validation', { parsedJson: stringifyJsonForLog(parsedJson), error: e });
     throw new Error(`Response schema mismatch: ${e instanceof Error ? e.message : 'Check logs'}`);
   }
 
