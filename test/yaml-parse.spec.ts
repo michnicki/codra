@@ -98,6 +98,63 @@ describe('parseYaml — arrays', () => {
   });
 });
 
+// CR-02 (34-REVIEW): a trailing `# comment` on a block-sequence item used to become part of the
+// value. Zod accepts the result as a string, so the corruption was SILENT — no throw, no DB
+// fallback, no yaml_config_parse_failed event — and the mangled glob/rule went straight into
+// picomatch / the review prompt. These pin the strip on every `-` path.
+describe('parseYaml — CR-02: inline comments on block-sequence items', () => {
+  it('strips an inline comment from a plain list item', () => {
+    expect(parseYaml('review:\n  custom_rules:\n    - rule one # note')).toEqual({
+      review: { custom_rules: ['rule one'] },
+    });
+  });
+
+  it('strips an inline comment from a QUOTED list item and still unquotes it', () => {
+    const raw = ['review:', '  skip_files:', '    - "vendor/**"   # third-party', '    - "*.snap"'].join('\n');
+    expect(parseYaml(raw)).toEqual({ review: { skip_files: ['vendor/**', '*.snap'] } });
+  });
+
+  it('does NOT strip a `#` that sits inside a quoted list item', () => {
+    expect(parseYaml('items:\n  - "a # b"')).toEqual({ items: ['a # b'] });
+  });
+
+  it('strips an inline comment from an array-of-objects item line', () => {
+    const raw = ['model:', '  size_overrides:', '    - max_lines: 200 # small', '      model: "gpt-4o"'].join('\n');
+    expect(parseYaml(raw)).toEqual({ model: { size_overrides: [{ max_lines: 200, model: 'gpt-4o' }] } });
+  });
+});
+
+// CR-03 (34-REVIEW): the flow-array splitter tracked bracket depth but not quote state, so a
+// comma inside a quoted element split that element into two garbage entries with dangling
+// quotes. Same silent-corruption class as CR-02.
+describe('parseYaml — CR-03: commas inside quoted flow-array elements', () => {
+  it('keeps a comma inside a double-quoted element', () => {
+    expect(parseYaml('review:\n  custom_rules: ["Prefer const, not let", "No any"]')).toEqual({
+      review: { custom_rules: ['Prefer const, not let', 'No any'] },
+    });
+  });
+
+  it('keeps a comma inside a single-quoted element', () => {
+    expect(parseYaml("on: ['a,b', 'c']")).toEqual({ on: ['a,b', 'c'] });
+  });
+
+  it('keeps a comma inside a quoted glob', () => {
+    expect(parseYaml('review:\n  skip_files: ["a,b/**"]')).toEqual({ review: { skip_files: ['a,b/**'] } });
+  });
+
+  it('still splits on structural commas outside quotes', () => {
+    expect(parseYaml('skip_files: ["a", b, "c"]')).toEqual({ skip_files: ['a', 'b', 'c'] });
+  });
+
+  it('does not treat a bracket inside a quoted element as nesting', () => {
+    expect(parseYaml('skip_files: ["a[1],b", "c"]')).toEqual({ skip_files: ['a[1],b', 'c'] });
+  });
+
+  it('rejects an unterminated quoted element rather than mangling it', () => {
+    expect(() => parseYaml('skip_files: ["a, b]')).toThrow(/^YAML parse error:/);
+  });
+});
+
 describe('parseYaml — unsupported constructs throw "YAML parse error:"', () => {
   it('rejects multi-line block scalars (| and >)', () => {
     expect(() => parseYaml('key: |\n  multi\n  line')).toThrow(/^YAML parse error:/);
