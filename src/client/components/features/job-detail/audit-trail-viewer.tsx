@@ -13,6 +13,8 @@ interface AuditTrailViewerProps {
 // `ensemble` (one per `ensemble.voted` event) and `walkthrough` (one per `walkthrough.enrichment`
 // event) — both are synthetic display stages that wrap a single bounded aggregate.
 const STAGE_LABELS: Record<AuditStageGroup['stage'], string> = {
+  // WR-03: these two schema stages previously had no STAGE_ORDER entry and were never rendered.
+  yaml_config_parse_failed: 'Config parse failed',
   file_skipped: 'Files skipped',
   drafted: 'Drafted',
   severity_adjusted: 'Severity adjusted',
@@ -27,8 +29,12 @@ const STAGE_LABELS: Record<AuditStageGroup['stage'], string> = {
   critic: 'Critic',
   ensemble: 'Ensemble',
   walkthrough: 'Walkthrough enrichment',
+  cross_file_security: 'Cross-file security',
   // Phase 33 (PRD-01 / FR-031, D-03/D-04): posting-boundary aggregate event.
   inline_comment_skipped: 'Inline comments skipped',
+  // WR-03 catch-all: any schema stage without a dedicated display group renders here instead of
+  // being silently discarded by groupAuditByStage's STAGE_ORDER filter.
+  other: 'Other',
 };
 
 // A count pill mirroring the job-findings-list / critic-panel count-badge idiom.
@@ -439,9 +445,42 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
           {event.groupCount != null ? <MetricLine label="groups" value={String(event.groupCount)} /> : null}
         </li>
       );
-    default:
-      // drafted is handled by DraftedGroup; other variants are exhaustively handled above.
-      return null;
+    // WR-03: both variants existed in the schema but had no STAGE_ORDER entry, so
+    // `groupAuditByStage` discarded them and the viewer never rendered a row for either.
+    case 'cross_file_security':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="status" value={event.status} />
+          {event.reason ? <MetricLine label="reason" value={event.reason} /> : null}
+          {event.finding_count != null ? (
+            <MetricLine label="findings" value={String(event.finding_count)} />
+          ) : null}
+          {event.files_included != null ? (
+            <MetricLine label="files" value={String(event.files_included)} />
+          ) : null}
+        </li>
+      );
+    case 'yaml_config_parse_failed':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="reason" value={event.reason} />
+        </li>
+      );
+    default: {
+      // WR-03: the switch above is exhaustive over today's union, so TypeScript narrows `event` to
+      // the `drafted` variant here — hence the widening read. The runtime fallback below is
+      // deliberately kept for the drift case the WR-03 `other` display group exists to catch: a
+      // future schema variant added without a `case` would otherwise render as an empty group
+      // shell whose count badge disagrees with its visible rows.
+      const stage: string = (event as { stage: string }).stage;
+      // drafted is handled by DraftedGroup, so it stays a no-op here.
+      if (stage === 'drafted') return null;
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="stage" value={stage} />
+        </li>
+      );
+    }
   }
 }
 

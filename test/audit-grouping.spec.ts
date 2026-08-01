@@ -4,7 +4,7 @@ import {
   normalizeAuditDisplayStage,
   STAGE_ORDER,
 } from '@client/lib/audit-grouping';
-import type { JobAuditEvent } from '@shared/schema';
+import { jobAuditEventSchema, type JobAuditEvent } from '@shared/schema';
 
 // AUD-02 stable group-by-stage (Plan 16-02, Task 2) extended by Phases 18-19 — every
 // `rounds.*` and `threads.*` sub-variant collapses to its normalized display group. Fixtures are minimal
@@ -16,6 +16,8 @@ const ev = (stage: JobAuditEvent['stage'], timestamp = '2026-01-01T00:00:00Z') =
 describe('STAGE_ORDER', () => {
   it('is the fixed fourteen-stage order including learned_rule_suppressed, suggestion_dropped, rounds, threads, critic, ensemble, walkthrough, and inline_comment_skipped', () => {
     expect(STAGE_ORDER).toEqual([
+      // WR-03 gave these two previously-homeless schema stages a display group.
+      'yaml_config_parse_failed',
       'file_skipped',
       'drafted',
       'severity_adjusted',
@@ -31,8 +33,11 @@ describe('STAGE_ORDER', () => {
       'critic',
       'ensemble',
       'walkthrough',
+      'cross_file_security',
       // Phase 33 (PRD-01 / FR-031, D-03/D-04) appended this at the end.
       'inline_comment_skipped',
+      // WR-03 catch-all, deliberately last.
+      'other',
     ]);
   });
 });
@@ -272,6 +277,51 @@ describe('Phase 33 (PRD-01 / FR-031, D-03/D-04) — inline_comment_skipped is it
     const skipGroup = groups.find((g) => g.stage === 'inline_comment_skipped')!;
     expect(skipGroup.count).toBe(1);
     expect(skipGroup.events).toEqual([skipped]);
+  });
+});
+
+// WR-03: before the `other` catch-all existed, `normalizeAuditDisplayStage` ended in an unchecked
+// `return stage as AuditDisplayStage`, so any schema stage missing from STAGE_ORDER produced a
+// bucket the `STAGE_ORDER.filter(...)` in `groupAuditByStage` discarded without a trace — the
+// viewer's header badge (job.audit.length) then disagreed with the sum of the rendered group
+// counts. `cross_file_security` and `yaml_config_parse_failed` were both already in that state.
+// These tests are the guard: adding a schema stage without giving it a display home now fails
+// loudly here instead of silently vanishing at runtime.
+describe('WR-03 — every schema audit stage has a display home', () => {
+  // Derived from the schema itself (z.discriminatedUnion exposes `.options`), so a new variant is
+  // picked up automatically and cannot be forgotten in a hand-maintained list.
+  const SCHEMA_STAGES = jobAuditEventSchema.options.map(
+    (option) => option.shape.stage.value as JobAuditEvent['stage'],
+  );
+
+  it('derives a non-empty stage list from jobAuditEventSchema', () => {
+    expect(SCHEMA_STAGES.length).toBeGreaterThan(20);
+  });
+
+  it('normalizes every schema stage into a STAGE_ORDER entry', () => {
+    for (const stage of SCHEMA_STAGES) {
+      expect(STAGE_ORDER).toContain(normalizeAuditDisplayStage(stage));
+    }
+  });
+
+  it('routes every schema stage into exactly one rendered group (no silent drops)', () => {
+    const events = SCHEMA_STAGES.map((stage) => ev(stage));
+    const groups = groupAuditByStage(events);
+    const total = groups.reduce((sum, group) => sum + group.count, 0);
+    expect(total).toBe(events.length);
+  });
+
+  it('no schema stage falls into the `other` catch-all (each has a dedicated group or collapse)', () => {
+    const homeless = SCHEMA_STAGES.filter((stage) => normalizeAuditDisplayStage(stage) === 'other');
+    expect(homeless).toEqual([]);
+  });
+
+  it('an unknown stage collapses to `other` rather than being discarded', () => {
+    const unknown = ev('a_stage_that_does_not_exist_yet' as JobAuditEvent['stage']);
+    const groups = groupAuditByStage([unknown]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].stage).toBe('other');
+    expect(groups[0].count).toBe(1);
   });
 });
 
