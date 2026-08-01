@@ -7,15 +7,19 @@
 //   - nextPhaseAfterVerifyFixes:   verify_fixes → critic | walkthrough_enrichment | finalize
 //   - nextPhaseAfterCritic:        critic → walkthrough_enrichment | finalize
 //   - maybeRouteToWalkthroughEnrichment: walkthrough_enrichment | finalize
+//   - nextPhaseAfterPrepare:       prepare → agentic_context | review          (PRD-06, D-09)
+//   - nextPhaseAfterAgenticContext: agentic_context → review (unconditional)   (PRD-06, D-09)
 //
 // Chain order (all-v1.2-toggles-on): review → verify_fixes → critic → walkthrough_enrichment → finalize.
 
 import { describe, expect, it } from 'vitest';
-import { defaultRepoConfig, type RepoConfig } from '@shared/schema';
+import { defaultRepoConfig, repoConfigSchema, type RepoConfig } from '@shared/schema';
 import {
   maybeRouteToWalkthroughEnrichment,
+  nextPhaseAfterAgenticContext,
   nextPhaseAfterCritic,
   nextPhaseAfterCrossFileSecurity,
+  nextPhaseAfterPrepare,
   nextPhaseAfterReview,
   nextPhaseAfterVerifyFixes,
 } from '@server/core/phase-routing';
@@ -190,5 +194,46 @@ describe('phase-routing: full chain at all-v1.2-toggles-on', () => {
     expect(nextPhaseAfterCritic(allOn)).toBe('walkthrough_enrichment');
     // SEC-XDIFF-01: cross_file_security feeds into the same chain as review.
     expect(nextPhaseAfterCrossFileSecurity(allOn)).toBe('verify_fixes');
+  });
+});
+
+// ── PRD-06 (D-09/D-13): the agentic-context hop ────────────────────────────────
+
+const agenticOn = repoConfigSchema.parse({ review: { agentic_tools: { enabled: true } } });
+const agenticDefault = repoConfigSchema.parse({});
+
+describe('phase-routing: nextPhaseAfterPrepare / nextPhaseAfterAgenticContext', () => {
+  it('the toggle ships OFF, so prepare routes straight to review (NREG-01, D-13)', () => {
+    expect(agenticDefault.review.agentic_tools.enabled).toBe(false);
+    expect(nextPhaseAfterPrepare(agenticDefault)).toBe('review');
+    expect(nextPhaseAfterPrepare(defaultRepoConfig)).toBe('review');
+  });
+
+  it('routes prepare into agentic_context when the toggle is on', () => {
+    expect(nextPhaseAfterPrepare(agenticOn)).toBe('agentic_context');
+  });
+
+  it('requires the toggle to be EXACTLY true, not merely truthy-shaped', () => {
+    const missingBlock = {
+      ...defaultRepoConfig,
+      review: { ...defaultRepoConfig.review, agentic_tools: undefined },
+    } as unknown as RepoConfig;
+    expect(nextPhaseAfterPrepare(missingBlock)).toBe('review');
+  });
+
+  it('the EXIT selector returns review for BOTH toggle states, so a mid-job flip cannot strand a job', () => {
+    // The toggle gates ENTRY into the phase (nextPhaseAfterPrepare), never EXIT from it. If this
+    // selector re-checked the toggle, a repository toggled off between prepare and agentic_context
+    // would leave the in-flight job with nowhere to go and the review would never run.
+    expect(nextPhaseAfterAgenticContext(agenticOn)).toBe('review');
+    expect(nextPhaseAfterAgenticContext(agenticDefault)).toBe('review');
+    expect(nextPhaseAfterAgenticContext(defaultRepoConfig)).toBe('review');
+  });
+
+  it('pins the full D-09 chain: prepare → agentic_context → review → …', () => {
+    expect(nextPhaseAfterPrepare(agenticOn)).toBe('agentic_context');
+    expect(nextPhaseAfterAgenticContext(agenticOn)).toBe('review');
+    // and from review onward the pre-existing chain is untouched (NREG-01)
+    expect(nextPhaseAfterReview(agenticOn)).toBe('finalize');
   });
 });
