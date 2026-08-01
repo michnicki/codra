@@ -16,8 +16,12 @@ const STAGE_LABELS: Record<AuditStageGroup['stage'], string> = {
   // WR-03: these two schema stages previously had no STAGE_ORDER entry and were never rendered.
   yaml_config_parse_failed: 'Config parse failed',
   // Phase 34 WR-03/WR-07: which top-level config keys a repo's .review.yaml replaced (a WHOLESALE
-  // D-09 replacement from a PR-head-controlled file) and which it declared but the schema ignored.
+  // D-09 replacement, read from the maintainer-reviewed base branch) and which it declared but the
+  // schema ignored.
   yaml_config_applied: 'Repo config applied',
+  // quick-k31 (WR-03): the PR itself edits .review.yaml, but config comes from the base branch —
+  // the edit is inert for this review and takes effect once merged.
+  yaml_config_head_ignored: 'Repo config change ignored',
   file_skipped: 'Files skipped',
   drafted: 'Drafted',
   severity_adjusted: 'Severity adjusted',
@@ -491,7 +495,7 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
         </li>
       );
     // Phase 34 WR-03/WR-07: `replaced` is the operator-visible record of which top-level config
-    // keys the head-branch YAML overrode wholesale; `ignored` names keys the schema stripped, so a
+    // keys the base-branch YAML overrode wholesale; `ignored` names keys the schema stripped, so a
     // typo'd `reveiw:` no longer produces a silent no-op.
     case 'yaml_config_applied':
       return (
@@ -504,6 +508,18 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
           {event.ignored_keys.length > 0 ? (
             <MetricLine label="ignored" value={event.ignored_keys.join(', ')} />
           ) : null}
+        </li>
+      );
+    // quick-k31 (WR-03): this row exists so a contributor reading the audit trail learns that repo
+    // config is applied from the BASE branch — their `.review.yaml` edit did nothing for this
+    // review and takes effect once the PR is merged. `base` renders `(none)` when the fail-closed
+    // no-usable-base-SHA path produced an empty sha, which is itself the explanation.
+    case 'yaml_config_head_ignored':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="path" value={event.path} />
+          <MetricLine label="base" value={event.base_sha ? event.base_sha.slice(0, 12) : '(none)'} />
+          <MetricLine label="head" value={event.head_sha.slice(0, 12)} />
         </li>
       );
     default: {

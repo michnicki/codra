@@ -14,13 +14,16 @@ const ev = (stage: JobAuditEvent['stage'], timestamp = '2026-01-01T00:00:00Z') =
   ({ stage, timestamp } as unknown as JobAuditEvent);
 
 describe('STAGE_ORDER', () => {
-  it('is the fixed eighteen-stage order including yaml_config_applied, learned_rule_suppressed, suggestion_dropped, rounds, threads, critic, ensemble, walkthrough, cross_file_security, inline_comment_skipped, and the `other` catch-all', () => {
+  it('is the fixed nineteen-stage order including yaml_config_applied, yaml_config_head_ignored, learned_rule_suppressed, suggestion_dropped, rounds, threads, critic, ensemble, walkthrough, cross_file_security, inline_comment_skipped, and the `other` catch-all', () => {
     expect(STAGE_ORDER).toEqual([
       // WR-03 gave these two previously-homeless schema stages a display group.
       'yaml_config_parse_failed',
       // Phase 34 WR-03/WR-07 (34-REVIEW): the success-path config-resolution event, next to its
       // failure sibling.
       'yaml_config_applied',
+      // quick-k31 (WR-03): the PR edited .review.yaml but config is read from the base branch, so
+      // the edit was ignored for this review. Config resolution, hence next to its siblings.
+      'yaml_config_head_ignored',
       'file_skipped',
       'drafted',
       'severity_adjusted',

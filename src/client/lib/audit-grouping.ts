@@ -19,6 +19,9 @@ export const STAGE_ORDER = [
   // merged. Sits next to its failure sibling because both belong to config resolution, which runs
   // before file selection.
   'yaml_config_applied',
+  // quick-k31 (WR-03): the PR edited .review.yaml but config is read from the base branch, so the
+  // edit was ignored for this review. Config resolution, hence next to its two siblings.
+  'yaml_config_head_ignored',
   'file_skipped',
   'drafted',
   'severity_adjusted',

@@ -382,6 +382,53 @@ export async function recordYamlConfigApplied(
 }
 
 /**
+ * quick-k31 (WR-03): PURE builder for the `yaml_config_head_ignored` audit variant.
+ *
+ * The reviewed diff CHANGES `.review.yaml` / `.review.yml`, but `runPreparePhase` reads the config
+ * from the PR BASE branch, so the author's edit had NO effect on this review — it takes effect once
+ * the PR is merged. Without this event, a contributor editing the config in their own PR gets a
+ * review that ignored it and no explanation anywhere in the product. The event is emitted whether
+ * or not a base-branch config was found; "adding `.review.yaml` for the first time" is exactly the
+ * case where the signal matters most, and that case has no base config by definition (hence an
+ * empty `base_sha` is legal, both here and in the schema arm).
+ *
+ * Every string is bounded to `YAML_CONFIG_KEY_MAX_CHARS` because `path` is derived from a diff the
+ * PR author controls and the SHAs come from provider payloads. No I/O, never throws.
+ */
+export function buildYamlConfigHeadIgnoredEvent(
+  path: string,
+  baseSha: string,
+  headSha: string,
+): JobAuditEvent {
+  return {
+    stage: 'yaml_config_head_ignored',
+    path: path.slice(0, YAML_CONFIG_KEY_MAX_CHARS),
+    base_sha: baseSha.slice(0, YAML_CONFIG_KEY_MAX_CHARS),
+    head_sha: headSha.slice(0, YAML_CONFIG_KEY_MAX_CHARS),
+    timestamp: new Date().toISOString(),
+  };
+}
+
+/**
+ * quick-k31 (WR-03): job-level best-effort recorder for `yaml_config_head_ignored`. A VERBATIM
+ * clone of `recordYamlConfigApplied`'s shape: one `appendJobAuditEvents` in try/catch, logs a
+ * failure via `logger.warn`, NEVER rethrows — audit telemetry must never fail the prepare phase.
+ */
+export async function recordYamlConfigHeadIgnored(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  path: string,
+  baseSha: string,
+  headSha: string,
+): Promise<void> {
+  try {
+    await appendJobAuditEvents(env, jobId, [buildYamlConfigHeadIgnoredEvent(path, baseSha, headSha)]);
+  } catch (error) {
+    logger.warn(`Failed to record yaml_config_head_ignored audit event for job ${jobId}`, error);
+  }
+}
+
+/**
  * Phase 18 (RND-01..05): bounded best-effort recorder for the `rounds.*` audit variants.
  * `core/rounds.ts` builds typed events via the locked builder helpers (buildRoundsDetectedEvent
  * etc.) and the caller batches them into ONE `appendJobAuditEvents` call here. Mirrors
