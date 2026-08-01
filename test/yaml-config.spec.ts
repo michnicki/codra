@@ -13,8 +13,11 @@
 // merge for an absent YAML file, unknown-key stripping, and the .review.yaml-before-.review.yml
 // discovery ordering.
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { parseYaml } from '@server/core/yaml-parse';
+import { buildYamlConfigParseFailedEvent, recordYamlConfigParseFailed } from '@server/core/audit';
+import * as jobsModule from '@server/db/jobs';
+import { logger } from '@server/core/logger';
 import { repoConfigSchema, jobAuditEventSchema } from '@shared/schema';
 
 function auditEventFor(reason: string) {
@@ -171,5 +174,56 @@ describe('YAML config pipeline', () => {
 
     expect(config.review.on).toEqual(['opened', 'synchronize']);
     expect(config.review.skip_files).toEqual(['*.lock', 'dist/**']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 34 (34-03 Task 1): the audit builder/recorder family runPreparePhase composes.
+// The builder is pure; the recorder is best-effort / never-throws (mirrors
+// recordFileSkips — the codebase has NO emitAuditEvent, D-12). These cases fail
+// until the 34-03 Task 1 GREEN lands.
+// ---------------------------------------------------------------------------
+
+describe('Phase 34 (34-03): YAML config audit builder/recorder', () => {
+  it('builds a valid yaml_config_parse_failed event via the builder', () => {
+    const event = buildYamlConfigParseFailedEvent('Invalid YAML syntax at line 3');
+    const parsed = jobAuditEventSchema.parse(event);
+    expect(parsed.stage).toBe('yaml_config_parse_failed');
+    expect(parsed.reason).toBe('Invalid YAML syntax at line 3');
+  });
+
+  it('slices a 600-char reason to the 500-char schema bound', () => {
+    const event = buildYamlConfigParseFailedEvent('x'.repeat(600));
+    expect(event.reason).toHaveLength(500);
+    expect(jobAuditEventSchema.safeParse(event).success).toBe(true);
+  });
+
+  it('recordYamlConfigParseFailed appends via appendJobAuditEvents and never throws on a rejected write', async () => {
+    const env = { HYPERDRIVE: { connectionString: 'postgres://test' } } as any;
+    const jobId = 'job-id';
+    const appendSpy = vi
+      .spyOn(jobsModule, 'appendJobAuditEvents')
+      .mockRejectedValue(new Error('simulated audit-write failure'));
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    await expect(
+      recordYamlConfigParseFailed(env, jobId, 'Invalid YAML syntax at line 3'),
+    ).resolves.toBeUndefined();
+    expect(appendSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalled();
+    appendSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it('recordYamlConfigParseFailed appends the builder-shaped event with a stamped timestamp', async () => {
+    const env = { HYPERDRIVE: { connectionString: 'postgres://test' } } as any;
+    const jobId = 'job-id';
+    const appendSpy = vi.spyOn(jobsModule, 'appendJobAuditEvents').mockResolvedValue(undefined);
+    await recordYamlConfigParseFailed(env, jobId, 'bad yaml');
+    expect(appendSpy).toHaveBeenCalledTimes(1);
+    const passedEvent = appendSpy.mock.calls[0][2][0];
+    expect(passedEvent.stage).toBe('yaml_config_parse_failed');
+    expect(passedEvent.reason).toBe('bad yaml');
+    expect(passedEvent.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    appendSpy.mockRestore();
   });
 });

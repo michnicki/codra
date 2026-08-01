@@ -18,6 +18,7 @@ import {
   buildCriticDecisionsAuditEvent,
   buildFinalizeDropEvents,
   buildWalkthroughEnrichmentAuditEvent,
+  buildYamlConfigParseFailedEvent,
   recordCriticAudit,
   recordWalkthroughAudit,
 } from '@server/core/audit';
@@ -511,5 +512,20 @@ describe('BLOCKER 5: hand-crafted skipped event schema-validates', () => {
     };
     const parsed = jobAuditEventSchema.safeParse(event);
     expect(parsed.success).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 34 (PRD-05 / D-12): the yaml_config_parse_failed audit arm. The builder
+// (34-03 Task 1) produces the event shape locked by 34-01's schema arm; this block
+// pins it via the builder so a producer-side drift is caught at the source.
+// ---------------------------------------------------------------------------
+
+describe('buildYamlConfigParseFailedEvent (Phase 34 / PRD-05, D-12)', () => {
+  it('accepts yaml_config_parse_failed event', () => {
+    const event = buildYamlConfigParseFailedEvent('Invalid YAML syntax at line 3');
+    const parsed = jobAuditEventSchema.parse(event);
+    expect(parsed.stage).toBe('yaml_config_parse_failed');
+    expect(parsed.reason).toBe('Invalid YAML syntax at line 3');
   });
 });
