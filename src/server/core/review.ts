@@ -954,14 +954,52 @@ async function runPreparePhase(
 
   // Phase 34 (PRD-05): .review.yaml per-repo configuration discovery.
   // Gated on review.yaml_config.enabled (D-15, default false). When on, fetches
-  // .review.yaml (then .review.yml — first found wins) from the PR head, parses
-  // with the inline YAML parser, validates against the existing Zod schema, and
-  // merges at top-level key boundaries (D-09). Parse/validation failures fall
-  // back to the DB config + record a yaml_config_parse_failed audit event (D-12).
-  // No file found → no action (D-14). When the toggle is off, zero subrequests,
-  // zero behavior change (NREG-01).
+  // .review.yaml (then .review.yml — first found wins) from the PR BASE BRANCH TIP
+  // (`pr.baseSha`), parses with the inline YAML parser, validates against the existing
+  // Zod schema, and merges at top-level key boundaries (D-09). Parse/validation
+  // failures fall back to the DB config + record a yaml_config_parse_failed audit
+  // event (D-12). No file found → no action (D-14). When the toggle is off, zero
+  // subrequests, zero behavior change (NREG-01).
+  //
+  // WR-03 (quick-k31): THE BASE-BRANCH READ DELIBERATELY REVERSES THE HEAD HALF OF D-13.
+  // D-13's other half — re-read on EVERY review, never cached, first file found wins —
+  // stands unchanged. Do NOT "restore" the head read as a bug fix; it is the vector:
+  //
+  //   `pr.headSha` is a ref ANY PR AUTHOR CONTROLS, and the D-09 merge is wholesale at
+  //   top-level key boundaries. An author could commit `review: { skip_files: ["**"] }`
+  //   (or `max_comments: 0`, or `min_confidence: 1.0`) to their own branch and receive a
+  //   COMPLETED, GREEN review that examined nothing — review theater. The same file also
+  //   silently resets every operator-configured `review.*` sub-key to its Zod default
+  //   (passes.security.enabled → false, evidence.hard_drop → false, …), and that reset is
+  //   persisted to jobs.config_snapshot for every later phase.
+  //
+  //   An allow-list of "safe" sub-keys does NOT close this: `skip_files` is simultaneously
+  //   the most legitimately useful key in the file and the most effective neutering tool,
+  //   so any allow-list that keeps the feature useful keeps the bypass open.
+  //
+  //   Reading from the base branch makes the config MAINTAINER-REVIEWED CODE. An author may
+  //   still PROPOSE config changes in a PR; they take effect once merged. A contributor who
+  //   edits the file in their PR learns why it had no effect on that PR from the
+  //   `yaml_config_head_ignored` audit event emitted further below.
+  //
+  // The ref is the base branch TIP, not the merge base. Deliberate: we want the LATEST
+  // trusted config, not whatever the config looked like when the branch was cut.
   let mergedConfig = config;
-  if (config.review.yaml_config?.enabled === true && pr.headSha) {
+  // The seam type declares `baseSha: string` (non-nullable, src/server/vcs/types.ts:29) and both
+  // adapters populate it from the provider API (GitHub `pr.base.sha`, Bitbucket
+  // `destination.commit.hash`). This guard is defensive against a provider returning an EMPTY
+  // string, not against the type. It FAILS CLOSED: no usable base ref means NO config discovery
+  // at all. There is NO fallback to `pr.headSha` under any circumstance — a fail-open here would
+  // restore the exact vector the base-branch read closes.
+  const yamlConfigEnabled = config.review.yaml_config?.enabled === true;
+  const yamlConfigRef = pr.baseSha;
+  const hasUsableYamlConfigRef = typeof yamlConfigRef === 'string' && yamlConfigRef.trim().length > 0;
+  if (yamlConfigEnabled && !hasUsableYamlConfigRef) {
+    logger.warn(
+      `Skipping .review.yaml config discovery for job ${job.id}: the PR has no usable base SHA. The DB config governs this review; the PR head is NEVER used as a fallback.`,
+    );
+  }
+  if (yamlConfigEnabled && hasUsableYamlConfigRef) {
     for (const yamlPath of ['.review.yaml', '.review.yml']) {
       // WR-01 (34-REVIEW): the FETCH gets its own try/catch, separate from parse/validation.
       // A transient provider failure (GitHubError 500/403/429 after retries, TimeoutError) is an
@@ -972,7 +1010,7 @@ async function runPreparePhase(
       // Log and CONTINUE to the next candidate filename instead.
       let rawYaml: string | null;
       try {
-        rawYaml = await vcs.getFileContent(job.owner, job.repo, yamlPath, pr.headSha);
+        rawYaml = await vcs.getFileContent(job.owner, job.repo, yamlPath, yamlConfigRef);
       } catch (error) {
         logger.warn(
           `Failed to fetch ${yamlPath} for ${job.owner}/${job.repo}; trying the next candidate filename`,
@@ -1000,16 +1038,18 @@ async function runPreparePhase(
 
         // WR-03 / WR-07 (34-REVIEW): make the merge OBSERVABLE.
         //
-        // WR-03: the D-09 replacement above is WHOLESALE and the file comes from `pr.headSha` — a
-        // branch any PR author controls. A file that looks like it only adds a lint rule resets
-        // every operator-configured sub-key of the declared top-level key to its Zod default
-        // (passes.security.enabled → false, evidence.hard_drop → false, learning.learned_rules →
-        // [], …), and that reset is persisted to jobs.config_snapshot for every later phase.
-        // Naming the replaced keys in the audit trail does NOT close the tampering vector — an
-        // allow-list of safe sub-keys would reverse D-09, and reading the file from the base
-        // branch would reverse D-13 — but it makes the reset visible after the fact instead of
-        // invisible. Verified out of scope: this cannot reach command authorization
-        // (`authorizeActor` reads the webhook's DB config, not jobs.config_snapshot).
+        // WR-03: the TAMPERING VECTOR IS CLOSED by the base-branch read above — this file came
+        // from `pr.baseSha`, so its content is maintainer-reviewed code, not something the PR
+        // author can set for their own review. `replaced_keys` therefore records which top-level
+        // keys a MAINTAINER-REVIEWED config replaced. That is still worth auditing, because the
+        // D-09 replacement remains WHOLESALE: a declared top-level key reverts its unspecified
+        // sub-keys to their Zod defaults (passes.security.enabled → false, evidence.hard_drop →
+        // false, learning.learned_rules → [], …), and the merged config is persisted to
+        // jobs.config_snapshot where every later phase observes it. An operator who wonders why
+        // the security pass was off for a review can read the answer here.
+        //
+        // Verified out of scope: this cannot reach command authorization (`authorizeActor` reads
+        // the webhook's DB config, not jobs.config_snapshot).
         //
         // WR-07: `repoConfigSchema` is non-strict, so a typo'd top-level key (`reveiw:`) is
         // stripped by Zod and the merge becomes an identity — previously with no warning and no
@@ -1034,7 +1074,10 @@ async function runPreparePhase(
         const reasonText = error instanceof Error ? error.message : String(error);
         await recordYamlConfigParseFailed(env, job.id, reasonText); // best-effort, never throws (D-12)
       }
-      break; // first file FOUND wins (D-13) — parse outcome does not change the discovery stop
+      // First file FOUND wins — parse outcome does not change the discovery stop. This half of
+      // D-13 (first-found-wins, re-read every review, never cached) stands unchanged; only the
+      // head-vs-base half of D-13 was reversed (see the block comment above).
+      break;
     }
   }
   const yamlMerged = mergedConfig !== config; // captured BEFORE the reassignment below
