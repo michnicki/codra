@@ -471,12 +471,21 @@ export function parseFileReviewResponse(
       const severity = finding.priority !== undefined ? priorityMap[finding.priority] || 'P2' : 'P2';
 
       const title = cleanText(finding.title);
-      let body = cleanText(finding.body);
+      // CR-01: keep the model's OWN cleaned body around. `cleanText` flattens every newline to a
+      // space (:422), so `body.split('\n')[0]` is the ENTIRE body and the de-duplication strip
+      // below erases all of it whenever the body opens by restating its title — extremely common
+      // LLM output. The FR-153 drop clause keys off THIS value, not the strip residue, so an
+      // emptied body can never be mistaken for "the model gave no explanation".
+      const cleanedBody = cleanText(finding.body);
+      let body = cleanedBody;
 
-      // If the body starts with the title or a similar variant, strip it
+      // If the body starts with the title or a similar variant, strip it — but ONLY when something
+      // survives. The strip exists to de-duplicate a leading restatement, never to empty a body;
+      // before the guard it silently deleted complete, on-diff findings via the drop clause (CR-01).
       const bodyPrefix = cleanText(body.split('\n')[0]);
       if (bodyPrefix.toLowerCase().startsWith(title.toLowerCase()) || title.toLowerCase().startsWith(bodyPrefix.toLowerCase())) {
-        body = cleanText(body.slice(body.split('\n')[0].length));
+        const stripped = cleanText(body.slice(body.split('\n')[0].length));
+        if (stripped.length > 0) body = stripped;
       }
 
       // Phase 33 (FR-153, REVIEWS R6 HIGH): FR-153 logic runs AFTER the body-prefix strip and
@@ -486,8 +495,11 @@ export function parseFileReviewResponse(
       const hasSuggestion = typeof rawSuggestion === 'string' && rawSuggestion.trim().length > 0;
 
       // Drop clause (D-05): a comment with a non-empty suggestion but an EMPTY body is dropped and
-      // audit-tracked. `line` is resolved/non-null here (the orphan check passed above).
-      if (hasSuggestion && body.length === 0) {
+      // audit-tracked. CR-01: the predicate reads `cleanedBody` (the model's own body after
+      // cleanText) rather than `body` (the post-strip value) — otherwise "the model restated its
+      // title first" was indistinguishable from "the model gave no explanation", and complete
+      // findings were deleted with no user-visible trace.
+      if (hasSuggestion && cleanedBody.length === 0) {
         suggestionDropEntries.push({ path: file.path, line: line ?? null, title });
         return null;
       }
