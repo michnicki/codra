@@ -213,6 +213,32 @@ const DIFF_CACHE_TTL_SECONDS = 6 * 60 * 60;
 // the second pass is absorbed by a longer unit list, never by a higher per-unit cost.
 export const ESTIMATED_SUBREQUESTS_PER_FILE = 5;
 
+// PRD-04 (FR-114) / WR-04 (34-REVIEW): bounds on the prepare-phase file-history fetch loop.
+//
+// The loop's only bound used to be `hasRemainingSafeBudget(1)`, i.e. it was allowed to fetch until
+// the tracker reached MAX_SUBREQUESTS - SAFE_MARGIN (50 - 25 = 25) and reserved NOTHING for the
+// rest of the phase. But SAFE_MARGIN is not spare change: token-tracker.ts documents it as the
+// reserve for the UNTRACKED Hyperdrive queries (~15 per chunk) the tracker cannot see. After this
+// loop, prepare still runs completePreparationStep, a lease heartbeat, postWalkthroughPlaceholder
+// (a provider POST when the walkthrough is on), the check-run cosmetics update and
+// enqueueJobPhase. A 25-file PR with file_history on could therefore spend the entire safe budget
+// on history and push the invocation past the hard 50 cap -> "Too many subrequests" thrown out of
+// prepare. Recoverable (the KV map means the retry skips the fetches) but it costs a failed
+// invocation for a purely advisory feature.
+//
+// Two independent bounds, both deliberately conservative — history is CONTEXT ENRICHMENT, never
+// worth risking the phase that does the actual work:
+//
+//   RESERVE (8): stop fetching while 8 safe-budget slots remain, sized to cover the walkthrough
+//   POST + check-run update + queue send with headroom, so the tail of prepare always completes.
+//
+//   HARD CAP (10): an absolute ceiling on fetches per prepare invocation, independent of what the
+//   tracker reports. This is the bound that holds if the per-request cost is ever mis-estimated
+//   (the real client spends 1 subrequest per fetch, so the reserve alone would permit ~17).
+//   Files past the cap simply review diff-only — the documented D-05 degradation.
+const FILE_HISTORY_BUDGET_RESERVE = 8;
+const MAX_FILE_HISTORY_FETCHES_PER_PREPARE = 10;
+
 /**
  * How many files a single review chunk may process concurrently: the configured concurrency
  * level, capped only by what the invocation's remaining subrequest budget can safely cover.
@@ -1314,9 +1340,15 @@ async function runPreparePhase(
     } catch {
       // best-effort KV read; fall through to fetching
     }
+    let historyFetches = 0;
     for (const file of files) {
       if (fileHistoryMap.has(file.path)) continue;
-      if (!tracker.hasRemainingSafeBudget(1)) break; // D-05: budget cap
+      // WR-04: two bounds (see the constants above). The hard cap is checked first so it holds
+      // even if the tracker under-reports; the reserve keeps the tail of prepare (walkthrough
+      // POST, check-run update, enqueue) inside the budget.
+      if (historyFetches >= MAX_FILE_HISTORY_FETCHES_PER_PREPARE) break;
+      if (!tracker.hasRemainingSafeBudget(FILE_HISTORY_BUDGET_RESERVE)) break; // D-05: budget cap
+      historyFetches += 1; // count ATTEMPTS: a failed fetch still spent its subrequest
       try {
         // The GitHub/Bitbucket clients self-increment the tracker per request, so
         // hasRemainingSafeBudget(1) above is the correct AND only guard — never call
