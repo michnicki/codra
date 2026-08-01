@@ -260,7 +260,12 @@ async function authedFinalizePost(
 dbDescribe('POST /api/repos/bitbucket/workspaces -- WS-01 finalize endpoint (D-06/D-07)', () => {
   const env = createTestEnv();
   const app = createApp();
-  const WEBHOOK_URL = 'http://localhost/webhook/bitbucket';
+  // Must be derived from the same APP_URL the route reads (`repos.ts` builds
+  // `${c.env.APP_URL}/webhook/bitbucket`) and compares with exact string equality. Hardcoding a
+  // literal here makes the "matching hook already exists" test silently env-dependent: it only
+  // passes when APP_URL happens to be http://localhost, and fails against .env.test's
+  // https://codra.test because the mocked existing hook no longer matches the derived URL.
+  const WEBHOOK_URL = `${env.APP_URL}/webhook/bitbucket`;
 
   async function deleteWorkspaceIdentity(workspace: string) {
     await queryRows(env, `DELETE FROM vcs_workspace_credentials WHERE vcs_provider = 'bitbucket' AND workspace = $1`, [workspace]);
