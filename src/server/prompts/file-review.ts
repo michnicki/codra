@@ -165,6 +165,12 @@ const FILE_HISTORY_HARD_CAP_CHARS = 4_000;
 // 4,000-char total cap trips. 200 chars is generous for a real subject yet bounds the worst
 // single-entry contribution (T-34-02-02).
 const FILE_HISTORY_MAX_MESSAGE_CHARS = 200;
+// Per-entry cap on the OTHER-FILES list (WR-08, 34-REVIEW). Without it, one wide-refactor commit
+// (say 120 paths, ~4 KB) composed a single line that blew the 4,000-char total on the FIRST
+// iteration — and because the loop `break`ed there, the block degenerated to nothing but the
+// truncation note while entries 2-5, which would all have fitted, were never considered. 10 paths
+// is enough to convey "this commit also touched X, Y, Z" without letting one entry own the budget.
+const FILE_HISTORY_MAX_FILES_PER_ENTRY = 10;
 
 // Neutralize untrusted text before it is fenced into the prompt: strip control
 // characters (which can smuggle escape/terminal sequences), break any backtick run
@@ -216,10 +222,17 @@ export function buildFileHistoryBlock(history: VcsCommitEntry[]): string {
 
   const lines: string[] = [];
   let totalChars = 0;
+  let truncated = false;
   for (let i = 0; i < history.length; i++) {
     const entry = history[i];
+    // WR-08: bound the per-entry file list BEFORE composing the line, so a wide refactor cannot
+    // monopolize the total cap.
+    const shownFiles = entry.files.slice(0, FILE_HISTORY_MAX_FILES_PER_ENTRY).map(f => sanitizeUntrusted(f));
+    const overflow = entry.files.length - shownFiles.length;
     const filesStr = entry.files.length > 0
-      ? entry.files.map(f => sanitizeUntrusted(f)).join(', ')
+      ? overflow > 0
+        ? `${shownFiles.join(', ')}, +${overflow} more`
+        : shownFiles.join(', ')
       : entry.filesAvailable === false
         ? '(files list not available)'            // Bitbucket: provider limitation
         : '(none — only this file)';              // GitHub: commit genuinely touched only this file
@@ -229,12 +242,20 @@ export function buildFileHistoryBlock(history: VcsCommitEntry[]): string {
       ? `${msg.slice(0, FILE_HISTORY_MAX_MESSAGE_CHARS)}…`
       : msg;
     const line = `${i + 1}. ${sanitizeUntrusted(entry.hash)} — ${cappedMsg} — ${otherFilesLabel}`;
-    if (totalChars + line.length > FILE_HISTORY_HARD_CAP_CHARS) {
-      lines.push('[NOTE: File history truncated — remaining entries omitted for length.]');
-      break;
+    // WR-08: count the '\n' that `join` will add, so the rendered block honors the cap instead of
+    // drifting over it by up to history.length - 1 chars.
+    const cost = lines.length === 0 ? line.length : line.length + 1;
+    if (totalChars + cost > FILE_HISTORY_HARD_CAP_CHARS) {
+      // WR-08: SKIP the oversized entry rather than `break`ing, so older entries that still fit
+      // are rendered. The note is emitted once, after the loop.
+      truncated = true;
+      continue;
     }
     lines.push(line);
-    totalChars += line.length;
+    totalChars += cost;
+  }
+  if (truncated) {
+    lines.push('[NOTE: File history truncated — some entries omitted for length.]');
   }
   return lines.join('\n');
 }
