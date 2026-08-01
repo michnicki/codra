@@ -1,6 +1,7 @@
-import { parseCriticPruneResponse, parseFileReviewResponse, parseWalkthroughDiagram, parseWalkthroughEnrichmentResponse } from '@server/core/model-output';
+import { parseCriticPruneResponse, parseFileReviewResponse, parseWalkthroughDiagram, parseWalkthroughEnrichmentResponse, stringifyJsonForLog } from '@server/core/model-output';
 import { normalizeForEvidence } from '@server/core/evidence';
 import { truncateFileDiff, type FileDiff } from '@server/core/diff';
+import { vi } from 'vitest';
 
 describe('Model Output Parsing Deep Dive', () => {
   const mockFile: FileDiff = {
@@ -1173,5 +1174,122 @@ describe('parseWalkthroughEnrichmentResponse — Phase 20 D-05 malformedFields p
       expect(result.confidence).toBeNull();
       expect(result.effort).not.toBeNull();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// quick-gn1: raw model output must not reach the log sink unbounded.
+//
+// (1) `logger.redact()` is KEY-NAME based (api_key, secret, token, …) plus a set of
+//     embedded-credential regexes. It covers neither `parsedJson` nor `extracted`, which is exactly
+//     why those two call sites in model-output.ts have to bound their own values.
+// (2) Truncation is NOT redaction. The first MAX_LOGGED_JSON_CHARS (2,000) characters of the
+//     payload still carry real finding content from a private repo. These tests pin the BOUND —
+//     they do not claim the logged value is safe.
+// ---------------------------------------------------------------------------------------------
+describe('model-output log payload bounding (quick-gn1)', () => {
+  type Captured = Record<string, any>;
+
+  // The logger emits one JSON string per call, so reading the emitted payload means spying on
+  // console.* and re-parsing that string. (test/setup.ts replaces console.* with filtering
+  // wrappers; vi.spyOn binds to the CURRENT function, so the spy still intercepts.)
+  function captureConsole() {
+    const outputs: Captured[] = [];
+    const record = (args: any[]) => {
+      const first = args[0];
+      if (typeof first === 'string') {
+        try {
+          outputs.push(JSON.parse(first));
+        } catch {
+          // Not a JSON log line — ignore.
+        }
+      }
+    };
+    const spies = [
+      vi.spyOn(console, 'log').mockImplementation((...args: any[]) => record(args)),
+      vi.spyOn(console, 'warn').mockImplementation((...args: any[]) => record(args)),
+      vi.spyOn(console, 'error').mockImplementation((...args: any[]) => record(args)),
+    ];
+    return { outputs, restore: () => spies.forEach((s) => s.mockRestore()) };
+  }
+
+  const file: FileDiff = {
+    path: 'test.ts',
+    previousPath: null,
+    isNew: false,
+    isDeleted: false,
+    isBinary: false,
+    lineCount: 10,
+    hunks: [
+      {
+        header: '@@ -1,5 +1,5 @@',
+        lines: [
+          { kind: 'context', content: 'older', newLineNumber: 1, position: 1 },
+          { kind: 'add', content: 'new line', newLineNumber: 2, position: 2 },
+          { kind: 'context', content: 'older', newLineNumber: 3, position: 3 },
+        ],
+      },
+    ],
+  };
+
+  let cap: ReturnType<typeof captureConsole>;
+
+  beforeEach(() => {
+    cap = captureConsole();
+  });
+
+  afterEach(() => {
+    cap.restore();
+  });
+
+  it('bounds the schema-validation log payload so the tail of the model output never reaches the log', () => {
+    // Unique token parked at the END of a ~5,000-char body. Once the parsed object is serialized
+    // this token sits far past the 2,000-char cap, so its ABSENCE from the emitted line is direct
+    // evidence the payload was actually truncated rather than merely stringified.
+    const TAIL_MARKER = 'TAILMARKERq7x2v9';
+
+    // `fileReviewModelOutputSchema.findings[].title` is z.string().max(100) and `normalizeFinding`
+    // passes a long title through untouched, so a 150-char title is the cleanest way to reach a
+    // REAL schema-validation failure through the public entry point.
+    const raw = JSON.stringify({
+      findings: [
+        {
+          title: 'T'.repeat(150),
+          body: `${'B'.repeat(5000)} ${TAIL_MARKER}`,
+          priority: 1,
+          code_location: { absolute_file_path: 'test.ts', line: 2 },
+        },
+      ],
+      overall_correctness: 'patch is correct',
+      overall_explanation: 'ok',
+    });
+
+    // The thrown contract is unchanged by the logging fix.
+    expect(() => parseFileReviewResponse(raw, file)).toThrow(/Response schema mismatch/);
+
+    const entry = cap.outputs.find((o) => o.message === 'Model response failed schema validation');
+    expect(entry).toBeDefined();
+
+    // The value under the `parsedJson` key is now a bounded STRING, not a serialized object graph.
+    expect(typeof entry!.data.parsedJson).toBe('string');
+    expect(entry!.data.parsedJson.length).toBeLessThan(2_200); // 2,000 cap + truncation marker
+    expect(entry!.data.parsedJson).toContain('[truncated');
+
+    // The tail of the private-repo body never left the process.
+    expect(JSON.stringify(entry)).not.toContain(TAIL_MARKER);
+  });
+
+  it('returns a fallback marker instead of throwing for values JSON.stringify cannot serialize', () => {
+    // Direct call: this branch is NOT reachable through parseFileReviewResponse, whose `parsedJson`
+    // always comes from JSON.parse and therefore can never be circular or hold a BigInt. It is
+    // defense-in-depth for the guard sitting inside an active catch block.
+    const circular: any = { a: 1 };
+    circular.self = circular;
+
+    expect(() => stringifyJsonForLog(circular)).not.toThrow();
+    expect(stringifyJsonForLog(circular)).toBe('[unserializable]');
+
+    expect(() => stringifyJsonForLog({ n: BigInt(1) })).not.toThrow();
+    expect(stringifyJsonForLog({ n: BigInt(1) })).toBe('[unserializable]');
   });
 });
