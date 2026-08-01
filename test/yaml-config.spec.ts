@@ -18,7 +18,105 @@ import { parseYaml } from '@server/core/yaml-parse';
 import { buildYamlConfigParseFailedEvent, recordYamlConfigParseFailed } from '@server/core/audit';
 import * as jobsModule from '@server/db/jobs';
 import { logger } from '@server/core/logger';
-import { repoConfigSchema, jobAuditEventSchema } from '@shared/schema';
+import { repoConfigSchema, jobAuditEventSchema, defaultRepoConfig, type RepoConfig } from '@shared/schema';
+import { runReviewJob } from '@server/core/review';
+import { createTestEnv, generateMockDiff, hasConfiguredTestDatabaseUrl } from './helpers';
+import { findExistingJobForHead } from '@server/db/jobs';
+import { getOrCreateRepository } from '@server/db/repositories';
+import { upsertRepoConfig } from '@server/db/repo-configs';
+import { queryRows } from '@server/db/client';
+
+const sha = (char: string) => char.repeat(40);
+const OWNER = 'test-owner';
+const INSTALLATION_ID = '123';
+const PR_NUMBER = 1;
+const HEAD_SHA = sha('c');
+
+// vi.hoisted so the vi.mock factory below can reference the spy (vitest hoists mock factories
+// above the imports). The prepare-phase integration tests assert getFileContent call counts.
+const mocks = vi.hoisted(() => ({
+  getRepoFileContent: vi.fn(),
+}));
+
+vi.mock('@server/db/jobs', async (importOriginal) => {
+  const mod = await importOriginal<any>();
+  return {
+    ...mod,
+    // Concurrency admission in runReviewJob returns 'retry' when the shared test DB has too
+    // many running jobs; force the count to 0 so prepare actually runs.
+    getOtherRunningJobsCount: vi.fn().mockResolvedValue(0),
+  };
+});
+
+vi.mock('@server/services/github', () => {
+  return {
+    GitHubService: class MockGitHubService {
+      async getPullRequest() {
+        return {
+          title: 'Test PR',
+          body: 'Test Body',
+          head: { sha: HEAD_SHA, ref: 'feature' },
+          base: { sha: sha('0'), ref: 'main' },
+          user: { login: 'author' },
+        };
+      }
+      async getPullRequestDiff() {
+        return generateMockDiff([{ path: 'src/x.ts', content: 'x' }]);
+      }
+      async getCompareDiff() {
+        return '';
+      }
+      async createCheckRun() {
+        return { id: 1 };
+      }
+      async updateCheckRun() {
+        return {};
+      }
+      async createReview() {
+        return { id: 999 };
+      }
+      async findBotReviewForCommit() {
+        return null;
+      }
+      async ensureLabel() {
+        return {};
+      }
+      async addIssueLabels() {
+        return {};
+      }
+      async removeIssueLabelsIfPresent() {
+        return {};
+      }
+      async getReviewThreads() {
+        return [];
+      }
+      async resolveReviewThread() {
+        return true;
+      }
+      async getRepoFileContent(...args: any[]) {
+        return mocks.getRepoFileContent(...args);
+      }
+      async getRepoFileOrNull() {
+        return null;
+      }
+      async getBotIdentity() {
+        return { accountId: 'bot-1', login: 'codra-app' };
+      }
+      async createStatusCheck() {
+        return { ref: 'status-ref' };
+      }
+      async updateStatusCheck() {
+        return;
+      }
+      async resolveBotUserIdentity() {
+        return { accountId: 'bot-1', login: 'codra-app' };
+      }
+      async getUserRepoPermission() {
+        return 'admin';
+      }
+    },
+  };
+});
 
 function auditEventFor(reason: string) {
   return { stage: 'yaml_config_parse_failed', reason, timestamp: new Date().toISOString() };
@@ -225,5 +323,120 @@ describe('Phase 34 (34-03): YAML config audit builder/recorder', () => {
     expect(passedEvent.reason).toBe('bad yaml');
     expect(passedEvent.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     appendSpy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 34 (34-03 Task 3): prepare-phase integration — the runPreparePhase YAML block
+// composed end-to-end. DB-gated: drives the REAL runReviewJob prepare phase against a
+// mocked GitHubService whose getRepoFileContent serves (or withholds) .review.yaml.
+// Proves the D-09 merge contract through the prepare phase, config_snapshot persistence
+// (review HIGH-2), and the NREG-01 toggle-off inertness (zero getFileContent calls, zero
+// yaml_config_parse_failed audit events, byte-identical config).
+// ---------------------------------------------------------------------------
+
+const dbDescribe = hasConfiguredTestDatabaseUrl() ? describe : describe.skip;
+
+dbDescribe('Phase 34 (34-03): prepare-phase YAML config integration', () => {
+  const env = createTestEnv();
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    mocks.getRepoFileContent.mockReset();
+  });
+
+  async function seedRepoWithYamlToggle(repo: string, enabled: boolean, maxComments: number, maxFiles: number) {
+    await getOrCreateRepository(env, {
+      installationId: INSTALLATION_ID,
+      owner: OWNER,
+      repo,
+      vcsProvider: 'github',
+    });
+    const parsedJson = structuredClone(defaultRepoConfig) as RepoConfig;
+    parsedJson.review.yaml_config = { enabled };
+    parsedJson.review.max_comments = maxComments;
+    parsedJson.review.max_files = maxFiles;
+    await upsertRepoConfig(env, {
+      installationId: INSTALLATION_ID,
+      owner: OWNER,
+      repo,
+      parsedJson,
+    });
+  }
+
+  async function runPrepare(repo: string) {
+    return runReviewJob(env, {
+      deliveryId: `delivery-yaml-${Date.now()}`,
+      eventName: 'pull_request',
+      payload: {
+        action: 'opened',
+        installation: { id: INSTALLATION_ID },
+        repository: { owner: { login: OWNER }, name: repo },
+        pull_request: {
+          number: PR_NUMBER,
+          head: { sha: HEAD_SHA, ref: 'feature' },
+          base: { sha: sha('0'), ref: 'main' },
+          title: 'Test PR',
+          user: { login: 'author' },
+          draft: false,
+        },
+      },
+    } as any);
+  }
+
+  async function jobFor(repo: string) {
+    return findExistingJobForHead(env, {
+      owner: OWNER,
+      repo,
+      prNumber: PR_NUMBER,
+      commitSha: HEAD_SHA,
+      trigger: 'auto',
+    });
+  }
+
+  it('D-09 + HIGH-2: valid .review.yaml merges at top-level boundaries and persists to config_snapshot', async () => {
+    const repo = `repo-yaml-on-${Date.now()}`;
+    await seedRepoWithYamlToggle(repo, true, 10, 100); // DB review: max_comments 10, max_files 100
+    mocks.getRepoFileContent.mockImplementation(async (_o: string, _r: string, path: string) =>
+      path === '.review.yaml' ? 'review:\n  max_comments: 3' : null,
+    );
+
+    const prep = await runPrepare(repo);
+    expect(prep).toMatchObject({ action: 'next_phase', phase: 'review' });
+
+    // D-13: .review.yaml discovered first (with the PR head SHA); .review.yml never tried.
+    expect(mocks.getRepoFileContent).toHaveBeenCalledTimes(1);
+    expect(mocks.getRepoFileContent).toHaveBeenCalledWith(OWNER, repo, '.review.yaml', HEAD_SHA);
+
+    const job = await jobFor(repo);
+    // review HIGH-2: the merged config round-trips through jobs.config_snapshot so
+    // review/finalize/critic/verify-fixes observe the YAML override.
+    expect(job!.configSnapshot!.review.max_comments).toBe(3);
+    // D-09 (checker context_compliance fix): the YAML review subtree replaces the DB subtree
+    // wholesale — sub-keys the YAML omits revert to the Zod schema default (150), NOT the
+    // DB's 100. A deep merge would yield 100 and fail this assertion.
+    expect(job!.configSnapshot!.review.max_files).toBe(150);
+    // Undeclared top-level keys keep their DB values.
+    expect(job!.configSnapshot!.review.file_history.enabled).toBe(false);
+  });
+
+  it('NREG-01: toggle off produces zero getFileContent calls, byte-identical config, zero audit events', async () => {
+    const repo = `repo-yaml-off-${Date.now()}`;
+    await seedRepoWithYamlToggle(repo, false, 10, 100);
+
+    const prep = await runPrepare(repo);
+    expect(prep).toMatchObject({ action: 'next_phase', phase: 'review' });
+    expect(mocks.getRepoFileContent).not.toHaveBeenCalled();
+
+    const job = await jobFor(repo);
+    // Byte-identical: the persisted config_snapshot is exactly the seeded DB config.
+    expect(job!.configSnapshot!.review.max_comments).toBe(10);
+    expect(job!.configSnapshot!.review.max_files).toBe(100);
+    expect(job!.configSnapshot!.review.yaml_config.enabled).toBe(false);
+
+    // Zero yaml_config_parse_failed audit events on the job.
+    const rows = await queryRows<{ audit: unknown }>(env, `SELECT audit FROM jobs WHERE id = $1`, [job!.id]);
+    const stages = ((rows[0]?.audit as Array<{ stage: string }>) ?? []).map((event) => event.stage);
+    expect(stages).not.toContain('yaml_config_parse_failed');
   });
 });
