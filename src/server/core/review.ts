@@ -1440,12 +1440,20 @@ async function runReviewPhase(
   // KV-read-only — no REST fetches here, so chunk/retry invocations cost one KV
   // read at most (review HIGH-3). [] entries survive JSON.parse, so zero-history
   // files still render the D-08 "(no prior history — new file)" block.
+  //
+  // WR-05 (34-REVIEW): gated on the SAME toggle the prepare block uses. Ungated, every review
+  // invocation — one per chunk, per fresh-instance handoff, per retry — issued a KV read that can
+  // only ever miss when the feature is off, contradicting NREG-01 ("when off, zero subrequests,
+  // zero behavior change") and spending per-invocation binding budget the surrounding code treats
+  // as scarce, invisibly to the TokenTracker.
   let persistedHistory: Record<string, VcsCommitEntry[]> | null = null;
-  try {
-    const raw = await env.APP_KV.get(`file-history:${job.id}`, 'text');
-    if (raw) persistedHistory = JSON.parse(raw) as Record<string, VcsCommitEntry[]>;
-  } catch {
-    // best-effort: no history on KV failure (fail-open, D-06)
+  if (config.review.file_history?.enabled === true) {
+    try {
+      const raw = await env.APP_KV.get(`file-history:${job.id}`, 'text');
+      if (raw) persistedHistory = JSON.parse(raw) as Record<string, VcsCommitEntry[]>;
+    } catch {
+      // best-effort: no history on KV failure (fail-open, D-06)
+    }
   }
   const totalLineCount = files.reduce((sum, file) => sum + file.lineCount, 0);
   const { concurrencyLevel } = await getReviewSettings(env);
