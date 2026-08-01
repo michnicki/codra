@@ -64,7 +64,11 @@ const EMBEDDED_SECRET_PATTERNS: RegExp[] = [
   /ATCTT[A-Za-z0-9_=-]{20,}/g, // Bitbucket app passwords / access tokens
 ];
 
-function scrubEmbeddedSecrets(value: string): string {
+// EXPORTED (WR-02, 34-REVIEW) so producers of persisted, operator-visible text that never routes
+// through the logger — notably `jobs.audit` event reasons built from untrusted input — can apply
+// the same credential scrubbing the log path gets. `redact()` itself stays private: it is
+// object-shaped and key-aware, which is the wrong contract for a bare string.
+export function scrubEmbeddedSecrets(value: string): string {
   let result = value;
   for (const pattern of EMBEDDED_SECRET_PATTERNS) {
     result = result.replace(pattern, '[REDACTED]');

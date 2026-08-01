@@ -6,7 +6,7 @@ import type { DropRecord, NoiseFilterResult } from './noise-filter';
 import type { EnsembleReconciliation } from './ensemble';
 import type { EvidenceDropEntry } from './evidence';
 import type { LearnedRuleSuppressionEntry } from './learned-rules';
-import { logger } from './logger';
+import { logger, scrubEmbeddedSecrets } from './logger';
 import { redactFindingTitle } from './audit-redact';
 
 /**
@@ -292,7 +292,15 @@ export async function recordFileSkips(
 export function buildYamlConfigParseFailedEvent(reason: string): JobAuditEvent {
   return {
     stage: 'yaml_config_parse_failed',
-    reason: reason.slice(0, 500),
+    // WR-02 (34-REVIEW): the reason derives from an error raised while reading an UNTRUSTED,
+    // PR-head-controlled `.review.yaml`, and it lands in `jobs.audit` (durable), the dashboard
+    // audit-trail viewer, and the logs. The primary defense is upstream — `core/yaml-parse.ts`
+    // reports position + construct and never echoes source text (see its ERROR-MESSAGE CONTRACT).
+    // This scrub is the second layer for reasons this builder does not control (Zod messages, a
+    // future producer): it strips credential-shaped tokens in place. Scrub BEFORE the slice so a
+    // token straddling the 500-char bound cannot survive as a partial. The 500-char cap remains
+    // the secondary bound (and the schema rejects anything longer).
+    reason: scrubEmbeddedSecrets(reason).slice(0, 500),
     timestamp: new Date().toISOString(),
   };
 }

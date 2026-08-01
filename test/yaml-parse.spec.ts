@@ -155,6 +155,55 @@ describe('parseYaml — CR-03: commas inside quoted flow-array elements', () => 
   });
 });
 
+// WR-02 (34-REVIEW): `.review.yaml` is UNTRUSTED PR-head content and the thrown message travels
+// verbatim into jobs.audit (yaml_config_parse_failed.reason), the dashboard audit-trail viewer,
+// and the logs. Messages must name the POSITION and the CONSTRUCT, never echo the source text.
+describe('parseYaml — WR-02: error messages never echo source content', () => {
+  it('reports a 1-based source line number instead of the failing line text', () => {
+    // Line 3 is the offender; lines 1-2 are a comment and a blank line, which are dropped from
+    // the significant-line list but still counted for the source line number.
+    const raw = ['# header', '', 'this line has no colon'].join('\n');
+    expect(() => parseYaml(raw)).toThrow("YAML parse error: expected 'key: value' at line 3");
+  });
+
+  it('does not leak a secret-looking line that sits inside the failing document', () => {
+    const raw = ['api_token: ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 'a colonless line'].join('\n');
+    let message = '';
+    try {
+      parseYaml(raw);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toMatch(/^YAML parse error:/);
+    expect(message).not.toContain('ghp_');
+    expect(message).not.toContain('a colonless line');
+  });
+
+  it('names the construct for an unsupported scalar without echoing it', () => {
+    let message = '';
+    try {
+      parseYaml('key: &secret-anchor-name value');
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toBe('YAML parse error: unsupported anchor/alias/tag construct in a scalar value');
+    expect(message).not.toContain('secret-anchor-name');
+  });
+
+  it('reports the line number for inconsistent indentation without the line text', () => {
+    // Line 4 dedents to an indent no open block owns (3 sits between the b-block's 4 and a's 2).
+    const raw = ['a:', '  b:', '    c: 1', '   password: hunter2'].join('\n');
+    let message = '';
+    try {
+      parseYaml(raw);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toBe('YAML parse error: inconsistent indentation at line 4');
+    expect(message).not.toContain('hunter2');
+  });
+});
+
 describe('parseYaml — unsupported constructs throw "YAML parse error:"', () => {
   it('rejects multi-line block scalars (| and >)', () => {
     expect(() => parseYaml('key: |\n  multi\n  line')).toThrow(/^YAML parse error:/);

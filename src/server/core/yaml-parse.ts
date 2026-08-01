@@ -15,6 +15,14 @@
 // emits a yaml_config_parse_failed audit event. Never silent misbehavior: a mis-parse would
 // otherwise silently alter review behavior via config. Users who rely on unsupported constructs get
 // the DB config + an audit event, never a wrong config.
+//
+// ERROR-MESSAGE CONTRACT (WR-02, 34-REVIEW): a message MUST report the POSITION (1-based source
+// line) and the offending CONSTRUCT — it must NEVER echo the source text. The message travels
+// verbatim into `jobs.audit` (yaml_config_parse_failed.reason), the dashboard audit-trail viewer,
+// and the logs, and `.review.yaml` is UNTRUSTED PR-head content: echoing the failing line leaked
+// whatever a contributor put next to their syntax error (a stray `api_token: …` line, for
+// instance) into a durable, operator-visible store. AUD-01 keeps that content class out of
+// `jobs.audit`, and the phase's own PATTERNS note says "Do NOT log raw YAML (untrusted)".
 
 type Context =
   | { kind: 'object'; indent: number; obj: Record<string, unknown> }
@@ -72,7 +80,8 @@ function assertNoUnsupportedScalar(value: string): void {
   const trimmed = value.trim();
   if (trimmed === '' || trimmed.startsWith('"') || trimmed.startsWith("'")) return;
   if (trimmed.startsWith('&') || trimmed.startsWith('*') || trimmed.includes('!!')) {
-    throw new Error(`YAML parse error: unsupported anchor/alias/tag construct in scalar "${trimmed}"`);
+    // WR-02: name the CONSTRUCT, never echo the scalar. See the header note on error messages.
+    throw new Error('YAML parse error: unsupported anchor/alias/tag construct in a scalar value');
   }
 }
 
@@ -156,13 +165,20 @@ export function parseYaml(raw: string): Record<string, unknown> {
   const stack: Context[] = [{ kind: 'object', indent: -1, obj: root }];
 
   // Pre-scan into significant lines, stripping comment-only lines and trailing whitespace while
-  // preserving leading indentation for depth tracking.
-  const lines: Array<{ indent: number; text: string }> = [];
-  for (const rawLine of raw.split(/\r?\n/)) {
-    const trimmedRight = rawLine.trimEnd();
+  // preserving leading indentation for depth tracking. `line` is the 1-based ORIGINAL source line
+  // number (blank/comment lines are dropped from `lines` but still counted), so WR-02 error
+  // messages can point the operator at their file without echoing its content.
+  const sourceLines = raw.split(/\r?\n/);
+  const lines: Array<{ indent: number; text: string; line: number }> = [];
+  for (let sourceIndex = 0; sourceIndex < sourceLines.length; sourceIndex += 1) {
+    const trimmedRight = sourceLines[sourceIndex].trimEnd();
     const trimmed = trimmedRight.trim();
     if (trimmed.length === 0 || trimmed.startsWith('#')) continue;
-    lines.push({ indent: trimmedRight.length - trimmedRight.trimStart().length, text: trimmed });
+    lines.push({
+      indent: trimmedRight.length - trimmedRight.trimStart().length,
+      text: trimmed,
+      line: sourceIndex + 1,
+    });
   }
 
   const popTo = (indent: number): Context => {
@@ -179,13 +195,15 @@ export function parseYaml(raw: string): Record<string, unknown> {
   };
 
   for (let i = 0; i < lines.length; i += 1) {
-    const { indent, text } = lines[i];
+    const { indent, text, line } = lines[i];
     const next = lines[i + 1];
 
     if (text.startsWith('-')) {
       const top = popTo(indent);
       if (top.kind !== 'array' || top.indent !== indent) {
-        throw new Error(`YAML parse error: array item at indent ${indent} without a matching parent key`);
+        throw new Error(
+          `YAML parse error: array item at indent ${indent} without a matching parent key at line ${line}`,
+        );
       }
       // CR-02 (34-REVIEW): strip the inline comment ONCE, at the top of the `-` branch, so every
       // downstream path (empty item, array-of-objects, plain scalar) is covered consistently.
@@ -219,7 +237,7 @@ export function parseYaml(raw: string): Record<string, unknown> {
 
     const colon = findKeyValueColon(text);
     if (colon === -1) {
-      throw new Error(`YAML parse error: expected 'key: value' on line "${text}"`);
+      throw new Error(`YAML parse error: expected 'key: value' at line ${line}`);
     }
     const key = text.slice(0, colon).trim();
     assertValidKey(key);
@@ -233,7 +251,7 @@ export function parseYaml(raw: string): Record<string, unknown> {
     // key landing on the root means the document dedented past its open blocks (inconsistent
     // indentation).
     if (top.indent < indent && !(stack.length === 1 && indent === 0)) {
-      throw new Error(`YAML parse error: inconsistent indentation at line "${text}"`);
+      throw new Error(`YAML parse error: inconsistent indentation at line ${line}`);
     }
 
     if (rawValue === '') {
