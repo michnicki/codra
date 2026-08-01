@@ -6,6 +6,7 @@ import {
   fileReviewPassSchema,
   fileReviewRecordSchema,
   jobAuditEventSchema,
+  parseVcsCommitEntries,
   vcsCommitEntrySchema,
   defaultRepoConfig,
 } from '@shared/schema';
@@ -192,6 +193,72 @@ describe('Phase 34 (PRD-04/PRD-05): vcsCommitEntrySchema contract', () => {
     if (result.success) {
       expect(result.data.filesAvailable).toBe(false);
     }
+  });
+
+  // WR-09 (34-REVIEW): the schema is no longer decorative — parseVcsCommitEntries enforces it at
+  // the adapter-output and KV-round-trip boundaries. These pin that the contract is actually
+  // SATISFIABLE by what the producers emit (it was not: `message: z.string().min(1)` rejected the
+  // `''` both adapters legitimately produce for an empty commit subject), and that the enforcement
+  // is fail-open.
+  it('accepts the empty message both adapters legitimately produce for an empty commit subject', () => {
+    // Both adapters compute `message.split('\n')[0] ?? ''`, which is '' for a commit whose message
+    // is empty or starts with a newline — git permits both (`--allow-empty-message`).
+    const result = vcsCommitEntrySchema.safeParse({ hash: 'abc1234', message: '', files: [] });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts the EXACT shape the GitHub adapter emits (no files[] on the list-commits response)', () => {
+    // Mirrors core/github.ts getFileHistory's mapper against the real list-commits shape (CR-01).
+    const commits: Array<{ sha: string; commit: { message: string }; files?: Array<{ filename: string }> }> = [
+      { sha: 'abc1234567890abcdef', commit: { message: 'fix: resolve race\n\nbody' } },
+    ];
+    const emitted = commits.map((c) => {
+      const manifest = Array.isArray(c.files) ? c.files : null;
+      return {
+        hash: c.sha.slice(0, 7),
+        message: c.commit.message.split('\n')[0] ?? '',
+        files: (manifest ?? []).map((f) => f.filename),
+        filesAvailable: manifest !== null,
+      };
+    });
+
+    expect(parseVcsCommitEntries(emitted)).toEqual([
+      { hash: 'abc1234', message: 'fix: resolve race', files: [], filesAvailable: false },
+    ]);
+  });
+
+  it('accepts the EXACT shape the Bitbucket adapter emits', () => {
+    const values = [{ hash: 'def4567abcdef1234567', message: '' }];
+    const emitted = values.map((c) => ({
+      hash: c.hash.slice(0, 7),
+      message: c.message.split('\n')[0] ?? '',
+      files: [] as string[],
+      filesAvailable: false,
+    }));
+
+    expect(parseVcsCommitEntries(emitted)).toEqual([
+      { hash: 'def4567', message: '', files: [], filesAvailable: false },
+    ]);
+  });
+
+  it('parseVcsCommitEntries drops non-conforming entries fail-open instead of throwing', () => {
+    const drifted = [
+      { hash: 'abc1234', message: 'good', files: [] },
+      { hash: 'too-short-and-then-some', message: 'bad hash', files: [] },
+      { hash: 'def4567', message: 'bad files', files: 'not-an-array' },
+      null,
+      'nonsense',
+    ];
+
+    expect(parseVcsCommitEntries(drifted)).toEqual([
+      { hash: 'abc1234', message: 'good', files: [], filesAvailable: true },
+    ]);
+  });
+
+  it('parseVcsCommitEntries returns [] for a non-array (JSON.parse drift at the KV boundary)', () => {
+    expect(parseVcsCommitEntries(undefined)).toEqual([]);
+    expect(parseVcsCommitEntries({ not: 'an array' })).toEqual([]);
+    expect(parseVcsCommitEntries('[]')).toEqual([]);
   });
 });
 

@@ -357,6 +357,44 @@ dbDescribe('Phase 34 (34-03): prepare/review file-history pipeline', () => {
     kvGetSpy.mockRestore();
   });
 
+  // WR-09 (34-REVIEW): the KV round-trip used to be an unchecked `JSON.parse(raw) as
+  // Record<string, VcsCommitEntry[]>`. A map persisted by an earlier deploy (entries live for the
+  // 1-hour TTL) whose shape drifted surfaced as a TypeError inside buildFileHistoryBlock during
+  // prompt construction. It is now validated and drops non-conforming entries fail-open.
+  it('WR-09: drifted entries in the persisted KV map are dropped fail-open, not thrown on', async () => {
+    const repo = `repo-fh-drift-${Date.now()}`;
+    await seedRepoWithFileHistoryToggle(repo, true);
+    mocks.getFileHistory.mockResolvedValue([]);
+
+    await runPrepare(repo);
+    const job = await findExistingJobForHead(env, {
+      owner: OWNER,
+      repo,
+      prNumber: PR_NUMBER,
+      commitSha: HEAD_SHA,
+      trigger: 'auto',
+    });
+    // Simulate a cross-deploy drift: one valid entry, one missing `files`, one outright garbage.
+    await env.APP_KV.put(
+      `file-history:${job!.id}`,
+      JSON.stringify({
+        'src/x.ts': [
+          { hash: 'abc1234', message: 'fix: real', files: ['src/other.ts'], filesAvailable: true },
+          { hash: 'def4567', message: 'drifted — no files field' },
+          'not-an-entry',
+        ],
+      }),
+    );
+
+    const { result } = await runReview(repo);
+    expect(result).toMatchObject({ action: 'next_phase', phase: 'finalize' });
+    expect(mocks.reviewFileCalls.length).toBeGreaterThan(0);
+    // Only the conforming entry survived; the review completed normally.
+    expect(mocks.reviewFileCalls[0].fileHistory).toEqual([
+      { hash: 'abc1234', message: 'fix: real', files: ['src/other.ts'], filesAvailable: true },
+    ]);
+  });
+
   // The positive control for the assertion above: with the toggle ON the review phase DOES read
   // the map from KV (and only from KV — review HIGH-3 forbids re-fetching over REST).
   it('WR-05: toggle ON still issues the file-history KV read in the review phase', async () => {

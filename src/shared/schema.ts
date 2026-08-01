@@ -135,13 +135,43 @@ export const labelsSchema = z.union([
 // When filesAvailable is false the prompt builder renders a distinct message so the model can tell
 // "commit only touched this one file" from "provider didn't tell us." Defaults to true — set to
 // false only by the Bitbucket provider.
+//
+// WR-09 (34-REVIEW): this schema is now ENFORCED at runtime (see parseVcsCommitEntries below), not
+// merely used for its inferred type. `message` deliberately has NO `.min(1)`: both adapters compute
+// it as `message.split('\n')[0] ?? ''`, which is legitimately `''` for a commit whose message is
+// empty or starts with a newline (git permits both — `--allow-empty-message`). A `.min(1)` here
+// was unsatisfiable by the producers, so making the schema authoritative would have dropped
+// entries the adapters correctly produce.
 export const vcsCommitEntrySchema = z.object({
   hash: z.string().min(7).max(7),
-  message: z.string().min(1),
+  message: z.string(),
   files: z.array(z.string()),
   filesAvailable: z.boolean().default(true),
 });
 export type VcsCommitEntry = z.infer<typeof vcsCommitEntrySchema>;
+
+/**
+ * WR-09 (34-REVIEW): FAIL-OPEN validator for a commit-history list.
+ *
+ * Two boundaries need it and both used to be unchecked:
+ *   - ADAPTER OUTPUT — `vcsCommitEntrySchema` documented the contract but nothing enforced it, so
+ *     a provider-side shape drift reached the prompt builder untyped-in-practice.
+ *   - THE KV ROUND-TRIP — `JSON.parse(raw) as Record<string, VcsCommitEntry[]>` is an unchecked
+ *     cast. Any drift in a map persisted by an earlier deploy (the entries live for the 1-hour
+ *     TTL) surfaced as a TypeError inside `buildFileHistoryBlock` during prompt construction.
+ *
+ * File history is ADVISORY CONTEXT, so the posture matches D-06: drop what does not validate and
+ * keep going, never throw. A non-array input yields [].
+ */
+export function parseVcsCommitEntries(value: unknown): VcsCommitEntry[] {
+  if (!Array.isArray(value)) return [];
+  const entries: VcsCommitEntry[] = [];
+  for (const candidate of value) {
+    const result = vcsCommitEntrySchema.safeParse(candidate);
+    if (result.success) entries.push(result.data);
+  }
+  return entries;
+}
 
 export const reviewConfigSchema = z.object({
   on: z.array(z.enum(['opened', 'synchronize', 'ready_for_review', 'reopened', 'closed'])).default(['opened', 'synchronize', 'ready_for_review', 'reopened']),
