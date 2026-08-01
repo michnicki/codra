@@ -11,7 +11,7 @@ import { WALKTHROUGH_DIAGRAM_SYSTEM_PROMPT, buildWalkthroughDiagramPrompt } from
 import { WALKTHROUGH_ENRICHMENT_SYSTEM_PROMPT, buildWalkthroughEnrichmentPrompt, type EnrichmentFileEntry } from '../prompts/walkthrough-enrichment';
 import { parseFileReviewResponse, parseAnswerResponse } from '../core/model-output';
 import { truncateFileDiff, chunkFileDiff, type FileDiff } from '../core/diff';
-import type { JobAuditEvent, RepoConfig } from '@shared/schema';
+import type { JobAuditEvent, RepoConfig, VcsCommitEntry } from '@shared/schema';
 import type { TokenTracker } from '../core/token-tracker';
 import { UnparseableModelResponseError, type ModelRequestInput, type ModelResponse } from '../models/types';
 import { logger } from '../core/logger';
@@ -327,6 +327,10 @@ export class ModelService {
     // the prompt — model resolution, chunking, fallback chain, and retry classification are shared
     // (D-02: there is NO per-pass model override).
     pass?: 'main' | 'security';
+    // Phase 34 (PRD-04): per-file commit history threaded to the main-review prompt builder. The
+    // security pass ignores it (D-04 — file history is main-pass only). undefined = no history
+    // available; [] = new file (D-08 block renders). Propagated via the existing ...params spreads.
+    fileHistory?: VcsCommitEntry[];
     temperature?: number;
   }) {
     const configuredLineCap = params.config.review.max_diff_lines_per_file;
@@ -473,6 +477,9 @@ export class ModelService {
     totalLineCount: number;
     compactPrompt?: boolean;
     pass?: 'main' | 'security';
+    // Phase 34 (PRD-04): threaded to the main-review prompt builder via the inner reviewFile
+    // calls (the ...params spread in the fan-out loop carries it to every sample).
+    fileHistory?: VcsCommitEntry[];
     runs: number;
     ensembleTemperature?: number;
     // Internal: when an inner reviewFile call returns, this method may need to know the
@@ -599,6 +606,7 @@ export class ModelService {
     prDescription: string | null;
     config: RepoConfig;
     totalLineCount: number;
+    fileHistory?: VcsCommitEntry[];
     compactPrompt?: boolean;
   }): Promise<{ requestId: string; model: string; modelLineCap: number } | null> {
     const { primary } = this.selectModel({ totalLineCount: params.totalLineCount, config: params.config });
@@ -721,6 +729,8 @@ export class ModelService {
     totalLineCount: number;
     compactPrompt?: boolean;
     pass?: 'main' | 'security';
+    // Phase 34 (PRD-04): threaded to buildFileReviewPrompts below.
+    fileHistory?: VcsCommitEntry[];
     temperature?: number;
   }) {
     // The security pass swaps in buildSecurityReviewPrompts (same input shape, identical findings
@@ -728,6 +738,8 @@ export class ModelService {
     // selectModel, resolveModel, the fallback chain, adaptive timeout, tracker recording, and
     // RetryableModelError classification — is reused verbatim, so a transient failure on a
     // (file,'security') unit classifies retryable exactly like the main pass (D-01/D-02).
+    // NOTE: fileHistory is intentionally ignored by the security pass —
+    // buildSecurityReviewPrompts does not consume it (D-04: file history is main-pass only).
     const { systemPrompt, userPrompt } = params.pass === 'security'
       ? buildSecurityReviewPrompts({
           ...params,
