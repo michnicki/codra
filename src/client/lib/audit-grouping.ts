@@ -12,6 +12,9 @@ import type { JobAuditEvent } from '@shared/schema';
 // adds `ensemble` (one per `ensemble.voted` event) and `walkthrough` (one per `walkthrough.enrichment`
 // event).
 export const STAGE_ORDER = [
+  // WR-03: `yaml_config_parse_failed` (Phase 34) had NO display group, so `groupAuditByStage`
+  // dropped it silently. Config resolution runs before file selection, hence first.
+  'yaml_config_parse_failed',
   'file_skipped',
   'drafted',
   'severity_adjusted',
@@ -28,9 +31,23 @@ export const STAGE_ORDER = [
   'critic',
   'ensemble',
   'walkthrough',
+  // WR-03: `cross_file_security` had NO display group either. It is a late whole-diff pass, so it
+  // sits after walkthrough and before the posting-boundary group.
+  'cross_file_security',
   // Phase 33 (PRD-01 / FR-031, D-03/D-04): posting-boundary aggregate event; its own display
   // group (learned_rule_suppressed precedent — a DIFFERENT gate than the parse-drop groups).
   'inline_comment_skipped',
+  // WR-03 CATCH-ALL, DELIBERATELY LAST. Every `jobAuditEventSchema` stage that has no dedicated
+  // display group above lands here instead of being silently dropped by the `groupAuditByStage`
+  // filter. Before this entry existed, `normalizeAuditDisplayStage`'s unchecked
+  // `return stage as AuditDisplayStage` produced buckets whose key was not in STAGE_ORDER, and
+  // `STAGE_ORDER.filter((stage) => buckets.has(stage))` discarded them with no trace — so the
+  // viewer's header badge (`job.audit.length`) did not match the sum of the rendered group
+  // counts, and events like `cross_file_security` / `yaml_config_parse_failed` were invisible.
+  // `audit-grouping.spec.ts` asserts every schema stage literal resolves to a STAGE_ORDER entry,
+  // so a new stage still cannot be added without a display home — it just fails loudly in a test
+  // rather than vanishing at runtime.
+  'other',
 ] as const;
 
 /**
@@ -85,6 +102,10 @@ export type AuditDisplayStage = typeof STAGE_ORDER[number];
  *     line number vs. their own approved rule suppressing the finding). That is the defect G-28-4
  *     documents; the collapse branch that used to sit here was its cause.
  */
+// WR-03: the set form of STAGE_ORDER, used to validate the pass-through branch below instead of
+// asserting it with an unchecked `as`.
+const DISPLAY_STAGES: ReadonlySet<string> = new Set<string>(STAGE_ORDER);
+
 export function normalizeAuditDisplayStage(stage: JobAuditEvent['stage']): AuditDisplayStage {
   if (stage.startsWith('rounds.')) return 'rounds';
   if (stage.startsWith('threads.')) return 'threads';
@@ -95,6 +116,9 @@ export function normalizeAuditDisplayStage(stage: JobAuditEvent['stage']): Audit
   // so the aggregate event lands in the same Evidence missing group as legacy per-finding events.
   if (stage === 'evidence_missing_summary') return 'evidence_missing';
   if (stage === 'evidence_hard_dropped') return 'evidence_missing';
+  // WR-03: a stage with no dedicated group falls into the catch-all rather than producing a
+  // bucket that `groupAuditByStage`'s STAGE_ORDER filter would silently discard.
+  if (!DISPLAY_STAGES.has(stage)) return 'other';
   return stage as AuditDisplayStage;
 }
 
