@@ -94,13 +94,34 @@ export type VcsPostedComment = { path: string; line: number; body: string; link?
 
 /**
  * Phase 33 (PRD-01 / FR-031, D-03/D-04): populated when an inline comment was NOT posted during
- * `submitReview` -- a per-comment 422 skip (GitHub + Bitbucket) or budget exhaustion (GitHub's
- * per-comment fallback loop). `line` is the provider anchor coordinate (GitHub maps the client's
- * `position` via `s.position ?? null`); `title` is the finding title for audit identifiers only
- * and never reaches the wire. Consumers (Plan 33-03's aggregate audit event) admit ONLY
- * { path, line, title } -- body never crosses this seam (T-13-03-03).
+ * `submitReview` -- a per-comment 422 skip (GitHub + Bitbucket), budget exhaustion (GitHub's
+ * per-comment fallback loop), or a comment with no usable anchor at all.
+ *
+ * WR-01 -- COORDINATE SYSTEMS ARE NOT INTERCHANGEABLE ACROSS PROVIDERS (G-28-3, and see the long
+ * note on `getInlineCommentDetails` below). `line` is a HEAD-SIDE LINE NUMBER and `position` is a
+ * DIFF OFFSET; the two fields are separate because they are not the same quantity:
+ *   - Bitbucket anchors by line, so it fills `line` and leaves `position` null.
+ *   - GitHub anchors by diff position, so it fills `position` and leaves `line` null.
+ * This type previously had only `line`, and the GitHub adapter wrote its `position` into it -- so
+ * the viewer rendered "src/foo.ts:3" for a finding at POSITION 3, i.e. a fabricated line number.
+ * Do NOT re-collapse these into one field.
+ *
+ * `title` is the finding title, threaded for audit identifiers only; it never reaches the wire, and
+ * both the audit builder and the skip log statements redact it (see `redactFindingTitle`). Because
+ * that redaction maps EVERY non-empty title to a single fixed marker, the field currently carries
+ * no identifying information at either sink -- `{ path, line, position }` is what actually
+ * identifies the comment. It is retained as the hook for a future non-reversible digest rather
+ * than being removed and re-threaded through five layers later.
+ *
+ * Consumers (Plan 33-03's aggregate audit event) admit ONLY { path, line, position, title } --
+ * body never crosses this seam (T-13-03-03).
  */
-export type VcsSkippedComment = { path: string; line: number | null; title?: string };
+export type VcsSkippedComment = {
+  path: string;
+  line: number | null;
+  position?: number | null;
+  title?: string;
+};
 
 /**
  * Phase 30 (ANNO-01): input to `postAnnotations?`. `postedComments` is OPTIONAL because a

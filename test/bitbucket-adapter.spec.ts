@@ -466,8 +466,10 @@ describe('BitbucketAdapter (VcsProvider mapping)', () => {
 
       // The 422'd comment is skipped; the others are posted.
       expect(result.postedComments).toHaveLength(2);
+      // WR-01: Bitbucket anchors by LINE and has no diff offset, so `position` is null. The two
+      // coordinates stay in separate fields so a consumer never reads one as the other (G-28-3).
       expect(result.skippedComments).toEqual([
-        { path: 'src/foo.ts', line: 3, title: 'finding two' },
+        { path: 'src/foo.ts', line: 3, position: null, title: 'finding two' },
       ]);
 
       // Warn fired for the skipped comment with the exact payload — no body key.
@@ -478,7 +480,9 @@ describe('BitbucketAdapter (VcsProvider mapping)', () => {
         repo: REPO,
         path: 'src/foo.ts',
         line: 3,
-        title: 'finding two',
+        // WR-05: redacted, matching the audit boundary — the raw model-supplied title must never
+        // reach the log sink (the logger's redaction list does not cover `title`).
+        title: '[title-redacted]',
       });
     } finally {
       warnSpy.mockRestore();
@@ -516,6 +520,60 @@ describe('BitbucketAdapter (VcsProvider mapping)', () => {
     ).rejects.toBeInstanceOf(BitbucketError);
 
     void mock;
+  });
+
+  // WR-04: this drop path used to `continue` with only a log line, so a finding whose position
+  // could not be anchored produced no audit event at all — unanswerable from the audit trail,
+  // which is exactly what the skippedComments seam exists to prevent.
+  it('a comment with no resolvable anchor is surfaced through skippedComments (WR-04)', async () => {
+    const mock = installBitbucketFetchMock({
+      postPullRequestCommentResponses: [
+        { status: 201, body: { id: 100 } }, // the anchorable inline comment
+        { status: 201, body: { id: 101 } }, // summary post
+      ],
+      listPullRequestCommentsResponse: { body: { values: [] } },
+    });
+    const { adapter, env } = buildAdapter();
+    const seededDiff = [
+      'diff --git a/src/foo.ts b/src/foo.ts',
+      'index 1234567..890abcd 100644',
+      '--- a/src/foo.ts',
+      '+++ b/src/foo.ts',
+      '@@ -1,1 +1,2 @@',
+      ' context',
+      '+added1',
+    ].join('\n');
+    await env.APP_KV.put(`diff:${(adapter as unknown as { job: { id: string } }).job.id}`, seededDiff);
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    try {
+      const result = await adapter.submitReview(WORKSPACE, REPO, PR_NUMBER, {
+        commitSha: COMMIT_SHA,
+        verdict: 'comment',
+        summaryBody: 'Looks good',
+        jobIdHint: 'job-bb-1',
+        comments: [
+          { path: 'src/foo.ts', position: 2, body: 'anchored', title: 'finding one' },
+          // No position at all -> anchorForComment returns undefined.
+          { path: 'src/foo.ts', body: 'unanchorable', title: 'finding two' },
+        ],
+      });
+
+      // Only the anchorable comment posted (plus the summary).
+      const commentPosts = mock.calls.filter(
+        (call) => call.method === 'POST' && call.path.includes('/pullrequests/') && call.path.endsWith('/comments'),
+      );
+      expect(commentPosts).toHaveLength(2);
+      expect(result.postedComments).toHaveLength(1);
+
+      // The un-anchorable one is reported rather than silently dropped. There is no resolved
+      // anchor, so BOTH coordinates are null.
+      expect(result.skippedComments).toEqual([
+        { path: 'src/foo.ts', line: null, position: null, title: 'finding two' },
+      ]);
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it('a 422-skipped comment never poisons the dedup map — an identical later comment still posts (REVIEWS R3)', async () => {
@@ -563,7 +621,7 @@ describe('BitbucketAdapter (VcsProvider mapping)', () => {
       expect(result.postedComments).toHaveLength(1);
       expect(result.postedComments[0]).toMatchObject({ path: 'src/foo.ts', line: 2, body: 'identical text' });
       expect(result.skippedComments).toEqual([
-        { path: 'src/foo.ts', line: 2, title: 'finding one' },
+        { path: 'src/foo.ts', line: 2, position: null, title: 'finding one' },
       ]);
     } finally {
       warnSpy.mockRestore();

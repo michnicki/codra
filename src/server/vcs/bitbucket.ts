@@ -1,6 +1,9 @@
 import type { AppBindings } from '@server/env';
 import { logger } from '@server/core/logger';
 import { BitbucketClient, BitbucketError } from '@server/core/bitbucket';
+// WR-05: the same redaction the audit boundary applies, reused so a skipped comment's title is
+// never emitted verbatim to the log sink.
+import { redactFindingTitle } from '@server/core/audit-redact';
 import { decryptSecret } from '@server/core/crypto';
 import { parseUnifiedDiff, getValidNewLines, type FileDiff } from '@server/core/diff';
 import { resolveBitbucketBotCredential } from '@server/core/bitbucket-credential-resolution';
@@ -500,6 +503,10 @@ export class BitbucketAdapter implements VcsProvider {
       const anchor = anchorForComment(comment, files);
       if (!anchor) {
         logger.warn(`BitbucketAdapter: no anchor found for comment on ${comment.path} position ${comment.position}; skipping`);
+        // WR-04: this drop path used to `continue` with only a log line, so a finding that could
+        // not be anchored was unanswerable from the audit trail -- exactly what the skippedComments
+        // seam exists to prevent. `line` is null because there IS no resolved anchor line.
+        skippedComments.push({ path: comment.path, line: null, position: null, title: comment.title });
         continue;
       }
 
@@ -534,9 +541,19 @@ export class BitbucketAdapter implements VcsProvider {
             repo,
             path: comment.path,
             line: anchor.line,
+            // WR-05: redacted, matching the audit boundary. The logger's redaction list does not
+            // cover `title`, so logging it raw emitted the very value `redactFindingTitle` exists
+            // to keep out of persisted audit rows -- and finding titles routinely quote
+            // identifiers and code fragments from a private repository.
+            title: redactFindingTitle(comment.title),
+          });
+          // WR-01: Bitbucket anchors by LINE and has no diff offset at all, so `position` is null.
+          skippedComments.push({
+            path: comment.path,
+            line: anchor.line,
+            position: null,
             title: comment.title,
           });
-          skippedComments.push({ path: comment.path, line: anchor.line, title: comment.title });
           continue;
         }
         throw error;

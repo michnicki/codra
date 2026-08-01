@@ -1426,8 +1426,13 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
   // Phase 33 (PRD-01 / FR-031, D-03/D-04): inline_comment_skipped audit event. AGGREGATE — one event
   // per review round when inline comments were skipped (422 or budget exhaustion) at posting.
   // `count` is the FULL total; the sample is capped at 20 (INLINE_COMMENT_SKIPPED_SAMPLE_CAP).
-  // Sample identifiers admit ONLY { path, line, title } (T-13-03-03) and titles route through
-  // redactFindingTitle at production time (AUD-01); never body/existingCode/codeSuggestion.
+  // Sample identifiers admit ONLY { path, line, position, title } (T-13-03-03) and titles route
+  // through redactFindingTitle at production time (AUD-01); never body/existingCode/codeSuggestion.
+  //
+  // WR-01: `line` (head-side line number) and `position` (diff offset) are SEPARATE fields because
+  // they are not the same quantity and are not comparable across providers (G-28-3) — Bitbucket
+  // fills `line`, GitHub fills `position`. Collapsing them made the viewer render a fabricated line
+  // number for every GitHub skip. `position` is optional so pre-existing persisted rows still parse.
   z
     .object({
       stage: z.literal('inline_comment_skipped'),
@@ -1438,6 +1443,7 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
         z.object({
           path: z.string(),
           line: z.number().nullable().optional(),
+          position: z.number().nullable().optional(),
           title: z.string().max(100),
         }),
       ).max(20),
