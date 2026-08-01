@@ -1,6 +1,6 @@
 import { logger } from './logger';
 import { isSupportedGitHubWebhookEvent, type GitHubWebhookEventName, type GitHubWebhookPayload, type IssueCommentWebhookPayload, type PullRequestWebhookPayload } from '@shared/github';
-import { defaultRepoConfig, normalizeModelId, repoConfigSchema, reviewUnitKey, type CriticResult, type FileReviewPass, type JobAuditEvent, type ParsedReviewComment, type RepoConfig, type ReviewJobMessage, type VcsCommitEntry } from '@shared/schema';
+import { defaultRepoConfig, normalizeModelId, parseVcsCommitEntries, repoConfigSchema, reviewUnitKey, type CriticResult, type FileReviewPass, type JobAuditEvent, type ParsedReviewComment, type RepoConfig, type ReviewJobMessage, type VcsCommitEntry } from '@shared/schema';
 import { isTimeoutMessage, matchesAnyTransientSubstring } from '@shared/transient-errors';
 import type { AppBindings } from '@server/env';
 import { bulkInheritFileReviews, bulkMarkFilesFailed, getFileReviewsForJobs, recordRetryableFileReviewFailure, upsertFileReview } from '@server/db/file-reviews';
@@ -1333,8 +1333,12 @@ async function runPreparePhase(
     try {
       const raw = await env.APP_KV.get(`file-history:${job.id}`, 'text');
       if (raw) {
-        for (const [path, entries] of Object.entries(JSON.parse(raw) as Record<string, VcsCommitEntry[]>)) {
-          fileHistoryMap.set(path, entries); // preserve [] (D-08) — never `if (entries.length > 0)`
+        // WR-09: validate the KV round-trip instead of casting it. A map persisted by an earlier
+        // deploy (entries live for the 1-hour TTL) that no longer matches the contract used to
+        // surface as a TypeError inside buildFileHistoryBlock during prompt construction; now
+        // non-conforming entries are dropped fail-open.
+        for (const [path, entries] of Object.entries(JSON.parse(raw) as Record<string, unknown>)) {
+          fileHistoryMap.set(path, parseVcsCommitEntries(entries)); // preserve [] (D-08) — never `if (entries.length > 0)`
         }
       }
     } catch {
@@ -1351,10 +1355,13 @@ async function runPreparePhase(
       historyFetches += 1; // count ATTEMPTS: a failed fetch still spent its subrequest
       try {
         // The GitHub/Bitbucket clients self-increment the tracker per request, so
-        // hasRemainingSafeBudget(1) above is the correct AND only guard — never call
+        // hasRemainingSafeBudget(...) above is the correct AND only guard — never call
         // tracker.incrementSubrequests() manually here.
         const history = await vcs.getFileHistory?.(job.owner, job.repo, file.path, pr.headSha, 5);
-        if (history !== undefined) fileHistoryMap.set(file.path, history); // keep [] (D-08); undefined = no support
+        // WR-09: run ADAPTER OUTPUT through the schema too — it is the documented contract, and
+        // until now nothing enforced it. `undefined` still means "provider has no support" and is
+        // distinct from `[]` ("no history"), so the check stays outside the validator (D-08).
+        if (history !== undefined) fileHistoryMap.set(file.path, parseVcsCommitEntries(history)); // keep [] (D-08); undefined = no support
       } catch (error) {
         logger.warn(
           `Failed to fetch history for ${file.path} in job ${job.id}`,
@@ -1450,7 +1457,16 @@ async function runReviewPhase(
   if (config.review.file_history?.enabled === true) {
     try {
       const raw = await env.APP_KV.get(`file-history:${job.id}`, 'text');
-      if (raw) persistedHistory = JSON.parse(raw) as Record<string, VcsCommitEntry[]>;
+      if (raw) {
+        // WR-09: validated, not cast — see the matching prepare-phase read. Drift in a map written
+        // by an earlier deploy is dropped fail-open instead of throwing inside the prompt builder.
+        persistedHistory = Object.fromEntries(
+          Object.entries(JSON.parse(raw) as Record<string, unknown>).map(([path, entries]) => [
+            path,
+            parseVcsCommitEntries(entries),
+          ]),
+        );
+      }
     } catch {
       // best-effort: no history on KV failure (fail-open, D-06)
     }
