@@ -85,10 +85,23 @@ function parseFlowArray(rawValue: string): unknown[] {
   const items: string[] = [];
   let depth = 0;
   let current = '';
+  // CR-03 (34-REVIEW): the splitter MUST track quote state, mirroring findKeyValueColon /
+  // stripInlineComment. Without it, `["Prefer const, not let", "No any"]` split on the comma
+  // INSIDE the quoted element and produced ['"Prefer const', 'not let"', 'No any'] — two garbage
+  // custom_rules with dangling quotes, each a valid Zod string, so no throw and no audit event.
+  // Brackets and commas are structural only outside quotes.
+  let inSingle = false;
+  let inDouble = false;
   for (const ch of inner) {
-    if (ch === '[') depth += 1;
-    else if (ch === ']') depth -= 1;
-    if (ch === ',' && depth === 0) {
+    if (ch === "'" && !inDouble) inSingle = !inSingle;
+    else if (ch === '"' && !inSingle) inDouble = !inDouble;
+
+    const quoted = inSingle || inDouble;
+    if (!quoted) {
+      if (ch === '[') depth += 1;
+      else if (ch === ']') depth -= 1;
+    }
+    if (ch === ',' && depth === 0 && !quoted) {
       items.push(current);
       current = '';
     } else {
@@ -97,6 +110,7 @@ function parseFlowArray(rawValue: string): unknown[] {
     if (depth < 0) throw new Error('YAML parse error: unbalanced flow-style array');
   }
   if (depth !== 0) throw new Error('YAML parse error: unbalanced flow-style array');
+  if (inSingle || inDouble) throw new Error('YAML parse error: unterminated quoted string in flow-style array');
   items.push(current);
   // Trailing comma leaves one empty element; drop it.
   if (items[items.length - 1].trim() === '') items.pop();
@@ -173,7 +187,12 @@ export function parseYaml(raw: string): Record<string, unknown> {
       if (top.kind !== 'array' || top.indent !== indent) {
         throw new Error(`YAML parse error: array item at indent ${indent} without a matching parent key`);
       }
-      const itemContent = text.slice(1).trim();
+      // CR-02 (34-REVIEW): strip the inline comment ONCE, at the top of the `-` branch, so every
+      // downstream path (empty item, array-of-objects, plain scalar) is covered consistently.
+      // Previously only the `key: value` paths stripped comments, so `- "vendor/**"  # third-party`
+      // became the literal glob `"vendor/**"   # third-party` — a valid Zod string, so no throw,
+      // no DB fallback, no audit event: exactly the silent mis-parse the module contract forbids.
+      const itemContent = stripInlineComment(text.slice(1).trim());
       if (itemContent === '') {
         const entry: Record<string, unknown> = {};
         top.arr.push(entry);
@@ -182,9 +201,10 @@ export function parseYaml(raw: string): Record<string, unknown> {
       }
       const colon = findKeyValueColon(itemContent);
       if (colon !== -1) {
-        // First key-value pair on the item line starts an array-of-objects entry.
+        // First key-value pair on the item line starts an array-of-objects entry. The inline
+        // comment was already stripped from `itemContent` above (CR-02).
         const key = itemContent.slice(0, colon).trim();
-        const rawValue = stripInlineComment(itemContent.slice(colon + 1).trim());
+        const rawValue = itemContent.slice(colon + 1).trim();
         assertValidKey(key);
         const entry: Record<string, unknown> = {};
         assignScalarValue(entry, key, rawValue);
