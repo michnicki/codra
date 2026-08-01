@@ -16,6 +16,7 @@ import type { ReportAnnotation } from '@shared/bitbucket';
 import type { RepoConfig, ParsedReviewComment } from '@shared/schema';
 import type {
   VcsCapabilities,
+  VcsCommitEntry,
   VcsCreateStatusCheckInput,
   VcsPostAnnotationsInput,
   VcsPostedComment,
@@ -220,6 +221,20 @@ export class BitbucketAdapter implements VcsProvider {
   // (R-5). Empty success passes through as `''`; non-2xx throws BitbucketError.
   async getCompareDiff(owner: string, repo: string, base: string, head: string): Promise<string> {
     return this.client.getCompareDiff(owner, repo, base, head);
+  }
+
+  // PRD-04 (FR-114): per-touched-file commit history (review HIGH-1). Pure delegation — `ref`
+  // arrives as a parameter from the prepare-phase caller (which passes `pr.headSha` in 34-03);
+  // this adapter never references a `pr` object. The client property is `this.client` (never
+  // `this.bitbucket`), and the client itself documents its deliberate path-before-ref ordering.
+  async getFileHistory?(
+    owner: string,
+    repo: string,
+    path: string,
+    ref: string,
+    maxCommits: number,
+  ): Promise<VcsCommitEntry[]> {
+    return this.client.getFileHistory(owner, repo, path, ref, maxCommits);
   }
 
   // QA-IDX-01 (D-09): default-branch blob listing. Thin delegation -- three client reads, no walk
