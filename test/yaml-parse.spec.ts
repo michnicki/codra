@@ -98,6 +98,36 @@ describe('parseYaml — arrays', () => {
   });
 });
 
+// WR-06 (34-REVIEW): two forms a normal editor produces used to throw and therefore discard the
+// ENTIRE .review.yaml (DB fallback + one audit event), even though both are valid YAML.
+describe('parseYaml — WR-06: same-indent block sequences and a UTF-8 BOM', () => {
+  it('parses a block sequence at the SAME indent as its key', () => {
+    const raw = ['review:', '  skip_files:', '  - "dist/**"', '  - "*.lock"'].join('\n');
+    expect(parseYaml(raw)).toEqual({ review: { skip_files: ['dist/**', '*.lock'] } });
+  });
+
+  it('parses a same-indent sequence at the document root', () => {
+    expect(parseYaml('skip_files:\n- a\n- b')).toEqual({ skip_files: ['a', 'b'] });
+  });
+
+  it('closes a same-indent sequence when a sibling key arrives at that indent', () => {
+    const raw = ['review:', '  skip_files:', '  - "dist/**"', '  max_files: 5', 'model:', '  main: "gpt-4o"'].join('\n');
+    expect(parseYaml(raw)).toEqual({
+      review: { skip_files: ['dist/**'], max_files: 5 },
+      model: { main: 'gpt-4o' },
+    });
+  });
+
+  it('still parses the deeper-indent sequence form (no regression)', () => {
+    const raw = ['review:', '  skip_files:', '    - "dist/**"', '  max_files: 5'].join('\n');
+    expect(parseYaml(raw)).toEqual({ review: { skip_files: ['dist/**'], max_files: 5 } });
+  });
+
+  it('strips a leading UTF-8 BOM instead of failing with a bogus indentation error', () => {
+    expect(parseYaml('﻿review:\n  max_files: 20')).toEqual({ review: { max_files: 20 } });
+  });
+});
+
 // CR-02 (34-REVIEW): a trailing `# comment` on a block-sequence item used to become part of the
 // value. Zod accepts the result as a string, so the corruption was SILENT — no throw, no DB
 // fallback, no yaml_config_parse_failed event — and the mangled glob/rule went straight into
