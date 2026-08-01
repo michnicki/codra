@@ -1431,7 +1431,9 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
   z
     .object({
       stage: z.literal('inline_comment_skipped'),
-      count: z.number().int(),
+      // IN-01: `.min(0)` mirrors the sibling suggestion_dropped.droppedCount bound — a negative
+      // skip count is never producible and must not round-trip through the audit column.
+      count: z.number().int().min(0),
       sample: z.array(
         z.object({
           path: z.string(),

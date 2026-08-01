@@ -436,6 +436,17 @@ describe('buildInlineCommentSkippedEvent (PRD-01, D-03/D-04)', () => {
     const result = jobAuditEventSchema.safeParse(event);
     expect(result.success).toBe(true);
   });
+
+  // IN-01: mirrors the sibling suggestion_dropped negative-droppedCount rejection test.
+  it('schema rejects a negative count (z.number().int().min(0))', () => {
+    const negative = {
+      stage: 'inline_comment_skipped',
+      count: -1,
+      sample: [],
+      timestamp: '2026-01-01T00:00:00.000Z',
+    };
+    expect(jobAuditEventSchema.safeParse(negative).success).toBe(false);
+  });
 });
 
 describe('buildSuggestionDroppedEvent (PRD-02, D-08)', () => {
