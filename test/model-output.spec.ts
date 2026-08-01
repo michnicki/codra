@@ -380,6 +380,60 @@ describe('FR-153/FR-154 parse normalization (PRD-02)', () => {
     expect(result.comments[0].body).toContain('the real explanation');
   });
 
+  // WR-09: `withSuggestion('', undefined)` returns '', which parsedReviewCommentSchema.body
+  // (z.string().min(1)) rejects — and that .parse() sits inside .map() with no try/catch, while
+  // parseFileReviewResponse's only try/catch covers JSON extraction. So an empty body threw out of
+  // the whole function and failed the ENTIRE file's review instead of dropping one comment. The
+  // empty-body + no-suggestion combination is the trivially reachable case (the clear clause is
+  // gated on hasSuggestion, so it never runs here to supply a fallback).
+  it('an empty body with NO suggestion falls back to the title instead of throwing the file parse (WR-09)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({ title: 'a bare finding', body: '   ', priority: 1 }),
+      mockFile,
+    );
+
+    expect(result.comments).toHaveLength(1);
+    expect(result.comments[0].body.length).toBeGreaterThan(0);
+    expect(result.comments[0].body).toBe('a bare finding');
+  });
+
+  it('an empty-bodied finding does not take the rest of the file down with it (WR-09)', () => {
+    const raw = JSON.stringify({
+      findings: [
+        { title: 'empty one', body: '  ', priority: 1, code_location: { absolute_file_path: 'test.ts', line: 2 } },
+        { title: 'good one', body: 'a real explanation', priority: 1, code_location: { absolute_file_path: 'test.ts', line: 2 } },
+      ],
+      overall_correctness: 'patch is incorrect',
+      overall_explanation: 'Found an issue',
+    });
+
+    const result = parseFileReviewResponse(raw, mockFile);
+
+    // Both survive: the empty one via the title fallback, the good one untouched.
+    expect(result.comments.map((c) => c.title)).toEqual(['empty one', 'good one']);
+  });
+
+  // IN-03: the suggestion_dropped sample records the model's CITED line, matching the adjacent
+  // evidence accumulators' EVID-04 convention rather than the post-remap line.
+  it('the suggestion_dropped sample carries the model-cited line, not the remapped one (IN-03)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({
+        title: 'finding',
+        body: '   ',
+        priority: 1,
+        code_suggestion: 'x',
+        // Line 5 is off-diff; findClosestValidLine remaps it onto the hunk (line 3).
+        code_location: { absolute_file_path: 'test.ts', line: 5 },
+      }),
+      mockFile,
+    );
+
+    expect(result.comments).toHaveLength(0);
+    const events = dropEvents(result);
+    expect(events).toHaveLength(1);
+    expect(events[0].sample[0].line).toBe(5);
+  });
+
   it('code_suggestion: "" is treated as absent — the per-file parse never throws (fail-open hardening)', () => {
     const result = parseFileReviewResponse(
       rawWith({ title: 'finding', body: 'the issue', priority: 1, code_suggestion: '' }),
