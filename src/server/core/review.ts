@@ -1,6 +1,6 @@
 import { logger } from './logger';
 import { isSupportedGitHubWebhookEvent, type GitHubWebhookEventName, type GitHubWebhookPayload, type IssueCommentWebhookPayload, type PullRequestWebhookPayload } from '@shared/github';
-import { defaultRepoConfig, normalizeModelId, repoConfigSchema, reviewUnitKey, type CriticResult, type FileReviewPass, type JobAuditEvent, type ParsedReviewComment, type RepoConfig, type ReviewJobMessage } from '@shared/schema';
+import { defaultRepoConfig, normalizeModelId, repoConfigSchema, reviewUnitKey, type CriticResult, type FileReviewPass, type JobAuditEvent, type ParsedReviewComment, type RepoConfig, type ReviewJobMessage, type VcsCommitEntry } from '@shared/schema';
 import { isTimeoutMessage, matchesAnyTransientSubstring } from '@shared/transient-errors';
 import type { AppBindings } from '@server/env';
 import { bulkInheritFileReviews, bulkMarkFilesFailed, getFileReviewsForJobs, recordRetryableFileReviewFailure, upsertFileReview } from '@server/db/file-reviews';
@@ -508,7 +508,7 @@ export async function runReviewJob(env: AppBindings, message: ReviewJobMessage):
 
   try {
     if (phase === 'prepare') {
-      await runPreparePhase(env, job, leaseOwner, vcs);
+      await runPreparePhase(env, job, leaseOwner, vcs, tracker);
     } else if (phase === 'finalize') {
       await runFinalizePhase(env, job, leaseOwner, vcs, formatter);
     } else if (phase === 'critic') {
@@ -919,6 +919,7 @@ async function runPreparePhase(
   job: PersistedReviewJob,
   leaseOwner: string,
   vcs: VcsProvider,
+  tracker: TokenTracker,
 ) {
   await updateJobStep(env, job.id, 'Preparation', { status: 'running' });
   const pr = await vcs.getPullRequest(job.owner, job.repo, job.prNumber);
@@ -1244,6 +1245,58 @@ async function runPreparePhase(
     await recordFileSkips(env, job.id, buildFileSkipEvents(dropped));
   }
 
+  // Phase 34 (PRD-04): per-file commit history for decision archaeology.
+  // Fetch happens ONCE here in prepare (budget-capped via TokenTracker) and is
+  // persisted to KV under `file-history:${jobId}`. The review phase loads from KV
+  // only — never re-fetching over REST on chunk/retry invocations (review HIGH-3).
+  // KV-read-first: a prepare retry (job recovery) reuses the persisted map.
+  // Fetch failures are fail-open (D-06): skip that file's history, proceed with
+  // the diff-only prompt. When the toggle is off, the entire block is skipped (NREG-01).
+  // EMPTY ARRAYS ARE PRESERVED: a zero-history (new) file persists as [] so the review
+  // phase passes [] to the prompt builder and the D-08 "(no prior history — new file)"
+  // block renders. Only a missing method (undefined) or a fetch failure (catch below)
+  // leaves a file out of the map — the review phase treats that as "no history
+  // available" (no appendix block).
+  const fileHistoryMap = new Map<string, VcsCommitEntry[]>();
+  if (config.review.file_history?.enabled === true) {
+    try {
+      const raw = await env.APP_KV.get(`file-history:${job.id}`, 'text');
+      if (raw) {
+        for (const [path, entries] of Object.entries(JSON.parse(raw) as Record<string, VcsCommitEntry[]>)) {
+          fileHistoryMap.set(path, entries); // preserve [] (D-08) — never `if (entries.length > 0)`
+        }
+      }
+    } catch {
+      // best-effort KV read; fall through to fetching
+    }
+    for (const file of files) {
+      if (fileHistoryMap.has(file.path)) continue;
+      if (!tracker.hasRemainingSafeBudget(1)) break; // D-05: budget cap
+      try {
+        // The GitHub/Bitbucket clients self-increment the tracker per request, so
+        // hasRemainingSafeBudget(1) above is the correct AND only guard — never call
+        // tracker.incrementSubrequests() manually here.
+        const history = await vcs.getFileHistory?.(job.owner, job.repo, file.path, pr.headSha, 5);
+        if (history !== undefined) fileHistoryMap.set(file.path, history); // keep [] (D-08); undefined = no support
+      } catch (error) {
+        logger.warn(
+          `Failed to fetch history for ${file.path} in job ${job.id}`,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      }
+    }
+    if (fileHistoryMap.size > 0) {
+      const serializable = Object.fromEntries(fileHistoryMap);
+      try {
+        await env.APP_KV.put(`file-history:${job.id}`, JSON.stringify(serializable), {
+          expirationTtl: 3600, // 1-hour TTL — history is bounded to this job's lifespan
+        });
+      } catch (error) {
+        logger.warn(`Failed to persist file history map to KV for job ${job.id}`, error instanceof Error ? error : new Error(String(error)));
+      }
+    }
+  }
+
   await completePreparationStep(env, job.id, files.length);
   await heartbeatJobLease(env, job.id, leaseOwner, JOB_LEASE_SECONDS);
 
@@ -1291,7 +1344,7 @@ async function runReviewPhase(
   tracker: TokenTracker,
 ) {
   if (!hasCompletedStep(job, 'Preparation')) {
-    await runPreparePhase(env, job, leaseOwner, vcs);
+    await runPreparePhase(env, job, leaseOwner, vcs, tracker);
     return;
   }
 
@@ -1306,6 +1359,17 @@ async function runReviewPhase(
     return failureModelProviderPromise;
   };
   const files = await getJobDiffFiles(env, job, vcs, config);
+  // Phase 34 (PRD-04): load the file-history map persisted by the prepare phase.
+  // KV-read-only — no REST fetches here, so chunk/retry invocations cost one KV
+  // read at most (review HIGH-3). [] entries survive JSON.parse, so zero-history
+  // files still render the D-08 "(no prior history — new file)" block.
+  let persistedHistory: Record<string, VcsCommitEntry[]> | null = null;
+  try {
+    const raw = await env.APP_KV.get(`file-history:${job.id}`, 'text');
+    if (raw) persistedHistory = JSON.parse(raw) as Record<string, VcsCommitEntry[]>;
+  } catch {
+    // best-effort: no history on KV failure (fail-open, D-06)
+  }
   const totalLineCount = files.reduce((sum, file) => sum + file.lineCount, 0);
   const { concurrencyLevel } = await getReviewSettings(env);
   const configuredChunkFileLimit = REVIEW_CONCURRENCY_LIMITS[concurrencyLevel];
@@ -1404,6 +1468,11 @@ async function runReviewPhase(
 
     const inherited = parentReviews.get(unitKey);
     const reviewTask = async () => {
+      // Phase 34 (PRD-04): per-file commit history from the KV-persisted map. A file absent
+      // from the map (fetch failure D-06, budget exhaustion D-05, or provider without
+      // getFileHistory) is undefined → the 34-02 toggle-aware builder renders no appendix;
+      // a new file persisted as [] → the D-08 "(no prior history — new file)" block renders.
+      const fileHistory = persistedHistory?.[file.path];
       // (0) Poll an already-submitted async batch review. Only the main pass ever submits to the
       // async batch queue (see below), so awaitingReview is main-only; the pass is threaded anyway.
       if (awaitingReview) {
@@ -1432,7 +1501,7 @@ async function runReviewPhase(
           logger.warn(`Async batch poll failed for ${file.path}; falling back to synchronous review`, {
             error: poll.error instanceof Error ? poll.error.message : String(poll.error),
           });
-          await reviewAndPersistFile(env, job, file, pr, config, totalLineCount, model, resolveFailureModelProvider, existingReview, pass);
+          await reviewAndPersistFile(env, job, file, pr, config, totalLineCount, model, resolveFailureModelProvider, existingReview, pass, fileHistory);
           terminalProgress += 1;
           return;
         }
@@ -1452,6 +1521,7 @@ async function runReviewPhase(
             prDescription: pr.body ?? null,
             config,
             totalLineCount,
+            fileHistory,
             compactPrompt: (existingReview?.transient_error_count ?? 0) > 0,
           });
           if (submitted) {
@@ -1497,20 +1567,21 @@ async function runReviewPhase(
               model,
               resolveFailureModelProvider,
               existingReview,
+              fileHistory,
               { runs: ensembleConfig.runs, temperature: ensembleConfig.temperature ?? 0.7 },
             );
             terminalProgress += 1;
             return;
           }
         }
-        await reviewAndPersistFile(env, job, file, pr, config, totalLineCount, model, resolveFailureModelProvider, existingReview, pass);
+        await reviewAndPersistFile(env, job, file, pr, config, totalLineCount, model, resolveFailureModelProvider, existingReview, pass, fileHistory);
         terminalProgress += 1;
         return;
       }
 
       if (!canInheritParentFileReview(config, inherited)) {
         logger.info(`Ignoring inherited review for ${file.path} (${pass}); parent model ${inherited.model_used} is not in the current model strategy`);
-        await reviewAndPersistFile(env, job, file, pr, config, totalLineCount, model, resolveFailureModelProvider, existingReview, pass);
+        await reviewAndPersistFile(env, job, file, pr, config, totalLineCount, model, resolveFailureModelProvider, existingReview, pass, fileHistory);
         terminalProgress += 1;
       } else {
         await upsertFileReview(env, job.id, {
@@ -1773,6 +1844,10 @@ async function reviewAndPersistFile(
   // security-unit failure never touches the main row. Note: 'cross_file_security' is NOT valid here
   // — that pass uses callVerifierRaw directly in runCrossFileSecurityPhase.
   pass: 'main' | 'security' = 'main',
+  // Phase 34 (PRD-04): per-file commit history for the main-review prompt. The security pass
+  // intentionally ignores it (D-04 — file history is main-pass only; the model layer comments
+  // the same). undefined = no history available; [] = new file (D-08 block renders).
+  fileHistory?: VcsCommitEntry[],
 ) {
   const startedAt = Date.now();
   const compactPrompt = (previousReview?.transient_error_count ?? 0) > 0;
@@ -1785,6 +1860,7 @@ async function reviewAndPersistFile(
       totalLineCount,
       compactPrompt,
       pass,
+      fileHistory,
     });
 
     await upsertFileReview(env, job.id, {
@@ -1929,6 +2005,9 @@ async function reviewAndPersistFileWithEnsemble(
   model: ModelService,
   resolveFailureModelProvider: () => Promise<string | null>,
   previousReview: { transient_error_count: number } | undefined,
+  // Phase 34 (PRD-04): per-file commit history for the main-review prompt (D-04 — file history
+  // is main-pass only; undefined = no history, [] = new file D-08 block).
+  fileHistory: VcsCommitEntry[] | undefined,
   // The ensemble config drives the fan-out; defaults to runs:1 to keep the function safe for
   // any unexpected caller (the main scheduling site is the only writer).
   ensembleConfig: { runs: number; temperature: number },
@@ -1949,6 +2028,7 @@ async function reviewAndPersistFileWithEnsemble(
       totalLineCount,
       compactPrompt,
       pass: 'main',
+      fileHistory,
       runs: ensembleConfig.runs,
       ensembleTemperature: ensembleConfig.temperature,
     });
