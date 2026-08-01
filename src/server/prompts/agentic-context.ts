@@ -168,7 +168,10 @@ export function buildAgenticSystemPrompt(input: {
     '### RESPONSE PROTOCOL (STRICT)',
     'Reply with EXACTLY ONE raw JSON object and nothing else. One of:',
     '{"action":"read_file","path":"relative/path/from/repo/root.ts"}',
-    '{"action":"grep_repo","query":"literal keywords"}',
+    // The literal action shapes track the CATALOG, not the full protocol: advertising an action shape
+    // for a tool the catalog just said is unavailable is an invitation to spend one of six hops on a
+    // call that can only come back "unavailable".
+    ...(input.grepSupported ? ['{"action":"grep_repo","query":"literal keywords"}'] : []),
     '{"action":"done","reason":"why you have enough context"}',
     '',
     // 35-REVIEWS.md (Antigravity MEDIUM): extractJson + jsonrepair recover a lot, but a weaker model
