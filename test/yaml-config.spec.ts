@@ -420,6 +420,60 @@ dbDescribe('Phase 34 (34-03): prepare-phase YAML config integration', () => {
     expect(job!.configSnapshot!.review.file_history.enabled).toBe(false);
   });
 
+  // WR-01 (34-REVIEW): a transient provider failure on the .review.yaml probe must NOT be recorded
+  // as a parse failure and must NOT suppress the .review.yml fallback. Before the fix, one try
+  // wrapped getFileContent + parseYaml + both Zod parses, so a GitHub 500 emitted
+  // yaml_config_parse_failed (blaming the operator's syntax for an API hiccup) and `break`ed —
+  // a repo that uses `.review.yml` silently lost its config for that review.
+  it('WR-01: a fetch failure on .review.yaml falls through to .review.yml with no parse-failed event', async () => {
+    const repo = `repo-yaml-fetchfail-${Date.now()}`;
+    await seedRepoWithYamlToggle(repo, true, 10, 100);
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    mocks.getRepoFileContent.mockImplementation(async (_o: string, _r: string, path: string) => {
+      if (path === '.review.yaml') throw Object.assign(new Error('GitHub API failed with 500'), { status: 500 });
+      return 'review:\n  max_comments: 7';
+    });
+
+    const prep = await runPrepare(repo);
+    expect(prep).toMatchObject({ action: 'next_phase', phase: 'review' });
+
+    // BOTH candidates were probed — the failure did not stop discovery.
+    expect(mocks.getRepoFileContent).toHaveBeenCalledTimes(2);
+    expect(mocks.getRepoFileContent.mock.calls.map((call: any[]) => call[2])).toEqual(['.review.yaml', '.review.yml']);
+
+    // The .review.yml config actually applied.
+    const job = await jobFor(repo);
+    expect(job!.configSnapshot!.review.max_comments).toBe(7);
+
+    // The infrastructure failure is a warning, NOT a yaml_config_parse_failed audit event (D-12).
+    expect(warnSpy.mock.calls.some(([message]) => String(message).includes('Failed to fetch .review.yaml'))).toBe(true);
+    const rows = await queryRows<{ audit: unknown }>(env, `SELECT audit FROM jobs WHERE id = $1`, [job!.id]);
+    const stages = ((rows[0]?.audit as Array<{ stage: string }>) ?? []).map((event) => event.stage);
+    expect(stages).not.toContain('yaml_config_parse_failed');
+  });
+
+  // Discovery still stops at the first file FOUND, even when that file fails to parse — falling
+  // through to .review.yml on a parse failure would let a syntactically broken .review.yaml be
+  // silently shadowed by a stale .review.yml.
+  it('WR-01: a PARSE failure on .review.yaml still stops discovery and records the audit event', async () => {
+    const repo = `repo-yaml-parsefail-${Date.now()}`;
+    await seedRepoWithYamlToggle(repo, true, 10, 100);
+    mocks.getRepoFileContent.mockImplementation(async (_o: string, _r: string, path: string) =>
+      path === '.review.yaml' ? 'review:\n  max_comments: |\n    block' : 'review:\n  max_comments: 7',
+    );
+
+    const prep = await runPrepare(repo);
+    expect(prep).toMatchObject({ action: 'next_phase', phase: 'review' });
+
+    expect(mocks.getRepoFileContent).toHaveBeenCalledTimes(1);
+    const job = await jobFor(repo);
+    // DB config retained (fallback), not the .review.yml value.
+    expect(job!.configSnapshot!.review.max_comments).toBe(10);
+    const rows = await queryRows<{ audit: unknown }>(env, `SELECT audit FROM jobs WHERE id = $1`, [job!.id]);
+    const stages = ((rows[0]?.audit as Array<{ stage: string }>) ?? []).map((event) => event.stage);
+    expect(stages).toContain('yaml_config_parse_failed');
+  });
+
   it('NREG-01: toggle off produces zero getFileContent calls, byte-identical config, zero audit events', async () => {
     const repo = `repo-yaml-off-${Date.now()}`;
     await seedRepoWithYamlToggle(repo, false, 10, 100);

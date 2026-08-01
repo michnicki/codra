@@ -936,34 +936,49 @@ async function runPreparePhase(
   let mergedConfig = config;
   if (config.review.yaml_config?.enabled === true && pr.headSha) {
     for (const yamlPath of ['.review.yaml', '.review.yml']) {
+      // WR-01 (34-REVIEW): the FETCH gets its own try/catch, separate from parse/validation.
+      // A transient provider failure (GitHubError 500/403/429 after retries, TimeoutError) is an
+      // INFRASTRUCTURE problem, not a config-syntax problem. Folding it into the parse catch (a)
+      // emitted a yaml_config_parse_failed event blaming the operator's YAML for an API hiccup —
+      // D-12 scopes that event to parse/validation failure — and (b) `break`ed, so a repo that
+      // uses `.review.yml` silently lost its config whenever the `.review.yaml` probe 500'd.
+      // Log and CONTINUE to the next candidate filename instead.
+      let rawYaml: string | null;
       try {
-        const rawYaml = await vcs.getFileContent(job.owner, job.repo, yamlPath, pr.headSha);
-        if (rawYaml !== null) {
-          const yamlObject = parseYaml(rawYaml); // plain JS object — ONLY the keys the file declares
-          repoConfigSchema.parse(yamlObject); // D-10 standalone validation: type-checks + fills defaults; throws on bad YAML
-          // Merge at top-level key boundaries (D-09, contract locked by 34-01 Task 3):
-          // overlay ONLY the top-level keys the YAML actually declares onto the DB config,
-          // then re-validate. A declared key replaces the DB key WHOLESALE — its sub-keys
-          // revert to Zod schema defaults (e.g. review.max_files → 150, never the DB's
-          // value); top-level keys the YAML does not declare keep their DB values.
-          // NOTE: overlay `yamlObject` (the raw declared keys), NOT the fully-defaulted
-          // parse() result — spreading the latter would clobber undeclared top-level
-          // keys (e.g. model) with Zod defaults.
-          mergedConfig = repoConfigSchema.parse({
-            ...config,
-            ...yamlObject,
-          });
-          break; // first file found wins (D-13)
-        }
+        rawYaml = await vcs.getFileContent(job.owner, job.repo, yamlPath, pr.headSha);
       } catch (error) {
         logger.warn(
-          `Failed to parse .review.yaml for ${job.owner}/${job.repo}`,
+          `Failed to fetch ${yamlPath} for ${job.owner}/${job.repo}; trying the next candidate filename`,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+        continue;
+      }
+      if (rawYaml === null) continue; // no such file (D-14) — try the next candidate
+
+      try {
+        const yamlObject = parseYaml(rawYaml); // plain JS object — ONLY the keys the file declares
+        repoConfigSchema.parse(yamlObject); // D-10 standalone validation: type-checks + fills defaults; throws on bad YAML
+        // Merge at top-level key boundaries (D-09, contract locked by 34-01 Task 3):
+        // overlay ONLY the top-level keys the YAML actually declares onto the DB config,
+        // then re-validate. A declared key replaces the DB key WHOLESALE — its sub-keys
+        // revert to Zod schema defaults (e.g. review.max_files → 150, never the DB's
+        // value); top-level keys the YAML does not declare keep their DB values.
+        // NOTE: overlay `yamlObject` (the raw declared keys), NOT the fully-defaulted
+        // parse() result — spreading the latter would clobber undeclared top-level
+        // keys (e.g. model) with Zod defaults.
+        mergedConfig = repoConfigSchema.parse({
+          ...config,
+          ...yamlObject,
+        });
+      } catch (error) {
+        logger.warn(
+          `Failed to parse ${yamlPath} for ${job.owner}/${job.repo}`,
           error instanceof Error ? error : new Error(String(error)),
         );
         const reasonText = error instanceof Error ? error.message : String(error);
         await recordYamlConfigParseFailed(env, job.id, reasonText); // best-effort, never throws (D-12)
-        break; // don't try the other filename on parse/validation failure
       }
+      break; // first file FOUND wins (D-13) — parse outcome does not change the discovery stop
     }
   }
   const yamlMerged = mergedConfig !== config; // captured BEFORE the reassignment below
