@@ -3939,9 +3939,12 @@ async function runAgenticContextPhase(
       // to rewrite, whereas reading the pull request's OWN head content is precisely the feature here.
       // Do not "fix" this to match k31.
       readFile: async (path) => vcs.getFileContent(job.owner, job.repo, path, pr.headSha),
-      // D-05: no adapter implements searchCode yet, so this resolves to undefined, is coerced to null,
-      // and grep_repo reports itself unavailable to the model. That is the DESIGNED degradation path
-      // (and the expected steady state on Bitbucket), exercised end-to-end from wave 1 — not a stub.
+      // D-05: `?.` + `?? null` is a THREE-WAY coercion, and all three arms are live. On GitHub
+      // (35-03) the adapter implements searchCode, so grep_repo returns real matches; a rate-limited
+      // 403/429 comes back as null and permanently downgrades the capability for this invocation. On a
+      // provider whose adapter does NOT implement it, the optional call resolves to undefined, is
+      // coerced to null, and grep_repo reports itself unavailable to the model — the DESIGNED
+      // degradation path, exercised end-to-end from wave 1, not a stub.
       searchCode: async (query) => (await vcs.searchCode?.(job.owner, job.repo, query, AGENTIC_MAX_GREP_HITS)) ?? null,
       // The provider clients self-increment the tracker per request, so the reserve check is the
       // correct AND only guard — never call tracker.incrementSubrequests() from the loop.

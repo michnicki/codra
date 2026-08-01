@@ -39,6 +39,16 @@ export class GitHubService {
     return this.client.getFileHistory(owner, repo, path, ref, maxCommits);
   }
 
+  // PRD-06 (FR-131, D-05): repository code search backing the agentic `grep_repo` tool. One-line
+  // passthrough, and it MUST exist here: `GithubAdapter` holds a `GitHubService`, never a
+  // `GitHubClient`, so a method present only on the client is unreachable from the adapter -- the
+  // same load-bearing module boundary the QA-IDX-01 comment below spells out. The three-valued return
+  // (`null` = capability unavailable, `[]` = ran with zero matches, entries = matches) passes straight
+  // through; do not coalesce it here.
+  async searchCode(owner: string, repo: string, query: string, maxHits: number) {
+    return this.client.searchCode(owner, repo, query, maxHits);
+  }
+
   // QA-IDX-01 (D-09): the two reads the index build's tree enumeration needs. Declared HERE and not
   // only on GitHubClient because `GithubAdapter` holds a `GitHubService`, never a `GitHubClient` --
   // that module boundary is load-bearing for the three specs that `vi.mock('@server/services/github')`

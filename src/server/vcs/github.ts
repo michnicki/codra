@@ -3,6 +3,7 @@ import { GitHubError } from '../core/github';
 import type { AppBindings } from '../env';
 import type {
   VcsCapabilities,
+  VcsCodeSearchHit,
   VcsCommitEntry,
   VcsCreateStatusCheckInput,
   VcsProvider,
@@ -99,6 +100,28 @@ export class GithubAdapter implements VcsProvider {
     maxCommits: number,
   ): Promise<VcsCommitEntry[]> {
     return this.gh.getFileHistory(owner, repo, path, ref, maxCommits);
+  }
+
+  // PRD-06 (FR-131, D-05): repository code search backing `grep_repo`. Pure delegation -- the query
+  // composition, the `per_page` clamp, the text-match media type and the three-valued status handling
+  // all live in `GitHubClient.searchCode`; nothing about them is re-decided here.
+  //
+  // Declared with the OPTIONAL class-method form `async searchCode?(`, the same shape `getFileHistory?`
+  // above uses, so it satisfies `VcsProvider.searchCode?` exactly and callers keep feature-detecting
+  // with `vcs.searchCode?.(...) ?? null`. Its presence -- not a capability flag -- is what tells the
+  // executor that grep_repo is available on this provider (see the `VcsCapabilities` note in
+  // `./types`: no `supportsCodeSearch` flag is added, deliberately).
+  //
+  // The three-valued return passes through untouched: `null` = the capability is unavailable for this
+  // repository or credential (rate-limited), `[]` = the search ran and found nothing, entries =
+  // matches with the provider's fragment untruncated and a D-07 default-branch ref label.
+  async searchCode?(
+    owner: string,
+    repo: string,
+    query: string,
+    maxHits: number,
+  ): Promise<VcsCodeSearchHit[] | null> {
+    return this.gh.searchCode(owner, repo, query, maxHits);
   }
 
   // QA-IDX-01 (D-09): default-branch blob listing. Thin delegation -- no new REST logic lives here.

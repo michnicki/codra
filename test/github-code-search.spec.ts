@@ -1,6 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { GitHubClient, GitHubError } from '@server/core/github';
-import { AGENTIC_GREP_HIT_MAX_BYTES } from '@server/core/agentic-tools';
+import { GitHubService } from '@server/services/github';
+import { GithubAdapter } from '@server/vcs/github';
+import {
+  AGENTIC_GREP_HIT_MAX_BYTES,
+  AGENTIC_MAX_GREP_HITS,
+  executeAgenticLoop,
+  type AgenticLoopDeps,
+} from '@server/core/agentic-tools';
+import type { VcsCodeSearchHit } from '@server/vcs/types';
 import { createTestEnv, seedInstallationToken } from './helpers';
 import { installGitHubFetchMock, type GitHubFetchMockFixtures } from './github-fetch-mock';
 
@@ -367,5 +375,151 @@ describe('GitHubClient.searchCode: subrequest accounting', () => {
         expect(searchCalls()).toHaveLength(2);
       },
     );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// Task 2 — GitHubService pass-through + GithubAdapter delegation
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+describe('GithubAdapter.searchCode: the delegation chain', () => {
+  it('is DEFINED, so optional-call feature detection resolves to a function and not undefined', () => {
+    const adapter = new GithubAdapter(createTestEnv(), INSTALLATION_ID);
+    // This is the single assertion that separates "grep_repo is live on GitHub" from the wave-1
+    // steady state, where `vcs.searchCode?.(...)` resolved to undefined and was coerced to null.
+    expect(typeof adapter.searchCode).toBe('function');
+  });
+
+  it('forwards owner, repo, query and maxHits UNCHANGED through GitHubService to GitHubClient', async () => {
+    const adapter = new GithubAdapter(createTestEnv(), INSTALLATION_ID);
+    // The service spy calls through (vi.spyOn preserves the implementation), so this proves the
+    // adapter -> service -> client chain rather than just the adapter's own argument list. A method
+    // missing from the service seam would be unreachable from the adapter entirely.
+    const serviceSpy = vi.spyOn(GitHubService.prototype, 'searchCode');
+    const clientSpy = vi
+      .spyOn(GitHubClient.prototype, 'searchCode')
+      .mockResolvedValue([] as VcsCodeSearchHit[]);
+    try {
+      await adapter.searchCode?.(OWNER, REPO, 'handleWebhook payload', 30);
+
+      expect(serviceSpy).toHaveBeenCalledExactlyOnceWith(OWNER, REPO, 'handleWebhook payload', 30);
+      expect(clientSpy).toHaveBeenCalledExactlyOnceWith(OWNER, REPO, 'handleWebhook payload', 30);
+    } finally {
+      serviceSpy.mockRestore();
+      clientSpy.mockRestore();
+    }
+  });
+
+  it('does not collapse the three-valued contract anywhere in the chain', async () => {
+    const adapter = new GithubAdapter(createTestEnv(), INSTALLATION_ID);
+    const hits: VcsCodeSearchHit[] = [
+      { path: 'src/a.ts', fragment: 'A1', line: null, ref: 'default branch' },
+    ];
+    const clientSpy = vi
+      .spyOn(GitHubClient.prototype, 'searchCode')
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(hits);
+    try {
+      // null (capability unavailable) must NOT become [], and [] (ran, zero matches) must NOT
+      // become null — the executor branches on exactly that difference.
+      expect(await adapter.searchCode?.(OWNER, REPO, 'q', 30)).toBeNull();
+      expect(await adapter.searchCode?.(OWNER, REPO, 'q', 30)).toEqual([]);
+      expect(await adapter.searchCode?.(OWNER, REPO, 'q', 30)).toEqual(hits);
+    } finally {
+      clientSpy.mockRestore();
+    }
+  });
+
+  it('adds NO capability flag: VcsCapabilities has the same field set as before this plan', () => {
+    const adapter = new GithubAdapter(createTestEnv(), INSTALLATION_ID);
+    // The optional method plus the `null` return already express both the static capability and its
+    // runtime downgrade; a flag no consumer branches on is what vcs/types.ts warns against.
+    expect(Object.keys(adapter.capabilities).sort()).toEqual([
+      'supportsMermaid',
+      'supportsThreadListing',
+      'supportsThreadResolution',
+    ]);
+    expect(adapter.capabilities).not.toHaveProperty('supportsCodeSearch');
+  });
+});
+
+describe('grep_repo end to end on GitHub (D-05 / D-07)', () => {
+  const grepAction = (query: string) => JSON.stringify({ action: 'grep_repo', query });
+  const doneAction = JSON.stringify({ action: 'done', reason: 'enough_context' });
+
+  /** The loop dependency wired EXACTLY as `runAgenticContextPhase` wires it (review.ts:3945). */
+  function loopDeps(adapter: GithubAdapter, turns: string[]): AgenticLoopDeps {
+    let modelCalls = 0;
+    return {
+      callModel: async () => turns[Math.min(modelCalls++, turns.length - 1)],
+      readFile: async () => 'export const a = 1;\n',
+      searchCode: async (query) =>
+        (await adapter.searchCode?.(OWNER, REPO, query, AGENTIC_MAX_GREP_HITS)) ?? null,
+      hasBudget: () => true,
+    };
+  }
+
+  const loopInput = {
+    prTitle: 'Add auth middleware',
+    touchedPaths: ['src/server/app.ts'],
+    headSha: 'headsha1234567890',
+    skipFiles: ['**/*.lock', 'dist/**'],
+  };
+
+  it('leaves grepSupported TRUE after a successful search and labels the block with the default branch', async () => {
+    await withClient(
+      {
+        codeSearchResponses: {
+          body: {
+            total_count: 1,
+            incomplete_results: false,
+            items: [
+              { path: 'src/server/auth.ts', text_matches: [{ fragment: 'FRAGMENT-FROM-GITHUB' }] },
+            ],
+          },
+        },
+      },
+      async ({ searchCalls }) => {
+        const env = createTestEnv();
+        await seedInstallationToken(env, INSTALLATION_ID);
+        const adapter = new GithubAdapter(env, INSTALLATION_ID);
+
+        const outcome = await executeAgenticLoop(loopDeps(adapter, [grepAction('authenticate'), doneAction]), loopInput);
+
+        // The wave-1 steady state was `grepSupported: false` on every provider. This is the
+        // assertion that proves the adapter stopped being absent.
+        expect(outcome.grepSupported).toBe(true);
+        expect(outcome.grepsRun).toBe(1);
+        expect(outcome.stopReason).toBe('done');
+        expect(outcome.context).toContain('FRAGMENT-FROM-GITHUB');
+        expect(outcome.context).toContain('src/server/auth.ts');
+        expect(outcome.context).not.toContain('unavailable');
+        // D-07: the block discloses the default branch and never presents the hit as head content.
+        expect(outcome.context).toContain('default branch');
+        expect(outcome.context).not.toContain(loopInput.headSha);
+        // One subrequest for the grep, and the media type survived the whole chain.
+        expect(searchCalls()).toHaveLength(1);
+        expect(searchCalls()[0].accept).toBe(TEXT_MATCH_ACCEPT);
+      },
+    );
+  });
+
+  it('NEGATIVE CONTROL: a 403 from the same chain still downgrades the capability and tells the model', async () => {
+    await withClient({ codeSearchResponses: { status: 403 } }, async ({ searchCalls }) => {
+      const env = createTestEnv();
+      await seedInstallationToken(env, INSTALLATION_ID);
+      const adapter = new GithubAdapter(env, INSTALLATION_ID);
+
+      const outcome = await executeAgenticLoop(
+        loopDeps(adapter, [grepAction('authenticate'), grepAction('authorize'), doneAction]),
+        loopInput,
+      );
+
+      expect(outcome.grepSupported).toBe(false);
+      expect(outcome.context).toContain('unavailable');
+      // Downgraded PERMANENTLY for the invocation: the second grep hop spends no subrequest.
+      expect(searchCalls()).toHaveLength(1);
+    });
   });
 });
