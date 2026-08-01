@@ -7,6 +7,12 @@
 // VcsPostAnnotationsInput.findings. This is a type-only import from a module that has no imports
 // back from vcs/types.ts, so no circular import is introduced.
 import type { ParsedReviewComment } from '@shared/schema';
+// Phase 34 (PRD-04 / FR-114): the per-touched-file commit-history entry, landed as the Wave-1
+// contract in @shared/schema (34-01) and consumed by the optional `getFileHistory?` seam below.
+// Imported, never re-defined — @shared/schema is the single source of truth for the shape.
+// Re-exported so both adapters can import `VcsCommitEntry` from this seam module.
+import type { VcsCommitEntry } from '@shared/schema';
+export type { VcsCommitEntry };
 
 /**
  * Flattened PR metadata. Deliberately NOT the nested `{ head: { sha, ref }, base: {...},
@@ -196,6 +202,23 @@ export interface VcsProvider {
    * `context=3&topic=true` (R-5).
    */
   getCompareDiff(owner: string, repo: string, base: string, head: string): Promise<string>;
+
+  /**
+   * PRD-04 (FR-114): fetch recent commits touching a single file for decision-archaeology
+   * context. Returns up to `maxCommits` entries (short hash, subject line, other files
+   * changed in the same commit). The caller filters budget + gates on the config toggle;
+   * this method performs the raw provider call only.
+   *
+   * OPTIONAL, following the `getRepositoryMetadata?` / `postAnnotations?` / `labels?`
+   * feature-detect pattern. A missing method = no history (fail-open, D-06).
+   */
+  getFileHistory?(
+    owner: string,
+    repo: string,
+    path: string,
+    ref: string,
+    maxCommits: number,
+  ): Promise<VcsCommitEntry[]>;
 
   /**
    * List the blob paths of the repository's DEFAULT branch (QA-IDX-01, D-09).

@@ -3,6 +3,7 @@ import { GitHubError } from '../core/github';
 import type { AppBindings } from '../env';
 import type {
   VcsCapabilities,
+  VcsCommitEntry,
   VcsCreateStatusCheckInput,
   VcsProvider,
   VcsPullRequest,
@@ -84,6 +85,20 @@ export class GithubAdapter implements VcsProvider {
   // passes through as `''`; non-2xx throws GitHubError.
   async getCompareDiff(owner: string, repo: string, base: string, head: string): Promise<string> {
     return this.gh.getCompareDiff(owner, repo, base, head);
+  }
+
+  // PRD-04 (FR-114): per-touched-file commit history (review HIGH-1). Pure delegation — `ref`
+  // arrives as a parameter from the prepare-phase caller (which passes `pr.headSha` in 34-03);
+  // this adapter NEVER resolves refs from its own state and never references an out-of-scope
+  // `pr` object.
+  async getFileHistory?(
+    owner: string,
+    repo: string,
+    path: string,
+    ref: string,
+    maxCommits: number,
+  ): Promise<VcsCommitEntry[]> {
+    return this.gh.getFileHistory(owner, repo, path, ref, maxCommits);
   }
 
   // QA-IDX-01 (D-09): default-branch blob listing. Thin delegation -- no new REST logic lives here.

@@ -2,6 +2,9 @@ import type { AppBindings } from '@server/env';
 import { withTimeout } from '@server/core/timeout';
 import { logger } from '@server/core/logger';
 import type { BotIdentityResolver } from '@server/core/bot-identity';
+// Phase 34 (PRD-04 / FR-114): Wave-1 contract from @shared/schema (34-01). Imported, never
+// re-defined — the shape is shared with the prompt builder and both providers' adapters.
+import type { VcsCommitEntry } from '@shared/schema';
 
 export class GitHubError extends Error {
   constructor(
@@ -487,6 +490,31 @@ export class GitHubClient {
         'application/vnd.github.diff',
       );
       return response.text();
+    });
+  }
+
+  // PRD-04 (FR-114): per-touched-file commit history for decision-archaeology context. One
+  // subrequest per file. The response carries the file manifest (`files[].filename`), so every
+  // entry reports `filesAvailable: true` (review LOW-10) — the queried path itself is filtered
+  // out of the other-files list. Any non-2xx (including 404 for a path with no commits on this
+  // ref) throws GitHubError; the caller catches and skips that file's history (fail-open, D-06).
+  async getFileHistory(owner: string, repo: string, path: string, ref: string, maxCommits: number): Promise<VcsCommitEntry[]> {
+    const query = `path=${encodeURIComponent(path)}&sha=${encodeURIComponent(ref)}&per_page=${maxCommits}`;
+    return withRetry(`getFileHistory ${owner}/${repo} ${path}@${ref}`, async () => {
+      const response = await this.requestAndCheck(
+        `${repoApiPath(owner, repo)}/commits?${query}`,
+      );
+      const commits = (await response.json()) as Array<{
+        sha: string;
+        commit: { message: string };
+        files?: Array<{ filename: string }>;
+      }>;
+      return commits.map((c) => ({
+        hash: c.sha.slice(0, 7),
+        message: c.commit.message.split('\n')[0] ?? '',
+        files: (c.files ?? []).map((f) => f.filename).filter((f) => f !== path),
+        filesAvailable: true, // GitHub's commits endpoint returns the file manifest (review LOW-10)
+      }));
     });
   }
 

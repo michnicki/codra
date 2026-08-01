@@ -38,9 +38,21 @@ type AdapterHandle = {
   env: ReturnType<typeof createTestEnv>;
 };
 
+type BitbucketJobFixture = {
+  id: string;
+  owner: string;
+  repo: string;
+  prNumber: number;
+  commitSha: string;
+  headSha: string;
+  installationId: null;
+  repositoryVcsProvider: 'bitbucket';
+  repositoryWorkspace: string;
+};
+
 function buildBitbucketAdapter(env: ReturnType<typeof createTestEnv> = createTestEnv()): AdapterHandle {
   const client = new BitbucketClient(env, 'test-token-bearer');
-  const job = {
+  const job: BitbucketJobFixture = {
     id: 'job-bb-1',
     owner: OWNER,
     repo: REPO,
@@ -50,11 +62,11 @@ function buildBitbucketAdapter(env: ReturnType<typeof createTestEnv> = createTes
     installationId: null,
     repositoryVcsProvider: 'bitbucket',
     repositoryWorkspace: OWNER,
-  } as const;
+  };
   const adapter = new (BitbucketAdapter as unknown as new (
     env: ReturnType<typeof createTestEnv>,
     client: BitbucketClient,
-    job: typeof job,
+    job: BitbucketJobFixture,
     tracker?: { incrementSubrequests: ReturnType<typeof vi.fn> },
   ) => BitbucketAdapter)(env, client, job);
   return { adapter, client, env };

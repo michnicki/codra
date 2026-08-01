@@ -33,6 +33,12 @@ export class GitHubService {
     return this.client.getCompareDiff(owner, repo, base, head);
   }
 
+  // PRD-04 (FR-114): per-touched-file commit history. One-line passthrough so the adapter can
+  // reach the client (the GithubAdapter holds a GitHubService, never a GitHubClient).
+  async getFileHistory(owner: string, repo: string, path: string, ref: string, maxCommits: number) {
+    return this.client.getFileHistory(owner, repo, path, ref, maxCommits);
+  }
+
   // QA-IDX-01 (D-09): the two reads the index build's tree enumeration needs. Declared HERE and not
   // only on GitHubClient because `GithubAdapter` holds a `GitHubService`, never a `GitHubClient` --
   // that module boundary is load-bearing for the three specs that `vi.mock('@server/services/github')`
