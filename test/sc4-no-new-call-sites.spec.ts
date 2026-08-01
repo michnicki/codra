@@ -89,13 +89,22 @@ const SOURCE_SCAN_ALLOWLIST = new Set<string>([
 // `getCompareDiff` derives the changed-path set for a push-triggered incremental refresh ("D-08's
 // incremental refresh is a getCompareDiff call, not new provider work").
 //
+// Phase 34 carve-out (PRD-05 / D-13 / D-15): `src/server/core/review.ts` also consumes
+// `getFileContent` in the runPreparePhase YAML-config discovery block — it reads `.review.yaml`
+// (then `.review.yml`) from the PR head. That call site is the documented Phase 34 consumer of the
+// Phase 17 seam primitive, scoped to at most two `getFileContent` calls PER REVIEW, and gated on
+// `review.yaml_config.enabled` which defaults to false (D-15). With the toggle off the block never
+// executes, so review output stays byte-identical (NREG-01) — the same invariant this spec protects.
+// The carve-out is per-identifier rather than file-level, so a future edit that reached for
+// `resolveThread` or `getUnresolvedBotThreads` from the YAML block would still fail closed.
+//
 // GRANTING THIS DOES NOT WEAKEN THE INVARIANT THIS SPEC PROTECTS. SC4/NREG-01 exists so review OUTPUT
 // stays byte-identical; this consumer never runs inside a review job, is gated off by default
 // (`review.interactive.qa.index.enabled` defaults to false), and writes only to the code_index_* tables.
 // The carve-out is per-identifier rather than file-level, so a future edit that reached for
 // `resolveThread` or `getUnresolvedBotThreads` from the index build would still fail closed.
 const SC4_ALLOWLISTED_REVIEW_CALL_SITES = new Map<string, ReadonlySet<string>>([
-  ['src/server/core/review.ts', new Set(['getUnresolvedBotThreads', 'getCompareDiff'])],
+  ['src/server/core/review.ts', new Set(['getUnresolvedBotThreads', 'getCompareDiff', 'getFileContent'])],
   ['src/server/core/rounds.ts', new Set(['getCompareDiff'])],
   [
     'src/server/core/verify-fixes.ts',
