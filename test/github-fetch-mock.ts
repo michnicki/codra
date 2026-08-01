@@ -408,7 +408,14 @@ export function installGitHubFetchMock(fixtures: GitHubFetchMockFixtures) {
           return json({ id: replyCommentId, user: { id: commentUserId, login: commentUserLogin } }, 201);
         }
         if (parsedBody && typeof parsedBody === 'object' && 'commit_id' in parsedBody) {
-          const script = reviewCommentResponses[Math.min(reviewCommentCallIndex, reviewCommentResponses.length - 1)];
+          // WR-08: `?? { status: 201 }` guards the `length === 0` case. An explicitly-supplied
+          // empty array passes the truthy gate above, and `Math.min(idx, -1)` is `-1`, so the
+          // unguarded lookup returned `undefined` and `script.status` threw a TypeError from
+          // inside the mock -- masking the real assertion failure in whichever spec supplied it.
+          // Same posture as the try/catch around `parsedBody`: route handling must never throw.
+          const script = reviewCommentResponses[
+            Math.min(reviewCommentCallIndex, reviewCommentResponses.length - 1)
+          ] ?? { status: 201 };
           reviewCommentCallIndex += 1;
           if (script.status >= 400) {
             return json({ message: 'Unprocessable Entity' }, script.status);
