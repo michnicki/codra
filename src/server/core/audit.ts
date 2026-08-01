@@ -325,6 +325,62 @@ export async function recordYamlConfigParseFailed(
   }
 }
 
+// WR-03/WR-07 (34-REVIEW) bounds, matching the schema arm: at most 20 key names, each at most 64
+// chars. `.review.yaml` is untrusted PR-head content, so an author could otherwise declare
+// hundreds of long junk top-level keys and have every one of them written into jobs.audit.
+const YAML_CONFIG_KEY_SAMPLE_LIMIT = 20;
+const YAML_CONFIG_KEY_MAX_CHARS = 64;
+
+function boundKeyNames(keys: string[]): string[] {
+  return keys.slice(0, YAML_CONFIG_KEY_SAMPLE_LIMIT).map((key) => key.slice(0, YAML_CONFIG_KEY_MAX_CHARS));
+}
+
+/**
+ * Phase 34 WR-03 / WR-07 (34-REVIEW): PURE builder for the `yaml_config_applied` audit variant —
+ * the SUCCESS-path counterpart to `buildYamlConfigParseFailedEvent`.
+ *
+ * `replacedKeys` are the top-level keys the YAML declared that the schema recognizes; each one
+ * replaced the operator's DB subtree WHOLESALE under D-09 (its unspecified sub-keys reverted to
+ * Zod defaults). `ignoredKeys` are the declared top-level keys the schema does NOT recognize —
+ * Zod strips them silently, so without this field a typo'd `reveiw:` makes the whole file a
+ * no-op with no operator-visible signal (WR-07).
+ *
+ * Key names are bounded (count and length) because the file is untrusted. No I/O, never throws.
+ */
+export function buildYamlConfigAppliedEvent(
+  source: string,
+  replacedKeys: string[],
+  ignoredKeys: string[],
+): JobAuditEvent {
+  return {
+    stage: 'yaml_config_applied',
+    source: source.slice(0, YAML_CONFIG_KEY_MAX_CHARS),
+    replaced_keys: boundKeyNames(replacedKeys),
+    ignored_keys: boundKeyNames(ignoredKeys),
+    timestamp: new Date().toISOString(),
+  };
+}
+
+/**
+ * Phase 34 WR-03 / WR-07 (34-REVIEW): job-level best-effort recorder for `yaml_config_applied`.
+ * A VERBATIM clone of `recordYamlConfigParseFailed`: one `appendJobAuditEvents` in try/catch,
+ * logs a failure via `logger.warn`, NEVER rethrows — audit telemetry must never fail the prepare
+ * phase.
+ */
+export async function recordYamlConfigApplied(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  source: string,
+  replacedKeys: string[],
+  ignoredKeys: string[],
+): Promise<void> {
+  try {
+    await appendJobAuditEvents(env, jobId, [buildYamlConfigAppliedEvent(source, replacedKeys, ignoredKeys)]);
+  } catch (error) {
+    logger.warn(`Failed to record yaml_config_applied audit event for job ${jobId}`, error);
+  }
+}
+
 /**
  * Phase 18 (RND-01..05): bounded best-effort recorder for the `rounds.*` audit variants.
  * `core/rounds.ts` builds typed events via the locked builder helpers (buildRoundsDetectedEvent
