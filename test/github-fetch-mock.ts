@@ -173,6 +173,14 @@ export type GitHubFetchMockFixtures = {
     truncated?: boolean;
     tree?: Array<{ path: string; type: 'blob' | 'tree' | 'commit'; sha?: string; size?: number }>;
   };
+  /**
+   * PRD-04 (FR-114): response for GET /repos/{owner}/{repo}/commits?path=...&sha=...&per_page=...
+   * (per-touched-file commit history). `status` defaults to 200; `body` is the commit array, each
+   * entry shaped `{ sha, commit: { message }, files?: [{ filename }] }`.
+   *
+   * Registered ONLY when supplied, so every other spec's route table is byte-identical (NREG-01).
+   */
+  fileHistoryResponses?: BitbucketLikeMockResponse;
 };
 
 /**
@@ -284,6 +292,19 @@ export function installGitHubFetchMock(fixtures: GitHubFetchMockFixtures) {
         return json({ message: `Repository read error ${status}` }, status);
       }
       return json(fixture.body ?? {}, status);
+    }
+
+    // --- PRD-04 (FR-114): GET /repos/{owner}/{repo}/commits (file history) ---
+    // Exact-match on the bare commits path — the path/ref/per_page operands ride the query string.
+    // Registered ONLY when the fixture is supplied so every other spec's route table is
+    // byte-identical (NREG-01); the final fallthrough 404 covers the unregistered case.
+    if (method === 'GET' && fixtures.fileHistoryResponses && url.pathname === `${repoPrefix}/commits`) {
+      const fixture = fixtures.fileHistoryResponses;
+      const status = fixture.status ?? 200;
+      if (status >= 400) {
+        return json({ message: `File history error ${status}` }, status);
+      }
+      return json(fixture.body ?? [], status);
     }
 
     if (method === 'GET' && fixtures.branchResponse && url.pathname.startsWith(`${repoPrefix}/branches/`)) {
