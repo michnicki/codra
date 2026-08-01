@@ -339,7 +339,7 @@ dbDescribe('Phase 34 (34-03): prepare/review file-history pipeline', () => {
     expect(mocks.reviewFileCalls[0].fileHistory).toBeUndefined();
   });
 
-  it('D-05: the prepare fetch loop stops once tracker.hasRemainingSafeBudget(1) is false — remaining files get no history and still review diff-only', async () => {
+  it('D-05 / WR-04: the prepare fetch loop stops while FILE_HISTORY_BUDGET_RESERVE safe budget remains — remaining files get no history and still review diff-only', async () => {
     const repo = `repo-fh-budget-${Date.now()}`;
     await seedRepoWithFileHistoryToggle(repo, true);
     // 4 reviewable files so the loop has work left AFTER the budget boundary trips.
@@ -351,19 +351,26 @@ dbDescribe('Phase 34 (34-03): prepare/review file-history pipeline', () => {
     ];
     mocks.getPullRequestDiff.mockImplementation(() => generateMockDiff(diffFiles));
     // Each history fetch spends 12 subrequests (the real client spends 1; 12 makes the boundary
-    // deterministic: safe budget starts at 25 = MAX 50 - SAFE_MARGIN 25, so calls 1-3 pass the
-    // guard and the 4th file hits hasRemainingSafeBudget(1) === false).
+    // deterministic). Safe budget starts at 25 = MAX 50 - SAFE_MARGIN 25.
+    //
+    // WR-04 (34-REVIEW): the guard is now `hasRemainingSafeBudget(FILE_HISTORY_BUDGET_RESERVE)`
+    // (reserve 8), not `(1)`. So: call 1 (25 >= 8) spends 12 -> 13 left; call 2 (13 >= 8) spends
+    // 12 -> 1 left; the third file trips the guard (1 < 8). The loop now STOPS WITH BUDGET LEFT
+    // for the rest of prepare — postWalkthroughPlaceholder, the check-run update and
+    // enqueueJobPhase — instead of consuming the entire SAFE_MARGIN that exists for the untracked
+    // Hyperdrive traffic the tracker cannot see. Under the old `(1)` guard this test allowed 3
+    // fetches and left the invocation with nothing.
     mocks.fileHistoryIncrementPerCall = 12;
     mocks.getFileHistory.mockResolvedValue([]);
 
     const prep = await runPrepare(repo);
     expect(prep).toMatchObject({ action: 'next_phase', phase: 'review' });
 
-    // Exactly the 3 budget-allowable files were fetched; the loop broke before src/d.ts.
-    expect(mocks.getFileHistory).toHaveBeenCalledTimes(3);
-    expect(mocks.getFileHistory.mock.calls.map((call) => call[2])).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts']);
+    // Exactly the 2 budget-allowable files were fetched; the loop broke before src/c.ts.
+    expect(mocks.getFileHistory).toHaveBeenCalledTimes(2);
+    expect(mocks.getFileHistory.mock.calls.map((call) => call[2])).toEqual(['src/a.ts', 'src/b.ts']);
 
-    // The skipped file is absent from the persisted map — D-05: remaining files get no history.
+    // The skipped files are absent from the persisted map — D-05: remaining files get no history.
     const job = await findExistingJobForHead(env, {
       owner: OWNER,
       repo,
@@ -372,20 +379,46 @@ dbDescribe('Phase 34 (34-03): prepare/review file-history pipeline', () => {
       trigger: 'auto',
     });
     const persisted = JSON.parse((await env.APP_KV.get(`file-history:${job!.id}`, 'text'))!);
-    expect(persisted).toEqual({ 'src/a.ts': [], 'src/b.ts': [], 'src/c.ts': [] });
+    expect(persisted).toEqual({ 'src/a.ts': [], 'src/b.ts': [] });
 
-    // The job still proceeds: the review phase completes every file, the budget-skipped one
+    // The job still proceeds: the review phase completes every file, the budget-skipped ones
     // diff-only (fileHistory undefined = no appendix), the fetched ones with history ([]).
     const result = await runReviewUntilFinalize(repo);
     expect(result).toMatchObject({ action: 'next_phase', phase: 'finalize' });
-    expect(mocks.getFileHistory).toHaveBeenCalledTimes(3); // review HIGH-3: no re-fetch
+    expect(mocks.getFileHistory).toHaveBeenCalledTimes(2); // review HIGH-3: no re-fetch
     const callsByPath = new Map(
       mocks.reviewFileCalls.map((params: any) => [params.file.path, params.fileHistory] as const),
     );
     expect(callsByPath.get('src/a.ts')).toEqual([]);
     expect(callsByPath.get('src/b.ts')).toEqual([]);
-    expect(callsByPath.get('src/c.ts')).toEqual([]);
+    expect(callsByPath.get('src/c.ts')).toBeUndefined();
     expect(callsByPath.get('src/d.ts')).toBeUndefined();
+  });
+
+  // WR-04 (34-REVIEW): the absolute per-invocation ceiling, independent of the tracker. With the
+  // REAL per-fetch cost (1 subrequest) the reserve alone would permit ~17 fetches; this cap is the
+  // bound that holds if the per-request cost is ever mis-estimated.
+  it('WR-04: at most MAX_FILE_HISTORY_FETCHES_PER_PREPARE (10) fetches happen in one prepare invocation', async () => {
+    const repo = `repo-fh-cap-${Date.now()}`;
+    await seedRepoWithFileHistoryToggle(repo, true);
+    const diffFiles = Array.from({ length: 14 }, (_, i) => ({ path: `src/f${i}.ts`, content: `f${i}` }));
+    mocks.getPullRequestDiff.mockImplementation(() => generateMockDiff(diffFiles));
+    mocks.fileHistoryIncrementPerCall = 1; // the REAL client cost — the budget guard never trips here
+    mocks.getFileHistory.mockResolvedValue([]);
+
+    const prep = await runPrepare(repo);
+    expect(prep).toMatchObject({ action: 'next_phase', phase: 'review' });
+
+    expect(mocks.getFileHistory).toHaveBeenCalledTimes(10);
+    const job = await findExistingJobForHead(env, {
+      owner: OWNER,
+      repo,
+      prNumber: PR_NUMBER,
+      commitSha: HEAD_SHA,
+      trigger: 'auto',
+    });
+    const persisted = JSON.parse((await env.APP_KV.get(`file-history:${job!.id}`, 'text'))!);
+    expect(Object.keys(persisted)).toHaveLength(10);
   });
 
   it('D-06: a provider getFileHistory rejection logs a warning, skips that file only, and the review proceeds diff-only with no audit event', async () => {
