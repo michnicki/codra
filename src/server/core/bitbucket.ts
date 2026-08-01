@@ -9,6 +9,9 @@ import type {
 } from '@shared/bitbucket';
 import type { VcsPullRequest } from '@server/vcs/types';
 import type { BotIdentityResolver } from '@server/core/bot-identity';
+// Phase 34 (PRD-04 / FR-114): Wave-1 contract from @shared/schema (34-01). Imported, never
+// re-defined — the shape is shared with the prompt builder and both providers' adapters.
+import type { VcsCommitEntry } from '@shared/schema';
 
 // BB-01 deliberately mirrors the hand-rolled GitHub client: Workers-native fetch keeps the REST
 // surface small and avoids an SDK. The methods below own Bitbucket-specific mappings for PR fields,
@@ -424,6 +427,27 @@ export class BitbucketClient {
     const path = `${repositoryPath(workspace, repoSlug)}/diff/${spec}?context=3&topic=true`;
     const response = await this.request('GET', path, undefined, 'text/plain');
     return response.text();
+  }
+
+  /**
+   * PRD-04 (FR-114): fetch recent commits touching a single file.
+   *
+   * NOTE: parameter order deliberately deviates from `getFileContent` (:402, which takes
+   * ref BEFORE path) — this method takes `path` BEFORE `ref` to mirror the VcsProvider
+   * interface signature `getFileHistory?(owner, repo, path, ref, maxCommits)` (vcs/types.ts)
+   * that the adapter delegates against, keeping the adapter a pure passthrough.
+   */
+  async getFileHistory(workspace: string, repoSlug: string, path: string, ref: string, maxCommits: number): Promise<VcsCommitEntry[]> {
+    const encodedPath = encodeSrcPathSegments(path);
+    const apiPath = `${repositoryPath(workspace, repoSlug)}/commits/${encodeURIComponent(ref)}?path=${encodedPath}&pagelen=${maxCommits}`;
+    const response = await this.request('GET', apiPath);
+    const body = (await response.json()) as { values?: Array<{ hash: string; message: string }> };
+    return (body.values ?? []).map((c) => ({
+      hash: c.hash.slice(0, 7),
+      message: c.message.split('\n')[0] ?? '',
+      files: [], // Bitbucket Cloud commit-list endpoint omits the file manifest
+      filesAvailable: false, // Tells prompt builder to render "(files list not available)"
+    }));
   }
 
   // QA-IDX-01 (D-09): repository metadata read, used ONLY to resolve the default branch for the index
