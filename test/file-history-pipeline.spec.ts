@@ -339,6 +339,41 @@ dbDescribe('Phase 34 (34-03): prepare/review file-history pipeline', () => {
     expect(mocks.reviewFileCalls[0].fileHistory).toBeUndefined();
   });
 
+  // WR-05 (34-REVIEW): the previous NREG-01 test asserted only that the KV VALUE was null when the
+  // toggle is off — it never asserted that no READ occurred, so the ungated review-phase
+  // `APP_KV.get` (one per chunk / fresh-instance handoff / retry, always a guaranteed miss) went
+  // unnoticed. This asserts the absence of the read itself.
+  it('WR-05 (NREG-01): toggle OFF issues ZERO file-history KV reads in either phase', async () => {
+    const repo = `repo-fh-kvoff-${Date.now()}`;
+    await seedRepoWithFileHistoryToggle(repo, false);
+    const kvGetSpy = vi.spyOn(env.APP_KV, 'get');
+
+    await runPrepare(repo);
+    const { result } = await runReview(repo);
+    expect(result).toMatchObject({ action: 'next_phase', phase: 'finalize' });
+
+    const historyReads = kvGetSpy.mock.calls.filter(([key]) => String(key).startsWith('file-history:'));
+    expect(historyReads).toEqual([]);
+    kvGetSpy.mockRestore();
+  });
+
+  // The positive control for the assertion above: with the toggle ON the review phase DOES read
+  // the map from KV (and only from KV — review HIGH-3 forbids re-fetching over REST).
+  it('WR-05: toggle ON still issues the file-history KV read in the review phase', async () => {
+    const repo = `repo-fh-kvon-${Date.now()}`;
+    await seedRepoWithFileHistoryToggle(repo, true);
+    mocks.getFileHistory.mockResolvedValue([]);
+
+    await runPrepare(repo);
+    const kvGetSpy = vi.spyOn(env.APP_KV, 'get');
+    const { result } = await runReview(repo);
+    expect(result).toMatchObject({ action: 'next_phase', phase: 'finalize' });
+
+    const historyReads = kvGetSpy.mock.calls.filter(([key]) => String(key).startsWith('file-history:'));
+    expect(historyReads.length).toBeGreaterThan(0);
+    kvGetSpy.mockRestore();
+  });
+
   it('D-05 / WR-04: the prepare fetch loop stops while FILE_HISTORY_BUDGET_RESERVE safe budget remains — remaining files get no history and still review diff-only', async () => {
     const repo = `repo-fh-budget-${Date.now()}`;
     await seedRepoWithFileHistoryToggle(repo, true);
