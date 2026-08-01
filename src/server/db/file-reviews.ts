@@ -514,6 +514,14 @@ export async function getFileReviewsForJobs(env: Pick<AppBindings, 'HYPERDRIVE'>
               -- Stripping null keys turns "present with null" into "absent" (= undefined), which is
               -- schema-legal for every field here, nullable or not.
               JSON_STRIP_NULLS(JSON_BUILD_OBJECT(
+                -- WR-06: the stable identifier for this comment, projected so a comment skipped at
+                -- the posting boundary can be joined back to its row from the audit trail.
+                -- CAST TO TEXT DELIBERATELY: rc.id is BIGSERIAL (64-bit) and a JSON number loses
+                -- precision above 2^53 -- verified against this database, where
+                -- 9007199254740993::bigint projects back as 9007199254740992. An audit identifier
+                -- that is silently off by one points at a DIFFERENT comment. The text cast is
+                -- exact, and it is also the form an operator pastes straight into a WHERE clause.
+                'commentId', rc.id::text,
                 'path', rc.path,
                 'line', rc.line,
                 'position', rc.position,

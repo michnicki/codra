@@ -2961,7 +2961,7 @@ dbDescribe('Review Flow Lifecycle', () => {
     // report a fabricated line for every GitHub skip (G-28-3).
     const createSpy = vi
       .spyOn(GitHubService.prototype, 'createReview')
-      .mockResolvedValue({ id: 456, skippedComments: [{ path: 'src/foo.ts', position: 3, title: 'my finding' }] } as any);
+      .mockResolvedValue({ id: 456, skippedComments: [{ path: 'src/foo.ts', position: 3, commentId: '4242' }] } as any);
 
     const job = await insertJob(env, {
       installationId: '123',
@@ -3011,10 +3011,128 @@ dbDescribe('Review Flow Lifecycle', () => {
     expect(skipEvents).toHaveLength(1);
     expect(skipEvents[0]).toMatchObject({ stage: 'inline_comment_skipped', count: 1 });
     // WR-01: the diff offset lands in `position` (3) with `line` null — NOT `line: 3`, which would
-    // be a line number the finding was never on. The sample title is redacted (AUD-01).
+    // be a line number the finding was never on. WR-06: the sample identifies the comment by its
+    // persisted review_comments.id, not by a title that would always read '[title-redacted]'.
     expect(skipEvents[0].sample).toEqual([
-      { path: 'src/foo.ts', line: null, position: 3, title: '[title-redacted]' },
+      { path: 'src/foo.ts', line: null, position: 3, commentId: '4242' },
     ]);
+
+    findSpy.mockRestore();
+    createSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
+
+  // WR-06 END-TO-END: the whole point of replacing the inert '[title-redacted]' marker with
+  // review_comments.id is that an operator can join a skipped entry back to the EXACT finding.
+  // Carrying "some string" through the seam would satisfy a shape assertion while still being
+  // useless, so this test resolves the recorded id against the real table and proves it names the
+  // right row. It also proves the id survives the full path:
+  //   review_comments INSERT -> getFileReviewsForJobs' rc.id::text projection -> finalComments
+  //   -> submitReview's comment payload -> skippedComments -> inline_comment_skipped audit sample.
+  it('the recorded commentId resolves to the skipped comment\'s own review_comments row (WR-06)', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const repo = `test-repo-${Date.now()}-skipid`;
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);\nconsole.log(2);' }]),
+    );
+    const findSpy = vi.spyOn(GitHubService.prototype, 'findBotReviewForCommit');
+
+    // Skip the SECOND comment, using whatever commentId finalize actually threaded for it. The id
+    // is never hardcoded here -- it is read back out of the call the production code made.
+    let skippedIdFromCall: string | undefined;
+    const createSpy = vi
+      .spyOn(GitHubService.prototype, 'createReview')
+      .mockImplementation(async (_owner: any, _repo: any, _pr: any, params: any) => {
+        const target = params.comments.find((c: any) => c.path === 'src/second.ts');
+        skippedIdFromCall = target?.commentId;
+        return {
+          id: 456,
+          skippedComments: [{ path: target.path, position: target.position, commentId: target.commentId }],
+        } as any;
+      });
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 11,
+      prTitle: 'Skipped Comment Id Test',
+      prAuthor: 'author',
+      commitSha: sha('e2'),
+      baseSha: sha('f2'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: defaultRepoConfig,
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+    await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+    // TWO persisted comments so a wrong-row bug (off-by-one, first-row-always) is detectable —
+    // a single-comment fixture would pass even if the id resolution were broken.
+    await upsertFileReview(env, job.id, {
+      filePath: 'src/app.ts',
+      fileStatus: 'done',
+      modelUsed: 'test-model',
+      modelProvider: 'test-provider',
+      diffLineCount: 2,
+      diffInput: 'diff',
+      rawAiOutput: '{}',
+      parsedComments: [
+        {
+          path: 'src/first.ts',
+          line: 1,
+          position: 1,
+          severity: 'P2',
+          category: 'quality',
+          title: 'the FIRST finding',
+          body: 'first body',
+        },
+        {
+          path: 'src/second.ts',
+          line: 2,
+          position: 2,
+          severity: 'P1',
+          category: 'correctness',
+          title: 'the SECOND finding',
+          body: 'second body',
+        },
+      ],
+      inputTokens: 1,
+      outputTokens: 1,
+      durationMs: 1,
+      verdict: 'comment',
+      fileSummary: 'ok',
+      errorMessage: null,
+    });
+
+    await runWithDb(env, async () => {
+      const result = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-skipid', phase: 'finalize' });
+      expect(result).toEqual({ action: 'ack' });
+    });
+
+    // finalize actually threaded a real id (not undefined) into the provider call.
+    expect(skippedIdFromCall).toMatch(/^\d+$/);
+
+    const detail = await getJobDetail(env, job.id);
+    const skipEvents: any[] = (detail?.audit ?? []).filter((e: any) => e.stage === 'inline_comment_skipped');
+    expect(skipEvents).toHaveLength(1);
+    const recordedId: string = skipEvents[0].sample[0].commentId;
+    expect(recordedId).toBe(skippedIdFromCall);
+
+    // THE ASSERTION THAT MATTERS: the recorded id names the second comment's row, not the first's
+    // and not a nonexistent one.
+    await runWithDb(env, async () => {
+      const rows = await queryRows<{ path: string; title: string; body: string }>(
+        env,
+        `SELECT path, title, body FROM review_comments WHERE id = $1::bigint`,
+        [recordedId],
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0].path).toBe('src/second.ts');
+      expect(rows[0].title).toBe('the SECOND finding');
+      expect(rows[0].title).not.toBe('the FIRST finding');
+    });
 
     findSpy.mockRestore();
     createSpy.mockRestore();

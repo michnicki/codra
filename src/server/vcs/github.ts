@@ -342,7 +342,8 @@ export class GithubAdapter implements VcsProvider {
       path: s.path,
       line: null,
       position: s.position,
-      title: s.title,
+      // WR-06: the persisted review_comments.id, the identifier the audit trail joins on.
+      commentId: s.commentId,
     }));
     return skipped && skipped.length > 0 ? { ref: String(id), skippedComments: skipped } : { ref: String(id) };
   }

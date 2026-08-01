@@ -449,9 +449,9 @@ describe('BitbucketAdapter (VcsProvider mapping)', () => {
         summaryBody: 'Looks mostly good',
         jobIdHint: 'job-bb-1',
         comments: [
-          { path: 'src/foo.ts', position: 2, body: 'first', title: 'finding one' },
-          { path: 'src/foo.ts', position: 3, body: 'second', title: 'finding two' },
-          { path: 'src/foo.ts', position: 4, body: 'third', title: 'finding three' },
+          { path: 'src/foo.ts', position: 2, body: 'first', commentId: '801' },
+          { path: 'src/foo.ts', position: 3, body: 'second', commentId: '802' },
+          { path: 'src/foo.ts', position: 4, body: 'third', commentId: '803' },
         ],
       });
 
@@ -469,20 +469,21 @@ describe('BitbucketAdapter (VcsProvider mapping)', () => {
       // WR-01: Bitbucket anchors by LINE and has no diff offset, so `position` is null. The two
       // coordinates stay in separate fields so a consumer never reads one as the other (G-28-3).
       expect(result.skippedComments).toEqual([
-        { path: 'src/foo.ts', line: 3, position: null, title: 'finding two' },
+        { path: 'src/foo.ts', line: 3, position: null, commentId: '802' },
       ]);
 
       // Warn fired for the skipped comment with the exact payload — no body key.
       const skipWarn = warnSpy.mock.calls.find(([message]) => String(message).includes('rejected with 422'));
       expect(skipWarn).toBeDefined();
+      // WR-05/WR-06: identified by the persisted review_comments.id. No model-supplied title is
+      // carried at all now, so there is nothing for the logger to leak (`toEqual` is exact, so this
+      // also asserts no `title` key survives).
       expect(skipWarn?.[1]).toEqual({
         workspace: WORKSPACE,
         repo: REPO,
         path: 'src/foo.ts',
         line: 3,
-        // WR-05: redacted, matching the audit boundary — the raw model-supplied title must never
-        // reach the log sink (the logger's redaction list does not cover `title`).
-        title: '[title-redacted]',
+        commentId: '802',
       });
     } finally {
       warnSpy.mockRestore();
@@ -515,7 +516,7 @@ describe('BitbucketAdapter (VcsProvider mapping)', () => {
         verdict: 'comment',
         summaryBody: 'Looks good',
         jobIdHint: 'job-bb-1',
-        comments: [{ path: 'src/foo.ts', position: 2, body: 'first', title: 'finding one' }],
+        comments: [{ path: 'src/foo.ts', position: 2, body: 'first', commentId: '801' }],
       }),
     ).rejects.toBeInstanceOf(BitbucketError);
 
@@ -553,9 +554,9 @@ describe('BitbucketAdapter (VcsProvider mapping)', () => {
         summaryBody: 'Looks good',
         jobIdHint: 'job-bb-1',
         comments: [
-          { path: 'src/foo.ts', position: 2, body: 'anchored', title: 'finding one' },
+          { path: 'src/foo.ts', position: 2, body: 'anchored', commentId: '801' },
           // No position at all -> anchorForComment returns undefined.
-          { path: 'src/foo.ts', body: 'unanchorable', title: 'finding two' },
+          { path: 'src/foo.ts', body: 'unanchorable', commentId: '802' },
         ],
       });
 
@@ -569,7 +570,7 @@ describe('BitbucketAdapter (VcsProvider mapping)', () => {
       // The un-anchorable one is reported rather than silently dropped. There is no resolved
       // anchor, so BOTH coordinates are null.
       expect(result.skippedComments).toEqual([
-        { path: 'src/foo.ts', line: null, position: null, title: 'finding two' },
+        { path: 'src/foo.ts', line: null, position: null, commentId: '802' },
       ]);
     } finally {
       warnSpy.mockRestore();
@@ -605,8 +606,8 @@ describe('BitbucketAdapter (VcsProvider mapping)', () => {
         summaryBody: 'Looks good',
         jobIdHint: 'job-bb-1',
         comments: [
-          { path: 'src/foo.ts', position: 2, body: 'identical text', title: 'finding one' },
-          { path: 'src/foo.ts', position: 2, body: 'identical text', title: 'finding two' },
+          { path: 'src/foo.ts', position: 2, body: 'identical text', commentId: '801' },
+          { path: 'src/foo.ts', position: 2, body: 'identical text', commentId: '802' },
         ],
       });
 
@@ -621,7 +622,7 @@ describe('BitbucketAdapter (VcsProvider mapping)', () => {
       expect(result.postedComments).toHaveLength(1);
       expect(result.postedComments[0]).toMatchObject({ path: 'src/foo.ts', line: 2, body: 'identical text' });
       expect(result.skippedComments).toEqual([
-        { path: 'src/foo.ts', line: 2, position: null, title: 'finding one' },
+        { path: 'src/foo.ts', line: 2, position: null, commentId: '801' },
       ]);
     } finally {
       warnSpy.mockRestore();

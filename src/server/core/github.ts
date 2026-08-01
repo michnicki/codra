@@ -1,9 +1,6 @@
 import type { AppBindings } from '@server/env';
 import { withTimeout } from '@server/core/timeout';
 import { logger } from '@server/core/logger';
-// WR-05: the same redaction the audit boundary applies, reused so a skipped comment's title is
-// never emitted verbatim to the log sink.
-import { redactFindingTitle } from '@server/core/audit-redact';
 import type { BotIdentityResolver } from '@server/core/bot-identity';
 // Phase 34 (PRD-04 / FR-114): Wave-1 contract from @shared/schema (34-01). Imported, never
 // re-defined — the shape is shared with the prompt builder and both providers' adapters.
@@ -102,7 +99,9 @@ export type GitHubReviewComment = {
   path: string;
   position?: number;
   body: string;
-  title?: string;
+  // WR-06: the persisted `review_comments.id` (as text), used ONLY to identify a comment that was
+  // not posted. Never on the wire — `createReviewComment` sends a fixed 4-key body.
+  commentId?: string | null;
 };
 
 /**
@@ -110,8 +109,14 @@ export type GitHubReviewComment = {
  * usable position at all (WR-04's batch-filter drop path). It is deliberately NOT called `line`:
  * a GitHub diff position is not a head-side line number, and conflating the two is the exact
  * defect G-28-3 documents (see the COORDINATE SYSTEMS note on `vcs/types.ts::getInlineCommentDetails`).
+ *
+ * WR-06: `commentId` is the persisted `review_comments.id`, the identifier an operator joins on.
  */
-export type GitHubSkippedComment = { path: string; position: number | null; title?: string };
+export type GitHubSkippedComment = {
+  path: string;
+  position: number | null;
+  commentId?: string | null;
+};
 
 /**
  * WR-04: THE predicate for "GitHub can anchor this comment", shared by the batch body and the
@@ -903,7 +908,7 @@ export class GitHubClient {
     // `skippedComments` seam exists to answer, so they are surfaced with `position: null`.
     const unpositionedSkips: GitHubSkippedComment[] = input.comments
       .filter((comment) => !hasReviewPosition(comment))
-      .map((comment) => ({ path: comment.path, position: null, title: comment.title }));
+      .map((comment) => ({ path: comment.path, position: null, commentId: comment.commentId }));
     if (unpositionedSkips.length > 0) {
       logger.warn(`GitHub review comments dropped: no usable diff position`, {
         owner,
@@ -1023,7 +1028,7 @@ export class GitHubClient {
         skipped.push(
           ...positionedComments
             .slice(i)
-            .map((c) => ({ path: c.path, position: c.position, title: c.title })),
+            .map((c) => ({ path: c.path, position: c.position, commentId: c.commentId })),
         );
         break;
       }
@@ -1037,15 +1042,13 @@ export class GitHubClient {
             pullNumber,
             path: comment.path,
             position: comment.position,
-            // WR-05: the redacted form, matching the audit boundary. `redactFindingTitle` exists
-            // because jobs.audit can never retain model-supplied title content, and the logger's
-            // redaction list does not cover `title` -- so logging it raw emitted exactly the value
-            // the audit trail is forbidden to store. Finding titles routinely quote identifiers
-            // and code fragments from a private repository.
-            title: redactFindingTitle(comment.title),
+            // WR-05/WR-06: the model-supplied title is no longer carried at all, so there is
+            // nothing here to redact -- the `review_comments.id` is title-free by construction and
+            // is what an operator actually needs to find the finding.
+            commentId: comment.commentId,
             reason: 'unprocessable',
           });
-          skipped.push({ path: comment.path, position: comment.position, title: comment.title });
+          skipped.push({ path: comment.path, position: comment.position, commentId: comment.commentId });
         } else {
           throw error;
         }

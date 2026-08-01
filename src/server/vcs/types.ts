@@ -68,7 +68,11 @@ export type VcsReviewComment = {
   path: string;
   position?: number;
   body: string;
-  title?: string;
+  // WR-06: the persisted `review_comments.id` (as text), carried so a comment that is NOT posted
+  // can be identified in the audit trail. NEVER reaches the wire — see the fixed 4-key body in
+  // `core/github.ts::createReviewComment`. This replaces the former `title` field, which was inert
+  // at every sink because `redactFindingTitle` collapses every title to one fixed marker.
+  commentId?: string | null;
 };
 
 export type VcsSubmitReviewInput = {
@@ -106,21 +110,28 @@ export type VcsPostedComment = { path: string; line: number; body: string; link?
  * the viewer rendered "src/foo.ts:3" for a finding at POSITION 3, i.e. a fabricated line number.
  * Do NOT re-collapse these into one field.
  *
- * `title` is the finding title, threaded for audit identifiers only; it never reaches the wire, and
- * both the audit builder and the skip log statements redact it (see `redactFindingTitle`). Because
- * that redaction maps EVERY non-empty title to a single fixed marker, the field currently carries
- * no identifying information at either sink -- `{ path, line, position }` is what actually
- * identifies the comment. It is retained as the hook for a future non-reversible digest rather
- * than being removed and re-threaded through five layers later.
+ * WR-06: `commentId` is the persisted `review_comments.id` (as text) and is THE identifier here --
+ * it is what lets an operator join a skipped entry back to the exact finding
+ * (`SELECT * FROM review_comments WHERE id = <commentId>`). It replaces a former `title` field that
+ * was inert at every sink: `redactFindingTitle` maps every non-empty title to one fixed marker, so
+ * the audit sample always read `[title-redacted]` no matter what was threaded.
  *
- * Consumers (Plan 33-03's aggregate audit event) admit ONLY { path, line, position, title } --
- * body never crosses this seam (T-13-03-03).
+ * A DIGEST of the title was considered and rejected: `redactFindingTitle`'s own contract forbids
+ * retaining a "source-derived prefix, digest, length, or other title content", and finding titles
+ * are formulaic enough to be dictionary-attackable over a small plausible-title space. The row id
+ * is not title-derived at all, so it restores operator value at no privacy cost.
+ *
+ * It is a STRING because `review_comments.id` is BIGSERIAL (64-bit) and a JSON number silently
+ * loses precision above 2^53. Do not "simplify" it to a number.
+ *
+ * Consumers (Plan 33-03's aggregate audit event) admit ONLY { path, line, position, commentId } --
+ * body and title never cross this seam (T-13-03-03).
  */
 export type VcsSkippedComment = {
   path: string;
   line: number | null;
   position?: number | null;
-  title?: string;
+  commentId?: string | null;
 };
 
 /**
