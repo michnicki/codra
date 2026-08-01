@@ -736,11 +736,18 @@ export function buildEvidenceHardDroppedEvent(
 // precedent for the per-(file, pass) aggregate shape.
 // ---------------------------------------------------------------------------
 
-/** Sample cap for suggestion_dropped events — matches the other aggregate builders. */
-export const SUGGESTION_DROP_SAMPLE_CAP = 20;
+/**
+ * Sample cap for suggestion_dropped events — matches the other aggregate builders.
+ * Module-private, like `LEARNED_RULE_SUPPRESS_SAMPLE_CAP`: nothing outside this module
+ * consumes it, so exporting it would widen the surface for no consumer (IN-05).
+ */
+const SUGGESTION_DROP_SAMPLE_CAP = 20;
 
 /** One FR-153-dropped finding identifier: { path, line, title } only (T-13-03-03). */
 export type SuggestionDropEntry = { path: string; line: number | null; title: string };
+
+/** Narrowed `suggestion_dropped` variant, mirroring `InlineCommentSkippedAuditEvent` (IN-02). */
+export type SuggestionDroppedAuditEvent = Extract<JobAuditEvent, { stage: 'suggestion_dropped' }>;
 
 /**
  * PURE suggestion-dropped audit builder (FR-153 / D-08).
@@ -761,7 +768,7 @@ export function buildSuggestionDroppedEvent(
   file: string,
   pass: FileReviewPass,
   entries: SuggestionDropEntry[],
-): JobAuditEvent | null {
+): SuggestionDroppedAuditEvent | null {
   if (entries.length === 0) return null;
 
   const sample = entries.slice(0, SUGGESTION_DROP_SAMPLE_CAP).map((e) => ({
@@ -783,10 +790,13 @@ export function buildSuggestionDroppedEvent(
   // the `JobAuditEvent` union member, TypeScript rejects at compile time.
   return event satisfies JobAuditEvent;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 28 (LRN-01) — bounded learned_rule_suppressed audit builder.
 //
 // One aggregate event per (file, pass) when learned-rule suppression removed >=1
-// finding from the finalize pass output. Follows the evidence_hard_dropped
-// precedent (lines 642-691) for the per-(file, pass) aggregate shape.
+// finding from the finalize pass output. Follows the `buildEvidenceHardDroppedEvent`
+// precedent for the per-(file, pass) aggregate shape.
 // ---------------------------------------------------------------------------
 
 /** Sample cap for learned_rule_suppressed events — matches evidence_hard_dropped precedent. */
@@ -840,8 +850,11 @@ export function buildLearnedRuleSuppressedEvent(
 // the widened VcsProvider.submitReview return. Follows the learned_rule_suppressed precedent.
 // ---------------------------------------------------------------------------
 
-/** Sample cap for inline_comment_skipped events — matches the other aggregate builders. */
-export const INLINE_COMMENT_SKIPPED_SAMPLE_CAP = 20;
+/**
+ * Sample cap for inline_comment_skipped events — matches the other aggregate builders.
+ * Module-private for the same reason as `LEARNED_RULE_SUPPRESS_SAMPLE_CAP` (IN-05).
+ */
+const INLINE_COMMENT_SKIPPED_SAMPLE_CAP = 20;
 
 export type InlineCommentSkippedAuditEvent = Extract<JobAuditEvent, { stage: 'inline_comment_skipped' }>;
 
