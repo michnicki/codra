@@ -67,6 +67,7 @@ import {
   recordUnitAudit,
   recordVerifyFixesAudit,
   recordYamlConfigApplied,
+  recordYamlConfigHeadIgnored,
   recordYamlConfigParseFailed,
 } from './audit';
 import { runVerifyFixesPhase } from './verify-fixes';
@@ -1200,6 +1201,10 @@ async function runPreparePhase(
   // NO file_skipped events (a review-rest job consumes prior skips, it does not re-record drops).
   let files: FileDiff[];
   let dropped: FileSelectionResult['dropped'] | null = null;
+  // quick-k31 (WR-03): the changed-path list the `yaml_config_head_ignored` notice reads. Populated
+  // from data BOTH branches below already compute, so the head-ignored detection costs ZERO extra
+  // subrequests — it never fetches the head file to compare.
+  let changedPathsForConfigNotice: string[] = [];
   // Phase 18 Plan 02 (RND-02): the durable, immutable diff-selection descriptor. Persisted on
   // the job row IMMEDIATELY after the prepare-time resolver + compare-fetch + selectDiffForRound
   // classify the diff source so review/finalize can re-fetch the EXACT same compare range on
@@ -1209,6 +1214,7 @@ async function runPreparePhase(
   let selectionDescriptor: DiffSelectionDescriptor | null = null;
   if (job.reviewScope === 'rest') {
     files = await getJobDiffFiles(env, job, vcs, config);
+    changedPathsForConfigNotice = files.map((file) => file.path);
   } else {
     // Build the descriptor against the prepare-time round context. The full diff is fetched on
     // 'full' (the default round 1 path) AND on the thrown-compare fallback path for 'incremental'.
@@ -1318,9 +1324,16 @@ async function runPreparePhase(
     // Use the SELECTED raw diff for the file selection. The KV cache is keyed on the SELECTED
     // mode + range so a cache miss never silently substitutes a different source (Codex HIGH).
     const rawDiff = selectDiffForSelection(selectionDescriptor, compareDiff, fullDiff);
-    const selection = selectReviewableFiles(parseUnifiedDiff(rawDiff, config.review), config.review);
+    // quick-k31 (WR-03): the parse is HOISTED (a rename, not an extra parse) so the UNFILTERED
+    // parsed list is nameable for the head-ignored notice below. The unfiltered output is the right
+    // source: `parseUnifiedDiff` still emits a `FileDiff` entry for a path the review skips
+    // (`isIgnored` only suppresses hunk accumulation — see core/diff.ts:147), so a `.review.yaml`
+    // change stays visible here even when `skip_files` excludes it from review.
+    const parsedSelectedFiles = parseUnifiedDiff(rawDiff, config.review);
+    const selection = selectReviewableFiles(parsedSelectedFiles, config.review);
     files = selection.kept;
     dropped = selection.dropped;
+    changedPathsForConfigNotice = parsedSelectedFiles.map((file) => file.path);
   }
 
   // CMD-02 / D-10 skipped-for-size producer: when the commands feature is active, persist the files
@@ -1357,6 +1370,32 @@ async function runPreparePhase(
   // Best-effort: recordFileSkips swallows failures and never blocks enqueuing the review phase.
   if (dropped && config.review.file_selection.enabled) {
     await recordFileSkips(env, job.id, buildFileSkipEvents(dropped));
+  }
+
+  // quick-k31 (WR-03): tell a contributor who edited `.review.yaml` in THIS PR why it had no
+  // effect. Config is read from the base branch (see the discovery block above), so a head-side
+  // edit is inert until the PR merges — without this event, that is silent.
+  //
+  // Two non-obvious properties:
+  //   (i)  The event is emitted whether or not a base-branch config was FOUND. "A contributor is
+  //        adding `.review.yaml` for the first time" is exactly when the signal matters most, and
+  //        that case has no base config by definition.
+  //   (ii) The `no_changes` short-circuit above RETURNS before this point. That is correct: that
+  //        round reviewed no diff at all, so there is no config change in the reviewed diff.
+  //
+  // Gated on the feature toggle: with `yaml_config` off the config file has no effect on ANY
+  // review, so an "ignored" notice would be noise — and emitting it would break NREG-01's
+  // byte-identical disabled path. Detection reads the already-parsed changed-file list (exact,
+  // repo-root-relative match — discovery only reads root-level files), so it costs zero extra
+  // subrequests and never fetches the head file. Best-effort: the recorder swallows its own
+  // failures and never throws.
+  if (config.review.yaml_config?.enabled === true) {
+    const touchedConfigPath = changedPathsForConfigNotice.find(
+      (path) => path === '.review.yaml' || path === '.review.yml',
+    );
+    if (touchedConfigPath) {
+      await recordYamlConfigHeadIgnored(env, job.id, touchedConfigPath, pr.baseSha ?? '', pr.headSha ?? '');
+    }
   }
 
   // Phase 34 (PRD-04): per-file commit history for decision archaeology.

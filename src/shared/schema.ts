@@ -1513,14 +1513,16 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
       timestamp: dateStringSchema,
     })
     .passthrough(),
-  // Phase 34 WR-03 / WR-07 (34-REVIEW): a `.review.yaml` was found, parsed and MERGED. This event
-  // exists because the D-09 merge is a WHOLESALE top-level replacement driven by a file read from
-  // `pr.headSha` — a branch any PR author controls. A two-line file declaring `review:` resets
-  // EVERY operator-configured sub-key to its Zod default (passes.security.enabled → false,
-  // evidence.hard_drop → false, learning.learned_rules → [], max_files → 150, …) and that reset is
-  // then persisted to jobs.config_snapshot, where every later phase observes it. Nothing in the
-  // audit trail said so. `replaced_keys` names the top-level keys the YAML overrode, so the reset
-  // is OBSERVABLE after the fact.
+  // Phase 34 WR-03 / WR-07 (34-REVIEW): a `.review.yaml` was found, parsed and MERGED. The file is
+  // read from the PR BASE BRANCH (quick-k31 reversed the head half of D-13), so its content is
+  // MAINTAINER-REVIEWED — the head-controlled-file premise this event was originally written
+  // against no longer holds. The event still earns its place because the D-09 merge is a WHOLESALE
+  // top-level replacement: a two-line file declaring `review:` resets EVERY operator-configured
+  // sub-key to its Zod default (passes.security.enabled → false, evidence.hard_drop → false,
+  // learning.learned_rules → [], max_files → 150, …) and that reset is then persisted to
+  // jobs.config_snapshot, where every later phase observes it. Nothing in the audit trail said so.
+  // `replaced_keys` names the top-level keys the YAML overrode, so the reset is OBSERVABLE after
+  // the fact.
   //
   // `ignored_keys` covers WR-07: `repoConfigSchema` is non-strict, so a typo'd top-level key
   // (`reveiw:`) is silently stripped by Zod, the merge becomes an identity, and the operator gets
@@ -1534,6 +1536,29 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
       source: z.string().min(1).max(64),
       replaced_keys: z.array(z.string().max(64)).max(20),
       ignored_keys: z.array(z.string().max(64)).max(20),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // quick-k31 (WR-03): the reviewed diff CHANGES `.review.yaml` / `.review.yml`, but config is read
+  // from the PR base branch, so that change has NO effect on THIS review — it takes effect once the
+  // PR is merged. Without this event a contributor who edits the config in their PR sees a review
+  // that ignored it and no explanation anywhere; with it, the audit trail says so.
+  //
+  // Emitted whether or not a base-branch config was FOUND: "a contributor adding `.review.yaml` for
+  // the first time" is exactly the case where the signal matters most, and that case has no base
+  // config by definition. Hence `base_sha` is `.max(64)` and NOT `.min(1)` — the fail-closed
+  // no-usable-base-SHA path carries an empty string.
+  //
+  // Detection is DIFF-DERIVED (the already-parsed changed-file list), so the event costs no extra
+  // provider call and never fetches the head file. `path` is bounded like every other untrusted
+  // string in this union; only the matched literal `.review.yaml` / `.review.yml` is ever recorded,
+  // and no file CONTENT is recorded at all (the WR-02 rule holds).
+  z
+    .object({
+      stage: z.literal('yaml_config_head_ignored'),
+      path: z.string().min(1).max(64),
+      base_sha: z.string().max(64),
+      head_sha: z.string().max(64),
       timestamp: dateStringSchema,
     })
     .passthrough(),
