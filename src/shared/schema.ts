@@ -441,6 +441,23 @@ export const reviewConfigSchema = z.object({
       enabled: z.boolean().default(false),
     })
     .default({ enabled: false }),
+  // Phase 35 (PRD-06, FR-131/FR-132, D-13): the bounded agentic-context pass. When on, a review job
+  // routes prepare → agentic_context → review and a bounded loop (6 hops max) lets the model pull
+  // extra repository context with `read_file` / `grep_repo` before the per-file review runs.
+  //
+  // Defaults OFF, DELIBERATELY AGAINST the PRD's stated default-enabled (D-13). The loop spends real
+  // money (up to 6 extra model calls per review) and real subrequests on every review, so an existing
+  // instance must not silently start making extra model calls on upgrade — NREG-01 inertness beats the
+  // PRD's default here, and the ROADMAP success criterion was amended to match (D-15).
+  //
+  // OPERATOR DATA-BOUNDARY NOTE: enabling this forwards repository files the pull request did not
+  // touch to the operator's configured LLM provider. That is a real widening of the self-hosting data
+  // boundary and the operator should understand it before opting in.
+  agentic_tools: z
+    .object({
+      enabled: z.boolean().default(false),
+    })
+    .default({ enabled: false }),
   // Phase 30 (ANNO-01, D-01/D-06): Bitbucket Code Insights annotations toggle. This is the FIRST
   // purely Bitbucket-only capability toggle — no GitHub equivalent (NREG-02 by exclusion: GitHub
   // already has native inline PR comments, so this capability only makes sense for Bitbucket).
@@ -513,6 +530,9 @@ export const repoConfigSchema = z.object({
     // short-circuit semantics for the nested `review` object (same reasoning as :409-412 above).
     file_history: { enabled: false },
     yaml_config: { enabled: false },
+    // Phase 35 (PRD-06, D-13): mirror the agentic_tools toggle here too. Setting only the toggle
+    // block above and not this literal is the classic silent bug in this file — see :484-488.
+    agentic_tools: { enabled: false },
   }),
   model: z
     .object({
@@ -552,7 +572,10 @@ export const reviewJobMessageSchema = z.object({
   // WIRE contract widened with durable auxiliary phases. The INTERNAL ReviewJobRunResult.phase union
   // and dispatch switch are widened only when each phase's worker lands; accepting the values here
   // lets fresh Workflow handoffs carry their persisted cursor without another contract edit.
-  phase: z.enum(['prepare', 'review', 'finalize', 'critic', 'verify_fixes', 'walkthrough_enrichment', 'cross_file_security']).optional(),
+  // Phase 35 (PRD-06, D-09) adds 'agentic_context'. This enum is a RUNTIME validation, NOT a `tsc`
+  // site: a queue message naming an unknown phase is DROPPED by design in src/server/index.ts, so
+  // omitting the value here degrades silently rather than breaking the build.
+  phase: z.enum(['prepare', 'review', 'finalize', 'critic', 'verify_fixes', 'walkthrough_enrichment', 'cross_file_security', 'agentic_context']).optional(),
   // Optional multi-pass routing fields (D-07). Kept `.optional()` (no default) so every
   // pre-widening producer/fixture — and ReviewJobMessage = z.input<...> — keeps compiling.
   kind: z.enum(['review', 'qa', 'command']).optional(),

@@ -569,6 +569,7 @@ describe('ModelService', () => {
             bitbucket: { annotations_enabled: false },
             file_history: { enabled: false },
             yaml_config: { enabled: false },
+            agentic_tools: { enabled: false },
           },
           model: {
             main: '@cf/zai-org/glm-4.7-flash',

@@ -3,8 +3,9 @@
 // over `RepoConfig` — no DB, no I/O, no shared mutable state — so the test layer can pin every
 // toggle combination without spinning up Cloudflare bindings.
 //
-// Chain order (all-v1.2-toggles-on + SEC-XDIFF-01):
-//   review → cross_file_security → verify_fixes → critic → walkthrough_enrichment → finalize.
+// Chain order (all-v1.2-toggles-on + SEC-XDIFF-01 + PRD-06):
+//   prepare → agentic_context → review → cross_file_security → verify_fixes → critic →
+//   walkthrough_enrichment → finalize.
 // The walkthrough enrichment sits AT THE END (wraps the post-filter summary per Phase 19's intent),
 // so every selector that can hand off to it routes there ONLY after the upstream LLM phases have
 // either run or their toggles are off.
@@ -12,10 +13,44 @@
 // NREG-01 (default byte-identity): at v1.2 defaults (all toggles off), every selector returns
 // 'finalize' exactly as it did before — the walkthrough branch is a no-op when
 // `walkthrough.enabled === false`, the verify_fixes branch is a no-op when `threads.verify_fixes`
-// is false, the critic branch is a no-op when `passes.critic.enabled` is false, and the
-// cross_file_security branch is a no-op when `passes.security.cross_file` is false.
+// is false, the critic branch is a no-op when `passes.critic.enabled` is false, the
+// cross_file_security branch is a no-op when `passes.security.cross_file` is false, and the
+// agentic_context branch is a no-op when `agentic_tools.enabled` is false (D-13) — so at defaults
+// prepare hands off straight to 'review' exactly as it did before Phase 35, with no extra phase hop,
+// no extra model call and no extra KV read.
 
 import type { RepoConfig } from '@shared/schema';
+
+/**
+ * PRD-06 (FR-131, D-09/D-13): post-prepare hand-off. This is the ONLY thing that can route a job into
+ * the `agentic_context` phase.
+ *
+ * Routes to `agentic_context` when `review.agentic_tools.enabled` is EXACTLY true, and to `review`
+ * otherwise. The strict `=== true` comparison (rather than a truthiness test) matches the toggle-gate
+ * idiom the phase body and the consumer-side KV read both use, so all three agree on what "on" means.
+ *
+ * NREG-01: the toggle defaults false, so this returns 'review' at defaults and the prepare hand-off is
+ * byte-identical to the pre-Phase-35 hard-coded `'review'`.
+ *
+ * The zero-reviewable-files early return in the prepare phase does NOT come through here — it goes
+ * straight to 'finalize', and must stay that way: there is nothing to gather context for.
+ */
+export function nextPhaseAfterPrepare(config: RepoConfig): 'agentic_context' | 'review' {
+  return config.review.agentic_tools?.enabled === true ? 'agentic_context' : 'review';
+}
+
+/**
+ * PRD-06 (FR-131, D-09): post-agentic_context hand-off. Returns 'review' UNCONDITIONALLY.
+ *
+ * It does NOT re-check `agentic_tools.enabled`, for the same reason
+ * `nextPhaseAfterCrossFileSecurity` does not re-check its own toggle: the toggle gates ENTRY into the
+ * phase (`nextPhaseAfterPrepare`), never EXIT from it. A re-check here would strand an in-flight job
+ * whose repository config was toggled off between prepare and agentic_context — the phase would have
+ * nowhere to go while the review it was gathering context for never ran.
+ */
+export function nextPhaseAfterAgenticContext(_config: RepoConfig): 'review' {
+  return 'review';
+}
 
 /**
  * Phase 19 (THR-01/THR-02) + Phase 20.1 (BLOCKER 2) + SEC-XDIFF-01: post-review hand-off.
