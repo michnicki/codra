@@ -12,6 +12,14 @@
 // builder/recorder family itself is 34-03's — here the SHAPE is the contract), the identity
 // merge for an absent YAML file, unknown-key stripping, and the .review.yaml-before-.review.yml
 // discovery ordering.
+//
+// quick-k31 (WR-03) — READ FROM THE BASE BRANCH. `runPreparePhase` fetches the config file at
+// `pr.baseSha`, NOT `pr.headSha`. This deliberately reverses the head half of D-13 (its
+// first-found-wins / re-read-every-review / no-cache half stands): `pr.headSha` is a ref the PR
+// author controls and the D-09 merge is wholesale, so a head-side `skip_files: ["**"]` used to buy
+// an author a green review that examined nothing. The integration block below pins the fetch ref,
+// pins that a head-side neutering config is inert, pins the fail-closed empty-base-SHA path (no
+// fetch, no head fallback, no crash), and pins the `yaml_config_head_ignored` notice.
 
 import { describe, expect, it, vi } from 'vitest';
 import { parseYaml } from '@server/core/yaml-parse';
@@ -36,11 +44,20 @@ const OWNER = 'test-owner';
 const INSTALLATION_ID = '123';
 const PR_NUMBER = 1;
 const HEAD_SHA = sha('c');
+// quick-k31 (WR-03): the ref config discovery must actually read from. Named (rather than the
+// inline `sha('0')` it replaces) so the base-vs-head assertions below are unmistakable.
+const BASE_SHA = sha('0');
 
 // vi.hoisted so the vi.mock factory below can reference the spy (vitest hoists mock factories
 // above the imports). The prepare-phase integration tests assert getFileContent call counts.
+// quick-k31: `getPullRequest` and `getPullRequestDiff` are spies too so a single test can vary the
+// PR's base SHA (the fail-closed case) or the reviewed diff (the head-ignored notice) without
+// touching the shared class. Their defaults are (re-)installed in the integration block's
+// beforeEach, so every pre-existing test keeps today's behavior byte-for-byte.
 const mocks = vi.hoisted(() => ({
   getRepoFileContent: vi.fn(),
+  getPullRequest: vi.fn(),
+  getPullRequestDiff: vi.fn(),
 }));
 
 vi.mock('@server/db/jobs', async (importOriginal) => {
@@ -56,17 +73,11 @@ vi.mock('@server/db/jobs', async (importOriginal) => {
 vi.mock('@server/services/github', () => {
   return {
     GitHubService: class MockGitHubService {
-      async getPullRequest() {
-        return {
-          title: 'Test PR',
-          body: 'Test Body',
-          head: { sha: HEAD_SHA, ref: 'feature' },
-          base: { sha: sha('0'), ref: 'main' },
-          user: { login: 'author' },
-        };
+      async getPullRequest(...args: any[]) {
+        return mocks.getPullRequest(...args);
       }
-      async getPullRequestDiff() {
-        return generateMockDiff([{ path: 'src/x.ts', content: 'x' }]);
+      async getPullRequestDiff(...args: any[]) {
+        return mocks.getPullRequestDiff(...args);
       }
       async getCompareDiff() {
         return '';
@@ -122,6 +133,20 @@ vi.mock('@server/services/github', () => {
     },
   };
 });
+
+// quick-k31: the byte-for-byte defaults the mocked class used to hard-code. Re-installed before
+// every integration test so a test that overrides one of them cannot leak into the next.
+function installVcsMockDefaults() {
+  mocks.getPullRequest.mockResolvedValue({
+    title: 'Test PR',
+    body: 'Test Body',
+    head: { sha: HEAD_SHA, ref: 'feature' },
+    base: { sha: BASE_SHA, ref: 'main' },
+    user: { login: 'author' },
+  });
+  mocks.getPullRequestDiff.mockResolvedValue(generateMockDiff([{ path: 'src/x.ts', content: 'x' }]));
+}
+installVcsMockDefaults();
 
 function auditEventFor(reason: string) {
   return { stage: 'yaml_config_parse_failed', reason, timestamp: new Date().toISOString() };
@@ -400,6 +425,9 @@ dbDescribe('Phase 34 (34-03): prepare-phase YAML config integration', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     mocks.getRepoFileContent.mockReset();
+    mocks.getPullRequest.mockReset();
+    mocks.getPullRequestDiff.mockReset();
+    installVcsMockDefaults();
   });
 
   async function seedRepoWithYamlToggle(repo: string, enabled: boolean, maxComments: number, maxFiles: number) {
@@ -432,7 +460,7 @@ dbDescribe('Phase 34 (34-03): prepare-phase YAML config integration', () => {
         pull_request: {
           number: PR_NUMBER,
           head: { sha: HEAD_SHA, ref: 'feature' },
-          base: { sha: sha('0'), ref: 'main' },
+          base: { sha: BASE_SHA, ref: 'main' },
           title: 'Test PR',
           user: { login: 'author' },
           draft: false,
@@ -461,9 +489,10 @@ dbDescribe('Phase 34 (34-03): prepare-phase YAML config integration', () => {
     const prep = await runPrepare(repo);
     expect(prep).toMatchObject({ action: 'next_phase', phase: 'review' });
 
-    // D-13: .review.yaml discovered first (with the PR head SHA); .review.yml never tried.
+    // .review.yaml discovered first, read at the BASE BRANCH TIP (quick-k31 reversed D-13's head
+    // half; its first-found-wins half stands, so .review.yml is never tried).
     expect(mocks.getRepoFileContent).toHaveBeenCalledTimes(1);
-    expect(mocks.getRepoFileContent).toHaveBeenCalledWith(OWNER, repo, '.review.yaml', HEAD_SHA);
+    expect(mocks.getRepoFileContent).toHaveBeenCalledWith(OWNER, repo, '.review.yaml', BASE_SHA);
 
     const job = await jobFor(repo);
     // review HIGH-2: the merged config round-trips through jobs.config_snapshot so
@@ -477,13 +506,13 @@ dbDescribe('Phase 34 (34-03): prepare-phase YAML config integration', () => {
     expect(job!.configSnapshot!.review.file_history.enabled).toBe(false);
   });
 
-  // WR-03 (34-REVIEW): the D-09 merge is a WHOLESALE top-level replacement driven by a file read
-  // from the PR HEAD, so an innocuous-looking two-line .review.yaml resets every operator-
-  // configured sub-key of `review` (here: the security pass) to its Zod default, and that reset is
-  // persisted to jobs.config_snapshot. Closing the vector fully would reverse D-09 (allow-list) or
-  // D-13 (read from base) — see 34-REVIEW-FIX.md. What this test pins is that the reset is now
-  // OBSERVABLE: a yaml_config_applied event names the top-level keys the YAML replaced.
-  it('WR-03: a head-branch YAML that resets the security pass records which top-level keys it replaced', async () => {
+  // WR-03 (34-REVIEW): the D-09 merge is a WHOLESALE top-level replacement, so an innocuous-looking
+  // two-line .review.yaml resets every operator-configured sub-key of `review` (here: the security
+  // pass) to its Zod default, and that reset is persisted to jobs.config_snapshot. quick-k31 closed
+  // the TAMPERING half of WR-03 at the source (the file now comes from the maintainer-reviewed base
+  // branch — see the tests below), so the config here is trusted; what this test pins is that the
+  // wholesale reset is OBSERVABLE: a yaml_config_applied event names the replaced top-level keys.
+  it('WR-03: a base-branch YAML that resets the security pass records which top-level keys it replaced', async () => {
     const repo = `repo-yaml-wr03-${Date.now()}`;
     await getOrCreateRepository(env, { installationId: INSTALLATION_ID, owner: OWNER, repo, vcsProvider: 'github' });
     const parsedJson = structuredClone(defaultRepoConfig) as RepoConfig;
@@ -610,5 +639,131 @@ dbDescribe('Phase 34 (34-03): prepare-phase YAML config integration', () => {
     const rows = await queryRows<{ audit: unknown }>(env, `SELECT audit FROM jobs WHERE id = $1`, [job!.id]);
     const stages = ((rows[0]?.audit as Array<{ stage: string }>) ?? []).map((event) => event.stage);
     expect(stages).not.toContain('yaml_config_parse_failed');
+  });
+
+  // -------------------------------------------------------------------------
+  // quick-k31 (WR-03): the base-branch read and the head-ignored notice.
+  //
+  // PROVIDER COVERAGE: this fixture mocks only `@server/services/github`, so a Bitbucket prepare
+  // run is not reachable here — but it does not need to be. Both adapters' `baseSha` mapping is
+  // ALREADY pinned elsewhere: `test/vcs-github-adapter.spec.ts:39-55` ("flattens the nested PR
+  // shape into a flat VcsPullRequest", asserting `baseSha: 'basesha1234567890'` from
+  // `pr.base.sha`) and `test/bitbucket-client.spec.ts:48` (`baseSha: 'base123'` from
+  // `pullRequest.destination.commit.hash`). Do NOT add duplicate adapter tests here.
+  // -------------------------------------------------------------------------
+
+  // Catches a regression to `pr.headSha` (or to any ref that is not the base tip): the mock THROWS
+  // if it is ever asked for the head SHA, so a reverted ref fails loudly instead of quietly
+  // returning the same config. Asserting the actual fetch ref — not just the call count — is the
+  // whole point of this test.
+  it('quick-k31: config discovery fetches at the BASE sha and never at the head', async () => {
+    const repo = `repo-yaml-baseref-${Date.now()}`;
+    await seedRepoWithYamlToggle(repo, true, 10, 100);
+    mocks.getRepoFileContent.mockImplementation(async (_o: string, _r: string, path: string, ref: string) => {
+      if (ref === HEAD_SHA) throw new Error('config discovery must never read from the PR head');
+      return ref === BASE_SHA && path === '.review.yaml' ? 'review:\n  max_comments: 3' : null;
+    });
+
+    const prep = await runPrepare(repo);
+    expect(prep).toMatchObject({ action: 'next_phase', phase: 'review' });
+
+    expect(mocks.getRepoFileContent).toHaveBeenCalledTimes(1);
+    expect(mocks.getRepoFileContent).toHaveBeenCalledWith(OWNER, repo, '.review.yaml', BASE_SHA);
+
+    const job = await jobFor(repo);
+    expect(job!.configSnapshot!.review.max_comments).toBe(3);
+  });
+
+  // THE BYPASS IS DEAD. Catches a regression that lets head content reach the effective config.
+  // The head file declares `skip_files: ["**"]`; if it were applied, `parseUnifiedDiff` would
+  // ignore every file and prepare would enqueue `finalize` on zero reviewable files instead of
+  // advancing to `review`. So the single `phase: 'review'` assertion is a DIRECT proof that the
+  // head file did nothing — review theater is no longer purchasable by a PR author.
+  it('quick-k31: a head-branch skip_files: ["**"] does not neuter the review', async () => {
+    const repo = `repo-yaml-bypass-${Date.now()}`;
+    await seedRepoWithYamlToggle(repo, true, 10, 100);
+    mocks.getRepoFileContent.mockImplementation(async (_o: string, _r: string, _path: string, ref: string) =>
+      ref === HEAD_SHA ? 'review:\n  skip_files:\n    - "**"' : null,
+    );
+
+    const prep = await runPrepare(repo);
+    expect(prep).toMatchObject({ action: 'next_phase', phase: 'review' });
+
+    const job = await jobFor(repo);
+    expect(job!.configSnapshot!.review.skip_files).not.toContain('**');
+  });
+
+  // FAIL CLOSED. Catches a fail-OPEN regression (a head fallback, or discovery running against an
+  // empty ref). Only `getPullRequest` is overridden — the webhook payload's base sha is left alone
+  // so `insertJob` stays on its normal path and the guard is isolated to the `pr.baseSha` the seam
+  // call returns.
+  it('quick-k31: an empty base SHA skips discovery entirely with a warn and no head fallback', async () => {
+    const repo = `repo-yaml-nobase-${Date.now()}`;
+    await seedRepoWithYamlToggle(repo, true, 10, 100);
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    mocks.getPullRequest.mockResolvedValue({
+      title: 'Test PR',
+      body: 'Test Body',
+      head: { sha: HEAD_SHA, ref: 'feature' },
+      base: { sha: '', ref: 'main' },
+      user: { login: 'author' },
+    });
+
+    const prep = await runPrepare(repo);
+    expect(prep).toMatchObject({ action: 'next_phase', phase: 'review' });
+
+    // No fetch at ALL — not at the base ref, and emphatically not at the head.
+    expect(mocks.getRepoFileContent).not.toHaveBeenCalled();
+    expect(
+      warnSpy.mock.calls.some(([message]) => String(message).includes('no usable base SHA')),
+    ).toBe(true);
+
+    // The DB config still governs; nothing from the head leaked in.
+    const job = await jobFor(repo);
+    expect(job!.configSnapshot!.review.max_comments).toBe(10);
+    expect(job!.configSnapshot!.review.max_files).toBe(100);
+  });
+
+  // Catches the notice going missing for the case it matters most in: a contributor ADDING
+  // .review.yaml for the first time, where the base branch has no config at all. Without the event
+  // that contributor gets a review that ignored their file and no explanation anywhere.
+  it.each(['.review.yaml', '.review.yml'])(
+    'quick-k31: records yaml_config_head_ignored when the reviewed diff touches %s',
+    async (configPath) => {
+      const repo = `repo-yaml-headignored-${configPath.replace(/\W/g, '')}-${Date.now()}`;
+      await seedRepoWithYamlToggle(repo, true, 10, 100);
+      mocks.getPullRequestDiff.mockResolvedValue(
+        generateMockDiff([
+          { path: configPath, content: 'review:' },
+          { path: 'src/x.ts', content: 'x' },
+        ]),
+      );
+      mocks.getRepoFileContent.mockResolvedValue(null); // no base-branch config — first-time add
+
+      await runPrepare(repo);
+      const job = await jobFor(repo);
+
+      const rows = await queryRows<{ audit: unknown }>(env, `SELECT audit FROM jobs WHERE id = $1`, [job!.id]);
+      const ignored = ((rows[0]?.audit as Array<Record<string, unknown>>) ?? []).find(
+        (event) => event.stage === 'yaml_config_head_ignored',
+      );
+      expect(ignored).toBeDefined();
+      expect(ignored).toMatchObject({ path: configPath, base_sha: BASE_SHA, head_sha: HEAD_SHA });
+    },
+  );
+
+  // The mirror guard: catches an emission that fires on every review regardless of the diff, which
+  // would make the notice meaningless noise in the audit trail.
+  it('quick-k31: does NOT record yaml_config_head_ignored when the diff leaves the config alone', async () => {
+    const repo = `repo-yaml-noignore-${Date.now()}`;
+    await seedRepoWithYamlToggle(repo, true, 10, 100);
+    mocks.getRepoFileContent.mockResolvedValue(null);
+
+    await runPrepare(repo);
+    const job = await jobFor(repo);
+
+    const rows = await queryRows<{ audit: unknown }>(env, `SELECT audit FROM jobs WHERE id = $1`, [job!.id]);
+    const stages = ((rows[0]?.audit as Array<{ stage: string }>) ?? []).map((event) => event.stage);
+    expect(stages).not.toContain('yaml_config_head_ignored');
   });
 });
