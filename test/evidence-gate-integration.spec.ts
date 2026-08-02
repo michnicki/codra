@@ -64,7 +64,7 @@ const RAW_JSON = JSON.stringify({
 const dbDescribe = hasConfiguredTestDatabaseUrl() ? describe : describe.skip;
 const TIMEOUT_MS = 60_000;
 
-dbDescribe('EVID-01 evidence_missing DB round-trip (recordUnitAudit -> getJobDetail)', () => {
+dbDescribe('EVID-01/EVID-03 evidence_missing_summary DB round-trip (recordUnitAudit -> getJobDetail)', () => {
   const env = createTestEnv();
 
   it('produces a not_in_hunk event carrying NO code/body keys (producer-level privacy)', () => {
@@ -72,10 +72,10 @@ dbDescribe('EVID-01 evidence_missing DB round-trip (recordUnitAudit -> getJobDet
     // The finding ALWAYS still posts (soft gate, D-14).
     expect(parsed.comments).toHaveLength(1);
 
-    const evidenceEvents = parsed.severityAuditEvents.filter((e) => e.stage === 'evidence_missing');
+    const evidenceEvents = parsed.severityAuditEvents.filter((e) => e.stage === 'evidence_missing_summary');
     expect(evidenceEvents).toHaveLength(1);
     const event = evidenceEvents[0];
-    expect(event).toMatchObject({ stage: 'evidence_missing', reason: 'not_in_hunk', path: 'src/evidence.ts' });
+    expect(event).toMatchObject({ stage: 'evidence_missing_summary', notInHunkCount: 1, file: 'src/evidence.ts' });
 
     // Producer-level privacy: the serialized event's keys are EXACTLY the bounded set.
     const keys = Object.keys(JSON.parse(JSON.stringify(event)));
@@ -83,7 +83,7 @@ dbDescribe('EVID-01 evidence_missing DB round-trip (recordUnitAudit -> getJobDet
     expect(keys).not.toContain('diff');
     expect(keys).not.toContain('existingCode');
     expect(keys).not.toContain('codeSuggestion');
-    expect(keys.sort()).toEqual(['line', 'path', 'reason', 'stage', 'timestamp', 'title']);
+    expect(keys.sort()).toEqual(['absentCount', 'file', 'notInHunkCount', 'pass', 'sample', 'stage', 'timestamp']);
   });
 
   it('the not_in_hunk event survives recordUnitAudit and is readable from getJobDetail().audit', async () => {
@@ -105,16 +105,16 @@ dbDescribe('EVID-01 evidence_missing DB round-trip (recordUnitAudit -> getJobDet
       });
 
       // The EXISTING per-unit recorder — zero new plumbing (D-18). It carries the severityAuditEvents
-      // accumulator (drafted + any evidence_missing) to jobs.audit in a single append.
+      // accumulator (drafted + any evidence_missing_summary) to jobs.audit in a single append.
       await recordUnitAudit(env, job.id, EVIDENCE_FILE.path, 'main', parsed.severityAuditEvents);
 
       const detail = await getJobDetail(env, job.id);
       expect(detail).not.toBeNull();
 
       const evidence = detail!.audit.filter(
-        (e): e is Extract<JobAuditEvent, { stage: 'evidence_missing' }> => e.stage === 'evidence_missing',
+        (e): e is Extract<JobAuditEvent, { stage: 'evidence_missing_summary' }> => e.stage === 'evidence_missing_summary',
       );
-      expect(evidence.some((e) => e.reason === 'not_in_hunk' && e.path === EVIDENCE_FILE.path)).toBe(true);
+      expect(evidence.some((e) => e.notInHunkCount > 0 && e.stage === 'evidence_missing_summary' && e.file === EVIDENCE_FILE.path)).toBe(true);
     });
   }, TIMEOUT_MS);
 });

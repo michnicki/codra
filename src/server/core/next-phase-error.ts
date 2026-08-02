@@ -8,7 +8,13 @@ export type PhaseName =
   | 'finalize'
   | 'critic'
   | 'verify_fixes'
-  | 'walkthrough_enrichment';
+  | 'walkthrough_enrichment'
+  | 'cross_file_security'
+  // Phase 35 (PRD-06, D-09): the bounded agentic-context phase between prepare and review. This is a
+  // `tsc` site — the phase cannot be thrown or dispatched without it — and it is what makes the
+  // `error.phase === 'agentic_context'` freshInstance test in review.ts type-check rather than being
+  // flagged as a comparison with no overlap.
+  | 'agentic_context';
 
 export class NextPhaseError extends Error {
   constructor(public phase: PhaseName, public delaySeconds: number) {

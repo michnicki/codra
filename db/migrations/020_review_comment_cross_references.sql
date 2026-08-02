@@ -1,0 +1,13 @@
+-- Phase 27 (SEC-XDIFF-01) bug fix: review_comments never persisted cross_references.
+--
+-- parsedReviewCommentSchema.cross_references (src/shared/schema.ts) is parsed correctly from the
+-- cross-file security model output, but insertFileReview/upsertFileReview never wrote it and
+-- getFileReviewsForJobs never read it back — every cross-file finding lost its cross_references
+-- the instant it round-tripped through Postgres. That silently disabled the formatter's "Also
+-- affects" links and the walkthrough's "Cross-file Security" section in production; both are
+-- gated on cross_references presence, which was always undefined after any DB reload.
+--
+-- JSONB (not a join table): cross_references is a small, read-mostly array of
+-- {path, line?, relationship} that is only ever written once per comment and read back whole —
+-- the same shape/access pattern as file_reviews.ensemble_result, which already uses JSONB.
+ALTER TABLE review_comments ADD COLUMN IF NOT EXISTS cross_references JSONB;

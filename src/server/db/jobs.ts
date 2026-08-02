@@ -1396,6 +1396,27 @@ export async function updateJobCriticResult(
 }
 
 /**
+ * Phase 34 (PRD-05 / review HIGH-2): single writer of jobs.config_snapshot. The prepare phase
+ * persists the merged (DB + .review.yaml) RepoConfig here so review/finalize/critic/
+ * verify-fixes all observe YAML overrides — every downstream phase reloads config from the job
+ * row, so without this write PRD-05 would be defeated across workflow phase boundaries. Mirrors
+ * `updateJobCriticResult`'s parameterized JSONB binding with the same serialization `insertJob`
+ * uses (JSON.stringify); `mapJob` re-validates with repoConfigSchema.parse on every read. The
+ * caller wraps the write (fail-open) — a persistence failure must never fail the review.
+ */
+export async function updateJobConfigSnapshot(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  config: RepoConfig,
+): Promise<void> {
+  await queryRows(
+    env,
+    `UPDATE jobs SET config_snapshot = $2::jsonb WHERE id = $1`,
+    [jobId, JSON.stringify(config)],
+  );
+}
+
+/**
  * Phase 19 THR-01/THR-02: persist the resumable verify-fixes state/result as one JSONB value. The
  * caller writes after each bounded batch so a fresh Workflow instance can resume from durable
  * cursors; mapJob validates the value fail-soft on every processing/detail reload. Parameterized

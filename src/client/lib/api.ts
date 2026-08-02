@@ -18,7 +18,9 @@ import type {
   VcsCredentialStatus,
   VcsCredentialStoreInput,
   VcsProvider,
+  VcsWorkspaceCredentialStatus,
 } from '@shared/schema';
+import type { AddBitbucketWorkspaceInput, WorkspaceRepoListItem } from '@shared/bitbucket';
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
@@ -40,6 +42,32 @@ export type ProviderPayload = {
   enabled: boolean;
 };
 type RepoConfigPatch = Partial<Pick<RepoConfig, 'review' | 'model'> & { enabled: boolean }>;
+
+// Phase 29 (QA-IDX-01): wire shapes of the code-index endpoints. CamelCase to match the
+// dashboard convention the handler projects (`mapJob`), not the `code_index_state` column names.
+export interface CodeIndexStatus {
+  status: 'idle' | 'building' | 'ready' | 'failed';
+  /** What produced the current index: 'full' = dashboard rebuild, 'incremental' = push refresh, null = never built. */
+  mode: 'full' | 'incremental' | null;
+  indexedSha: string | null;
+  indexedAt: string | null;
+  fileCount: number;
+  chunkCount: number;
+  truncated: boolean;
+  /** Already redacted at the server write site (AUD-01) — render as-is, never re-process. */
+  lastError: string | null;
+}
+
+export interface CodeIndexStatusResponse {
+  index: CodeIndexStatus;
+}
+
+export interface CodeIndexBuildResponse {
+  ok: boolean;
+  /** True when the press coalesced against a live build (already_exists / lease_held) — informational, not an error. */
+  coalesced: boolean;
+  build: { mode: 'full'; workflowInstanceId: string };
+}
 
 async function request<T>(input: string, init?: RequestInit) {
   const method = init?.method?.toUpperCase() ?? 'GET';
@@ -280,10 +308,56 @@ export const api = {
       body: JSON.stringify(input),
     });
   },
+  discoverBitbucketWorkspaceRepos(input: { workspace: string; accessToken: string }) {
+    return request<{ repos: WorkspaceRepoListItem[] }>('/api/repos/bitbucket/workspaces/discover', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    });
+  },
+  addBitbucketWorkspace(input: AddBitbucketWorkspaceInput) {
+    return request<{ credential: VcsWorkspaceCredentialStatus; repositoryCount: number }>(
+      '/api/repos/bitbucket/workspaces',
+      {
+        method: 'POST',
+        body: JSON.stringify(input),
+      },
+    );
+  },
   deleteVcsCredential(key: { vcsProvider: string; workspace: string; repoSlug: string }) {
     return request<{ ok: boolean }>(
       `/api/vcs-credentials/${pathSegment(key.vcsProvider)}/${pathSegment(key.workspace)}/${pathSegment(key.repoSlug)}`,
       { method: 'DELETE' },
+    );
+  },
+  // Phase 28 (LRN-01): learned-rule synthesis and status transitions.
+  synthesizeLearnedRules(owner: string, repo: string, vcsProvider?: VcsProvider) {
+    const query = vcsProvider ? `?provider=${vcsProvider}` : '';
+    return request<{ ok: boolean; rules: unknown[]; message?: string }>(
+      `/api/repos/${pathSegment(owner)}/${pathSegment(repo)}/learned-rules/synthesize${query}`,
+      { method: 'POST' },
+    );
+  },
+  updateLearnedRule(owner: string, repo: string, ruleId: string, status: 'pending' | 'active' | 'disabled', vcsProvider?: VcsProvider) {
+    const query = vcsProvider ? `?provider=${vcsProvider}` : '';
+    return request<{ ok: boolean }>(
+      `/api/repos/${pathSegment(owner)}/${pathSegment(repo)}/learned-rules/${pathSegment(ruleId)}${query}`,
+      { method: 'PATCH', body: JSON.stringify({ status }) },
+    );
+  },
+  // Phase 29 (QA-IDX-01, D-07): the dashboard build trigger and the operator status read.
+  // Neither sets the CSRF header by hand — the shared `request` helper sets `x-requested-with`
+  // on every non-safe method (T-29-09-01).
+  buildCodeIndex(owner: string, repo: string, vcsProvider?: VcsProvider) {
+    const query = vcsProvider ? `?provider=${vcsProvider}` : '';
+    return request<CodeIndexBuildResponse>(
+      `/api/repos/${pathSegment(owner)}/${pathSegment(repo)}/code-index/build${query}`,
+      { method: 'POST' },
+    );
+  },
+  getCodeIndexStatus(owner: string, repo: string, vcsProvider?: VcsProvider) {
+    const query = vcsProvider ? `?provider=${vcsProvider}` : '';
+    return request<CodeIndexStatusResponse>(
+      `/api/repos/${pathSegment(owner)}/${pathSegment(repo)}/code-index/status${query}`,
     );
   },
 };

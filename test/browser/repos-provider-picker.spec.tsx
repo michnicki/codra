@@ -53,7 +53,7 @@ describe('ReposPage provider picker (D-30 / D-38)', () => {
     expect(screen.getByRole('button', { name: /Add Repositories/i })).toBeInTheDocument();
   });
 
-  it('opening the trigger shows exactly two provider items', async () => {
+  it('opening the trigger shows exactly three provider items', async () => {
     const user = userEvent.setup();
     renderPage(<ReposPage />);
 
@@ -62,7 +62,8 @@ describe('ReposPage provider picker (D-30 / D-38)', () => {
 
     expect(await screen.findByRole('menuitem', { name: /Install via GitHub App/i })).toBeInTheDocument();
     expect(screen.getByRole('menuitem', { name: /Add Bitbucket repository/i })).toBeInTheDocument();
-    expect(screen.getAllByRole('menuitem')).toHaveLength(2);
+    expect(screen.getByRole('menuitem', { name: /Add Bitbucket workspace/i })).toBeInTheDocument();
+    expect(screen.getAllByRole('menuitem')).toHaveLength(3);
   });
 
   it('selecting the GitHub item opens /api/repos/install in a new tab', async () => {
@@ -88,6 +89,19 @@ describe('ReposPage provider picker (D-30 / D-38)', () => {
 
     await waitFor(() => {
       expect(navigateMock).toHaveBeenCalledWith('/repos/add/bitbucket');
+    });
+  });
+
+  it('selecting the Bitbucket workspace item navigates to /repos/add/bitbucket-workspace', async () => {
+    const user = userEvent.setup();
+    renderPage(<ReposPage />);
+
+    await screen.findByText('acme/widgets');
+    await user.click(screen.getByRole('button', { name: /Add Repositories/i }));
+    await user.click(await screen.findByRole('menuitem', { name: /Add Bitbucket workspace/i }));
+
+    await waitFor(() => {
+      expect(navigateMock).toHaveBeenCalledWith('/repos/add/bitbucket-workspace');
     });
   });
 });

@@ -14,9 +14,12 @@ import {
   reviewSeverities,
 } from '@shared/schema';
 import { z } from 'zod';
+import { agenticActionSchema, type AgenticToolAction } from './agentic-tools';
 import { logger } from './logger';
 import { applySeverityRules } from './severity';
-import { redactFindingTitle } from './audit-redact';
+import { buildEvidenceMissingSummary, buildSuggestionDroppedEvent } from './audit';
+import type { EvidenceMissingEntry, SuggestionDropEntry } from './audit';
+import { checkEvidence, normalizeForEvidence, stripLeadingDiffMarkers } from './evidence';
 import { findClosestValidLine, findPositionForLine, getValidNewLines, getValidPositions } from './diff';
 import type { FileDiff } from './diff';
 import { jsonrepair } from 'jsonrepair';
@@ -26,6 +29,27 @@ const MAX_LOGGED_JSON_CHARS = 2_000;
 function truncateJsonForLog(value: string) {
   if (value.length <= MAX_LOGGED_JSON_CHARS) return value;
   return `${value.slice(0, MAX_LOGGED_JSON_CHARS)}... [truncated ${value.length - MAX_LOGGED_JSON_CHARS} chars]`;
+}
+
+// Model output quotes identifiers and code from a PRIVATE repo, and `logger.redact()` scrubs only by
+// key name (`api_key`, `secret`, `token`, …) plus a set of embedded-credential regexes — neither of
+// the two keys guarded with this helper (`extracted`, `parsedJson`) matches any of them, so their
+// values would otherwise be emitted to the log sink in full.
+//
+// The stringify is guarded because the sole caller sits inside a `catch` that is already reporting a
+// schema-validation failure. A throw there (circular reference, BigInt, a hostile `toJSON`) would
+// replace a useful schema error with an unrelated serialization error.
+//
+// EXPORTED purely so a test can pin the unserializable branch: it is unreachable through any public
+// entry point (the caller's `parsedJson` always comes from `JSON.parse`, which cannot produce a
+// circular reference or a BigInt). Same test-only-export rationale as `COMMENT_TITLE_MAX` below.
+export function stringifyJsonForLog(value: unknown): string {
+  try {
+    // `JSON.stringify(undefined)` returns undefined, not a string — coalesce so a string is returned.
+    return truncateJsonForLog(JSON.stringify(value) ?? String(value));
+  } catch {
+    return '[unserializable]';
+  }
 }
 
 function hasReviewKeys(input: string) {
@@ -277,42 +301,28 @@ function preprocessJson(json: string): string {
   return result;
 }
 
-/**
- * Normalizer for the soft evidence gate (EVID-01, D-16). Collapses every whitespace run to a single
- * space, trims, AND lower-cases — the substring match is therefore whitespace- AND case-INSENSITIVE,
- * so trivial `Const` vs `const` / indentation differences do NOT inflate the `not_in_hunk` count and
- * pollute the EVID-02 go/no-go signal (OpenCode C4 / Antigravity). No Unicode normalization.
- *
- * This is DELIBERATELY NOT `cleanText` (D-16 Anti-Pattern): cleanText strips leading tag/emoji
- * prefixes (SECURITY/BUG/P0/…), which are meaningless for diff-line evidence and would corrupt the
- * haystack/needle comparison. Never reuse cleanText here.
- */
-export function normalizeForEvidence(s: string): string {
-  return s.replace(/\s+/g, ' ').trim().toLowerCase();
+// IN-04: the two fence operations below were re-implemented inline in the FR-153 clear clause,
+// duplicating logic `withSuggestion` already owned. Both sites now call these helpers so the two
+// copies cannot drift.
+
+/** Strip any ```suggestion / ``` fence the model wrapped around a suggestion, then trim. */
+function stripSuggestionFence(codeSuggestion: string) {
+  return codeSuggestion.replace(/```suggestion\n?|```/g, '').trim();
 }
 
-/**
- * WR-02: The evidence haystack is built from hunk `content`, which is already diff-prefix-stripped
- * (diff.ts strips the leading +/-/space marker). The needle (`existing_code`) is only produced by the
- * model, which is merely ASKED not to prepend a `+`/`-` marker. When it disobeys (common), the needle
- * keeps that leading char and fails the `includes()` test, producing a FALSE `not_in_hunk` that
- * inflates the exact count EVID-02 reads as a go/no-go signal. Strip a single leading `+`/`-` from EACH
- * line (evidence may be multi-line) so the needle is normalized the same way the haystack already is.
- * Whitespace markers need no handling — normalizeForEvidence collapses/trims them anyway. Audit-only:
- * no posting behavior changes.
- */
-function stripLeadingDiffMarkers(s: string): string {
-  return s.split('\n').map((line) => line.replace(/^[+-]/, '')).join('\n');
+/** The prose portion of a body, dropping any redundant suggestion block the model double-output. */
+function bodyBeforeSuggestion(body: string) {
+  return body.split('```suggestion')[0].trim();
 }
 
 function withSuggestion(body: string, codeSuggestion?: string) {
   if (!codeSuggestion) return body;
 
   // Clean suggestion: remove existing fences if model added them, and trim
-  const cleanSuggestion = codeSuggestion.replace(/```suggestion\n?|```/g, '').trim();
+  const cleanSuggestion = stripSuggestionFence(codeSuggestion);
 
   // Clean body: remove any trailing redundant suggestion blocks if the model double-outputted
-  const cleanBody = body.split('```suggestion')[0].trim();
+  const cleanBody = bodyBeforeSuggestion(body);
 
   return `${cleanBody}\n\n\`\`\`suggestion\n${cleanSuggestion}\n\`\`\``;
 }
@@ -350,7 +360,10 @@ export function parseFileReviewResponse(
   try {
     preprocessed = preprocessJson(extracted);
   } catch (e) {
-    logger.warn('JSON preprocessing partially failed, continuing...', { extracted, error: e });
+    // `extracted` is the raw extracted model JSON — private-repo code that `logger.redact()` does
+    // not cover (it is key-name based and `extracted` is not a sensitive key). Bound it like the
+    // `preprocessed`/`repaired` sites below.
+    logger.warn('JSON preprocessing partially failed, continuing...', { extracted: truncateJsonForLog(extracted), error: e });
     preprocessed = extracted;
   }
 
@@ -416,7 +429,11 @@ export function parseFileReviewResponse(
 
     parsed = fileReviewModelOutputSchema.parse(data);
   } catch (e) {
-    logger.error('Model response failed schema validation', { parsedJson, error: e });
+    // `parsedJson` is the ENTIRE parsed model output — every finding title, body, existing_code and
+    // code_suggestion, i.e. private-repo content that `logger.redact()` does not cover by key name.
+    // `stringifyJsonForLog` is failure-safe so a serialization throw can never replace the schema
+    // error below. The key stays `parsedJson`; its logged VALUE is now a bounded string, not an object.
+    logger.error('Model response failed schema validation', { parsedJson: stringifyJsonForLog(parsedJson), error: e });
     throw new Error(`Response schema mismatch: ${e instanceof Error ? e.message : 'Check logs'}`);
   }
 
@@ -428,20 +445,37 @@ export function parseFileReviewResponse(
   // findings that survive the orphan check (i.e. become a persisted comment) contribute events, so
   // the trail never references a dropped, off-diff finding.
   const severityAuditEvents: JobAuditEvent[] = [];
+  // EVID-03: accumulate evidence-missing entries per (file, pass); builder call after .filter(Boolean).
+  const evidenceMissingEntries: EvidenceMissingEntry[] = [];
+  // Phase 33 (FR-153, D-08): accumulate FR-153-drop entries (non-empty suggestion + empty body);
+  // the buildSuggestionDroppedEvent call sits next to buildEvidenceMissingSummary after the map.
+  const suggestionDropEntries: SuggestionDropEntry[] = [];
 
-  // EVID-01 soft evidence gate (D-16). Build the cleaned-hunk haystack ONCE for this file: concat of
-  // ALL hunk lines (context + add + del) content — hunk `content` is already diff-prefix-stripped
-  // (diff.ts) — then normalizeForEvidence. Per surviving finding, we test whether its normalized
-  // existing_code is a substring of this haystack. This is audit-only (D-14): a miss NEVER drops or
-  // penalizes the finding, it only emits an `evidence_missing` telemetry event.
-  const evidenceHaystack = normalizeForEvidence(
-    file.hunks.flatMap((h) => h.lines).map((l) => l.content).join('\n'),
-  );
+  // Phase 33 (FR-153, consensus fold-in (c)): HOISTED out of the map callback so the orphan bucket
+  // can apply the same cleanText normalization as inline titles before the 80-char truncation
+  // (D-11). Behavior-neutral for inline comments — same pure parameter-only function, same call
+  // sites, now closure-scoped.
+  const cleanText = (text: string) => {
+    let current = text.trim();
+    let prev = '';
+    while (current !== prev) {
+      prev = current;
+      current = current
+        .replace(/^(?:[^\w\s]+|(?:QUALITY|SECURITY|BUG|PERFORMANCE|CORRECTNESS|P[0-3]|NIT)\b)+/giu, '')
+        .replace(/\n\s*/g, ' ') // Flatten newlines in titles/snippets
+        .trim();
+    }
+    return current;
+  };
 
   const comments = (parsed.findings || [])
     .map((finding) => {
       // Codex style findings use start/end or line
       let line = finding.code_location.line || finding.code_location.line_range?.start;
+      // EVID-04: capture the original model-cited line BEFORE the orphan-comment line remap below
+      // (lines 451-460). The evidence_missing_summary sample records the pre-remap line so EVID-02
+      // analysis sees the model's cited line, not the remapped position-lookup line.
+      const originalLine = finding.code_location.line || finding.code_location.line_range?.start;
       let position: number | undefined;
 
       // Try to find position for the line
@@ -463,7 +497,10 @@ export function parseFileReviewResponse(
 
       // Final validation
       if (position === undefined || !validPositions.has(position)) {
-        orphanedComments.push(`- **${finding.title}:** ${finding.body}`);
+        // Phase 33 (FR-154, D-11 + consensus fold-in (c)): orphan titles get the SAME cleanText
+        // normalization as inline titles before the 80-char truncation — closing the reviewers'
+        // flagged raw-vs-cleaned asymmetry. The orphan body stays raw, matching pre-existing behavior.
+        orphanedComments.push(`- **${cleanText(finding.title).slice(0, COMMENT_TITLE_MAX)}:** ${finding.body}`);
         return null;
       }
 
@@ -476,26 +513,64 @@ export function parseFileReviewResponse(
       };
       const severity = finding.priority !== undefined ? priorityMap[finding.priority] || 'P2' : 'P2';
 
-      const cleanText = (text: string) => {
-        let current = text.trim();
-        let prev = '';
-        while (current !== prev) {
-          prev = current;
-          current = current
-            .replace(/^(?:[^\w\s]+|(?:QUALITY|SECURITY|BUG|PERFORMANCE|CORRECTNESS|P[0-3]|NIT)\b)+/giu, '')
-            .replace(/\n\s*/g, ' ') // Flatten newlines in titles/snippets
-            .trim();
-        }
-        return current;
-      };
-
       const title = cleanText(finding.title);
-      let body = cleanText(finding.body);
+      // CR-01: keep the model's OWN cleaned body around. `cleanText` flattens every newline to a
+      // space (:422), so `body.split('\n')[0]` is the ENTIRE body and the de-duplication strip
+      // below erases all of it whenever the body opens by restating its title — extremely common
+      // LLM output. The FR-153 drop clause keys off THIS value, not the strip residue, so an
+      // emptied body can never be mistaken for "the model gave no explanation".
+      const cleanedBody = cleanText(finding.body);
+      let body = cleanedBody;
 
-      // If the body starts with the title or a similar variant, strip it
+      // If the body starts with the title or a similar variant, strip it — but ONLY when something
+      // survives. The strip exists to de-duplicate a leading restatement, never to empty a body;
+      // before the guard it silently deleted complete, on-diff findings via the drop clause (CR-01).
       const bodyPrefix = cleanText(body.split('\n')[0]);
       if (bodyPrefix.toLowerCase().startsWith(title.toLowerCase()) || title.toLowerCase().startsWith(bodyPrefix.toLowerCase())) {
-        body = cleanText(body.slice(body.split('\n')[0].length));
+        const stripped = cleanText(body.slice(body.split('\n')[0].length));
+        if (stripped.length > 0) body = stripped;
+      }
+
+      // Phase 33 (FR-153, REVIEWS R6 HIGH): FR-153 logic runs AFTER the body-prefix strip and
+      // BEFORE the severity engine, in this exact order — drop first (evaluates the ORIGINAL
+      // pre-clearing suggestion + the CLEANED body), then clear (D-07: drop happens BEFORE clear).
+      const rawSuggestion = finding.code_suggestion;
+      const hasSuggestion = typeof rawSuggestion === 'string' && rawSuggestion.trim().length > 0;
+
+      // Drop clause (D-05): a comment with a non-empty suggestion but an EMPTY body is dropped and
+      // audit-tracked. CR-01: the predicate reads `cleanedBody` (the model's own body after
+      // cleanText) rather than `body` (the post-strip value) — otherwise "the model restated its
+      // title first" was indistinguishable from "the model gave no explanation", and complete
+      // findings were deleted with no user-visible trace.
+      if (hasSuggestion && cleanedBody.length === 0) {
+        // IN-03: record the model's CITED line (pre-`findClosestValidLine` remap), matching the
+        // adjacent evidence accumulators' EVID-04 convention at :560/:574 — downstream analysis
+        // wants to see what the model claimed, not where the orphan remap moved it.
+        suggestionDropEntries.push({ path: file.path, line: originalLine ?? null, title });
+        return null;
+      }
+
+      // Clear clause (D-06/D-07): when the CLEANED suggestion equals the trimmed existingCode, the
+      // suggestion is cleared to null AND any redundant ```suggestion fence is stripped from the
+      // posted body. `''`-suggestions are treated as absent (fail-open hardening — the
+      // z.string().min(1) at schema.ts:50 no longer throws the whole per-file parse).
+      let codeSuggestion: string | null | undefined = hasSuggestion ? rawSuggestion : undefined;
+      let commentBody = body;
+      if (hasSuggestion) {
+        // IN-04: shared helpers, not re-implemented regexes — `withSuggestion` owns the same logic.
+        const cleanSuggestion = stripSuggestionFence(rawSuggestion);
+        if (cleanSuggestion === (finding.existing_code ?? '').trim()) {
+          codeSuggestion = null;
+          commentBody = bodyBeforeSuggestion(body);
+        }
+      }
+      // WR-09: the clear clause can zero the body when its leading content IS the suggestion fence.
+      // `withSuggestion('', undefined)` then returns '', which `parsedReviewCommentSchema.body`
+      // (z.string().min(1)) rejects — and that .parse() sits inside .map() with no try/catch, so a
+      // single bad finding would throw out of parseFileReviewResponse and fail the WHOLE file's
+      // review. Fall back to the title so a comment body is never empty.
+      if (commentBody.trim().length === 0) {
+        commentBody = title;
       }
 
       // Apply the deterministic severity/category engine (SEV-01/02/03/04). Category resolution is
@@ -512,55 +587,94 @@ export function parseFileReviewResponse(
       // The finding ALWAYS still posts below regardless of the evidence outcome — this block only pushes
       // telemetry into the SAME severityAuditEvents accumulator (D-18), never a new returned field, and
       // NEVER carries body/diff/existingCode/codeSuggestion (privacy posture; T-15-04-01).
+
+      // EVID-01 soft evidence gate (D-14/D-16/D-17/D-18): only findings that SURVIVED the orphan check
+      // (they become a persisted comment) reach here, so the trail never references an off-diff finding.
+      // The finding ALWAYS still posts below regardless of the evidence outcome — this block only pushes
+      // telemetry into the SAME severityAuditEvents accumulator (D-18), never a new returned field, and
+      // NEVER carries body/diff/existingCode/codeSuggestion (privacy posture; T-15-04-01).
       const evidence = finding.existing_code;
-      // WR-02: strip a leading +/- diff marker from each needle line BEFORE normalizeForEvidence, the
-      // same way the haystack is already diff-prefix-stripped. Computed once and used for both the
-      // absent/whitespace check and the includes() check so the needle is normalized identically.
+      // Use shared normalize helpers from evidence.ts (extracted from this file). The needle is
+      // computed once and used for both the absent/whitespace check and the includes() test.
       const needle = evidence == null ? '' : normalizeForEvidence(stripLeadingDiffMarkers(evidence));
       if (evidence == null || needle.length === 0) {
         // null / undefined / whitespace-only -> `absent`. A JSON `null` reaches here (never a parse
         // failure) because fileReviewModelOutputSchema.existing_code is nullable().optional() (15-01).
-        // Phase 20.1 BLOCKER 1 (D-06): the title is redacted via redactFindingTitle (max 100 chars
-        // with a length-bounded head-clamp marker for over-length input). The prior clampAuditTitle
-        // only truncated; the redactor is the producer-side enforcement of the audit-event privacy
-        // boundary (AUD-01 sign-off text).
-        severityAuditEvents.push({
-          stage: 'evidence_missing',
-          reason: 'absent',
-          path: file.path,
-          line,
-          title: redactFindingTitle(title),
-          timestamp: new Date().toISOString(),
-        });
-      } else if (!evidenceHaystack.includes(needle)) {
-        severityAuditEvents.push({
-          stage: 'evidence_missing',
-          reason: 'not_in_hunk',
-          path: file.path,
-          line,
-          title: redactFindingTitle(title),
-          timestamp: new Date().toISOString(),
-        });
+        // EVID-03: accumulate as EvidenceMissingEntry (raw title, not redacted — the builder applies
+        // redactFindingTitle internally per D-06). `line` uses the pre-remap original model-cited
+        // line (EVID-04) for the evidence_missing_summary sample, not the orphan-remapped line.
+        evidenceMissingEntries.push({ path: file.path, line: originalLine ?? null, title, reason: 'absent' });
+      } else if (
+        // Haystack: build from file hunks same as checkEvidence() in core/evidence.ts.
+        // Using checkEvidence directly here would lose the originalLine pre-remap distinction
+        // (EVID-04), so we keep the inline check for EVID-01 audit parity.
+        !normalizeForEvidence(
+          file.hunks.flatMap((h) => h.lines).map((l) => l.content).join('\n'),
+        ).includes(needle)
+      ) {
+        // EVID-03: same accumulation for not_in_hunk; originalLine ?? null type normalization.
+        evidenceMissingEntries.push({ path: file.path, line: originalLine ?? null, title, reason: 'not_in_hunk' });
       }
 
-      return parsedReviewCommentSchema.parse({
-        path: file.path,
-        line: line,
-        position,
-        severity: ruled.severity,
-        category: ruled.category,
-        title,
-        body: withSuggestion(body, finding.code_suggestion),
-        codeSuggestion: finding.code_suggestion,
-        // EVID-01 (D-15): map the model-emitted evidence into the parsed comment's existingCode field.
-        // `?? null` because parsedReviewCommentSchema.existingCode is nullable().optional().
-        existingCode: finding.existing_code ?? null,
-        // Already validated/clamped by fileReviewModelOutputSchema + normalizeFinding.
-        // Absent -> undefined, which parsedReviewCommentSchema accepts (fail-open at finalize).
-        confidence: finding.confidence_score,
-      });
+      // Phase 33 (FR-154, D-10): truncation runs LAST in the parse pipeline — after cleanText, the
+      // body-prefix strip, the severity engine, and the EVID-01 evidence gate; immediately before
+      // the schema parse. The severity/category engine already saw the FULL title above.
+      const truncatedTitle = title.slice(0, COMMENT_TITLE_MAX);
+
+      // WR-09: fail SOFT, consistent with this module's tolerant-parse posture. This .parse() sits
+      // inside .map(), and `parseFileReviewResponse`'s only try/catch (:307-395) covers JSON
+      // extraction — so before this guard a single finding that violated
+      // parsedReviewCommentSchema threw out of the whole function and failed the ENTIRE file's
+      // review instead of dropping one comment.
+      try {
+        return parsedReviewCommentSchema.parse({
+          path: file.path,
+          line: line,
+          position,
+          severity: ruled.severity,
+          category: ruled.category,
+          title: truncatedTitle,
+          // Phase 33 (FR-153, REVIEWS R6 HIGH): pass the resolved LOCAL codeSuggestion
+          // (null/undefined/string), NOT `finding.code_suggestion` directly — the `?? undefined`
+          // collapses the cleared-null to a falsy suggestion so `withSuggestion` returns the
+          // fence-stripped commentBody unchanged.
+          body: withSuggestion(commentBody, codeSuggestion ?? undefined),
+          codeSuggestion,
+          // EVID-01 (D-15): map the model-emitted evidence into the parsed comment's existingCode field.
+          // `?? null` because parsedReviewCommentSchema.existingCode is nullable().optional().
+          existingCode: finding.existing_code ?? null,
+          // Already validated/clamped by fileReviewModelOutputSchema + normalizeFinding.
+          // Absent -> undefined, which parsedReviewCommentSchema accepts (fail-open at finalize).
+          confidence: finding.confidence_score,
+        });
+      } catch (error) {
+        // Identifiers only — never the body/suggestion/evidence (privacy posture, T-15-04-01).
+        logger.warn('Dropping a finding that failed parsedReviewCommentSchema', {
+          path: file.path,
+          line: line ?? null,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return null;
+      }
     })
     .filter((comment): comment is ParsedReviewComment => Boolean(comment));
+
+  // EVID-03 / D-05/D-06/D-08: single builder call per (file, pass) returning
+  // EvidenceMissingSummaryAuditEvent | null. Returns null when entries.length === 0
+  // (D-05 — no zero-count event). The result flows through the existing
+  // severityAuditEvents channel into recordUnitAudit (unchanged).
+  const evidenceSummary = buildEvidenceMissingSummary(file.path, opts.pass ?? 'main', evidenceMissingEntries);
+  if (evidenceSummary) {
+    severityAuditEvents.push(evidenceSummary);
+  }
+
+  // Phase 33 (FR-153, D-08): one suggestion_dropped aggregate per (file, pass) when the FR-153
+  // drop clause removed >=1 finding. Rides the existing severityAuditEvents channel into
+  // recordUnitAudit (review.ts:1651/:1749) — no new recorder. Null when nothing was dropped.
+  const suggestionDropSummary = buildSuggestionDroppedEvent(file.path, opts.pass ?? 'main', suggestionDropEntries);
+  if (suggestionDropSummary) {
+    severityAuditEvents.push(suggestionDropSummary);
+  }
 
   const verdict = parsed.overall_correctness.toLowerCase().includes('patch is correct') ? 'approve' : 'comment';
   let fileSummary = parsed.overall_explanation;
@@ -583,6 +697,46 @@ export function parseFileReviewResponse(
 // blowing the walkthrough comment-size budget (the formatter fences it under WALKTHROUGH_BODY_MAX);
 // over-length source is rejected (returns null -> diagram omitted).
 const DIAGRAM_SOURCE_MAX = 20_000;
+
+// FR-154 (D-09/D-10/D-11): plain substring truncation, no ellipsis marker, applied producer-side
+// LAST in the parse pipeline (the schema title has no max). EXPORTED because the orphan bucket
+// AND the map callback both consume it (REVIEWS R8, MEDIUM).
+export const COMMENT_TITLE_MAX = 80;
+
+// FR-155 (D-12/D-13): label tokens open at `["` and close at the first `"` immediately followed by
+// `]`; interior quotes inside the span are REMOVED (the PRD's canonical rewrite
+// `engine["core/"engine.py""]` → `engine["core/engine.py"]`). Everything outside `["…"]` spans is
+// copied verbatim so message/note text is never touched; a token with no valid close is copied
+// verbatim. A single-pass scan that ALWAYS advances `i` — an unterminated token like `A["unterminated`
+// advances one character per step, so it can never infinite-loop (REVIEWS R7, MEDIUM).
+function sanitizeMermaidLabels(source: string): string {
+  let out = '';
+  for (let i = 0; i < source.length; ) {
+    if (source[i] === '[' && source[i + 1] === '"') {
+      let close = -1;
+      for (let j = i + 2; j < source.length - 1; j++) {
+        // WR-02: a Mermaid label token NEVER spans lines. Without this bound the close-scan ran to
+        // the end of the whole document, so an unterminated `["` anywhere (including in prose that
+        // Mermaid treats as message/note text) swallowed everything up to the NEXT line's `"]` and
+        // rewrote a previously-valid label -- violating the "outside a span is copied verbatim" /
+        // "a token with no valid close is copied verbatim" invariants documented above.
+        if (source[j] === '\n') break;
+        if (source[j] === '"' && source[j + 1] === ']') {
+          close = j;
+          break;
+        }
+      }
+      if (close >= 0) {
+        out += '["' + source.slice(i + 2, close).replace(/"/g, '') + '"]';
+        i = close + 2;
+        continue;
+      }
+    }
+    out += source[i];
+    i += 1;
+  }
+  return out;
+}
 
 /**
  * Best-effort, tolerant parse of a model's Mermaid sequence-diagram output for the walkthrough
@@ -613,6 +767,12 @@ export function parseWalkthroughDiagram(raw: string): string | null {
     if (fenceMatch) {
       text = fenceMatch[1];
     }
+
+    // (2.5) FR-155 (D-14): repair nested double quotes inside `["…"]` label tokens BEFORE the
+    // first-token validation and the length cap — a diagram whose only defect is a broken label
+    // survives instead of being omitted. Operates on `text` (not `source`) so both the fenced and
+    // unfenced paths are covered by the single call.
+    text = sanitizeMermaidLabels(text);
 
     const source = text.trim();
     if (source.length === 0) return null;
@@ -908,5 +1068,185 @@ export function parseWalkthroughEnrichmentResponse(raw: string): ParsedWalkthrou
   // `readonly WalkthroughEnrichmentField[]` contract on ParsedWalkthroughEnrichment. The internal
   // `malformedFields` is left mutable above so the per-field push sites stay readable.
   return { kind: 'parsed', groups, confidence, effort, malformedFields: Object.freeze(malformedFields) };
+}
+
+// SEC-XDIFF-01: schema for the cross-file security model's JSON response. The model returns
+// `{ "findings": [...] }` where each finding has title, body, severity, path, line, confidence,
+// and optional cross_references. Severity is mapped to the Codra severity enum (P0..P3/nit) by
+// the prompt template; the parser validates the mapping but falls back to 'P2' for unexpected
+// values so a single malformed severity never drops a valid finding.
+const crossFileSecurityFindingSchema = z.object({
+  title: z.string().min(1),
+  body: z.string().min(1),
+  severity: z.enum(reviewSeverities).catch('P2'),
+  path: z.string().min(1),
+  line: z.number().int().positive().optional(),
+  confidence: z.number().min(0).max(1).optional(),
+  cross_references: z.array(z.object({
+    path: z.string().min(1),
+    line: z.number().int().positive().optional(),
+    relationship: z.string().min(1),
+  })).optional(),
+});
+
+const crossFileSecurityResponseSchema = z.object({
+  findings: z.array(crossFileSecurityFindingSchema),
+});
+
+export type CrossFileSecurityFinding = z.infer<typeof crossFileSecurityFindingSchema>;
+
+export type ParsedCrossFileSecurityResponse =
+  | { kind: 'parsed'; findings: CrossFileSecurityFinding[] }
+  | { kind: 'fail_open'; reason: string };
+
+/**
+ * SEC-XDIFF-01: tolerant parse of the cross-file security model's JSON response. Follows the
+ * same extract → repair → parse → validate pattern as parseWalkthroughEnrichmentResponse.
+ * Returns {kind: 'parsed', findings} on success, or {kind: 'fail_open', reason} on whole-call
+ * parse failure. Individual findings that fail schema validation are silently dropped (same
+ * tolerance posture as walkthrough enrichment's per-item filtering).
+ */
+export function parseCrossFileSecurityResponse(raw: string): ParsedCrossFileSecurityResponse {
+  if (typeof raw !== 'string' || raw.trim().length === 0) {
+    return { kind: 'fail_open', reason: 'empty_response' };
+  }
+
+  // Strip <think>...</think> reasoning before extraction — same tolerance as walkthrough enrichment.
+  const stripped = raw
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<think>[\s\S]*$/i, '');
+
+  let extracted: string;
+  try {
+    extracted = extractJson(stripped);
+  } catch {
+    return { kind: 'fail_open', reason: 'json_extract_failed' };
+  }
+
+  let repaired = extracted;
+  try {
+    repaired = jsonrepair(preprocessJson(extracted));
+  } catch {
+    // Fall back to the raw extracted text; the JSON.parse below is the final gate.
+  }
+
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(repaired);
+  } catch {
+    return { kind: 'fail_open', reason: 'json_parse_failed' };
+  }
+
+  if (!parsedJson || typeof parsedJson !== 'object' || Array.isArray(parsedJson)) {
+    return { kind: 'fail_open', reason: 'json_not_object' };
+  }
+
+  const obj = parsedJson as Record<string, unknown>;
+
+  if (!('findings' in obj) || !Array.isArray(obj.findings)) {
+    return { kind: 'fail_open', reason: 'findings_missing_or_not_array' };
+  }
+
+  // Per-item tolerant filtering: drop items that fail schema validation rather than failing the
+  // whole call. Matches walkthrough enrichment's group-validation posture.
+  const findings: CrossFileSecurityFinding[] = [];
+  for (const item of obj.findings) {
+    if (item && typeof item === 'object') {
+      const parsed = crossFileSecurityFindingSchema.safeParse(item);
+      if (parsed.success) {
+        findings.push(parsed.data);
+      }
+    }
+  }
+
+  if (findings.length === 0) {
+    return { kind: 'fail_open', reason: 'all_findings_invalid' };
+  }
+
+  return { kind: 'parsed', findings };
+}
+
+export type ParsedAgenticToolCall =
+  | { kind: 'action'; action: AgenticToolAction }
+  | { kind: 'done' }
+  | { kind: 'unparseable'; reason: string };
+
+/**
+ * PRD-06 (FR-131, D-01/D-03): tolerant parse of ONE agentic-context model turn into ONE tool action.
+ *
+ * Lives in THIS module, not in `core/agentic-tools.ts`, because the recovery ladder's helpers
+ * (`extractJson`, `preprocessJson`) are private here and the module header at :809-813 states the
+ * ladder MUST NOT be forked. Follows `parseCrossFileSecurityResponse`'s ladder exactly: reject empty →
+ * strip `<think>` (including an unterminated trailing one) → extractJson → jsonrepair(preprocessJson)
+ * with a fall-through to the raw extracted text → JSON.parse → reject non-object/array → one
+ * `agenticActionSchema.safeParse`.
+ *
+ * Every `reason` is a MACHINE TOKEN from this module's existing vocabulary — never provider text and
+ * never file content, so a reason can be logged or (from 35-06) written to the audit trail without a
+ * redaction pass.
+ *
+ * The array pre-check is deliberate and is a protocol rule, not a nicety: `extractJson` happily digs
+ * the FIRST object out of `[{...},{...}]`, so without it a model that emits a LIST of actions would
+ * have its first element silently executed while the rest were dropped. D-03's protocol is exactly one
+ * action per turn, so a list is rejected and costs the one corrective hop.
+ */
+export function parseAgenticToolCall(raw: string): ParsedAgenticToolCall {
+  if (typeof raw !== 'string' || raw.trim().length === 0) {
+    return { kind: 'unparseable', reason: 'empty_response' };
+  }
+
+  const stripped = raw
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<think>[\s\S]*$/i, '');
+
+  const trimmed = stripped.trim();
+  if (trimmed.length === 0) {
+    return { kind: 'unparseable', reason: 'empty_response' };
+  }
+  if (trimmed.startsWith('[')) {
+    try {
+      if (Array.isArray(JSON.parse(trimmed))) {
+        return { kind: 'unparseable', reason: 'json_not_object' };
+      }
+    } catch {
+      // Not a parseable array either; fall through to the normal ladder.
+    }
+  }
+
+  let extracted: string;
+  try {
+    extracted = extractJson(stripped);
+  } catch {
+    return { kind: 'unparseable', reason: 'json_extract_failed' };
+  }
+
+  let repaired = extracted;
+  try {
+    repaired = jsonrepair(preprocessJson(extracted));
+  } catch {
+    // Fall back to the raw extracted text; the JSON.parse below is the final gate.
+  }
+
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(repaired);
+  } catch {
+    return { kind: 'unparseable', reason: 'json_parse_failed' };
+  }
+
+  if (!parsedJson || typeof parsedJson !== 'object' || Array.isArray(parsedJson)) {
+    return { kind: 'unparseable', reason: 'json_not_object' };
+  }
+
+  const validated = agenticActionSchema.safeParse(parsedJson);
+  if (!validated.success) {
+    return { kind: 'unparseable', reason: 'schema_rejected' };
+  }
+
+  if (validated.data.action === 'done') {
+    return { kind: 'done' };
+  }
+
+  return { kind: 'action', action: validated.data };
 }
 

@@ -26,6 +26,16 @@ export type BitbucketFetchMockOptions = {
   approvePullRequestResponse?: BitbucketMockResponse;
   upsertCodeInsightsReportResponse?: BitbucketMockResponse;
   postCommitBuildStatusResponse?: BitbucketMockResponse;
+  /**
+   * Phase 30 (ANNO-01): response for DELETE .../commit/{commit}/reports/{reportId} (any reportId).
+   * Defaults to a 204. Use `status: 404` to exercise the round-1-no-prior-report swallow path.
+   */
+  deleteCodeInsightsReportResponse?: BitbucketMockResponse;
+  /**
+   * Phase 30 (ANNO-01): response for POST .../commit/{commit}/reports/{reportId}/annotations.
+   * Defaults to a 200 with an empty array body.
+   */
+  bulkUpsertAnnotationsResponse?: BitbucketMockResponse;
   responseSequence?: Array<BitbucketMockResponse | Response | ResponseFactory>;
   /**
    * Response for GET /repositories/{workspace}/{repo}/src/{ref}/{path} (PROV-01, D-08).
@@ -58,6 +68,26 @@ export type BitbucketFetchMockOptions = {
    * Repository Access Token. Use to verify the configured bot id SHORT-CIRCUITS that call.
    */
   blockResolveBotUserIdentity?: boolean;
+  /**
+   * PRD-04 (FR-114): response for GET /repositories/{workspace}/{repo}/commits/{ref}?path=...
+   * (per-touched-file commit history). `status` defaults to 200; `body` carries
+   * `{ values: [{ hash, message }] }` — Bitbucket's commit-list endpoint omits the file
+   * manifest. Registered ONLY when supplied, so every other spec's route table is
+   * byte-identical (NREG-01).
+   */
+  fileHistoryResponses?: BitbucketMockResponse;
+  /**
+   * PRD-06 (FR-131): response for GET /2.0/workspaces/{workspace}/search/code (the workspace-scoped
+   * code search backing `grep_repo`). `status` defaults to 200; `body` carries the swagger's
+   * `{ values: [{ file: { path }, content_matches: [{ lines: [{ line, segments: [{ text }] }] }] }] }`
+   * shape. Use `status: 401 | 403 | 404 | 429` to drive the `null` capability-unavailable branches,
+   * `400` for the empty-array malformed-query branch, and `500` for the rethrow branch.
+   *
+   * Registered ONLY when supplied, so every other spec's route table is byte-identical (NREG-01) —
+   * the same discipline `fileHistoryResponses` uses. Without the fixture the terminal 404 answers,
+   * which would look like "search not enabled for this workspace" rather than an unrouted call.
+   */
+  codeSearchResponses?: BitbucketMockResponse;
 };
 
 // Concrete author fixtures for the comment-primitive specs (review F6). Three DISTINCT string
@@ -85,9 +115,20 @@ const defaultPullRequest = {
   state: 'OPEN',
 };
 
+// The Fetch spec forbids a body on a null-body status (the WHATWG "null body status" list:
+// 101/103/204/205/304) -- the Response constructor throws if one is supplied. Phase 30's
+// deleteCodeInsightsReportResponse default (`{ status: 204 }`) exercises this path for the first
+// time in this shared helper (Rule 1 fix, scoped to toResponse only).
+const NULL_BODY_STATUSES = new Set([101, 103, 204, 205, 304]);
+
 function toResponse(spec: BitbucketMockResponse) {
   const status = spec.status ?? 200;
   const headers = new Headers(spec.headers);
+
+  if (NULL_BODY_STATUSES.has(status)) {
+    return new Response(null, { status, headers });
+  }
+
   const body = spec.body ?? {};
 
   if (typeof body === 'string') {
@@ -177,6 +218,21 @@ export function installBitbucketFetchMock(options: BitbucketFetchMockOptions = {
       };
       return toResponse(fixture);
     }
+    // PRD-04 (FR-114): GET /repositories/{w}/{r}/commits/{ref} (file history). The
+    // path/pagelen operands ride the query string (the recorder preserves pathname + search).
+    // Registered ONLY when the fixture is supplied so every other spec's route table is
+    // byte-identical (NREG-01); the terminal 404 covers the unregistered case.
+    if (method === 'GET' && options.fileHistoryResponses && /\/2\.0\/repositories\/[^/]+\/[^/]+\/commits\/[^/]+$/.test(url.pathname)) {
+      return toResponse(options.fileHistoryResponses);
+    }
+    // PRD-06 (FR-131): GET /2.0/workspaces/{workspace}/search/code. The `search_query`/`pagelen`
+    // operands ride the query string (the recorder preserves pathname + search, so a spec can assert
+    // the URL-encoded query and the clamped pagelen). Registered ONLY when the fixture is supplied so
+    // every other spec's route table is byte-identical (NREG-01); the terminal 404 covers the
+    // unregistered case. Anchored with `$` so no other /workspaces/ route can be shadowed.
+    if (method === 'GET' && options.codeSearchResponses && /^\/2\.0\/workspaces\/[^/]+\/search\/code$/.test(url.pathname)) {
+      return toResponse(options.codeSearchResponses);
+    }
     // PROV-02 (R-4): raw multi-page listRawPullRequestComments. MUST be checked BEFORE the existing
     // `listPullRequestComments` route below because the raw consumer wants control over the page
     // shape and follows the `next` URL itself; the legacy consumer wants the single-page mapped fixture.
@@ -242,8 +298,16 @@ export function installBitbucketFetchMock(options: BitbucketFetchMockOptions = {
     if (method === 'POST' && /\/pullrequests\/\d+\/approve$/.test(url.pathname)) {
       return toResponse(options.approvePullRequestResponse ?? { status: 200, body: {} });
     }
-    if (method === 'PUT' && /\/commit\/[^/]+\/reports\/codra-review$/.test(url.pathname)) {
+    // Phase 30 (ANNO-01): widened from the literal `codra-review` to ANY reportId. Every EXISTING
+    // caller still PUTs to `codra-review`, so this is a strict, non-breaking superset.
+    if (method === 'PUT' && /\/commit\/[^/]+\/reports\/[^/]+$/.test(url.pathname)) {
       return toResponse(options.upsertCodeInsightsReportResponse ?? { status: 200, body: {} });
+    }
+    if (method === 'DELETE' && /\/commit\/[^/]+\/reports\/[^/]+$/.test(url.pathname)) {
+      return toResponse(options.deleteCodeInsightsReportResponse ?? { status: 204 });
+    }
+    if (method === 'POST' && /\/commit\/[^/]+\/reports\/[^/]+\/annotations$/.test(url.pathname)) {
+      return toResponse(options.bulkUpsertAnnotationsResponse ?? { status: 200, body: [] });
     }
     if (method === 'POST' && /\/commit\/[^/]+\/statuses\/build$/.test(url.pathname)) {
       return toResponse(options.postCommitBuildStatusResponse ?? { status: 201, body: {} });

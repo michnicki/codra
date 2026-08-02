@@ -6,6 +6,7 @@ import {
   type IssueCommentWebhookPayload,
   type PullRequestReviewCommentWebhookPayload,
   type PullRequestWebhookPayload,
+  type PushWebhookPayload,
 } from '@shared/github';
 import type { AppEnv } from '@server/env';
 import { loadRepoConfig } from '@server/core/config';
@@ -13,8 +14,10 @@ import { extractReviewRequest, type ReviewRequest } from '@server/core/review';
 import { verifyGitHubWebhookSignature } from '@server/core/verify';
 import { jsonError } from '@server/core/http';
 import { ingestReviewWebhookEvent, isTransientCommentError, type WebhookIngestResult } from '@server/core/webhook-ingest';
+import { startIndexBuild } from '@server/core/code-index-build';
 import type { CommentContext } from '@server/core/commands';
 import { recordWebhookDelivery, deleteWebhookDelivery } from '@server/db/webhook-deliveries';
+import { findRepositoryIdByIdentity } from '@server/db/repositories';
 import { logger } from '@server/core/logger';
 
 // A mention-shaped ReviewRequest carrying the installationId the GitHub comment branch in the shared
@@ -192,6 +195,129 @@ export async function handleGitHubWebhook(c: Context<AppEnv>) {
     const config = repoConfig.parsedJson;
     const owner = payload.repository.owner.login;
     const repo = payload.repository.name;
+
+    // ── push (Phase 29, QA-IDX-01 / D-08): a default-branch push refreshes the codebase index.
+    //
+    // THE PLACEMENT OF THIS BRANCH IS LOAD-BEARING. `recordWebhookDelivery` runs BEFORE the
+    // supported-event gate above, so adding 'push' to the supported-event list immediately changes
+    // which deliveries flow into this part of the handler — and everything below this branch assumes
+    // a pull-request-shaped payload (`extractReviewRequest`, `payload.pull_request.body`). A push
+    // payload has no pull request, so the branch sits before that tail and EVERY path inside it
+    // returns.
+    //
+    // THE STORAGE CONSEQUENCE OF THAT ORDERING (review: OpenCode 29-06 MEDIUM, accepted and
+    // disclosed): every `push` delivery to every configured repository is now RECORDED, including
+    // pushes to branches this handler immediately ignores, so `webhook_deliveries` grows with total
+    // push traffic rather than with pull-request traffic. The recorder is deliberately NOT moved
+    // after the gate — recording before the gate is what makes an unrecognized or misrouted delivery
+    // diagnosable at all, and that diagnosability is worth more than the row count.
+    if (eventName === 'push') {
+      const push = payload as PushWebhookPayload;
+      // Every ignore path logs the event kind so an operator tracing a missing refresh can tell
+      // which event produced which decision. It is deliberately NOT in the response body: the event
+      // kind arrives on a client-supplied header from an unauthenticated caller, and reflecting
+      // unvalidated input into a response gains nothing an operator reads (review: OpenCode 29-06
+      // LOW, adopted with that deliberate change).
+      const logPushIgnore = (reason: string) =>
+        logger.info('GitHub push delivery ignored', { owner, repo, eventKind: eventName, ref: push.ref, reason });
+      const pushIgnored = (reason: string) => {
+        logPushIgnore(reason);
+        return c.json({ ok: true, ignored: true, reason }, 202);
+      };
+
+      // A deletion has no `after` commit to index — check before any ref reasoning, because deleting
+      // the DEFAULT branch would otherwise pass the ref equality check below.
+      if (push.deleted) {
+        return pushIgnored('deleted');
+      }
+      // Tags (and any other non-branch ref) can never be the default branch.
+      if (!push.ref.startsWith('refs/heads/')) {
+        return pushIgnored('non_branch_ref');
+      }
+      // ASSUMPTION A1: `repository.default_branch` is not documented for the push event, so read
+      // `default_branch ?? master_branch` and SKIP rather than guess when both are absent. This is
+      // the one branch whose failure is otherwise completely invisible: if the field turns out to be
+      // absent in practice, every default-branch push silently becomes an ignored acknowledgement
+      // and index freshness never fires with no error anywhere. The warning's payload carries the
+      // owner, the repo, the event kind and the ref — and nothing else; no commit list, no committer
+      // identity, no payload body.
+      const defaultBranch = push.repository.default_branch ?? push.repository.master_branch;
+      if (!defaultBranch) {
+        logger.warn('GitHub push delivery ignored: payload carries no default-branch field, so the default branch cannot be resolved', {
+          owner,
+          repo,
+          eventKind: eventName,
+          ref: push.ref,
+        });
+        return c.json({ ok: true, ignored: true, reason: 'default_branch_unknown' }, 202);
+      }
+      if (push.ref !== `refs/heads/${defaultBranch}`) {
+        return pushIgnored('non_default_branch');
+      }
+      // NREG-01 / T-29-06-03: the freshness path is inert for a repository that has not opted in.
+      if (!config.review.interactive.qa.index.enabled) {
+        return pushIgnored('index_disabled');
+      }
+
+      const repositoryId = await findRepositoryIdByIdentity(c.env, {
+        vcsProvider: 'github',
+        ownerOrWorkspace: owner,
+        repo,
+      });
+      if (repositoryId === null) {
+        return pushIgnored('repository_not_registered');
+      }
+
+      // A CREATED branch has an all-zeros before-sha, so a compare is meaningless — start a full
+      // rebuild instead of passing a zero sha to the build's compare call as if it were a real
+      // ancestor.
+      // A FORCED push may leave the before-sha not an ancestor of the after-sha, so the compare can
+      // be large or fail; the incremental build's own failure handling covers that and the reason is
+      // recorded rather than silently swallowed.
+      const mode = push.created ? 'full' : 'incremental';
+      // The lease claim, instance-id derivation (the SHARED helper both push branches and the
+      // dashboard trigger key on), and the `instance.already_exists` stale-instance retry all live in
+      // `startIndexBuild` — see its doc comment for why a per-repository-stable id would otherwise
+      // mean a repository's index could only ever be refreshed once.
+      const outcome = await startIndexBuild(c.env, {
+        repositoryId,
+        vcsProvider: 'github',
+        owner,
+        repo,
+        workspace: null,
+        installationId,
+        mode,
+        ...(mode === 'incremental' ? { baseSha: push.before, headSha: push.after } : {}),
+      });
+      if (!outcome.started) {
+        if (outcome.coalesced) {
+          logger.info('Codebase index refresh coalesced: workflow instance already exists', {
+            owner,
+            repo,
+            eventKind: eventName,
+            repositoryId,
+            reason: outcome.reason,
+          });
+          return c.json({ ok: true, coalesced: true, reason: outcome.reason }, 202);
+        }
+        throw outcome.error;
+      }
+      logger.info('GitHub push triggered a codebase index refresh', {
+        owner,
+        repo,
+        eventKind: eventName,
+        ref: push.ref,
+        mode,
+        repositoryId,
+      });
+      return c.json(
+        mode === 'full'
+          ? { ok: true, refreshed: true, mode, reason: 'branch_created_full_rebuild' }
+          : { ok: true, refreshed: true, mode },
+        202,
+      );
+    }
+
     // The interactive comment surface (commands / Q&A) is only wired when at least one toggle is on.
     // With BOTH off, issue_comment keeps its pre-Phase-11 legacy `@mention` review path (extract ->
     // queued_event -> Workflow) so mention-triggers-review stays byte-identical (NREG-01); we do NOT

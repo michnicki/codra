@@ -105,6 +105,9 @@ dbDescribe('Bitbucket webhook route (Wave 3 / Phase 5)', () => {
   // disabled — review finding 10).
   const createdRepoIds: number[] = [];
   const createdIdentities: Array<{ workspace: string; repoSlug: string }> = [];
+  // Phase 31 (WS-01): tracks `vcs_workspace_credentials` rows this file inserts so afterEach
+  // can clean them up independently of the per-repo `vcs_credentials` cleanup above.
+  const createdWorkspaceCredentials: string[] = [];
 
   beforeEach(() => {
     ingestSpy.mockClear();
@@ -120,6 +123,15 @@ dbDescribe('Bitbucket webhook route (Wave 3 / Phase 5)', () => {
       );
     }
     createdIdentities.length = 0;
+
+    if (createdWorkspaceCredentials.length > 0) {
+      await queryRows(
+        env,
+        `DELETE FROM vcs_workspace_credentials WHERE vcs_provider = 'bitbucket' AND workspace = ANY($1::text[])`,
+        [createdWorkspaceCredentials],
+      );
+      createdWorkspaceCredentials.length = 0;
+    }
 
     if (createdRepoIds.length > 0) {
       // FK constraint order: webhook_deliveries + jobs reference repositories via
@@ -171,6 +183,23 @@ dbDescribe('Bitbucket webhook route (Wave 3 / Phase 5)', () => {
       [workspace, repoSlug, encrypted],
     );
     createdIdentities.push({ workspace, repoSlug });
+  }
+
+  // Helper (Phase 31, WS-01): seed a `vcs_workspace_credentials` row with an encrypted webhook
+  // secret, mirroring seedCredential's raw-insert pattern above but keyed on
+  // (vcs_provider, workspace) only (no repoSlug column on this table).
+  async function seedWorkspaceCredential(workspace: string, secretPlaintext: string) {
+    const encrypted = await encryptSecret(env, secretPlaintext);
+    await queryRows(
+      env,
+      `INSERT INTO vcs_workspace_credentials (vcs_provider, workspace, encrypted_webhook_secret, encrypted_access_token, created_at, updated_at)
+       VALUES ('bitbucket', $1, $2, 'placeholder-encrypted-token', now(), now())
+       ON CONFLICT (vcs_provider, workspace) DO UPDATE
+         SET encrypted_webhook_secret = EXCLUDED.encrypted_webhook_secret,
+             updated_at = now()`,
+      [workspace, encrypted],
+    );
+    createdWorkspaceCredentials.push(workspace);
   }
 
   // Helper: send a POST /webhook/bitbucket with optional header overrides.
@@ -372,6 +401,119 @@ dbDescribe('Bitbucket webhook route (Wave 3 / Phase 5)', () => {
     expect(json.reason).toBe('repository_not_registered');
     expect(json.eventName).toBe('pullrequest:created');
 
+    expect(ingestSpy).not.toHaveBeenCalled();
+  });
+
+  // Phase 31 (WS-01, Plan 31-04, Task 1): widened Step 5-7 credential resolution + D-07
+  // regression. All four <behavior> tests from 31-04-PLAN.md.
+
+  // Test 1: a delivery for a repo with ONLY a workspace-level credential, signed with the
+  // workspace secret, verifies and proceeds (not 401).
+  it('verifies a delivery signed with a workspace-only webhook secret (WS-01)', async () => {
+    const workspace = `ws-bb-wsonly-${Date.now()}`;
+    const repoSlug = `repo-bb-wsonly-${Date.now()}`;
+    const workspaceSecret = 'workspace-level-shared-secret';
+    await seedRepository(workspace, repoSlug);
+    // Deliberately NO seedCredential call -- no per-repo vcs_credentials row exists.
+    await seedWorkspaceCredential(workspace, workspaceSecret);
+
+    const payload = buildPayload({
+      repository: { full_name: `${workspace}/${repoSlug}`, name: repoSlug, workspace: { slug: workspace }, uuid: '{u-ws-1}' },
+    });
+    const body = JSON.stringify(payload);
+    const signature = await signWebhookPayload(workspaceSecret, body);
+
+    const response = await postWebhook(body, {
+      'x-event-key': 'pullrequest:created',
+      'x-request-uuid': 'delivery-wsonly-1',
+    }, signature);
+
+    expect(response.status).not.toBe(401);
+    const json = await response.json() as any;
+    expect(json.ok).toBe(true);
+  });
+
+  // Test 2: a delivery for a repo with BOTH a per-repo credential (secret A) and a workspace
+  // credential (secret B), signed with secret B, still verifies (proves "try both").
+  it('verifies a delivery signed with the workspace secret when a DIFFERENT per-repo secret also exists (WS-01, Pitfall 1)', async () => {
+    const workspace = `ws-bb-both-${Date.now()}`;
+    const repoSlug = `repo-bb-both-${Date.now()}`;
+    const perRepoSecret = 'per-repo-secret-a';
+    const workspaceSecret = 'workspace-secret-b';
+    await seedRepository(workspace, repoSlug);
+    await seedCredential(workspace, repoSlug, perRepoSecret);
+    await seedWorkspaceCredential(workspace, workspaceSecret);
+
+    const payload = buildPayload({
+      repository: { full_name: `${workspace}/${repoSlug}`, name: repoSlug, workspace: { slug: workspace }, uuid: '{u-ws-2}' },
+    });
+    const body = JSON.stringify(payload);
+    // Signed with the WORKSPACE secret (B), not the per-repo secret (A).
+    const signature = await signWebhookPayload(workspaceSecret, body);
+
+    const response = await postWebhook(body, {
+      'x-event-key': 'pullrequest:created',
+      'x-request-uuid': 'delivery-both-1',
+    }, signature);
+
+    expect(response.status).not.toBe(401);
+    const json = await response.json() as any;
+    expect(json.ok).toBe(true);
+  });
+
+  // Test 3: a delivery for a repo with NEITHER credential still returns the exact
+  // byte-identical `{ error: 'Webhook secret not configured.' }` 401 (NREG-01 regression guard).
+  it('returns the byte-identical "Webhook secret not configured." 401 when neither credential exists (WS-01, NREG-01)', async () => {
+    const workspace = `ws-bb-neither-${Date.now()}`;
+    const repoSlug = `repo-bb-neither-${Date.now()}`;
+    await seedRepository(workspace, repoSlug);
+    // NO seedCredential, NO seedWorkspaceCredential -- neither source has a row.
+
+    const payload = buildPayload({
+      repository: { full_name: `${workspace}/${repoSlug}`, name: repoSlug, workspace: { slug: workspace }, uuid: '{u-ws-3}' },
+    });
+    const body = JSON.stringify(payload);
+    const signature = await signWebhookPayload('irrelevant-secret', body);
+
+    const response = await postWebhook(body, {
+      'x-event-key': 'pullrequest:created',
+      'x-request-uuid': 'delivery-neither-1',
+    }, signature);
+
+    expect(response.status).toBe(401);
+    const json = await response.json() as any;
+    expect(json).toEqual({ error: 'Webhook secret not configured.' });
+    expect(ingestSpy).not.toHaveBeenCalled();
+  });
+
+  // Test 4 (D-07): a delivery signed correctly against a workspace-level secret, for a repo
+  // that has no `repositories` row (never selected during Add Bitbucket Workspace), returns
+  // 202 { ok: true, ignored: true, eventName, reason: 'repository_not_registered' } -- proving
+  // the existing D-20 short-circuit needs zero changes under the new resolution path.
+  it('returns 202 ignored repository_not_registered for an unselected repo even under a valid workspace secret (D-07)', async () => {
+    const workspace = `ws-bb-unselected-${Date.now()}`;
+    const repoSlug = `repo-bb-unselected-${Date.now()}`;
+    const workspaceSecret = 'workspace-unselected-secret';
+    // Deliberately NO seedRepository call -- this repo was never selected/onboarded.
+    await seedWorkspaceCredential(workspace, workspaceSecret);
+
+    const payload = buildPayload({
+      repository: { full_name: `${workspace}/${repoSlug}`, name: repoSlug, workspace: { slug: workspace }, uuid: '{u-ws-4}' },
+    });
+    const body = JSON.stringify(payload);
+    const signature = await signWebhookPayload(workspaceSecret, body);
+
+    const response = await postWebhook(body, {
+      'x-event-key': 'pullrequest:created',
+      'x-request-uuid': 'delivery-unselected-1',
+    }, signature);
+
+    const json = await response.json() as any;
+    expect(response.status).toBe(202);
+    expect(json.ok).toBe(true);
+    expect(json.ignored).toBe(true);
+    expect(json.reason).toBe('repository_not_registered');
+    expect(json.eventName).toBe('pullrequest:created');
     expect(ingestSpy).not.toHaveBeenCalled();
   });
 

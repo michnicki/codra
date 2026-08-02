@@ -139,7 +139,7 @@ describe('ReposPage Review Settings editor (UI-01)', () => {
       max_comments: 10,
       mention_trigger: '@custom-handle',
       passes: {
-        security: { enabled: false },
+        security: { enabled: false, cross_file: false },
         critic: { enabled: false, skip_threshold: 42 },
         ensemble: { runs: 1, temperature: 0.7 },
       },
