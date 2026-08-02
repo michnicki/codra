@@ -15,6 +15,7 @@ import {
   redactErrorMessage,
   MACHINE_ERROR_REASONS,
 } from '@server/core/audit-redact';
+import { buildAgenticContextAuditEvent } from '@server/core/audit';
 import { machineErrorReasonSchema } from '@shared/transient-errors';
 
 // ---------------------------------------------------------------------------
@@ -166,5 +167,97 @@ describe('redactErrorMessage (D-07 machine-enum mapping)', () => {
     for (const input of adversarial) {
       expect(() => redactErrorMessage(input as any)).not.toThrow();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 35 (PRD-06 / T-35-21): the agentic_context event is the producer-side half of the
+// counts-not-content privacy boundary.
+//
+// What makes this arm different from every sibling is WHAT it stands next to: the content the
+// agentic loop gathers is untrusted, attacker-controlled repository source, and the audit trail is
+// operator-facing and durable. A path, a grep query, a match fragment or a file body reaching the
+// trail is a disclosure, not an inconvenience — so the assertion below is on the SERIALIZED string,
+// which is what actually lands in the jobs.audit JSONB column.
+// ---------------------------------------------------------------------------
+
+describe('agentic_context audit serialization carries no content (T-35-21)', () => {
+  // The shape a completed run has in hand at the audit write. Every string here is content the
+  // builder must never copy: two of them are repository paths the loop read, one is the model's own
+  // grep query, one is a matched line, one is a whole file body.
+  const RUN = {
+    filePaths: ['src/server/core/secret-handler.ts', 'infra/deploy/production.tfvars'],
+    grepQuery: 'authenticateUser repo:acme/private-monolith',
+    matchFragment: 'const API_KEY = process.env.CODRA_PRODUCTION_KEY;',
+    fileBody: 'export function chargeCard(token: string) { return stripe.charge(token); }',
+  };
+  const FORBIDDEN = [
+    ...RUN.filePaths,
+    RUN.grepQuery,
+    RUN.matchFragment,
+    RUN.fileBody,
+    // Fragments too: a "helpful" truncation to a prefix would still be a disclosure.
+    'secret-handler',
+    'production.tfvars',
+    'authenticateUser',
+    'CODRA_PRODUCTION_KEY',
+    'chargeCard',
+  ];
+
+  it('serializes a completed run to counts and machine tokens only', () => {
+    const event = buildAgenticContextAuditEvent('completed', {
+      reason: 'done',
+      hopsUsed: 4,
+      filesRead: RUN.filePaths.length,
+      grepsRun: 1,
+      bytesGathered: RUN.fileBody.length + RUN.matchFragment.length,
+      truncated: false,
+      grepSupported: true,
+      budgetHeadroom: 5,
+    });
+
+    const serialized = JSON.stringify(event);
+    for (const forbidden of FORBIDDEN) {
+      expect(serialized).not.toContain(forbidden);
+    }
+    // Positive control: the event is not vacuously clean because it is empty — the counts DERIVED
+    // from that content are exactly what it should carry.
+    expect(serialized).toContain('"files_read":2');
+    expect(serialized).toContain('"greps_run":1');
+  });
+
+  it('serializes a fail-open run whose reason came from a provider error to a redacted token', () => {
+    // The realistic leak path: `error.message` interpolated straight into `reason`. Routing it
+    // through redactErrorMessage first is what makes that impossible.
+    const providerError = new Error(
+      `502 Bad Gateway while reading ${RUN.filePaths[0]} — upstream pool for acme/private-monolith exhausted`,
+    );
+    const event = buildAgenticContextAuditEvent('partial', {
+      reason: redactErrorMessage(providerError),
+      hopsUsed: 2,
+      filesRead: 1,
+      grepsRun: 0,
+      bytesGathered: 812,
+      truncated: false,
+      grepSupported: true,
+      budgetHeadroom: 6,
+    });
+
+    expect(event.reason).toBe('provider_5xx');
+    expect(MACHINE_ERROR_REASONS).toContain(event.reason);
+
+    const serialized = JSON.stringify(event);
+    for (const forbidden of [...FORBIDDEN, 'Bad Gateway', 'acme/private-monolith', 'upstream pool']) {
+      expect(serialized).not.toContain(forbidden);
+    }
+  });
+
+  it('carries no content even when every optional field is omitted', () => {
+    const event = buildAgenticContextAuditEvent('failed', { reason: 'budget_exhausted' });
+    const serialized = JSON.stringify(event);
+    for (const forbidden of FORBIDDEN) {
+      expect(serialized).not.toContain(forbidden);
+    }
+    expect(Object.keys(event).sort()).toEqual(['reason', 'stage', 'status', 'timestamp']);
   });
 });

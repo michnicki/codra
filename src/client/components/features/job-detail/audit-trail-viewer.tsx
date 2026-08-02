@@ -23,6 +23,16 @@ const STAGE_LABELS: Record<AuditStageGroup['stage'], string> = {
   // the edit is inert for this review and takes effect once merged.
   yaml_config_head_ignored: 'Repo config change ignored',
   file_skipped: 'Files skipped',
+  // Phase 35 (PRD-06, D-09): the bounded agentic-context pass. Sentence case, matching every
+  // sibling label ('Cross-file security', 'Repo config applied', 'Evidence missing') — NOT title
+  // case, and not 'Agentic tool loop' / 'On-demand context': "loop" is an implementation detail the
+  // operator cannot act on, and the `agentic` wording keeps the `agentic_tools` config-key
+  // vocabulary the operator reads in `.review.yaml` and in the docs.
+  //
+  // This entry is STRUCTURALLY ATOMIC with the STAGE_ORDER entry in audit-grouping.ts: STAGE_LABELS
+  // is a `Record<AuditStageGroup['stage'], string>`, so adding the stage literal without this line
+  // fails `tsc`. It ships in the same commit for that reason.
+  agentic_context: 'Agentic context',
   drafted: 'Drafted',
   severity_adjusted: 'Severity adjusted',
   filtered: 'Filtered',

@@ -23,6 +23,13 @@ export const STAGE_ORDER = [
   // edit was ignored for this review. Config resolution, hence next to its two siblings.
   'yaml_config_head_ignored',
   'file_skipped',
+  // Phase 35 (PRD-06 / FR-131, D-09): the bounded agentic-context pass. Its position is DERIVED,
+  // not chosen — the phase runs between prepare and review (D-09), `file_skipped` is emitted inside
+  // prepare (review.ts:1364 comments it "Prepare-only") and `drafted` onward are review-time, so
+  // after `file_skipped` and before `drafted` is the only position true to execution order.
+  // This entry is also the ONLY thing stopping `groupAuditByStage`'s `STAGE_ORDER.filter` from
+  // discarding the event entirely — the WR-03 defect recorded in the catch-all comment below.
+  'agentic_context',
   'drafted',
   'severity_adjusted',
   'filtered',

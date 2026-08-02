@@ -14,7 +14,7 @@ const ev = (stage: JobAuditEvent['stage'], timestamp = '2026-01-01T00:00:00Z') =
   ({ stage, timestamp } as unknown as JobAuditEvent);
 
 describe('STAGE_ORDER', () => {
-  it('is the fixed nineteen-stage order including yaml_config_applied, yaml_config_head_ignored, learned_rule_suppressed, suggestion_dropped, rounds, threads, critic, ensemble, walkthrough, cross_file_security, inline_comment_skipped, and the `other` catch-all', () => {
+  it('is the fixed twenty-stage order including yaml_config_applied, yaml_config_head_ignored, agentic_context, learned_rule_suppressed, suggestion_dropped, rounds, threads, critic, ensemble, walkthrough, cross_file_security, inline_comment_skipped, and the `other` catch-all', () => {
     expect(STAGE_ORDER).toEqual([
       // WR-03 gave these two previously-homeless schema stages a display group.
       'yaml_config_parse_failed',
@@ -25,6 +25,10 @@ describe('STAGE_ORDER', () => {
       // the edit was ignored for this review. Config resolution, hence next to its siblings.
       'yaml_config_head_ignored',
       'file_skipped',
+      // Phase 35 (PRD-06, D-09): the bounded agentic-context pass runs BETWEEN prepare and review.
+      // `file_skipped` is prepare-only (review.ts:1364) and `drafted` onward are review-time, so
+      // this position is derived from execution order, not chosen.
+      'agentic_context',
       'drafted',
       'severity_adjusted',
       'filtered',
@@ -328,6 +332,70 @@ describe('WR-03 — every schema audit stage has a display home', () => {
     expect(groups).toHaveLength(1);
     expect(groups[0].stage).toBe('other');
     expect(groups[0].count).toBe(1);
+  });
+});
+
+// Phase 35 (PRD-06, D-09) — the agentic_context display group.
+//
+// B-2 (35-UI-SPEC.md, raised by the kind correction on element E2): the contract asserts "at most
+// one event per job" as a Task-3 EMISSION property, not as a rendered invariant, so nothing
+// specified how the group reads at zero, or if re-entry / a future multi-emit ever produced 2+.
+// All three counts are pinned here.
+describe('Phase 35 (PRD-06, D-09) — agentic_context is its own display group', () => {
+  it('normalizes agentic_context to itself — no normalizer branch, no `other` fallthrough', () => {
+    // It is a single snake_case literal with a dedicated group, so the DISPLAY_STAGES pass-through
+    // resolves it. A normalizer branch would be dead code; falling into `other` would bury a
+    // designed stage in the catch-all for undesigned ones.
+    expect(normalizeAuditDisplayStage('agentic_context')).toBe('agentic_context');
+    expect(normalizeAuditDisplayStage('agentic_context')).not.toBe('other');
+  });
+
+  it('places the group after file_skipped and before drafted regardless of arrival order', () => {
+    const drafted = ev('drafted', '2026-01-01T00:00:01Z');
+    const agentic = ev('agentic_context', '2026-01-01T00:00:02Z');
+    const fileSkipped = ev('file_skipped', '2026-01-01T00:00:03Z');
+
+    const groups = groupAuditByStage([drafted, agentic, fileSkipped]);
+
+    expect(groups.map((g) => g.stage)).toEqual(['file_skipped', 'agentic_context', 'drafted']);
+  });
+
+  // B-2 (i) — ZERO. The toggle-off run's correct UI is the ABSENCE of the group (NREG-01): no
+  // empty-state copy, and the section's header badge (job.audit.length) is unchanged.
+  it('B-2 zero: no agentic_context group at all when the stage emitted nothing', () => {
+    const groups = groupAuditByStage([ev('drafted', '2026-01-01T00:00:01Z')]);
+    expect(groups.find((g) => g.stage === 'agentic_context')).toBeUndefined();
+    expect(groups.map((g) => g.stage)).not.toContain('agentic_context');
+  });
+
+  // B-2 (ii) — ONE. The normal toggle-on run: one group, count badge 1, one row.
+  it('B-2 one: exactly one group holding one event, with count 1', () => {
+    const agentic = ev('agentic_context', '2026-01-01T00:00:01Z');
+    const groups = groupAuditByStage([agentic]);
+    const group = groups.find((g) => g.stage === 'agentic_context');
+
+    expect(group).toBeDefined();
+    expect(group!.count).toBe(1);
+    expect(group!.events).toEqual([agentic]);
+  });
+
+  // B-2 (iii) — TWO. Not producible today (Task 3 emits at most one per job and re-entry emits
+  // none), but the grouper must not merge, drop or reorder if it ever were: the badge counts both
+  // and the rows stack in timestamp order inside ONE group.
+  it('B-2 two: one group holding BOTH events in timestamp order, badge counts both', () => {
+    const first = ev('agentic_context', '2026-01-01T00:00:01Z');
+    const second = ev('agentic_context', '2026-01-01T00:00:02Z');
+
+    const groups = groupAuditByStage([first, second]);
+    const agenticGroups = groups.filter((g) => g.stage === 'agentic_context');
+
+    expect(agenticGroups).toHaveLength(1);
+    expect(agenticGroups[0].count).toBe(2);
+    expect(agenticGroups[0].events).toEqual([first, second]);
+    expect(agenticGroups[0].events.map((e) => e.timestamp)).toEqual([
+      '2026-01-01T00:00:01Z',
+      '2026-01-01T00:00:02Z',
+    ]);
   });
 });
 

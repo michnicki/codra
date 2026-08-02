@@ -1489,6 +1489,69 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
       timestamp: dateStringSchema,
     })
     .passthrough(),
+  // Phase 35 (PRD-06 / FR-131 / FR-132, D-05/D-09/D-11/D-14): the bounded agentic-context pass.
+  // ONE aggregate event per NON-SILENT exit from `runAgenticContextPhase`, shaped like the
+  // `cross_file_security` sibling above because it is the same kind of thing: a single whole-phase
+  // advisory pass with a status, an optional machine-token reason and optional counts.
+  //
+  // The toggle-off branch emits NOTHING AT ALL. NREG-01 promises that a default-config instance
+  // behaves byte-identically to the previous release, and an audit row is observable behaviour — so
+  // `toggle_off` exists in the reason vocabulary for completeness and is deliberately never written.
+  //
+  // COUNTS AND CLOSED MACHINE TOKENS ONLY (T-35-21). This is the counts-not-content rule the
+  // `inline_comment_skipped` WR-06 note below reasons through, and it binds harder here: the content
+  // this phase gathers is untrusted, attacker-controlled repository source, and the audit trail is
+  // operator-facing and durable. No file path, grep query, match fragment or file body may ever
+  // reach this event, and any error-derived string is routed through `redactErrorMessage`
+  // (core/audit-redact.ts) before it becomes a `reason`.
+  //
+  // What each field diagnoses — these are the four failure modes 35-RESEARCH.md predicted, made
+  // visible without a debugger, and every one is read by a 35-AI-SPEC.md §7 metric or alert:
+  //   status          'partial' = a D-11 fail-open that still gathered something; 'failed' = a hard
+  //                   error that yielded nothing. NEITHER is a job failure — the phase is advisory.
+  //   reason          the loop's own stop reason, a skip reason, or a redacted error token.
+  //                   `unparseable_action` clustered on ONE model id means that model cannot drive
+  //                   the text protocol.
+  //   hops_used       pinned at the cap across many jobs means the model is burning, not deciding.
+  //   files_read      the tool-choice mix.
+  //   greps_run
+  //   bytes_gathered  near zero with two or more hops means the operator paid for nothing (FM-5).
+  //   truncated       the 50,000-byte total cap was hit — the loop is over-fetching.
+  //   grep_supported  the ENTIRE D-05 degradation signal. `false` on Bitbucket is the documented
+  //                   expected steady state and must NOT alert; `false` on GitHub is a real signal
+  //                   (rate limit or token problem).
+  //   budget_headroom `tracker.remainingSafeBudget()` captured at the audit write. The only direct
+  //                   evidence that the phase tail (KV put, audit append, hand-off) still had room;
+  //                   a headroom trending to 0 is the early warning for the subrequest-exhaustion
+  //                   class of failure D-11 exists to prevent.
+  //
+  // Every field except `status` is OPTIONAL, so a phase that exits early emits a truthful subset
+  // instead of fabricating zeros. The viewer omits an absent line entirely and renders a PRESENT
+  // zero — "the phase never got that far" and "it did, and the answer was zero" are deliberately
+  // different statements, and conflating them makes the zero-yield alert unreadable.
+  z
+    .object({
+      stage: z.literal('agentic_context'),
+      status: z.enum(['completed', 'partial', 'skipped', 'failed']),
+      // Bounded like the other reason strings in this union. The producer only ever writes a token
+      // from the closed AGENTIC_CONTEXT_AUDIT_REASONS vocabulary (core/audit.ts); this cap is the
+      // schema's second line of defence, not the first.
+      reason: z.string().max(200).optional(),
+      // MIRRORS `AGENTIC_MAX_HOPS` (core/agentic-tools.ts:84). `src/shared/` must not import from
+      // `src/server/`, so the bound is duplicated rather than imported. IF THAT CONSTANT IS EVER
+      // RAISED, RAISE THIS MAX IN THE SAME COMMIT: otherwise every event from a longer run fails
+      // validation and is fail-soft dropped on the job-detail read path — i.e. the diagnostic
+      // vanishes precisely when the loop got more expensive, which is the opposite of the point.
+      hops_used: z.number().int().min(0).max(6).optional(),
+      files_read: z.number().int().nonnegative().optional(),
+      greps_run: z.number().int().nonnegative().optional(),
+      bytes_gathered: z.number().int().nonnegative().optional(),
+      truncated: z.boolean().optional(),
+      grep_supported: z.boolean().optional(),
+      budget_headroom: z.number().int().nonnegative().optional(),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
   // Phase 33 (PRD-01 / FR-031, D-03/D-04): inline_comment_skipped audit event. AGGREGATE — one event
   // per review round when inline comments were skipped (422 or budget exhaustion) at posting.
   // `count` is the FULL total; the sample is capped at 20 (INLINE_COMMENT_SKIPPED_SAMPLE_CAP).
