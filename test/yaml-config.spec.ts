@@ -303,6 +303,106 @@ describe('YAML config pipeline', () => {
     expect(config.review.on).toEqual(['opened', 'synchronize']);
     expect(config.review.skip_files).toEqual(['*.lock', 'dist/**']);
   });
+
+  // -------------------------------------------------------------------------
+  // Phase 35 (35-05, D-16): the agentic_tools toggle is settable from a repository's
+  // .review.yaml, not only from the dashboard-stored DB config.
+  //
+  // D-16's premise is that this needs ZERO production code: the toggle is declared on
+  // `reviewConfigSchema` (schema.ts:456-460) and the Phase-34 merge path re-parses the overlay
+  // through that same shared schema (review.ts:1096-1099), so a toggle is reachable from the file
+  // the moment it is declared. "Needs no implementation" is exactly the kind of claim that turns
+  // out to be false because of a key allow-list or a partial-merge shape, so these four cases are
+  // the PROOF rather than the assumption. They deliberately drive the merge EXPRESSION (the same
+  // one 34-01 Task 3 locked and `runPreparePhase` re-implements) with no database, so a bare
+  // `npx vitest run test/yaml-config.spec.ts` really does assert them — the prepare-phase
+  // integration block below is dbDescribe-gated and skips silently without a configured DB.
+  //
+  // D-16 also scopes NO DASHBOARD UI this phase; the toggle stays config-only and that stays
+  // deferred. Nothing here asserts a UI surface.
+  // -------------------------------------------------------------------------
+
+  it('D-16: a .review.yaml can ENABLE review.agentic_tools through the existing merge path', () => {
+    const dbConfig = repoConfigSchema.parse({
+      review: { yaml_config: { enabled: true }, max_files: 100 },
+      model: { main: 'gpt-4o', fallbacks: [], size_overrides: [] },
+    });
+    // Premise: the DB config has the toggle at its NREG-01 default. If this were already true the
+    // case would prove nothing.
+    expect(dbConfig.review.agentic_tools.enabled).toBe(false);
+
+    const yamlDeclared = parseYaml(['review:', '  agentic_tools:', '    enabled: true'].join('\n'));
+    const merged = repoConfigSchema.parse({ ...dbConfig, ...yamlDeclared });
+
+    expect(merged.review.agentic_tools.enabled).toBe(true);
+    // The D-09 wholesale-replacement consequence, recorded rather than worked around: a two-line
+    // file that declares `review:` replaces the WHOLE review subtree, so every sub-key it omits —
+    // including `yaml_config.enabled` itself — reverts to its Zod default. The gate was already
+    // read from the DB config before the merge (review.ts:1056), so this does not disable the
+    // feature mid-flight; but an operator enabling the agentic pass from a config file should
+    // declare the rest of their `review` subtree in the same file.
+    expect(merged.review.yaml_config.enabled).toBe(false);
+    expect(merged.review.max_files).toBe(150);
+    // A top-level key the file does not declare keeps its DB value.
+    expect(merged.model.main).toBe('gpt-4o');
+  });
+
+  it('D-16: a .review.yaml can explicitly DISABLE a DB-enabled agentic toggle', () => {
+    const dbConfig = repoConfigSchema.parse({
+      review: { yaml_config: { enabled: true }, agentic_tools: { enabled: true } },
+      model: { main: 'gpt-4o', fallbacks: [], size_overrides: [] },
+    });
+    expect(dbConfig.review.agentic_tools.enabled).toBe(true);
+
+    const yamlDeclared = parseYaml(['review:', '  agentic_tools:', '    enabled: false'].join('\n'));
+    const merged = repoConfigSchema.parse({ ...dbConfig, ...yamlDeclared });
+
+    expect(merged.review.agentic_tools.enabled).toBe(false);
+  });
+
+  it('D-16: a .review.yaml that never mentions the toggle leaves the schema default in place', () => {
+    const dbConfig = repoConfigSchema.parse({
+      review: { yaml_config: { enabled: true } },
+      model: { main: 'gpt-4o', fallbacks: [], size_overrides: [] },
+    });
+    const yamlDeclared = parseYaml('review:\n  max_comments: 3');
+
+    const merged = repoConfigSchema.parse({ ...dbConfig, ...yamlDeclared });
+
+    expect(merged.review.max_comments).toBe(3);
+    // Not silently enabled by an unrelated file, and not left `undefined` for a `?? false` lookup
+    // to no-op on: the schema default fills it (the REVIEWS CRITICAL FIX #1 re-parse in
+    // core/config.ts:93 relies on exactly this).
+    expect(merged.review.agentic_tools.enabled).toBe(false);
+  });
+
+  it('D-16: with review.yaml_config.enabled false the file cannot set the toggle at all', () => {
+    const dbConfig = repoConfigSchema.parse({
+      review: { yaml_config: { enabled: false } },
+      model: { main: 'gpt-4o', fallbacks: [], size_overrides: [] },
+    });
+    const rawYaml = ['review:', '  agentic_tools:', '    enabled: true'].join('\n');
+
+    // review.ts:1056 + :1064 — the gate that fronts the WHOLE discovery-and-merge path, in the
+    // same order and with the same predicate. A repository that has not opted into the YAML
+    // feature never fetches the file, so its content cannot reach the resolved config.
+    const yamlConfigEnabled = dbConfig.review.yaml_config?.enabled === true;
+    const resolved = yamlConfigEnabled
+      ? repoConfigSchema.parse({ ...dbConfig, ...parseYaml(rawYaml) })
+      : dbConfig;
+
+    expect(yamlConfigEnabled).toBe(false);
+    expect(resolved).toBe(dbConfig); // identity — not merely equal
+    expect(resolved.review.agentic_tools.enabled).toBe(false);
+  });
+
+  it('D-16: parseYaml accepts the toggle fixture body (plain nested mapping only)', () => {
+    // The fixture uses only the shape the inline parser supports — nested mappings and a boolean
+    // scalar. No anchors, no tags, no flow maps, no block scalars.
+    expect(parseYaml(['review:', '  agentic_tools:', '    enabled: true'].join('\n'))).toEqual({
+      review: { agentic_tools: { enabled: true } },
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -392,6 +492,32 @@ describe('Phase 34 (34-03): YAML config audit builder/recorder', () => {
     expect(warnSpy).toHaveBeenCalled();
     appendSpy.mockRestore();
     warnSpy.mockRestore();
+  });
+
+  // Phase 35 (35-05, D-16): the agentic toggle arriving from a config file is OBSERVABLE by the
+  // same WR-03/WR-07 machinery, with no new audit stage. This matters more for `agentic_tools`
+  // than for the Phase-34 toggles: enabling it starts spending real money and forwards files the
+  // pull request did not touch to the operator's LLM provider, so an operator asking "why did this
+  // repository start making extra model calls" must be able to read the answer out of the audit
+  // trail. `replaced_keys: ['review']` is that answer.
+  it('D-16: an agentic-enabling .review.yaml records `review` as a replaced top-level key', () => {
+    const yamlObject = parseYaml(['review:', '  agentic_tools:', '    enabled: true'].join('\n'));
+
+    // review.ts:1119-1122 verbatim — declared keys split against the schema's own top-level shape.
+    const declaredKeys = Object.keys(yamlObject);
+    const knownKeys = new Set(Object.keys(repoConfigSchema.shape));
+    const event = buildYamlConfigAppliedEvent(
+      '.review.yaml',
+      declaredKeys.filter((key) => knownKeys.has(key)),
+      declaredKeys.filter((key) => !knownKeys.has(key)),
+    );
+
+    expect(jobAuditEventSchema.parse(event)).toMatchObject({
+      stage: 'yaml_config_applied',
+      source: '.review.yaml',
+      replaced_keys: ['review'],
+      ignored_keys: [],
+    });
   });
 
   it('recordYamlConfigParseFailed appends the builder-shaped event with a stamped timestamp', async () => {
@@ -639,6 +765,45 @@ dbDescribe('Phase 34 (34-03): prepare-phase YAML config integration', () => {
     const rows = await queryRows<{ audit: unknown }>(env, `SELECT audit FROM jobs WHERE id = $1`, [job!.id]);
     const stages = ((rows[0]?.audit as Array<{ stage: string }>) ?? []).map((event) => event.stage);
     expect(stages).not.toContain('yaml_config_parse_failed');
+  });
+
+  // Phase 35 (35-05, D-16): the END-TO-END half of the D-16 proof.
+  //
+  // The pure cases in the first describe block prove the SCHEMA half — the toggle round-trips
+  // through the shared-schema overlay expression. They structurally cannot see the risk D-16 was
+  // actually worried about, which lives in `runPreparePhase`: a key allow-list or a partial-merge
+  // shape between the fetched file and the resolved config. This case closes that, and it asserts
+  // the strongest available observable — not that a boolean was persisted, but that a repository
+  // config FILE alone changes the pipeline route (`nextPhaseAfterPrepare(config)` at
+  // review.ts:1567 reads the MERGED config, so a merge that dropped the key would route to
+  // 'review' and this case would go red).
+  //
+  // The sibling repo is the control: identical DB config, no `.review.yaml`, routes to 'review'.
+  // Without it a build that routed everything to agentic_context would satisfy the assertion.
+  it('D-16: a base-branch .review.yaml enabling agentic_tools routes prepare → agentic_context', async () => {
+    const stamp = Date.now();
+    const withFile = `repo-yaml-agentic-on-${stamp}`;
+    const control = `repo-yaml-agentic-control-${stamp}`;
+    await seedRepoWithYamlToggle(withFile, true, 10, 100);
+    await seedRepoWithYamlToggle(control, true, 10, 100);
+
+    mocks.getRepoFileContent.mockImplementation(async (_o: string, repo: string, path: string) =>
+      repo === withFile && path === '.review.yaml'
+        ? 'review:\n  agentic_tools:\n    enabled: true'
+        : null,
+    );
+
+    const prep = await runPrepare(withFile);
+    expect(prep).toMatchObject({ action: 'next_phase', phase: 'agentic_context' });
+    const job = await jobFor(withFile);
+    expect(job!.configSnapshot!.review.agentic_tools.enabled).toBe(true);
+
+    // Control: same DB config, no config file — the DB default still governs and the extra hop
+    // is not inserted.
+    const controlPrep = await runPrepare(control);
+    expect(controlPrep).toMatchObject({ action: 'next_phase', phase: 'review' });
+    const controlJob = await jobFor(control);
+    expect(controlJob!.configSnapshot!.review.agentic_tools.enabled).toBe(false);
   });
 
   // -------------------------------------------------------------------------
