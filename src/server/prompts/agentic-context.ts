@@ -37,10 +37,11 @@ const AGENTIC_FRAMING_LINES = [
  *
  * Order is fixed and each position matters:
  *   framing lines (Codra, trusted) → BEGIN sentinel → `tool:` → `ref:` (the D-07 skew disclosure) →
- *   optional Codra-authored `note:` (FR-132 truncation / refusal signals) → markdown fence →
+ *   optional `note:` (FR-132 truncation / refusal signals) → markdown fence →
  *   sanitized body → closing fence → END sentinel.
  *
- * `ref` runs through `sanitizeUntrusted` too: it can carry a provider-supplied branch name.
+ * EVERY variable position — `ref`, `note` and `body` — runs through `sanitizeUntrusted`. `ref` can
+ * carry a provider-supplied branch name; `note` is the one that is easy to get wrong (see below).
  */
 export function renderAgenticToolResult(result: AgenticToolResult): string {
   const lines = [
@@ -50,7 +51,20 @@ export function renderAgenticToolResult(result: AgenticToolResult): string {
     `ref: ${sanitizeUntrusted(result.ref)}`,
   ];
   if (result.note) {
-    lines.push(`note: ${result.note}`);
+    // CR-01 (35-REVIEW.md): the note is Codra-AUTHORED FRAMING, but three of the executor's four
+    // notes INTERPOLATE the model-supplied path (`core/agentic-tools.ts`: refused / already-read /
+    // not-found), so the assembled line is untrusted no matter who wrote the wrapper text. Emitted
+    // raw, a path carrying a newline plus a literal `<<<END UNTRUSTED REPOSITORY CONTEXT>>>` forged
+    // the closing sentinel — and because that byte sequence ALSO closes the outer agentic fence in
+    // `prompts/file-review.ts`, the forged boundary escaped all the way into the per-file review
+    // prompt, defeating T-35-01/D-08.
+    //
+    // This is the boundary's real enforcement point and it must stand alone: the path schema in
+    // `core/agentic-tools.ts` additionally rejects control characters, but that only covers the
+    // notes built from a `read_file` path. Any future note built from any other untrusted value is
+    // covered here and only here. Do not "optimize away" this call because the note looks
+    // Codra-authored — it is a template, not a constant.
+    lines.push(`note: ${sanitizeUntrusted(result.note)}`);
   }
   lines.push('```', sanitizeUntrusted(result.body), '```', UNTRUSTED_AGENTIC_END);
   return lines.join('\n');

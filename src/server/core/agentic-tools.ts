@@ -271,6 +271,16 @@ const agenticToolPathSchema = z
   .max(400)
   .transform(normalizeToolPath)
   .refine((path) => path.length > 0, { message: 'empty path' })
+  // CR-01 (35-REVIEW.md), belt and braces to the renderer's own `sanitizeUntrusted(note)`. A path is
+  // interpolated verbatim into three executor-authored `note:` lines, and a newline in it forges a
+  // line boundary inside the fence header — the lead-in to the sentinel forgery the renderer now
+  // blocks. REJECTED rather than folded, unlike the sibling `query` field two blocks down: a query is
+  // free text where folding a control run to a space still leaves a usable search, whereas a path
+  // with a control character in it is never a real path. Rejecting also keeps this identical to every
+  // other invalid-path outcome here (leading `/`, `..`, backslash, URL scheme) — `schema_rejected`
+  // from `parseAgenticToolCall`, which costs the model D-03's one corrective hop instead of silently
+  // rewriting what it asked for.
+  .refine((path) => !/[\u0000-\u001f\u007f]/.test(path), { message: 'control characters are not allowed' })
   .refine((path) => !path.startsWith('/'), { message: 'absolute paths are not allowed' })
   .refine((path) => !path.split('/').includes('..'), { message: 'parent-directory segments are not allowed' })
   .refine((path) => !path.includes('\\'), { message: 'backslashes are not allowed' })
