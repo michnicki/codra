@@ -40,7 +40,7 @@ import { checkEvidence, type EvidenceDropEntry } from './evidence';
 import { suppressByLearnedRules } from './learned-rules';
 import { applyNoiseFilter, type NoiseFilterOptions } from './noise-filter';
 import { parseCrossFileSecurityResponse, parseSummaryResponse, parseWalkthroughDiagram } from './model-output';
-import { buildCriticDecisionsAuditEvent, buildCrossFileSecurityAuditEvent, buildEvidenceHardDroppedEvent, buildLearnedRuleSuppressedEvent, recordCrossFileSecurityAudit, recordCriticAudit } from './audit';
+import { buildAgenticContextAuditEvent, buildCriticDecisionsAuditEvent, buildCrossFileSecurityAuditEvent, buildEvidenceHardDroppedEvent, buildLearnedRuleSuppressedEvent, recordAgenticContextAudit, recordCrossFileSecurityAudit, recordCriticAudit, type AgenticContextAuditReason } from './audit';
 import {
   CRITIC_REASON_BELOW_SKIP_THRESHOLD,
   CRITIC_REASON_OVER_CHAR_BUDGET,
@@ -107,6 +107,7 @@ import {
   AGENTIC_MAX_GREP_HITS,
   agenticContextBlobSchema,
   executeAgenticLoop,
+  type AgenticLoopOutcome,
 } from './agentic-tools';
 import { findRepositoryIdByIdentity } from '@server/db/repositories';
 import { getCodeIndexState } from '@server/db/code-index';
@@ -3901,6 +3902,15 @@ async function runAgenticContextPhase(
       const indexState = await getCodeIndexState(env, { repositoryId });
       if (indexState !== null && indexState.status === 'ready') {
         logger.info(`Job ${job.id} targets a repository with a ready code index; skipping the agentic-context pass (D-14).`);
+        // The D-14 gate is a DECISION, not a non-event: without this row an operator looking at a
+        // toggle-on job that spent nothing cannot tell "the index made this unnecessary" from "the
+        // feature is broken". Best-effort, so a failing append cannot fail the job (T-35-19).
+        await recordAgenticContextAudit(env, job.id, [
+          buildAgenticContextAuditEvent('skipped', {
+            reason: 'index_present',
+            budgetHeadroom: tracker.remainingSafeBudget(),
+          }),
+        ]);
         throw new NextPhaseError(nextPhaseAfterAgenticContext(config), FRESH_INVOCATION_YIELD_SECONDS);
       }
     }
@@ -3981,9 +3991,74 @@ async function runAgenticContextPhase(
     }
   }
 
+  // The operator-visible trace (PRD-06). ONE event per non-silent exit, carrying the counts every
+  // 35-AI-SPEC.md §7 metric and alert reads. Best-effort: `recordAgenticContextAudit` never rethrows,
+  // so a failing append degrades to a log line rather than turning this advisory phase into a failed
+  // review (T-35-19) — which is why it is safe to sit on the critical path here.
+  const audit = mapAgenticOutcomeToAudit(outcome);
+  await recordAgenticContextAudit(env, job.id, [
+    buildAgenticContextAuditEvent(audit.status, {
+      reason: audit.reason,
+      hopsUsed: outcome.hopsUsed,
+      filesRead: outcome.filesRead,
+      grepsRun: outcome.grepsRun,
+      bytesGathered: outcome.bytesGathered,
+      truncated: outcome.truncated,
+      grepSupported: outcome.grepSupported,
+      // Captured HERE — at the audit write, AFTER the KV put — not at loop exit. §7 alerts on
+      // `budget_headroom < 2` precisely to catch a phase TAIL running on fumes, so a value sampled
+      // before the tail's own spend would report the number that cannot fail.
+      budgetHeadroom: tracker.remainingSafeBudget(),
+    }),
+  ]);
+
   // The ONLY exit (D-11). Note what is deliberately absent: no upsertFileReview, no file_reviews row,
   // and no migration — see agenticContextCacheKey for why (migration 017's recorded regression).
   throw new NextPhaseError(nextPhaseAfterAgenticContext(config), FRESH_INVOCATION_YIELD_SECONDS);
+}
+
+// The three loop exits that are D-11 FAIL-OPEN events rather than the loop deciding it was finished.
+// `budget_exhausted` and `model_call_failed` are self-explanatory; `unparseable_action` lands here
+// because it is only ever reached after D-03's single corrective hop was already spent, i.e. the
+// model failed the protocol twice. The other stop reasons (`done`, `hop_cap_reached`,
+// `byte_cap_reached`, `file_cap_reached`) are the loop or a bound working exactly as designed.
+const AGENTIC_FAIL_OPEN_STOP_REASONS: ReadonlySet<AgenticLoopOutcome['stopReason']> = new Set([
+  'budget_exhausted',
+  'model_call_failed',
+  'unparseable_action',
+]);
+
+/**
+ * PURE outcome → audit status/reason mapping (PRD-06). The status axis answers ONE operator
+ * question that no single field answers on its own: *did this run leave anything behind?*
+ *
+ *   gathered + clean exit    -> `completed`
+ *   gathered + fail-open     -> `partial`   (a bound or a provider cut it short; the review still
+ *                                            gets the context that was gathered)
+ *   nothing  + clean exit    -> `skipped`   with `no_content` — FR-131's documented fallback
+ *                                            ("review the diff alone"), not a malfunction
+ *   nothing  + fail-open     -> `failed`    the run cost model calls and yielded nothing
+ *
+ * The `partial` / `failed` split is the whole point: 35-AI-SPEC.md §7 alerts on
+ * `status: 'failed' > 5%` and deliberately does NOT alert on `partial`, because fail-open working
+ * as designed must not read as an incident. NEITHER status is a job failure — this phase cannot
+ * fail the job (D-11).
+ *
+ * `bytesGathered` is the gathered test rather than `context.length` so it agrees byte-for-byte with
+ * the `bytes_gathered` field the same event carries: a reader must never see `status: 'skipped'`
+ * next to a non-zero byte count.
+ */
+function mapAgenticOutcomeToAudit(outcome: AgenticLoopOutcome): {
+  status: 'completed' | 'partial' | 'skipped' | 'failed';
+  reason: AgenticContextAuditReason;
+} {
+  const failedOpen = AGENTIC_FAIL_OPEN_STOP_REASONS.has(outcome.stopReason);
+  if (outcome.bytesGathered > 0) {
+    return { status: failedOpen ? 'partial' : 'completed', reason: outcome.stopReason };
+  }
+  return failedOpen
+    ? { status: 'failed', reason: outcome.stopReason }
+    : { status: 'skipped', reason: 'no_content' };
 }
 
 export { NextPhaseError } from './next-phase-error';
