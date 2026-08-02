@@ -49,6 +49,7 @@ import {
   type AgenticLoopDeps,
 } from '@server/core/agentic-tools';
 import { parseAgenticToolCall } from '@server/core/model-output';
+import { NextPhaseError } from '@server/core/next-phase-error';
 
 const utf8 = (s: string) => new TextEncoder().encode(s).length;
 
@@ -417,6 +418,99 @@ describe('executeAgenticLoop: model-call failure', () => {
     expect(outcome.stopReason).toBe('model_call_failed');
     expect(calls).toBe(2);
     expect(outcome.context).toContain('src/a.ts');
+  });
+});
+
+// ── CR-02: a provider throw must never escape an ADVISORY phase ────────────────
+//
+// Before this guard the two model-driven callbacks were awaited bare. `GitHubClient
+// .getRepoFileOrNull` returns null ONLY on 404 and throws on everything else — including a 200 whose
+// payload carries no string `content`, which is exactly what GitHub's contents API returns for a
+// DIRECTORY. A `GitHubError` is not a NextPhaseError, not `isRetryableModelError` and not
+// `isSubrequestBudgetError`, so it fell through `runReviewJob`'s outer catch to `failJobAndCheckRun`:
+// an ordinary model mistake terminally failed the review and marked the check run failed.
+
+describe('executeAgenticLoop: a throwing tool call fails OPEN (CR-02 / D-11)', () => {
+  it('a rejecting readFile is reported to the model and the loop completes with what it has', async () => {
+    const turns = [readAction('src/server/core'), readAction('src/ok.ts'), JSON.stringify({ action: 'done' })];
+    const { deps, rec } = scriptedDeps(turns, {
+      readFile: async (path) => {
+        rec.reads.push(path);
+        // The directory case, verbatim from core/github.ts:500-507.
+        if (path === 'src/server/core') throw new Error('GitHub repo file fetch succeeded but content is not a string');
+        return 'export const ok = 1;\n';
+      },
+    });
+
+    const outcome = await executeAgenticLoop(deps, loopInput);
+
+    expect(outcome.stopReason).toBe('done');
+    // the failure consumed its hop and the loop kept going, so the LATER read still happened
+    expect(rec.reads).toEqual(['src/server/core', 'src/ok.ts']);
+    expect(outcome.context).toContain('this read_file call failed');
+    expect(outcome.context).toContain('export const ok = 1;');
+    expect(outcome.bytesGathered).toBeGreaterThan(0);
+  });
+
+  it('never re-dispatches a path whose read threw — the repeat is a free already_read no-op', async () => {
+    // Boundedness: a model that keeps asking for the same broken path must not keep spending
+    // subrequests on it. The path is recorded in filesRead whether the fetch succeeded, 404'd or threw.
+    let attempts = 0;
+    const turns = Array.from({ length: AGENTIC_MAX_HOPS }, () => readAction('src/server/core'));
+    const { deps } = scriptedDeps(turns, {
+      readFile: async () => {
+        attempts += 1;
+        throw new Error('GitHub repo file fetch failed with 403: too_large');
+      },
+    });
+
+    const outcome = await executeAgenticLoop(deps, loopInput);
+
+    expect(attempts).toBe(1);
+    expect(outcome.stopReason).toBe('hop_cap_reached');
+    expect(outcome.hopsUsed).toBe(AGENTIC_MAX_HOPS);
+    expect(outcome.context).toContain('already read');
+  });
+
+  it('a rejecting searchCode downgrades the capability instead of aborting the phase', async () => {
+    let attempts = 0;
+    const turns = [
+      JSON.stringify({ action: 'grep_repo', query: 'verifyToken' }),
+      JSON.stringify({ action: 'grep_repo', query: 'verifyToken again' }),
+      JSON.stringify({ action: 'done' }),
+    ];
+    const { deps } = scriptedDeps(turns, {
+      searchCode: async () => {
+        attempts += 1;
+        throw new Error('GitHub code search failed with 500');
+      },
+    });
+
+    const outcome = await executeAgenticLoop(deps, loopInput);
+
+    expect(outcome.stopReason).toBe('done');
+    // downgraded after the first throw, so the second grep_repo short-circuits without a subrequest
+    expect(attempts).toBe(1);
+    expect(outcome.grepSupported).toBe(false);
+    expect(outcome.context).toContain('grep_repo failed and is no longer available');
+  });
+
+  it('re-throws NextPhaseError — absorbing it would break the fresh-budget handoff', async () => {
+    const { deps } = scriptedDeps([readAction('src/a.ts')], {
+      readFile: async () => {
+        throw new NextPhaseError('review', 5);
+      },
+    });
+    await expect(executeAgenticLoop(deps, loopInput)).rejects.toBeInstanceOf(NextPhaseError);
+  });
+
+  it('re-throws JOB_SUPERSEDED — absorbing it would gather context for a cancelled job', async () => {
+    const { deps } = scriptedDeps([JSON.stringify({ action: 'grep_repo', query: 'anything' })], {
+      searchCode: async () => {
+        throw new Error('JOB_SUPERSEDED');
+      },
+    });
+    await expect(executeAgenticLoop(deps, loopInput)).rejects.toThrow('JOB_SUPERSEDED');
   });
 });
 

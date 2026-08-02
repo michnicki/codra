@@ -12,6 +12,12 @@
 // loop instead of a static one, because `model-output` imports `agenticActionSchema` from this file:
 // the lazy import keeps the module graph acyclic (same lazy-import precedent as `review.ts:3618`) and
 // keeps this module's static graph free of the logger/DB/severity graph `model-output` pulls in.
+//
+// `core/next-phase-error` is the second runtime import and it is deliberately safe: it is a LEAF
+// module that imports nothing at all (that is exactly why it was split out of `review.ts`), so it
+// adds no edge to the logger/DB/env graph and cannot create a cycle. It is needed here because the
+// tool-dispatch guard (CR-02) must be able to tell a provider failure — which it absorbs — from a
+// phase-transition signal, which it must let through.
 
 import { z } from 'zod';
 import picomatch from 'picomatch';
@@ -20,6 +26,7 @@ import {
   renderGrepResult,
   renderReadFileResult,
 } from '@server/prompts/agentic-context';
+import { NextPhaseError } from '@server/core/next-phase-error';
 import type { VcsCodeSearchHit } from '@server/vcs/types';
 
 // `renderToolCatalog` is a RENDERING concern, so it lives in the prompt module beside the fencing —
@@ -440,13 +447,63 @@ export type AgenticToolResult = {
 export type AgenticLoopDeps = {
   /** One hop's model turn. Wired to ModelService.callVerifierRaw by the phase driver. */
   callModel: (systemPrompt: string, userPrompt: string) => Promise<string>;
-  /** read_file at the PR HEAD SHA (D-06). Resolves to null ONLY on 404 (vcs/types.ts:219-226). */
+  /**
+   * read_file at the PR HEAD SHA (D-06). Resolves to null ONLY on 404 (vcs/types.ts:219-226).
+   *
+   * MAY REJECT, and the loop absorbs it (CR-02) — see `dispatchTool`. Both providers throw on any
+   * non-404 status, which a perfectly ordinary model action reaches: `read_file` on a DIRECTORY
+   * returns 200 with a JSON array (no string `content`) and throws, and a file over 1 MB answers 403.
+   */
   readFile: (path: string) => Promise<string | null>;
-  /** grep_repo. THREE-VALUED (D-05): null = capability unavailable, [] = ran with zero matches. */
+  /**
+   * grep_repo. THREE-VALUED (D-05): null = capability unavailable, [] = ran with zero matches.
+   *
+   * MAY REJECT, and the loop absorbs it as a fourth outcome equivalent to the D-05 downgrade.
+   */
   searchCode: (query: string) => Promise<VcsCodeSearchHit[] | null>;
   /** Subrequest guard. Wired to tracker.hasRemainingSafeBudget (the review.ts:1436 idiom). */
   hasBudget: (reserve: number) => boolean;
 };
+
+/**
+ * CR-02: the tool-dispatch guard that makes D-11's fail-open contract true rather than aspirational.
+ *
+ * WHY THIS EXISTS. `runAgenticContextPhase`'s header promises "no terminal failure path", and the
+ * phase is advisory — FR-131's own documented fallback is "review the diff alone". But before this
+ * guard the two model-driven callbacks were awaited bare, and a `GitHubError` out of `readFile` is
+ * neither a NextPhaseError nor `isRetryableModelError` nor `isSubrequestBudgetError`, so it fell
+ * straight through `runReviewJob`'s outer catch to `failJobAndCheckRun`. A model asking to read a
+ * directory — very common while exploring a repository — terminally failed the whole review, which
+ * is strictly a regression against the same PR with the toggle off.
+ *
+ * WHAT IS DELIBERATELY NOT ABSORBED. Two exception classes are CONTROL FLOW, not failures, and
+ * swallowing them would break the mechanisms they drive:
+ *   - `NextPhaseError` — the subrequest-budget / phase-handoff signal. Absorbed, the loop would keep
+ *     hopping on an invocation that has already decided to hand off.
+ *   - an Error whose message is `JOB_SUPERSEDED` — a newer push cancelled this job (review.ts:3598,
+ *     matched by message at review.ts:597 because it is a plain Error). Absorbed, a superseded job
+ *     would finish gathering context for a commit nobody is reviewing any more.
+ * Both are re-thrown unchanged. `hasBudget` is checked before each hop, so the budget signal should
+ * not normally reach here at all — this is the second line of defense, not the first.
+ *
+ * BOUNDEDNESS. A failure is reported to the model and CONSUMES the hop, so AGENTIC_MAX_HOPS still
+ * terminates the loop; the caller additionally records the failing path in `filesRead`, so a repeat
+ * request short-circuits to `already_read` without a second dispatch. There is no retry here.
+ */
+type ToolDispatch<T> = { ok: true; value: T } | { ok: false };
+
+async function dispatchTool<T>(call: () => Promise<T>): Promise<ToolDispatch<T>> {
+  try {
+    return { ok: true, value: await call() };
+  } catch (error) {
+    if (error instanceof NextPhaseError) throw error;
+    if (error instanceof Error && error.message === 'JOB_SUPERSEDED') throw error;
+    // The error itself is NOT propagated to the model: it is provider text (URLs, response bodies,
+    // rate-limit headers) and the counts-not-content rule of PRD-06 keeps it out of the prompt and
+    // out of the audit trail alike. The caller renders a fixed, Codra-authored failure block.
+    return { ok: false };
+  }
+}
 
 export type AgenticLoopInput = {
   prTitle: string | null;
@@ -609,9 +666,23 @@ export async function executeAgenticLoop(
           body: 'file scan limit reached; no further new files can be read in this session',
         });
       } else {
-        const content = await deps.readFile(path);
+        const read = await dispatchTool(() => deps.readFile(path));
+        // Recorded whether the fetch succeeded, 404'd or THREW. `filesRead` is "distinct paths
+        // attempted", not "files obtained" — that is what makes a repeat request of a failing path a
+        // free `already_read` no-op instead of a second doomed subrequest.
         acc.filesRead.add(path);
-        if (content === null) {
+        if (!read.ok) {
+          // CR-02: a provider throw is reported to the model and the loop CONTINUES. The wording is
+          // honest about what happened and names the two causes the model can act on, because the
+          // most common trigger is the model asking to read a directory.
+          block = renderAgenticToolResult({
+            tool: 'read_file',
+            ref: headRef,
+            note: `reading "${path}" failed — do not request it again`,
+            body: 'this read_file call failed (the path may be a directory, may be too large to read, '
+              + 'or the repository host may be unavailable); request a different path instead',
+          });
+        } else if (read.value === null) {
           block = renderAgenticToolResult({
             tool: 'read_file',
             ref: headRef,
@@ -619,6 +690,7 @@ export async function executeAgenticLoop(
             body: 'file not found at this ref (it may have been deleted or never existed)',
           });
         } else {
+          const content = read.value;
           const totalBytes = utf8ByteLength(content);
           const capped = truncateToUtf8Bytes(content, AGENTIC_READ_FILE_MAX_BYTES);
           let body = capped.text;
@@ -646,9 +718,19 @@ export async function executeAgenticLoop(
           body: 'grep_repo is unavailable for this repository; use read_file instead.',
         });
       } else {
-        const hits = await deps.searchCode(action.query);
+        const search = await dispatchTool(() => deps.searchCode(action.query));
         acc.grepsRun += 1;
-        if (hits === null) {
+        if (!search.ok) {
+          // CR-02: a throw is treated as the D-05 downgrade with an honest label. Downgrading rather
+          // than merely reporting is what BOUNDS this: without it the model would keep re-issuing
+          // grep_repo and spend every remaining hop on a capability that is already broken.
+          grepSupported = false;
+          block = renderAgenticToolResult({
+            tool: 'grep_repo',
+            ref: 'n/a',
+            body: 'grep_repo failed and is no longer available for this session; use read_file instead.',
+          });
+        } else if (search.value === null) {
           // D-05: a null return is a capability downgrade, permanent for the rest of the invocation.
           // Stated to the model rather than degraded silently (PRD-06 transparency prohibition).
           grepSupported = false;
@@ -658,6 +740,7 @@ export async function executeAgenticLoop(
             body: 'grep_repo is unavailable for this repository; use read_file instead.',
           });
         } else {
+          const hits = search.value;
           // Per-item cap AFTER the hit clamp and BEFORE the total cap — the ordering
           // prompts/file-review.ts:160-173 uses, so one abusive fragment cannot own the budget.
           const clamped = hits.slice(0, AGENTIC_MAX_GREP_HITS);

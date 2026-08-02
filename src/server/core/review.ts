@@ -41,6 +41,9 @@ import { suppressByLearnedRules } from './learned-rules';
 import { applyNoiseFilter, type NoiseFilterOptions } from './noise-filter';
 import { parseCrossFileSecurityResponse, parseSummaryResponse, parseWalkthroughDiagram } from './model-output';
 import { buildAgenticContextAuditEvent, buildCriticDecisionsAuditEvent, buildCrossFileSecurityAuditEvent, buildEvidenceHardDroppedEvent, buildLearnedRuleSuppressedEvent, recordAgenticContextAudit, recordCrossFileSecurityAudit, recordCriticAudit, type AgenticContextAuditReason } from './audit';
+// The audit boundary's error redactor (D-07). Used by the agentic-context fail-open handler so an
+// error-derived reason is one of MACHINE_ERROR_REASONS and never a provider response body.
+import { redactErrorMessage } from './audit-redact';
 import {
   CRITIC_REASON_BELOW_SKIP_THRESHOLD,
   CRITIC_REASON_OVER_CHAR_BUDGET,
@@ -582,8 +585,15 @@ export async function runReviewJob(env: AppBindings, message: ReviewJobMessage):
     } else if (phase === 'agentic_context') {
       // ROUTING ANCHOR 3. PRD-06 (FR-131, D-09): the bounded agentic-context phase. Runs up to
       // AGENTIC_MAX_HOPS tool-calling model turns on its own fresh-budget step between prepare and
-      // review. Fail-open in every branch (D-11): a disabled toggle, an existing KV blob, a repository
-      // that already has a code index, a model failure and an exhausted budget all hand off to review.
+      // review.
+      //
+      // Fail-open in every branch (D-11), and as of CR-02 (35-REVIEW.md) that is enforced rather than
+      // merely intended. Precisely what is guaranteed: the phase never reaches `failJobAndCheckRun`.
+      // A disabled toggle, an existing KV blob, a repository that already has a ready code index, a
+      // model failure, an unparseable model, a provider throw out of `read_file`/`grep_repo`, a failed
+      // seed read and an exhausted hop/byte/file budget ALL hand off to the next phase. The two
+      // exceptions that still propagate are not failures: JOB_SUPERSEDED (a newer push cancelled the
+      // job) and a subrequest-budget error (the outer catch reschedules THIS phase on a fresh budget).
       const configForAgentic = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
       await runAgenticContextPhase(env, job, configForAgentic, vcs, model, tracker);
     } else {
@@ -3845,10 +3855,20 @@ async function runCrossFileSecurityPhase(
 // off UNCONDITIONALLY without re-checking the agentic_tools toggle (a re-check would strand a job whose
 // config was toggled off mid-flight).
 //
-// EVERY exit is a NextPhaseError to 'review' (D-11). There is no other throw out of this phase and no
-// terminal failure path: the pass is advisory, and FR-131's own documented fallback is "review the diff
-// alone". A model failure, an exhausted budget, an unparseable model, a missing repository row and a
-// KV failure all land on the same hand-off.
+// There is NO terminal failure path (D-11): the pass is advisory, and FR-131's own documented
+// fallback is "review the diff alone". A model failure, an exhausted hop/byte/file budget, an
+// unparseable model, a provider throw out of read_file/grep_repo, a failed seed read, a missing
+// repository row and a KV failure all land on the same NextPhaseError hand-off.
+//
+// CR-02 (35-REVIEW.md) is why that is now a description of the code rather than of the intent. This
+// header used to claim "there is no other throw out of this phase", and it was false: the seed reads
+// and the two loop callbacks were awaited bare, so a GitHubError — from something as ordinary as the
+// model asking to read a directory — escaped into `runReviewJob`'s `failJobAndCheckRun`. TWO throws
+// are still deliberately allowed OUT, and neither is a failure of this phase:
+//   - `JOB_SUPERSEDED` — a newer push cancelled the job; the outer catch acks it.
+//   - a subrequest-budget error — the outer catch reschedules THIS phase on a fresh budget.
+// If you add an `await` to this function, it belongs inside the try/catch below or behind a
+// best-effort wrapper of its own. Nothing else may leave.
 //
 // NREG-01: with the toggle off (the default, D-13) gate 1 hits FIRST and does nothing at all — no audit
 // row, no KV touch, no model call, no extra subrequest — so an instance that has not opted in behaves
@@ -3921,53 +3941,102 @@ async function runAgenticContextPhase(
     logger.warn(`Failed to resolve the code-index state for job ${job.id}; treating the repository as unindexed`, error instanceof Error ? error : new Error(String(error)));
   }
 
-  // Seed: the pull request and its touched paths. Two subrequests, spent before the loop so the
-  // reserve guard sees their cost.
-  const pr = await vcs.getPullRequest(job.owner, job.repo, job.prNumber);
-  const files = await getJobDiffFiles(env, job, vcs, config);
-  const touchedPaths = files.map((file) => file.path);
+  // CR-02 (35-REVIEW.md) / D-11: the seed reads and the loop are the LAST places this phase could
+  // throw something that is not a phase transition, and the header above promises it cannot. Both
+  // `vcs.getPullRequest` and `getJobDiffFiles` throw on any non-2xx, and neither a GitHubError nor a
+  // BitbucketError is a NextPhaseError, `isRetryableModelError` or `isSubrequestBudgetError` — so
+  // before this catch each of them walked out of an ADVISORY pass straight into
+  // `failJobAndCheckRun`, terminally failing a review that would have succeeded with the toggle off.
+  //
+  // The tool-dispatch guard inside `executeAgenticLoop` covers `readFile`/`searchCode`; this covers
+  // everything else, which is what makes "fail-open in every branch" a fact rather than an intention.
+  let outcome: AgenticLoopOutcome;
+  try {
+    // Seed: the pull request and its touched paths. Two subrequests, spent before the loop so the
+    // reserve guard sees their cost.
+    const pr = await vcs.getPullRequest(job.owner, job.repo, job.prNumber);
+    const files = await getJobDiffFiles(env, job, vcs, config);
+    const touchedPaths = files.map((file) => file.path);
 
-  const outcome = await executeAgenticLoop(
-    {
-      // The four real callbacks and nothing else — this is the whole I/O surface of the loop.
-      callModel: async (systemPrompt, userPrompt) => {
-        // NO `temperature` IS PASSED, AND THAT IS A DECISION, NOT AN OVERSIGHT (35-REVIEWS.md,
-        // OpenCode Concern #2 + Suggestion #3, which proposed forwarding `temperature: 0` for
-        // deterministic tool use). Both existing raw-call sites — runCrossFileSecurityPhase above and
-        // verify-fixes.ts — omit it and let each provider's own default stand; the parameter is
-        // genuinely optional on callVerifierRaw; and forwarding an explicit 0 through callResolvedModel
-        // to four heterogeneous adapters (Workers AI the weakest) is an unvalidated behaviour change on
-        // every provider at once, for a loop whose non-determinism D-03's corrective hop already
-        // absorbs. REMEDY IF NEEDED, so the next maintainer does not have to re-derive it: if the
-        // flywheel ever shows `unparseable_action` clustering on one model id, adding `temperature: 0`
-        // to this one call is the one-line fix, behind this same seam.
-        const response = await model.callVerifierRaw({ systemPrompt, userPrompt, config });
-        return response.rawText;
+    outcome = await executeAgenticLoop(
+      {
+        // The four real callbacks and nothing else — this is the whole I/O surface of the loop.
+        callModel: async (systemPrompt, userPrompt) => {
+          // NO `temperature` IS PASSED, AND THAT IS A DECISION, NOT AN OVERSIGHT (35-REVIEWS.md,
+          // OpenCode Concern #2 + Suggestion #3, which proposed forwarding `temperature: 0` for
+          // deterministic tool use). Both existing raw-call sites — runCrossFileSecurityPhase above and
+          // verify-fixes.ts — omit it and let each provider's own default stand; the parameter is
+          // genuinely optional on callVerifierRaw; and forwarding an explicit 0 through callResolvedModel
+          // to four heterogeneous adapters (Workers AI the weakest) is an unvalidated behaviour change on
+          // every provider at once, for a loop whose non-determinism D-03's corrective hop already
+          // absorbs. REMEDY IF NEEDED, so the next maintainer does not have to re-derive it: if the
+          // flywheel ever shows `unparseable_action` clustering on one model id, adding `temperature: 0`
+          // to this one call is the one-line fix, behind this same seam.
+          const response = await model.callVerifierRaw({ systemPrompt, userPrompt, config });
+          return response.rawText;
+        },
+        // D-06: read at the PULL REQUEST HEAD SHA. This is deliberately NOT the base-branch rule quick
+        // task k31 applied to `.review.yaml` — that rule protects config a pull request must not be able
+        // to rewrite, whereas reading the pull request's OWN head content is precisely the feature here.
+        // Do not "fix" this to match k31.
+        //
+        // A rejection here is ABSORBED BY THE LOOP (CR-02), not by a try/catch at this seam: the loop
+        // owns the "tell the model the call failed and keep going" behaviour, and keeping the failure
+        // path in the pure module is what lets `test/agentic-tools.spec.ts` pin it with no bindings.
+        readFile: async (path) => vcs.getFileContent(job.owner, job.repo, path, pr.headSha),
+        // D-05: `?.` + `?? null` is a THREE-WAY coercion, and all three arms are live. On GitHub
+        // (35-03) the adapter implements searchCode, so grep_repo returns real matches; a rate-limited
+        // 403/429 comes back as null and permanently downgrades the capability for this invocation. On a
+        // provider whose adapter does NOT implement it, the optional call resolves to undefined, is
+        // coerced to null, and grep_repo reports itself unavailable to the model — the DESIGNED
+        // degradation path, exercised end-to-end from wave 1, not a stub. A THROW is the fourth arm and
+        // the loop maps it onto the same downgrade.
+        searchCode: async (query) => (await vcs.searchCode?.(job.owner, job.repo, query, AGENTIC_MAX_GREP_HITS)) ?? null,
+        // The provider clients self-increment the tracker per request, so the reserve check is the
+        // correct AND only guard — never call tracker.incrementSubrequests() from the loop.
+        hasBudget: (reserve) => tracker.hasRemainingSafeBudget(reserve),
       },
-      // D-06: read at the PULL REQUEST HEAD SHA. This is deliberately NOT the base-branch rule quick
-      // task k31 applied to `.review.yaml` — that rule protects config a pull request must not be able
-      // to rewrite, whereas reading the pull request's OWN head content is precisely the feature here.
-      // Do not "fix" this to match k31.
-      readFile: async (path) => vcs.getFileContent(job.owner, job.repo, path, pr.headSha),
-      // D-05: `?.` + `?? null` is a THREE-WAY coercion, and all three arms are live. On GitHub
-      // (35-03) the adapter implements searchCode, so grep_repo returns real matches; a rate-limited
-      // 403/429 comes back as null and permanently downgrades the capability for this invocation. On a
-      // provider whose adapter does NOT implement it, the optional call resolves to undefined, is
-      // coerced to null, and grep_repo reports itself unavailable to the model — the DESIGNED
-      // degradation path, exercised end-to-end from wave 1, not a stub.
-      searchCode: async (query) => (await vcs.searchCode?.(job.owner, job.repo, query, AGENTIC_MAX_GREP_HITS)) ?? null,
-      // The provider clients self-increment the tracker per request, so the reserve check is the
-      // correct AND only guard — never call tracker.incrementSubrequests() from the loop.
-      hasBudget: (reserve) => tracker.hasRemainingSafeBudget(reserve),
-    },
-    {
-      prTitle: job.prTitle ?? pr.title ?? null,
-      touchedPaths,
-      headSha: pr.headSha,
-      // G-11: the repository's own exclusion globs are the privacy refusal list.
-      skipFiles: config.review.skip_files,
-    },
-  );
+      {
+        prTitle: job.prTitle ?? pr.title ?? null,
+        touchedPaths,
+        headSha: pr.headSha,
+        // G-11: the repository's own exclusion globs are the privacy refusal list.
+        skipFiles: config.review.skip_files,
+      },
+    );
+  } catch (error) {
+    // Three classes are control flow or resumable state, NOT failures, and must survive this catch:
+    //   - NextPhaseError — a transition something inside the try already decided.
+    //   - JOB_SUPERSEDED — a newer push cancelled this job; the outer catch acks it (:597). Matched by
+    //     message because it is thrown as a plain Error (:3598).
+    //   - a subrequest-budget error — the invocation is out of budget and the outer catch reschedules
+    //     THIS phase on a fresh one. Absorbing it would discard a gather that would have succeeded.
+    if (error instanceof NextPhaseError) throw error;
+    if (error instanceof Error && error.message === 'JOB_SUPERSEDED') throw error;
+    if (isSubrequestBudgetError(error)) throw error;
+
+    logger.warn(
+      `Agentic-context phase failed for job ${job.id}; failing open to the next phase with no gathered context`,
+      error instanceof Error ? error : new Error(String(error)),
+    );
+    // The FIRST error-driven producer for this event, and the reason `MACHINE_ERROR_REASONS` is in
+    // AGENTIC_CONTEXT_AUDIT_REASONS at all (IN-06): the reason is routed through `redactErrorMessage`
+    // so the closed machine vocabulary holds and no provider text reaches `jobs.audit`. Zero counts
+    // are the honest record — nothing was gathered and nothing was persisted.
+    await recordAgenticContextAudit(env, job.id, [
+      buildAgenticContextAuditEvent('failed', {
+        reason: redactErrorMessage(error instanceof Error ? error : String(error)),
+        hopsUsed: 0,
+        filesRead: 0,
+        grepsRun: 0,
+        bytesGathered: 0,
+        truncated: false,
+        grepSupported: false,
+        budgetHeadroom: tracker.remainingSafeBudget(),
+      }),
+    ]);
+    throw new NextPhaseError(nextPhaseAfterAgenticContext(config), FRESH_INVOCATION_YIELD_SECONDS);
+  }
 
   logger.info(`Agentic-context phase completed for job ${job.id}`, {
     hopsUsed: outcome.hopsUsed,
