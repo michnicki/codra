@@ -53,6 +53,10 @@ import { UNTRUSTED_AGENTIC_BEGIN, UNTRUSTED_AGENTIC_END } from '@server/prompts/
 import { queryRows } from '@server/db/client';
 import { createTestEnv, generateMockDiff, hasConfiguredTestDatabaseUrl } from './helpers';
 import { findExistingJobForHead, getJobDetail } from '@server/db/jobs';
+// Namespace import so the T-35-19 case can spy on `appendJobAuditEvents` and force the audit write
+// to reject. The module is already partially mocked above (`getOtherRunningJobsCount`), and the
+// factory spreads the original, so the spy lands on the real function the recorder calls.
+import * as jobsModule from '@server/db/jobs';
 import { findRepositoryIdByIdentity, getOrCreateRepository } from '@server/db/repositories';
 import {
   markCodeIndexBuildCompleted,
@@ -86,6 +90,10 @@ const mocks = vi.hoisted(() => ({
   getPullRequestDiff: vi.fn(),
   subrequestsPerGetPullRequest: 1,
   trackers: [] as Array<{ remainingSafeBudget(): number }>,
+  // D-05 three-valued code search: null = the capability is unavailable for this repository or
+  // credential, [] = it ran and found nothing, entries = matches.
+  searchCodeResult: null as Array<{ path: string; line: number; fragment: string; ref: string }> | null,
+  searchCodeCalls: [] as number[],
 }));
 
 vi.mock('@server/db/jobs', async (importOriginal) => {
@@ -186,6 +194,13 @@ vi.mock('@server/services/github', () => {
       async getFileHistory() {
         return [];
       }
+      // 35-03 added GithubAdapter.searchCode, which delegates straight here. Returning null is the
+      // D-05 capability downgrade — the shape the Bitbucket arm is permanently in (35-04).
+      async searchCode() {
+        this.tracker?.incrementSubrequests(1);
+        mocks.searchCodeCalls.push(1);
+        return mocks.searchCodeResult;
+      }
     },
   };
 });
@@ -269,6 +284,8 @@ dbDescribe('Phase 35 (35-02): agentic-context pipeline', () => {
     mocks.reviewFileCalls.length = 0;
     mocks.trackers.length = 0;
     mocks.fileContents.clear();
+    mocks.searchCodeCalls.length = 0;
+    mocks.searchCodeResult = null;
     mocks.subrequestsPerGetPullRequest = 1;
     mocks.getPullRequestDiff.mockReset();
     mocks.getPullRequestDiff.mockImplementation(() => generateMockDiff([{ path: 'src/x.ts', content: 'x' }]));
@@ -357,7 +374,61 @@ dbDescribe('Phase 35 (35-02): agentic-context pipeline', () => {
   }
 
   const readFileAction = (path: string) => JSON.stringify({ action: 'read_file', path });
+  const grepAction = (query: string) => JSON.stringify({ action: 'grep_repo', query });
   const doneAction = (reason = 'enough context') => JSON.stringify({ action: 'done', reason });
+
+  // ── 35-06: the operator-visible audit trace ─────────────────────────────────────────────────
+  //
+  // Read back through the same job-detail path the dashboard uses, so an event that fails the
+  // per-element schema parse on the read side is INVISIBLE here too — exactly as it would be to an
+  // operator. Asserting on the append call instead would pass for an event nobody can ever see.
+  type AgenticAuditEvent = {
+    stage: 'agentic_context';
+    status: string;
+    reason?: string;
+    hops_used?: number;
+    files_read?: number;
+    greps_run?: number;
+    bytes_gathered?: number;
+    truncated?: boolean;
+    grep_supported?: boolean;
+    budget_headroom?: number;
+  };
+
+  async function agenticAuditEvents(jobId: string): Promise<AgenticAuditEvent[]> {
+    const detail = await getJobDetail(env, jobId);
+    return ((detail?.audit ?? []) as Array<{ stage: string }>).filter(
+      (event) => event.stage === 'agentic_context',
+    ) as AgenticAuditEvent[];
+  }
+
+  /**
+   * The single event a non-silent exit must leave. Fails loudly on 0 or 2+.
+   *
+   * `budget_headroom` is asserted on EVERY path including the pre-loop gates, because
+   * `tracker.remainingSafeBudget()` is knowable at any point and §7 alerts on `< 2`.
+   * `grep_supported` deliberately is NOT — see `theLoopExitAuditEvent`.
+   */
+  async function theAgenticAuditEvent(jobId: string): Promise<AgenticAuditEvent> {
+    const events = await agenticAuditEvents(jobId);
+    expect(events).toHaveLength(1);
+    expect(typeof events[0].budget_headroom).toBe('number');
+    expect(events[0].budget_headroom).toBeGreaterThanOrEqual(0);
+    return events[0];
+  }
+
+  /**
+   * The single event a run that actually REACHED the loop must leave. Adds the `grep_supported`
+   * assertion, which only a loop exit can honestly answer: a pre-loop gate (D-14 index present)
+   * never consulted the search capability, and fabricating `false` there would fire §7's
+   * "grep_supported: false on GitHub — any occurrence" alert for a repository where nothing was even
+   * attempted. Absent means unknown, and the viewer omits the line entirely.
+   */
+  async function theLoopExitAuditEvent(jobId: string): Promise<AgenticAuditEvent> {
+    const event = await theAgenticAuditEvent(jobId);
+    expect(typeof event.grep_supported).toBe('boolean');
+    return event;
+  }
 
   // ── D-09 routing + ROUTING ANCHOR 4 (freshInstance) ──────────────────────────────────────────
 
@@ -385,6 +456,18 @@ dbDescribe('Phase 35 (35-02): agentic-context pipeline', () => {
 
     const result = await runReviewUntilFinalize(repo);
     expect(result).toMatchObject({ action: 'next_phase', phase: 'finalize' });
+
+    // 35-06: a successful run leaves exactly ONE event, and it is the whole field set — this is the
+    // row the operator reads next to the findings the gathered context produced.
+    const job = await findJob(repo);
+    const event = await theLoopExitAuditEvent(job.id);
+    expect(event.status).toBe('completed');
+    expect(event.reason).toBe('done');
+    expect(event.hops_used).toBeGreaterThan(0);
+    expect(event.files_read).toBe(1);
+    expect(event.greps_run).toBe(0);
+    expect(event.bytes_gathered).toBeGreaterThan(0);
+    expect(event.truncated).toBe(false);
   });
 
   it('D-09 / NREG-01: toggle OFF routes prepare straight to review and never produces an agentic_context hand-off', async () => {
@@ -407,6 +490,11 @@ dbDescribe('Phase 35 (35-02): agentic-context pipeline', () => {
     expect(mocks.fileContentCalls).toEqual([]);
     const job = await findJob(repo);
     expect(await env.APP_KV.get(agenticContextCacheKey(job.id), 'text')).toBeNull();
+
+    // 35-06 / NREG-01: the toggle-off branch must stay COMPLETELY silent. An audit row is
+    // observable behaviour, so a single event here breaks the byte-identity promise just as surely
+    // as a KV read would. Asserted as a COUNT OF ZERO, not as "some other event also exists".
+    expect(await agenticAuditEvents(job.id)).toHaveLength(0);
   });
 
   it('T-35-06 (ROUTING ANCHOR 9): a phase:"agentic_context" queue message with NO jobId is rejected before the phase runs', async () => {
@@ -502,6 +590,16 @@ dbDescribe('Phase 35 (35-02): agentic-context pipeline', () => {
     expect(mocks.verifierCalls).toEqual([]);
     expect(mocks.fileContentCalls).toEqual([]);
     expect(await env.APP_KV.get(agenticContextCacheKey(job.id), 'text')).toBeNull();
+
+    // 35-06 / D-14: the gate is a DECISION and must be visible. Without this row an operator seeing
+    // a toggle-on job that spent nothing cannot tell "the index made this unnecessary" from "the
+    // feature is broken".
+    const event = await theAgenticAuditEvent(job.id);
+    expect(event.status).toBe('skipped');
+    expect(event.reason).toBe('index_present');
+    // The gate fires BEFORE the loop, so there are no loop counts to report — absent, not zero.
+    expect(event.hops_used).toBeUndefined();
+    expect(event.bytes_gathered).toBeUndefined();
   });
 
   it('D-14: a "building" row, a "failed" row and NO row at all each let the loop run', async () => {
@@ -591,6 +689,18 @@ dbDescribe('Phase 35 (35-02): agentic-context pipeline', () => {
     expect(agenticPuts).toHaveLength(1);
     expect(agenticPuts[0][2]).toMatchObject({ expirationTtl: 3600 });
     putSpy.mockRestore();
+
+    // 35-06: the audit event's counts agree with the persisted blob's, field for field. Two
+    // independent records of the same run that disagree would make both untrustworthy.
+    const event = await theLoopExitAuditEvent(job.id);
+    expect(event.status).toBe('completed');
+    expect(event.reason).toBe('done');
+    expect(event.hops_used).toBe(blob!.hopsUsed);
+    expect(event.files_read).toBe(blob!.filesRead);
+    expect(event.greps_run).toBe(blob!.grepsRun);
+    expect(event.bytes_gathered).toBe(blob!.bytesGathered);
+    expect(event.truncated).toBe(blob!.truncated);
+    expect(event.grep_supported).toBe(blob!.grepSupported);
   });
 
   it('D-12: re-entering the phase with the blob already in KV performs zero model calls and zero fetches and still advances to review', async () => {
@@ -611,12 +721,24 @@ dbDescribe('Phase 35 (35-02): agentic-context pipeline', () => {
 
     // A lease-recovery retry, a fresh-instance handoff and a redelivered queue message all look like
     // this. The script is now empty, so a leak of the idempotency gate would throw.
+    // 35-06: the first entry left exactly one event, and the count is captured BEFORE re-entry so
+    // the assertion after it is about a delta rather than an absolute.
+    const eventsAfterFirst = await agenticAuditEvents(first.job.id);
+    expect(eventsAfterFirst).toHaveLength(1);
+
     const second = await runPhase(repo, 'agentic_context');
     expect(second.result).toMatchObject({ action: 'next_phase', phase: 'review' });
     expect(mocks.verifierCalls.length).toBe(callsAfterFirst);
     expect(mocks.fileContentCalls.length).toBe(fetchesAfterFirst);
     // Byte-identical blob: re-entry neither re-gathers nor rewrites.
     expect(await env.APP_KV.get(agenticContextCacheKey(second.job.id), 'text')).toBe(blobAfterFirst);
+
+    // 35-06: re-entry emits ZERO additional events. A second event would double-count every metric
+    // the flywheel reads — hops, files, greps and bytes would all report roughly twice the truth for
+    // any job that was ever redelivered, retried or handed a fresh instance.
+    const eventsAfterSecond = await agenticAuditEvents(second.job.id);
+    expect(eventsAfterSecond).toHaveLength(1);
+    expect(eventsAfterSecond).toEqual(eventsAfterFirst);
   });
 
   // ── D-11 fail-open ──────────────────────────────────────────────────────────────────────────
@@ -651,6 +773,16 @@ dbDescribe('Phase 35 (35-02): agentic-context pipeline', () => {
     expect(blob!.context).toContain('BBB_MARKER');
     expect(blob!.filesRead).toBe(2);
     expect(blob!.hopsUsed).toBe(2);
+
+    // 35-06: `partial`, NOT `failed`. The distinction is the whole point of the status axis —
+    // 35-AI-SPEC.md §7 alerts on `status: 'failed' > 5%` and deliberately does not alert on
+    // `partial`, because fail-open that still delivered context is the design working.
+    const event = await theLoopExitAuditEvent(job.id);
+    expect(event.status).toBe('partial');
+    expect(event.reason).toBe('model_call_failed');
+    expect(event.hops_used).toBe(2);
+    expect(event.files_read).toBe(2);
+    expect(event.bytes_gathered).toBeGreaterThan(0);
   });
 
   it('D-11 / T-35-04: a drained subrequest budget stops the loop before hop 1 — zero model calls, zero fetches, no thrown error, still advances to review', async () => {
@@ -674,6 +806,18 @@ dbDescribe('Phase 35 (35-02): agentic-context pipeline', () => {
     // Nothing gathered, so nothing is persisted: an empty blob would satisfy the idempotency gate on
     // re-entry while carrying nothing, permanently stranding this job on a context-free review.
     expect(await env.APP_KV.get(agenticContextCacheKey(job.id), 'text')).toBeNull();
+
+    // 35-06: `failed` — a fail-open exit that yielded NOTHING. §7 alerts on `budget_exhausted` above
+    // 10% of enabled runs because it means AGENTIC_BUDGET_RESERVE is mis-sized or the phase is not
+    // getting a fresh invocation, and the reason token is what that query matches on.
+    const event = await theLoopExitAuditEvent(job.id);
+    expect(event.status).toBe('failed');
+    expect(event.reason).toBe('budget_exhausted');
+    expect(event.hops_used).toBe(0);
+    expect(event.bytes_gathered).toBe(0);
+    // The headroom really is on the floor — the number §7's `< 2` alert reads, at its worst value,
+    // and a present zero rather than an omitted field.
+    expect(event.budget_headroom).toBe(0);
   });
 
   // ── FR-131 no-content fallback (ROADMAP success criterion 4) + the positive control ──────────
@@ -699,6 +843,83 @@ dbDescribe('Phase 35 (35-02): agentic-context pipeline', () => {
     expect(mocks.reviewFileCalls[0].agenticContext).toBeUndefined();
     expect(mocks.reviewFileCalls[0].userPrompt).not.toContain(UNTRUSTED_AGENTIC_BEGIN);
     expect(mocks.reviewFileCalls[0].userPrompt).not.toContain(UNTRUSTED_AGENTIC_END);
+
+    // 35-06: `skipped` with the no-content token. The model terminated by its own decision, so this
+    // is NOT a fail-open — FR-131's documented fallback ("review the diff alone") working, not a
+    // malfunction, and `failed` here would put the run in §7's page-worthy bucket.
+    const event = await theLoopExitAuditEvent(job.id);
+    expect(event.status).toBe('skipped');
+    expect(event.reason).toBe('no_content');
+    // The counts are PRESENT zeroes, not omitted: `bytes_gathered == 0 && hops_used >= 2` is the
+    // FM-5 detector §7 samples at 100%, and it cannot fire on a field that was never written.
+    expect(event.hops_used).toBe(1);
+    expect(event.files_read).toBe(0);
+    expect(event.greps_run).toBe(0);
+    expect(event.bytes_gathered).toBe(0);
+  });
+
+  // ── 35-06: the D-05 capability signal and the T-35-19 never-fail-the-job contract ────────────
+
+  it('35-06 / D-05: a run whose code search returns null records grep_supported: false', async () => {
+    const repo = `repo-ag-grepnull-${Date.now()}`;
+    await seedRepoWithAgenticToggle(repo, true);
+    // The three-valued seam's null arm: rate-limited on GitHub (35-03), and the permanent steady
+    // state on Bitbucket (35-04, where the token class cannot call the endpoint at all).
+    mocks.searchCodeResult = null;
+    mocks.fileContents.set('src/after-grep.ts', 'export const AFTER_GREP = 1;\n');
+    mocks.verifierScript.push(
+      grepAction('authenticateUser'),
+      readFileAction('src/after-grep.ts'),
+      doneAction(),
+    );
+
+    await runPrepare(repo);
+    const { job, result } = await runPhase(repo, 'agentic_context');
+    expect(result).toMatchObject({ action: 'next_phase', phase: 'review' });
+    expect(mocks.searchCodeCalls).toHaveLength(1);
+
+    const event = await theLoopExitAuditEvent(job.id);
+    // FALSE, and rendered as such — this single boolean is the entire D-05 degradation signal, and
+    // §7 reads it with a provider split: any occurrence on GitHub is a real signal, while on
+    // Bitbucket it is the documented expected steady state that must NOT alert.
+    expect(event.grep_supported).toBe(false);
+    expect(event.greps_run).toBe(1);
+    // The run still succeeded via read_file: a lost capability degrades the pass, it does not end it.
+    expect(event.status).toBe('completed');
+    expect(event.files_read).toBe(1);
+  });
+
+  it('35-06 / T-35-19: a failing audit append does not fail the job — the phase still hands off', async () => {
+    const repo = `repo-ag-auditfail-${Date.now()}`;
+    await seedRepoWithAgenticToggle(repo, true);
+    mocks.fileContents.set('src/audit-fail.ts', 'export const AUDIT_FAIL = 1;\n');
+    mocks.verifierScript.push(readFileAction('src/audit-fail.ts'), doneAction());
+
+    await runPrepare(repo);
+    // The recorder is best-effort by contract. This forces the exact failure the contract is about:
+    // a phase whose entire promise is that it cannot fail the job must not be broken by the
+    // telemetry added to watch it.
+    const appendSpy = vi
+      .spyOn(jobsModule, 'appendJobAuditEvents')
+      .mockRejectedValue(new Error('simulated audit-write failure'));
+
+    const { job, result } = await runPhase(repo, 'agentic_context');
+    expect(appendSpy).toHaveBeenCalled();
+    appendSpy.mockRestore();
+
+    // Handed off normally, and the gathered context still reached KV — the audit failure cost the
+    // trace and nothing else.
+    expect(result).toMatchObject({ action: 'next_phase', phase: 'review' });
+    const detail = await getJobDetail(env, job.id);
+    expect(detail?.status).not.toBe('failed');
+    const blob = await readBlob(job.id);
+    expect(blob).not.toBeNull();
+    expect(blob!.context).toContain('AUDIT_FAIL');
+    // The event genuinely did not land, so this is not a vacuous pass.
+    expect(await agenticAuditEvents(job.id)).toHaveLength(0);
+
+    const reviewResult = await runReviewUntilFinalize(repo);
+    expect(reviewResult).toMatchObject({ action: 'next_phase', phase: 'finalize' });
   });
 
   it('D-10: a successful loop’s gathered content reaches the review prompt for every reviewed file, between the agentic-context sentinels', async () => {
