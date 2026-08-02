@@ -9,8 +9,8 @@
 | Phase | Name | Goal | Requirements | Success Criteria |
 |-------|------|------|--------------|-----------------|
 | 33 | Quality Fixes | 4/4 | Complete    | 2026-07-31 |
-| 34 | Context Enhancement | File history and .review.yaml config | PRD-04, PRD-05 | 1. File history fetched and injected into prompts 2. .review.yaml discovered and merged with DB config |
-| 35 | Agentic Tools | read_file/grep_repo tool loop for unindexed repos | PRD-06 | 1. Tool loop runs up to 6 hops 2. Byte limits enforced 3. Falls back to single review on failure 4. Config-gated |
+| 34 | Context Enhancement | 3/3 | Complete    | 2026-08-01 |
+| 35 | Agentic Tools | 6/6 | Complete   | 2026-08-02 |
 | 36 | Outbound Webhooks + Blast Radius | Event delivery and cross-repo dependency tracking | PRD-07, PRD-08 | 1. Events fire on review completion/failure 2. HTTPS + SSRF guard + 5s timeout 3. Blast radius computed from manifests 4. Visibility filtering works |
 
 ---
@@ -71,14 +71,56 @@
 2. Agentic executor runs up to 6 hops, feeding tool results back to the model
 3. Byte limits enforced: 12KB per read, 30 grep hits, 240 bytes/hit, 50KB total, 15 files max
 4. Falls back to single review call if loop returns no content
-5. Gated on `config.review.agentic_tools` (default: enabled)
+5. Gated on `config.review.agentic_tools` (default: **disabled**) and skipped when the repo already has a built code index
+
+> **Amended at plan time (35-CONTEXT.md D-15).** Criterion 5 previously read "default: enabled".
+> D-13 deliberately ships the toggle default-OFF, matching the `file_history` / `learning`
+> convention: the loop spends real money and subrequests on every review, and existing instances
+> must not start making extra model calls on upgrade. D-14 adds the second gate — an indexed repo
+> already has cross-file context, so the loop is redundant there.
+
+> **Amended at replan (35-REVIEWS.md, OpenCode Concern #3 + Suggestion #2).** Criterion 4's fallback is
+> also the **expected steady state on Bitbucket**, and the phase gate must not read that as a
+> regression. `grep_repo` is backed by provider code-search APIs (D-05); Atlassian has confirmed that
+> Workspace and Repository Access Tokens — the only credential class Codra stores — cannot call the
+> Bitbucket code-search endpoint (BCLOUD-22586), and that endpoint is marked deprecated with a removal
+> date of **2026-11-01** and no published replacement. A Bitbucket job is therefore expected to report
+> `grep_supported: false` and run `read_file`-only. That is the designed D-05 degradation, verified by a
+> passing test case in `35-04-PLAN.md` and by a blocking live-credential checkpoint before ship — not a
+> defect, and not a criterion-4 failure. GitHub is where `grep_repo` is live (`35-03-PLAN.md`).
+
+**Plans:** 6/6 plans complete
+
+Plans:
+**Wave 1**
+
+- [x] 35-01-PLAN.md — Tracer: end-to-end bounded agentic-context phase (read_file slice)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [x] 35-02-PLAN.md — Integration proof: pipeline behaviours and toggle-off byte identity
+- [x] 35-03-PLAN.md — GitHub code-search backing for `grep_repo`
+- [x] 35-04-PLAN.md — Bitbucket code-search backing and its designed degradation
+- [x] 35-05-PLAN.md — `.review.yaml` toggle path and the Tier-1 reference corpus
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [x] 35-06-PLAN.md — `agentic_context` audit event, redaction, and dashboard visibility
 
 **Key files:**
 
-- `src/server/core/agentic-tools.ts` — New module: tool executor with bounds
-- `src/server/services/model.ts` — Add `completeWithTools()` support
-- `src/server/core/review.ts` — Wire agentic loop before file review
-- `src/shared/schema.ts` — Add `agentic_tools` config field
+- `src/server/core/agentic-tools.ts` — New module: pure tool executor with the six FR-132 bounds
+- `src/server/prompts/agentic-context.ts` — New module: protocol prompts and untrusted-output fencing
+- `src/server/core/review.ts` — New `agentic_context` phase between prepare and review
+- `src/server/vcs/types.ts` — New optional `searchCode?()` seam backing `grep_repo`
+- `src/shared/schema.ts` — Add `agentic_tools` config field, the phase value, and the audit arm
+
+> **Note on `completeWithTools()`.** The original key-files list named
+> `src/server/services/model.ts — Add completeWithTools() support`. D-01 defers native provider
+> function-calling (four adapters, four response shapes, Workers AI weakest) and drives the loop over
+> the existing `ModelService.callVerifierRaw()` text path instead. `services/model.ts` is therefore
+> **not** modified by this phase; D-02 keeps the OpenAI-compatible tool definitions drop-in for a
+> future native path.
 
 ---
 

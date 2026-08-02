@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v1.5
 milestone_name: — PRD Parity
-current_phase: 34
-current_phase_name: Context Enhancement
-status: verifying
-stopped_at: Phase 33 context gathered
-last_updated: "2026-07-31T14:35:07.366Z"
-last_activity: 2026-07-31
-last_activity_desc: Phase 33 complete, transitioned to Phase 34
+current_phase: 35
+current_phase_name: agentic-tools
+status: executing
+stopped_at: Completed 35-06-PLAN.md — Phase 35 code-complete, ready for verification
+last_updated: "2026-08-02T09:47:08.448Z"
+last_activity: 2026-08-02
+last_activity_desc: Phase 35 execution started
 progress:
   total_phases: 4
-  completed_phases: 1
-  total_plans: 4
-  completed_plans: 4
-  percent: 25
+  completed_phases: 2
+  total_plans: 14
+  completed_plans: 13
+  percent: 50
 ---
 
 # Project State
@@ -24,14 +24,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-31 for v1.5 start)
 
 **Core value:** A Bitbucket Cloud PR gets the same AI review a GitHub PR gets, from one instance, without breaking GitHub — held end-to-end through v1.4 (all 4 milestones, 84/84 requirements satisfied).
-**Current focus:** Phase 33 — quality-fixes
+**Current focus:** Phase 35 — agentic-tools
 
 ## Current Position
 
-Phase: 34 — Context Enhancement
-Plan: Not started
-Status: Phase complete — ready for verification
-Last activity: 2026-07-31 — Phase 33 complete, transitioned to Phase 34
+Phase: 35 (agentic-tools) — EXECUTING
+Plan: 1 of 7
+Status: Executing Phase 35
+Last activity: 2026-08-02 — Phase 35 execution started
 
 ### Phase 27 Plan 27-01 Decisions (SEC-XDIFF-01)
 
@@ -145,6 +145,15 @@ Last activity: 2026-07-31 — Phase 33 complete, transitioned to Phase 34
 | Phase 31 P02 | 40min | 2 tasks | 6 files |
 | Phase 31 P04 | 35min | 2 tasks | 4 files |
 | Phase 31 P05 | 22min | 2 tasks | 4 files |
+| Phase 34 P01 | 13min | 3 tasks | 6 files |
+| Phase 34-context-enhancement P02 | 16min | 4 tasks | 9 files |
+| Phase 34-context-enhancement P03 | 23min | 4 tasks | 8 files |
+| Phase 35 P01 | 31min | 2 tasks | 14 files |
+| Phase 35 P02 | 16min | 2 tasks | 3 files |
+| Phase 35 P03 | 12min | 2 tasks | 6 files |
+| Phase 35 P04 | 3min | 3 tasks | 6 files |
+| Phase 35 P05 | 17min | 2 tasks | 3 files |
+| Phase 35 P06 | 22min | 3 tasks | 11 files |
 
 ## Accumulated Context
 
@@ -298,6 +307,43 @@ Decisions carried from v1.1 execution (still load-bearing for v1.2 — Phase 14 
 - [Phase 31]: 31-04: BitbucketAdapter.create's existing null/encryptedAccessToken guard and decryptSecret call needed zero changes to consume resolveBitbucketBotCredential's union return type -- both VcsCredentialSecret and VcsWorkspaceCredentialSecret share encryptedAccessToken
 - [Phase 31]: 31-05: Checkbox's Check icon must be a direct sibling of the native input (not nested inside the styled square div) -- Tailwind's peer-checked general-sibling selector only matches true DOM siblings of the peer, not descendants of another sibling
 - [Phase 31]: 31-05: selectedRepoSlugs submitted as Array.from(selectedSlugs).sort(), not raw Set insertion order, for a deterministic finalize payload regardless of check order
+- [Phase 34]: vcsCommitEntrySchema.filesAvailable defaults true; set false only by Bitbucket (commit-list API omits file manifest, review LOW-10)
+- [Phase 34]: Both feature toggles mirrored in the repoConfigSchema inline literal default so repoConfigSchema.parse({}) yields them regardless of Zod default short-circuit semantics
+- [Phase 34]: D-09 merge is top-level-key wholesale replacement: omitted sub-keys revert to Zod defaults (review.max_files -> 150, never DB's 100); undeclared top-level keys keep DB values; expression repoConfigSchema.parse({ ...dbConfig, ...yamlDeclared }) locked by 34-01 tests, re-implemented by 34-03 Task 1
+- [Phase 34]: YAML parser rejects unsupported constructs (block scalars |/>, flow maps {}, anchors &/*, tags !!, complex keys, inconsistent indentation) with 'YAML parse error:' prefix — the D-12 DB fallback + yaml_config_parse_failed audit path is the safety net, never silent misbehavior
+- [Phase ?]: VcsCommitEntry re-exported from vcs/types.ts (import from @shared/schema + export) so both adapters import the Wave-1 contract from the seam module; never re-defined (contract-first)
+- [Phase ?]: The toggle check inside buildFileReviewPrompts is input.config.file_history?.enabled !== false — the builder's config param IS the review subtree (RepoConfig['review']), so the plan's pseudocode config.review.file_history would be a TypeError; the implemented form matches the plan's own verification grep target
+- [Phase ?]: buildFileHistoryBlock is EXPORTED (plan artifact exports list) so tests pin the exact rendering; caps are applied per-message (200) BEFORE the total (4000) so an abusive Bitbucket subject is bounded independently (review LOW-8)
+- [Phase ?]: BitbucketClient.getFileHistory keeps path-before-ref ordering (mirrors the VcsProvider signature so the adapter stays a pure passthrough); deviation from getFileContent's ref-before-path documented in the method doc comment (INFO 2)
+- [Phase ?]: - "34-03: YAML merge detection captures mergedConfig !== config identity BEFORE the config reassignment — a merge always produces a fresh repoConfigSchema.parse() object"
+- "34-03: config_snapshot persistence is fail-open: job.configSnapshot mirrors in-memory FIRST, only the DB write is try/catch-wrapped with logger.warn — a persistence failure never fails the review"
+- "34-03: SC4 getFileContent carve-out for review.ts follows the Phase 18/19/29 per-identifier precedent — gated on yaml_config.enabled (default false, D-15), at most two getFileContent calls per review, byte-identical when off (NREG-01)"
+- "34-03: the review-phase file-history KV load is unconditional (a KV.get is not a tracked subrequest); an absent key yields null -> fileHistory undefined -> byte-identical prompts (NREG-01)"
+- "34-03: Task 3 integration tests pass immediately against committed Tasks 1-2 production code (contract pinned, not a RED cycle) — mirrors the 34-01 Task 3 precedent"
+- [Phase 35]: 35-01: agentic_tools ships default OFF against PRD-06's stated default (D-13) — the loop spends real money and subrequests per review, so NREG-01 inertness wins; ROADMAP criterion 5 amended at plan time (D-15)
+- [Phase 35]: 35-01: callVerifierRaw is called with NO temperature — a recorded decision, not an omission (both existing raw-call sites omit it); the one-line temperature: 0 remedy is documented in-code if unparseable_action ever clusters on one model id
+- [Phase 35]: 35-01: AGENTIC_BUDGET_RESERVE = 8 (worst-case hop 4 + phase tail 3 = 7, rounded to match FILE_HISTORY_BUDGET_RESERVE), raised from the first draft's 4
+- [Phase 35]: 35-01: module-graph acyclicity preserved without duplication — sentinels + renderToolCatalog defined in the prompt layer and re-exported from core, types cross back as erased import type, parseAgenticToolCall reached by a once-hoisted dynamic import
+- [Phase 35]: 35-02: review.ts was declared modifiable and needed ZERO changes — all 20 integration assertions pass against 35-01's committed implementation, and 9 targeted source mutations confirm that is conformance rather than vacuous assertions
+- [Phase 35]: 35-02: the freshInstance assertion targets the hand-off INTO agentic_context (ROUTING ANCHOR 4 keys the flag on error.phase, the DESTINATION); the phase's own exit to review correctly carries false and that is asserted too
+- [Phase 35]: 35-02: ModelService's TokenTracker is its SECOND ctor arg (new ModelService(env, tracker, {jobId}) at review.ts:549) — the third position is GitHubService's, which is what the file-history-pipeline precedent captures
+- [Phase 35]: 35-02: vitest 4 executes a SKIPPED suite's beforeAll AND beforeEach, so createTestEnv() must be reached via a memoized accessor called from test bodies or the DB half fails the whole file and takes the database-free byte-identity proof with it
+- [Phase 35]: 35-02: both must-not-happen cases (D-14 ready gate, budget exhaustion) supply NO model script, so a leaked gate throws instead of silently gathering context and still satisfying the phase:review assertion
+- [Phase 35]: GitHubClient.searchCode is deliberately NOT wrapped in withRetry, unlike every sibling method on that client — GET /search/code is rate-limited to 10 requests per minute PER INSTALLATION. withRetry retries a 429 and any 5xx with 2s/4s backoff, which would spend the invocation's remaining subrequest budget hammering a limit no single job can clear, and concurrent jobs on one installation would compound it (T-35-12). Recorded at the call site so it is not 'fixed' for consistency.
+- [Phase 35]: grep_repo's three-valued contract is implemented as three DISTINCT source branches, never merged — 403/429 -> null stands the capability down for the rest of the invocation; 422 -> [] keeps the capability intact because an over-long / operator-heavy / term-less query is a QUERY problem (and is the documented backstop for AGENTIC_MAX_QUERY_CHARS = 120 overflow on a pathological owner+repo pair); any other non-ok throws so a 5xx is never masked as 'search unavailable for this repository' (T-35-13).
+- [Phase 35]: No supportsCodeSearch flag was added to VcsCapabilities — src/server/vcs/types.ts has an empty diff — The optional method's PRESENCE plus the three-valued null return already express both the static capability and its runtime downgrade. A flag no consumer branches on is exactly what that type's own doc comment warns against.
+- [Phase 35]: The D-07 grep ref label is the fixed string 'default branch', not the resolved default-branch name — Resolving the real branch name would cost a second subrequest per grep for a string the model uses only as a staleness warning, and the executor already composes it as '<defaultBranchLabel> (<providerRef>)'.
+- [Phase 35]: 35-04: BitbucketClient.request split into request() + requestOnce() (pure extraction, withRetry lifted out) so searchCode can opt out of retry explicitly — Bitbucket bakes retry into request(), unlike GitHubClient where each method opts in
+- [Phase 35]: 35-04: Bitbucket searchCode maps 401/403/404/429 all to null (capability unavailable) and 400 to [] (query problem); everything else rethrows so a 5xx is never masked as 'search unavailable'
+- [Phase 35]: 35-04: no VcsCapabilities flag on either provider — method presence plus the null return already express the capability and its downgrade; vcs/types.ts has an empty diff
+- [Phase 35]: 35-04: the live Bitbucket probe was NOT executed and no status codes exist — Workspace Access Tokens are premium-gated and not held on this deployment, so the workspace code-search endpoint is unreachable here independently of BCLOUD-22586. grep_supported false on Bitbucket is the confirmed expected steady state and must not alert
+- [Phase 35]: 35-04: the repository-scoped Bitbucket search/code variant (RESEARCH R-6) remains UNPROBED — open question logged as deferred item D-35-04-01, time-boxed by the 2026-11-01 endpoint removal
+- [Phase 35]: D-16 proven with ZERO production code: the agentic_tools toggle is settable from .review.yaml because it lives in reviewConfigSchema and the Phase-34 merge re-parses through the shared schema — a base-branch file alone flips the pipeline route to agentic_context
+- [Phase 35]: The Tier-1 agentic corpus imports NONE of the byte/count constants it guards — every expectation is an absolute literal, because an assertion written against its own bound scales silently when that bound is loosened
+- [Phase 35]: Corpus case ids stay 1:1 with 35-AI-SPEC.md section 5.5; the leading-./ skip_files regression guard is carried as extra scripted turns on C-10, never as a minted C-15, enforced by a source-level id scan
+- [Phase 35]: 35-06: the agentic_context audit vocabulary is COMPOSED from the loop's own agenticStopReasons plus MACHINE_ERROR_REASONS, not hand-listed — A hand-copied token list drifts the first time the loop gains an exit, and drift here means an off-vocabulary reason that no AI-SPEC §7 alert query and no operator grep matches. Verified acyclic before importing agentic-tools into audit.ts.
+- [Phase 35]: 35-06: grep_supported is deliberately ABSENT from the D-14 index-present audit event — The gate fires before the loop, so the search capability was never consulted and there is no honest value. Emitting false would fire AI-SPEC §7's 'grep_supported: false on GitHub — any occurrence' alert for a repository where nothing was attempted. Absent means unknown; the viewer's presence rule omits the line.
+- [Phase 35]: 35-06: audit presence is a three-state contract — absent, present-zero, non-zero — enforced by != null and !== undefined gates in both the builder and the viewer, never truthiness — hops_used: 0, bytes_gathered: 0, budget_headroom: 0, truncated: false and grep_supported: false are all falsy and all diagnostic; §7 samples bytes_gathered == 0 && hops_used >= 2 at 100%. A truthy gate would delete the most diagnostic reading and render a stray literal 0 in its place.
 
 ### Roadmap Evolution
 
@@ -352,6 +398,10 @@ Decisions carried from v1.1 execution (still load-bearing for v1.2 — Phase 14 
 | 260721-dvh | Fix PR #9 CI browser-test failures (run 29812072387): add static `__APP_VERSION__` define to vitest.config.ts + update stale 3-arg `updateRepoConfig` assertion in repos.spec.tsx to the real 4-arg call (`vcsProvider`); full browser suite 62/62 green | 2026-07-21 | 0e6e4ae | [260721-dvh-fix-ci-browser-test-failures-add-app-ver](./quick/260721-dvh-fix-ci-browser-test-failures-add-app-ver/) |
 | 260721-dvh (fast) | Bump GitHub Actions to Node 24 runtimes: checkout v7.0.1, setup-node v7.0.0, cache v6.1.0 (SHA-pinned), codeql-action v4.37.1; all SHAs verified node24 via GitHub API | 2026-07-21 | b061c80 | _(gsd-fast — no task dir)_ |
 | 260727-hvc | Fix G-28-4: `learned_rule_suppressed` now renders in its own audit-trail group (dropped the collapse into `evidence_missing`, added the `DecisionEvent` case) so suppressions are visible and no longer inflate the "Evidence missing" badge; discriminating node + browser assertions added | 2026-07-27 | c94aeb6 | [260727-hvc-fix-g-28-4-render-learned-rule-suppresse](./quick/260727-hvc-fix-g-28-4-render-learned-rule-suppresse/) |
+| 260801-k31 | WR-03 (34-REVIEW): `.review.yaml` is now read from the PR **base** branch (`pr.baseSha`), not the head — **deliberately reverses the head half of D-13**; the every-review/no-cache/first-found-wins half stands. Closes a review-theater bypass: with the head read, a PR author could ship `review: { skip_files: ["**"] }` (or `max_comments: 0`, `min_confidence: 1.0`) in their own branch and get a completed, green review that examined nothing, plus a silent reset of every operator-configured `review.*` sub-key via the D-09 wholesale merge. An allow-list was rejected — `skip_files` is both the most useful key and the best neutering tool. Fail-closed when no base SHA (never falls back to head). New `yaml_config_head_ignored` audit event tells contributors why their config edit had no effect, at zero extra subrequests (reuses the already-parsed PR diff) | 2026-08-01 | 30d6949 | [260801-k31-wr-03-read-review-yaml-from-the-pr-base-](./quick/260801-k31-wr-03-read-review-yaml-from-the-pr-base-/) |
+| 260801-hdp | Narrow `logger.ts`'s over-broad JWT heuristic: dropped the `obj.split('.').length === 3` whole-string clause that redacted ANY two-dot value (`model-output.spec.ts`, `vite.config.ts`, `1.2.3`, `app.codra.dev` all vanished from logs while 4-segment hostnames and IPv4 survived). Structural detection moved into `EMBEDDED_SECRET_PATTERNS` (scrubs the token, keeps surrounding text): anchored `eyJ` pattern relaxed `+`→`*` on segments 2–3 so unsigned `alg:none` JWTs still redact, plus a ≥16-char base64url-triple arm for opaque credentials. **Loosens a security control** — plan-checker caught that removing the clause alone would have leaked unsigned JWTs; both edits coupled in one commit and gated | 2026-08-01 | ceb30ec | [260801-hdp-narrow-logger-jwt-heuristic](./quick/260801-hdp-narrow-logger-jwt-heuristic/) |
+| 260801-gn1 | Bound raw model output in `model-output.ts` log payloads: `extracted` (preprocess-warn) and `parsedJson` (schema-validation-error, the ENTIRE parsed model output — every finding title/body/existing_code/code_suggestion) now route through `truncateJsonForLog` / a new failure-safe `stringifyJsonForLog`. Found by the Phase 33 security audit; pre-existing since 698da54. **Bounds, does not redact** — the first 2000 chars still carry private-repo finding prose, and `logger.redact()` still covers neither key; "redact rather than truncate" left as open follow-up | 2026-08-01 | 4a9f961, b0cd82b | [260801-gn1-truncate-raw-model-output-in-logs](./quick/260801-gn1-truncate-raw-model-output-in-logs/) |
+| 260801-i7s | Closed `/gsd-progress --forensic` checks 6+7. **Check 6:** reverted the uncommitted `runWithDb` client cache in `src/server/db/client.ts` — caching one postgres.js client per connection string shared a connection across separate Cloudflare request contexts (`fetch`/`queue`/`scheduled` in `index.ts:141/159/175`), violating the "no I/O across request contexts" rule that `getDb`'s test-only carve-out comment (`client.ts:91-97`) exists to preserve. Restored to HEAD's per-invocation `createDbClient(env)`; `getDb`'s fallback cache and `fallbackClients` untouched. Local Postgres `max_connections` pressure is the real cause of the scattered test failures the cache was working around — an env fix, not a code one. **Check 7:** added machine-readable `status:` fields to `.planning/phases/*/deferred-items.md` so settled work stops re-surfacing — Phase 29 all 12 sections `resolved`, Phase 28 follow-ups 1–4 `resolved` (each re-verified in-tree), `review-flow.spec.ts` row `partial` (3 of 4 failing groups unverified), test-DB hygiene `open`, Phase 34's 4 `acknowledged` rows left open. Phase 28/34 files are gitignored+untracked so their edits are on-disk-only by design | 2026-08-01 | 8dcbf00 | [260801-i7s-close-forensic-checks-6-7-revert-runwith](./quick/260801-i7s-close-forensic-checks-6-7-revert-runwith/) |
 
 ## Deferred Items
 
@@ -372,9 +422,9 @@ Items acknowledged and carried forward:
 
 ## Session Continuity
 
-Last session: 2026-07-31T11:52:59.796Z
-Stopped at: Phase 33 context gathered
-Resume file: .planning/phases/33-quality-fixes/33-CONTEXT.md
+Last session: 2026-08-02T08:10:33.914Z
+Stopped at: Completed 35-06-PLAN.md — Phase 35 code-complete, ready for verification
+Resume file: None
 
 ## Operator Next Steps
 
