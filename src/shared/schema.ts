@@ -55,6 +55,27 @@ export const parsedReviewCommentSchema = z.object({
   // Per-finding model confidence (0..1). Threaded parse -> persist -> reconstruct -> finalize.
   // nullable + optional so a provider that omits it is representable and treated fail-open.
   confidence: z.number().min(0).max(1).nullable().optional(),
+  // SEC-XDIFF-01: cross-references to other files in the PR that share a security relationship
+  // with this finding (e.g. "auth middleware missing check" references "route handler no auth").
+  // Optional so existing providers/findings without cross-file context parse unchanged (NREG-01).
+  cross_references: z.array(z.object({
+    path: z.string().min(1),
+    line: z.number().int().positive().optional(),
+    relationship: z.string().min(1),
+  })).optional(),
+  // WR-06: the persisted `review_comments.id` for this finding, projected back by
+  // `getFileReviewsForJobs`. This is the stable identifier `criticPruneOutputSchema`'s comment
+  // below calls out as missing ("the index-assigned ids close the gap that
+  // parsedReviewCommentSchema has no stable id") -- it is now available on the finalize read path.
+  //
+  // A STRING, not a number: `review_comments.id` is BIGSERIAL (64-bit), and a JSON number loses
+  // precision above 2^53 -- verified against Postgres, where 9007199254740993 projects back as
+  // ...992. An audit identifier that is silently off by one points at a DIFFERENT comment, which is
+  // worse than no identifier at all, so the projection casts to text.
+  //
+  // Optional because the PRODUCER side has no id: `parseFileReviewResponse` builds findings before
+  // they are persisted, and the id is only assigned by the INSERT. Present on every read-back.
+  commentId: z.string().min(1).nullable().optional(),
 });
 
 export const fileReviewModelOutputSchema = z.object({
@@ -106,6 +127,51 @@ export const labelsSchema = z.union([
     p3: z.string().min(1),
   }),
 ]);
+
+// Phase 34 (PRD-04 / FR-114): per-touched-file commit history entry consumed by the file-review
+// prompt builder. `files` is the list of OTHER files modified in the same commit; `filesAvailable`
+// distinguishes GitHub (the REST commit endpoint returns files[]) from Bitbucket (the commit-list
+// endpoint omits the file manifest — files is always [] by provider limitation, review LOW-10).
+// When filesAvailable is false the prompt builder renders a distinct message so the model can tell
+// "commit only touched this one file" from "provider didn't tell us." Defaults to true — set to
+// false only by the Bitbucket provider.
+//
+// WR-09 (34-REVIEW): this schema is now ENFORCED at runtime (see parseVcsCommitEntries below), not
+// merely used for its inferred type. `message` deliberately has NO `.min(1)`: both adapters compute
+// it as `message.split('\n')[0] ?? ''`, which is legitimately `''` for a commit whose message is
+// empty or starts with a newline (git permits both — `--allow-empty-message`). A `.min(1)` here
+// was unsatisfiable by the producers, so making the schema authoritative would have dropped
+// entries the adapters correctly produce.
+export const vcsCommitEntrySchema = z.object({
+  hash: z.string().min(7).max(7),
+  message: z.string(),
+  files: z.array(z.string()),
+  filesAvailable: z.boolean().default(true),
+});
+export type VcsCommitEntry = z.infer<typeof vcsCommitEntrySchema>;
+
+/**
+ * WR-09 (34-REVIEW): FAIL-OPEN validator for a commit-history list.
+ *
+ * Two boundaries need it and both used to be unchecked:
+ *   - ADAPTER OUTPUT — `vcsCommitEntrySchema` documented the contract but nothing enforced it, so
+ *     a provider-side shape drift reached the prompt builder untyped-in-practice.
+ *   - THE KV ROUND-TRIP — `JSON.parse(raw) as Record<string, VcsCommitEntry[]>` is an unchecked
+ *     cast. Any drift in a map persisted by an earlier deploy (the entries live for the 1-hour
+ *     TTL) surfaced as a TypeError inside `buildFileHistoryBlock` during prompt construction.
+ *
+ * File history is ADVISORY CONTEXT, so the posture matches D-06: drop what does not validate and
+ * keep going, never throw. A non-array input yields [].
+ */
+export function parseVcsCommitEntries(value: unknown): VcsCommitEntry[] {
+  if (!Array.isArray(value)) return [];
+  const entries: VcsCommitEntry[] = [];
+  for (const candidate of value) {
+    const result = vcsCommitEntrySchema.safeParse(candidate);
+    if (result.success) entries.push(result.data);
+  }
+  return entries;
+}
 
 export const reviewConfigSchema = z.object({
   on: z.array(z.enum(['opened', 'synchronize', 'ready_for_review', 'reopened', 'closed'])).default(['opened', 'synchronize', 'ready_for_review', 'reopened']),
@@ -162,7 +228,13 @@ export const reviewConfigSchema = z.object({
     .default({ enabled: false, sequence_diagram: { enabled: true } }),
   passes: z
     .object({
-      security: z.object({ enabled: z.boolean().default(false) }).default({ enabled: false }),
+      security: z.object({
+        enabled: z.boolean().default(false),
+        // SEC-XDIFF-01: enable the cross-file security reasoning pass. Default-off so existing
+        // behavior is byte-identical (NREG-01). When enabled, a whole-diff security pass runs
+        // after the per-file review phase and before verify_fixes.
+        cross_file: z.boolean().default(false),
+      }).default({ enabled: false, cross_file: false }),
       // `skip_threshold` / `input_char_budget` are OPTIONAL critic tuning knobs (review suggestion):
       // when unset, 10-06 falls back to its in-code constants, so absence is behavior-identical.
       // Additive optional fields keep `passes.critic` all-off by default (NREG-01 inertness).
@@ -183,7 +255,7 @@ export const reviewConfigSchema = z.object({
         })
         .default({ runs: 1, temperature: 0.7 }),
     })
-    .default({ security: { enabled: false }, critic: { enabled: false }, ensemble: { runs: 1, temperature: 0.7 } }),
+    .default({ security: { enabled: false, cross_file: false }, critic: { enabled: false }, ensemble: { runs: 1, temperature: 0.7 } }),
   interactive: z
     .object({
       commands: z
@@ -206,12 +278,83 @@ export const reviewConfigSchema = z.object({
           // REVIEW (OpenCode 11-04): the Q&A hourly cap as a config knob, not a hardcoded constant.
           // Additive + defaulted so an existing config parses byte-identically (NREG-01).
           rate_limit_per_hour: z.number().int().positive().default(10),
+          // Phase 29 (QA-IDX-01, D-16 / D-16-R): codebase-index-backed Q&A. `enabled` is
+          // REQUIREMENTS' `qa.index_enabled` expressed at the PRE-EXISTING `review.interactive.qa`
+          // config path rather than as a new top-level `qa` block, so Q&A configuration is not split
+          // across two places. Default-off for NREG-01 inertness: `repoConfigSchema.parse({})` yields
+          // `review.interactive.qa.index.enabled === false`, so a repository whose operator has not
+          // explicitly opted in sees no retrieval, no index storage and no build activity.
+          //
+          // Every numeric key carries a `.max()` bound because these values later size provider
+          // fetches, stored rows and prompt bytes — the bound is what stops an authenticated-but-
+          // malicious config write from requesting an unbounded build or an unbounded retrieval
+          // (T-29-02-01, following the Phase 13 bounds precedent on `ensemble.runs` and the
+          // `.max(20)` on `evidence.hard_drop_exempt_categories`).
+          //
+          // ONE-WAY (D-16): these keys enter `repo_configs.parsed_json` for any repository that sets
+          // them, so removing one after it ships risks breaking config parsing for those repos. The
+          // key path, the four defaults and the `max_files` ceiling were confirmed by the developer
+          // at the Plan 29-02 Task 1 checkpoint (recorded as D-16-R in 29-CONTEXT.md).
+          index: z
+            .object({
+              enabled: z.boolean().default(false),
+              // Caps FETCHES, not stored files. Generated-file detection is content-based (D-09), so
+              // a file must be fetched before it can be dropped — a build that fetches `max_files`
+              // files therefore stores at most, and usually fewer than, `max_files` files. The
+              // schema cannot express that distinction, hence this note.
+              //
+              // BUILD COST — the number an operator types here is the ONLY place the build's
+              // wall-clock cost is chosen, so the arithmetic belongs where the value is picked
+              // (review: OpenCode 29-02 #8 / Consensus Agreed Concern 4). Derivation, entirely from
+              // constants that already exist in this repository: `TokenTracker`'s
+              // MAX_SUBREQUESTS = 50 minus SAFE_MARGIN = 25 leaves a fresh `remainingSafeBudget()`
+              // of 25; at ESTIMATED_SUBREQUESTS_PER_INDEX_FILE = 2 that funds floor(25 / 2) = 12
+              // files per invocation; and each continuation sleeps
+              // INDEX_FRESH_INVOCATION_YIELD_SECONDS = 60 to force hibernation. So a build advances
+              // roughly 12 FILES PER MINUTE — the 500 default is about 42 minutes and the 2 000
+              // ceiling about 2.8 hours.
+              //
+              // A large value is SLOW, NOT SILENTLY CAPPED: MAX_INDEX_CONTINUATIONS hands off to a
+              // fresh instance rather than abandoning the build, so a large request does finish; it
+              // just costs hours of wall clock and provider quota. The ceiling therefore bounds how
+              // long an operator can ask a build to run, NOT how much gets indexed. 2 000 was chosen
+              // over a drafted 5 000 (~7 hours) because it keeps 4x headroom over the 500 default
+              // while bounding the worst legal request to roughly three hours. The exact boundary is
+              // pinned by a spec PAIR in test/repo-configs.spec.ts (2 000 parses, 2 001 rejects) so
+              // it cannot drift looser without failing the suite.
+              //
+              // Deliberately NOT a `.refine()` cross-checking the budget constants: this file is
+              // imported by the dashboard client, so reaching into `core/code-index-build.ts` would
+              // drag server-side build constants into the browser bundle and invert the layering
+              // (`shared/` depends on nothing server-side). The bound plus this documented
+              // arithmetic is the whole mitigation.
+              max_files: z.number().int().positive().max(2_000).default(500),
+              // BAKED INTO STORED ROWS: the line window is persisted with every chunk at build time,
+              // so changing this value requires a FULL RE-INDEX, not a migration. 50 deliberately
+              // equals `WINDOW_LINE_COUNT` because D-10 reuses that windowing vocabulary. Bounded at
+              // 500 so a config write cannot demand pathologically large chunks.
+              chunk_lines: z.number().int().positive().max(500).default(50),
+              // Retrieval breadth per question. Bounded at 50 because every hit spends prompt bytes
+              // inside the `QA_MAX_INDEX_CHARS` retrieved-context fence (D-13).
+              top_k: z.number().int().positive().max(50).default(8),
+            })
+            .default({ enabled: false, max_files: 500, chunk_lines: 50, top_k: 8 }),
         })
-        .default({ enabled: false, rate_limit_per_hour: 10 }),
+        // Zod 4 returns a `.default(literal)` value WITHOUT re-parsing it, so this literal must carry
+        // `index` too — it is the value produced whenever `qa` itself is absent from a stored config.
+        .default({
+          enabled: false,
+          rate_limit_per_hour: 10,
+          index: { enabled: false, max_files: 500, chunk_lines: 50, top_k: 8 },
+        }),
     })
     .default({
       commands: { enabled: false, bitbucket_allowed_account_ids: [], bitbucket_bot_account_id: null },
-      qa: { enabled: false, rate_limit_per_hour: 10 },
+      qa: {
+        enabled: false,
+        rate_limit_per_hour: 10,
+        index: { enabled: false, max_files: 500, chunk_lines: 50, top_k: 8 },
+      },
     }),
   // v1.2 severity/category engine + lifecycle toggle blocks (SEV-01..04, consumed by Phases 14/18/19).
   // Follows the existing uniform `{ enabled: boolean }` toggle-block shape.
@@ -250,6 +393,84 @@ export const reviewConfigSchema = z.object({
       escalate_floors: z.boolean().default(true),
     })
     .default({ incremental: false, escalate_floors: true }),
+  // Phase 26 (EVID-02): evidence quality gate config. `hard_drop` defaults off (soft gate only);
+  // `hard_drop_exempt_categories` defaults to ['security'] so security findings always post
+  // regardless of evidence quality. Array bound .max(20) mirrors the custom_rules .max(50) precedent
+  // (line 130) and prevents unbounded config accumulation (defense-in-depth, Antigravity MEDIUM).
+  evidence: z
+    .object({
+      hard_drop: z.boolean().default(false),
+      hard_drop_exempt_categories: z.array(z.string()).max(20).default(['security']),
+    })
+    .default({ hard_drop: false, hard_drop_exempt_categories: ['security'] }),
+  // Phase 28 (LRN-01): learned-rule synthesis from reject feedback. `learning.enabled` is the
+  // master toggle gating both synthesis (on-demand clustering of reject_feedback rows) and
+  // suppression (dropping findings in finalize that match active rules). `learned_rules` is the
+  // in-config rule store — each rule is synthesized from a cluster of 2+ rejections sharing the
+  // same (category, file_path). Rules lifecycle: pending → active → disabled. Default-off for
+  // NREG-01 inertness: `repoConfigSchema.parse({})` yields `learning.enabled === false` and
+  // `learning.learned_rules === []`.
+  learning: z
+    .object({
+      enabled: z.boolean().default(false),
+      learned_rules: z
+        .array(
+          z.object({
+            id: z.uuid(),
+            category: z.string(),
+            file_pattern: z.string(),
+            status: z.enum(['pending', 'active', 'disabled']),
+            source_rejection_ids: z.array(z.string()),
+            created_at: z.string(),
+          }),
+        )
+        .default([]),
+    })
+    .default({ enabled: false, learned_rules: [] }),
+  // Phase 34 (PRD-04 / PRD-05): context-enhancement feature toggles. `file_history` (FR-114)
+  // gates the per-touched-file commit-history appendix in the review prompt; `yaml_config` (§15)
+  // gates .review.yaml discovery + merge. Both default false for NREG-01 inertness — when off,
+  // zero subrequests and zero behavior change.
+  file_history: z
+    .object({
+      enabled: z.boolean().default(false),
+    })
+    .default({ enabled: false }),
+  yaml_config: z
+    .object({
+      enabled: z.boolean().default(false),
+    })
+    .default({ enabled: false }),
+  // Phase 35 (PRD-06, FR-131/FR-132, D-13): the bounded agentic-context pass. When on, a review job
+  // routes prepare → agentic_context → review and a bounded loop (6 hops max) lets the model pull
+  // extra repository context with `read_file` / `grep_repo` before the per-file review runs.
+  //
+  // Defaults OFF, DELIBERATELY AGAINST the PRD's stated default-enabled (D-13). The loop spends real
+  // money (up to 6 extra model calls per review) and real subrequests on every review, so an existing
+  // instance must not silently start making extra model calls on upgrade — NREG-01 inertness beats the
+  // PRD's default here, and the ROADMAP success criterion was amended to match (D-15).
+  //
+  // OPERATOR DATA-BOUNDARY NOTE: enabling this forwards repository files the pull request did not
+  // touch to the operator's configured LLM provider. That is a real widening of the self-hosting data
+  // boundary and the operator should understand it before opting in.
+  agentic_tools: z
+    .object({
+      enabled: z.boolean().default(false),
+    })
+    .default({ enabled: false }),
+  // Phase 30 (ANNO-01, D-01/D-06): Bitbucket Code Insights annotations toggle. This is the FIRST
+  // purely Bitbucket-only capability toggle — no GitHub equivalent (NREG-02 by exclusion: GitHub
+  // already has native inline PR comments, so this capability only makes sense for Bitbucket).
+  // It is nested under `review` rather than added as a new top-level key on `repoConfigSchema` to
+  // preserve that schema's single-top-level-key shape, a choice explicitly confirmed at the Task 1
+  // checkpoint after cross-AI review flagged the config-key nesting question rather than defaulting
+  // it silently (30-REVIEWS.md, OpenCode Concern #3). Default-off for NREG-01 inertness:
+  // `repoConfigSchema.parse({})` yields `review.bitbucket.annotations_enabled === false`.
+  bitbucket: z
+    .object({
+      annotations_enabled: z.boolean().default(false),
+    })
+    .default({ annotations_enabled: false }),
 });
 
 export const repoConfigSchema = z.object({
@@ -283,10 +504,17 @@ export const repoConfigSchema = z.object({
     // two documented always-on v1.2 exceptions — `severity_engine.enabled` and `dedup.enabled` —
     // deliberately default `true` (D-01/D-02, FILT-03), so this is no longer an "all-off" literal.
     walkthrough: { enabled: false, sequence_diagram: { enabled: true } },
-    passes: { security: { enabled: false }, critic: { enabled: false }, ensemble: { runs: 1, temperature: 0.7 } },
+    passes: { security: { enabled: false, cross_file: false }, critic: { enabled: false }, ensemble: { runs: 1, temperature: 0.7 } },
     interactive: {
       commands: { enabled: false, bitbucket_allowed_account_ids: [], bitbucket_bot_account_id: null },
-      qa: { enabled: false, rate_limit_per_hour: 10 },
+      qa: {
+        enabled: false,
+        rate_limit_per_hour: 10,
+        // QA-IDX-01 index block, identical to the two `interactive`-level literals above. A divergence
+        // between the three is a silent config bug that only surfaces for repositories whose parent
+        // key happens to be absent from `parsed_json`.
+        index: { enabled: false, max_files: 500, chunk_lines: 50, top_k: 8 },
+      },
     },
     severity_engine: { enabled: true },
     dedup: { enabled: true },
@@ -294,6 +522,17 @@ export const repoConfigSchema = z.object({
     category_confidence: {},
     threads: { verify_fixes: false, auto_resolve: false },
     rounds: { incremental: false, escalate_floors: true },
+    evidence: { hard_drop: false, hard_drop_exempt_categories: ['security'] },
+    learning: { enabled: false, learned_rules: [] },
+    bitbucket: { annotations_enabled: false },
+    // Phase 34 (PRD-04 / PRD-05): mirror the toggle blocks in the inline literal default too, so
+    // repoConfigSchema.parse({}) yields each at its documented default regardless of Zod default
+    // short-circuit semantics for the nested `review` object (same reasoning as :409-412 above).
+    file_history: { enabled: false },
+    yaml_config: { enabled: false },
+    // Phase 35 (PRD-06, D-13): mirror the agentic_tools toggle here too. Setting only the toggle
+    // block above and not this literal is the classic silent bug in this file — see :484-488.
+    agentic_tools: { enabled: false },
   }),
   model: z
     .object({
@@ -333,7 +572,10 @@ export const reviewJobMessageSchema = z.object({
   // WIRE contract widened with durable auxiliary phases. The INTERNAL ReviewJobRunResult.phase union
   // and dispatch switch are widened only when each phase's worker lands; accepting the values here
   // lets fresh Workflow handoffs carry their persisted cursor without another contract edit.
-  phase: z.enum(['prepare', 'review', 'finalize', 'critic', 'verify_fixes', 'walkthrough_enrichment']).optional(),
+  // Phase 35 (PRD-06, D-09) adds 'agentic_context'. This enum is a RUNTIME validation, NOT a `tsc`
+  // site: a queue message naming an unknown phase is DROPPED by design in src/server/index.ts, so
+  // omitting the value here degrades silently rather than breaking the build.
+  phase: z.enum(['prepare', 'review', 'finalize', 'critic', 'verify_fixes', 'walkthrough_enrichment', 'cross_file_security', 'agentic_context']).optional(),
   // Optional multi-pass routing fields (D-07). Kept `.optional()` (no default) so every
   // pre-widening producer/fixture — and ReviewJobMessage = z.input<...> — keeps compiling.
   kind: z.enum(['review', 'qa', 'command']).optional(),
@@ -745,7 +987,7 @@ export type JobStep = z.infer<typeof jobStepSchema>;
 // D-07 pass value-set, locked contract-first (closes the file_reviews.pass gap so Phase 10 needs
 // no cross-layer contract edit). 'main' is today's single review pass; 'security' is Phase 10's
 // dedicated pass. Widen this enum when a new pass is introduced.
-export const fileReviewPassSchema = z.enum(['main', 'security']);
+export const fileReviewPassSchema = z.enum(['main', 'security', 'cross_file_security']);
 export type FileReviewPass = z.infer<typeof fileReviewPassSchema>;
 
 // Canonical (file_path, pass) tuple identity for the multi-pass engine. The review-consensus HIGH
@@ -915,6 +1157,108 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
       path: z.string(),
       line: z.number().nullable().optional(),
       title: z.string().max(100),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // Phase 21 (EVID-03 / D-01..D-04): AGGREGATE replacement for per-finding `evidence_missing` events.
+  // One `evidence_missing_summary` event per (file, pass) unit replaces N per-finding `evidence_missing`
+  // events, preventing a non-compliant model's flood of evidence-missing findings from evicting other
+  // telemetry from the 500-event ring buffer.
+  //
+  // The legacy `evidence_missing` per-finding variant (lines 907-920 above) is kept forever — old
+  // persisted events still parse; the two `stage` literals are distinct and coexist in the union.
+  //
+  // Counts are camelCase per D-03 (absentCount, notInHunkCount).
+  // Sample entry line is nullable and carries the pre-orphan-remap original line the model cited per D-02.
+  //   Implemented by Phase 22 (EVID-04).
+  // Sample preserves model emission order per D-07, NOT grouped by reason.
+  // Sample entries carry `reason` per D-04 for EVID-02 consumption.
+  // Privacy-bounded: titles route through redactFindingTitle (max 100 char marker); never
+  //   body/diff/existingCode/codeSuggestion.
+  z
+    .object({
+      stage: z.literal('evidence_missing_summary'),
+      file: z.string(),
+      pass: fileReviewPassSchema,
+      absentCount: z.number().int().min(0),
+      notInHunkCount: z.number().int().min(0),
+      sample: z.array(
+        z.object({
+          path: z.string(),
+          line: z.number().nullable().optional(),
+          title: z.string().max(100),
+          reason: z.enum(['absent', 'not_in_hunk']),
+        }),
+      ).max(20),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // Phase 26 (EVID-02): evidence_hard_dropped audit event. AGGREGATE — one event per (file, pass)
+  // when EVID-02 hard-drop removed >=1 finding from the finalize pass output. Follows the
+  // `evidence_missing_summary` precedent (lines 921-963) for the per-(file, pass) aggregate shape.
+  // droppedCount reflects the FULL total, NOT the capped sample length. Sample bounded to 20 entries.
+  // Design: each sample entry carries a `reason` ('absent' | 'not_in_hunk') per D-06; titles route
+  // through redactFindingTitle at production time (AUD-01); never body/diff/existingCode/codeSuggestion.
+  // Privacy bounded: same evidence_missing_summary posture.
+  z
+    .object({
+      stage: z.literal('evidence_hard_dropped'),
+      file: z.string(),
+      pass: fileReviewPassSchema,
+      droppedCount: z.number().int().min(0),
+      sample: z.array(
+        z.object({
+          path: z.string(),
+          line: z.number().nullable().optional(),
+          title: z.string().max(100),
+          reason: z.enum(['absent', 'not_in_hunk']),
+        }),
+      ).max(20),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // Phase 28 (LRN-01): learned_rule_suppressed audit event. AGGREGATE — one event per (file, pass)
+  // when learned-rule suppression removed >=1 finding from the finalize pass output. Follows the
+  // `evidence_hard_dropped` precedent (lines 1004-1027) for the per-(file, pass) aggregate shape.
+  // droppedCount reflects the FULL total, NOT the capped sample length. Sample bounded to 20 entries.
+  // Each sample entry carries `matched_rule` (the rule ID, string) per D-13; titles route through
+  // redactFindingTitle at production time (AUD-01); never body/diff/existingCode/codeSuggestion.
+  // Privacy bounded: same evidence_hard_dropped posture.
+  z
+    .object({
+      stage: z.literal('learned_rule_suppressed'),
+      file: z.string(),
+      pass: fileReviewPassSchema,
+      droppedCount: z.number().int().min(0),
+      sample: z.array(
+        z.object({
+          path: z.string(),
+          line: z.number().nullable().optional(),
+          title: z.string().max(100),
+          matched_rule: z.string(),
+        }),
+      ).max(20),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // Phase 33 (PRD-02 / FR-153, D-08): suggestion_dropped audit event. AGGREGATE — one event per
+  // (file, pass) when the FR-153 drop clause removed >=1 finding from the parse output (non-empty
+  // suggestion + empty body). droppedCount reflects the FULL total, NOT the capped sample length.
+  // Sample identifiers admit ONLY { path, line, title } (T-13-03-03) and titles route through
+  // redactFindingTitle at production time (AUD-01); never body/existingCode/codeSuggestion.
+  z
+    .object({
+      stage: z.literal('suggestion_dropped'),
+      file: z.string(),
+      pass: fileReviewPassSchema,
+      droppedCount: z.number().int().min(0),
+      sample: z.array(
+        z.object({
+          path: z.string(),
+          line: z.number().nullable().optional(),
+          title: z.string().max(100),
+        }),
+      ).max(20),
       timestamp: dateStringSchema,
     })
     .passthrough(),
@@ -1133,6 +1477,177 @@ export const jobAuditEventSchema = z.discriminatedUnion('stage', [
       timestamp: dateStringSchema,
     })
     .passthrough(),
+  // SEC-XDIFF-01: cross-file security reasoning pass audit event. Tracks completion status,
+  // finding count, and how many files were included in the whole-diff context.
+  z
+    .object({
+      stage: z.literal('cross_file_security'),
+      status: z.enum(['completed', 'skipped', 'failed']),
+      reason: z.string().optional(),
+      finding_count: z.number().int().nonnegative().optional(),
+      files_included: z.number().int().nonnegative().optional(),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // Phase 35 (PRD-06 / FR-131 / FR-132, D-05/D-09/D-11/D-14): the bounded agentic-context pass.
+  // ONE aggregate event per NON-SILENT exit from `runAgenticContextPhase`, shaped like the
+  // `cross_file_security` sibling above because it is the same kind of thing: a single whole-phase
+  // advisory pass with a status, an optional machine-token reason and optional counts.
+  //
+  // The toggle-off branch emits NOTHING AT ALL. NREG-01 promises that a default-config instance
+  // behaves byte-identically to the previous release, and an audit row is observable behaviour — so
+  // `toggle_off` exists in the reason vocabulary for completeness and is deliberately never written.
+  //
+  // COUNTS AND CLOSED MACHINE TOKENS ONLY (T-35-21). This is the counts-not-content rule the
+  // `inline_comment_skipped` WR-06 note below reasons through, and it binds harder here: the content
+  // this phase gathers is untrusted, attacker-controlled repository source, and the audit trail is
+  // operator-facing and durable. No file path, grep query, match fragment or file body may ever
+  // reach this event, and any error-derived string is routed through `redactErrorMessage`
+  // (core/audit-redact.ts) before it becomes a `reason`.
+  //
+  // What each field diagnoses — these are the four failure modes 35-RESEARCH.md predicted, made
+  // visible without a debugger, and every one is read by a 35-AI-SPEC.md §7 metric or alert:
+  //   status          'partial' = a D-11 fail-open that still gathered something; 'failed' = a hard
+  //                   error that yielded nothing. NEITHER is a job failure — the phase is advisory.
+  //   reason          the loop's own stop reason, a skip reason, or a redacted error token.
+  //                   `unparseable_action` clustered on ONE model id means that model cannot drive
+  //                   the text protocol.
+  //   hops_used       pinned at the cap across many jobs means the model is burning, not deciding.
+  //   files_read      the tool-choice mix.
+  //   greps_run
+  //   bytes_gathered  near zero with two or more hops means the operator paid for nothing (FM-5).
+  //   truncated       the 50,000-byte total cap was hit — the loop is over-fetching.
+  //   grep_supported  the ENTIRE D-05 degradation signal. `false` on Bitbucket is the documented
+  //                   expected steady state and must NOT alert; `false` on GitHub is a real signal
+  //                   (rate limit or token problem).
+  //   budget_headroom `tracker.remainingSafeBudget()` captured at the audit write. The only direct
+  //                   evidence that the phase tail (KV put, audit append, hand-off) still had room;
+  //                   a headroom trending to 0 is the early warning for the subrequest-exhaustion
+  //                   class of failure D-11 exists to prevent.
+  //
+  // Every field except `status` is OPTIONAL, so a phase that exits early emits a truthful subset
+  // instead of fabricating zeros. The viewer omits an absent line entirely and renders a PRESENT
+  // zero — "the phase never got that far" and "it did, and the answer was zero" are deliberately
+  // different statements, and conflating them makes the zero-yield alert unreadable.
+  z
+    .object({
+      stage: z.literal('agentic_context'),
+      status: z.enum(['completed', 'partial', 'skipped', 'failed']),
+      // Bounded like the other reason strings in this union. The producer only ever writes a token
+      // from the closed AGENTIC_CONTEXT_AUDIT_REASONS vocabulary (core/audit.ts); this cap is the
+      // schema's second line of defence, not the first.
+      reason: z.string().max(200).optional(),
+      // MIRRORS `AGENTIC_MAX_HOPS` (core/agentic-tools.ts:84). `src/shared/` must not import from
+      // `src/server/`, so the bound is duplicated rather than imported. IF THAT CONSTANT IS EVER
+      // RAISED, RAISE THIS MAX IN THE SAME COMMIT: otherwise every event from a longer run fails
+      // validation and is fail-soft dropped on the job-detail read path — i.e. the diagnostic
+      // vanishes precisely when the loop got more expensive, which is the opposite of the point.
+      hops_used: z.number().int().min(0).max(6).optional(),
+      files_read: z.number().int().nonnegative().optional(),
+      greps_run: z.number().int().nonnegative().optional(),
+      bytes_gathered: z.number().int().nonnegative().optional(),
+      truncated: z.boolean().optional(),
+      grep_supported: z.boolean().optional(),
+      budget_headroom: z.number().int().nonnegative().optional(),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // Phase 33 (PRD-01 / FR-031, D-03/D-04): inline_comment_skipped audit event. AGGREGATE — one event
+  // per review round when inline comments were skipped (422 or budget exhaustion) at posting.
+  // `count` is the FULL total; the sample is capped at 20 (INLINE_COMMENT_SKIPPED_SAMPLE_CAP).
+  // Sample identifiers admit ONLY { path, line, position, commentId } (T-13-03-03) —
+  // never body/title/existingCode/codeSuggestion.
+  //
+  // WR-01: `line` (head-side line number) and `position` (diff offset) are SEPARATE fields because
+  // they are not the same quantity and are not comparable across providers (G-28-3) — Bitbucket
+  // fills `line`, GitHub fills `position`. Collapsing them made the viewer render a fabricated line
+  // number for every GitHub skip. `position` is optional so pre-existing persisted rows still parse.
+  //
+  // WR-06: `title` is GONE, replaced by `commentId` (the persisted `review_comments.id`). The
+  // sample used to carry a title routed through `redactFindingTitle`, which maps EVERY non-empty
+  // title to one fixed marker — so the field was inert and an operator could not join a skipped
+  // entry back to a finding. A digest of the title was rejected deliberately: `redactFindingTitle`'s
+  // own contract forbids retaining a "source-derived prefix, digest, length, or other title
+  // content", and formulaic finding titles are dictionary-attackable over a small plausible-title
+  // space. The row id carries ZERO title content, so it restores operator value at no privacy cost.
+  // `commentId` is optional so pre-existing persisted audit rows (which have `title` instead) still
+  // parse; their now-unknown `title` key is simply stripped by this nested object.
+  z
+    .object({
+      stage: z.literal('inline_comment_skipped'),
+      // IN-01: `.min(0)` mirrors the sibling suggestion_dropped.droppedCount bound — a negative
+      // skip count is never producible and must not round-trip through the audit column.
+      count: z.number().int().min(0),
+      sample: z.array(
+        z.object({
+          path: z.string(),
+          line: z.number().nullable().optional(),
+          position: z.number().nullable().optional(),
+          commentId: z.string().max(64).nullable().optional(),
+        }),
+      ).max(20),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // Phase 34 (PRD-05, D-12): .review.yaml parse/validation failure → DB config fallback + this
+  // audit event. `reason` carries the parse/validation error message, bounded to 500 chars (the
+  // 34-03 builder slices to 500). The review always proceeds — the YAML file is advisory.
+  z
+    .object({
+      stage: z.literal('yaml_config_parse_failed'),
+      reason: z.string().min(1).max(500),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // Phase 34 WR-03 / WR-07 (34-REVIEW): a `.review.yaml` was found, parsed and MERGED. The file is
+  // read from the PR BASE BRANCH (quick-k31 reversed the head half of D-13), so its content is
+  // MAINTAINER-REVIEWED — the head-controlled-file premise this event was originally written
+  // against no longer holds. The event still earns its place because the D-09 merge is a WHOLESALE
+  // top-level replacement: a two-line file declaring `review:` resets EVERY operator-configured
+  // sub-key to its Zod default (passes.security.enabled → false, evidence.hard_drop → false,
+  // learning.learned_rules → [], max_files → 150, …) and that reset is then persisted to
+  // jobs.config_snapshot, where every later phase observes it. Nothing in the audit trail said so.
+  // `replaced_keys` names the top-level keys the YAML overrode, so the reset is OBSERVABLE after
+  // the fact.
+  //
+  // `ignored_keys` covers WR-07: `repoConfigSchema` is non-strict, so a typo'd top-level key
+  // (`reveiw:`) is silently stripped by Zod, the merge becomes an identity, and the operator gets
+  // NO signal that their file did nothing. Naming the stripped keys here is that signal.
+  //
+  // This event is NOT a failure — it is emitted on the success path. Bounds mirror the other
+  // sampled arms: at most 20 key names, each at most 64 chars.
+  z
+    .object({
+      stage: z.literal('yaml_config_applied'),
+      source: z.string().min(1).max(64),
+      replaced_keys: z.array(z.string().max(64)).max(20),
+      ignored_keys: z.array(z.string().max(64)).max(20),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
+  // quick-k31 (WR-03): the reviewed diff CHANGES `.review.yaml` / `.review.yml`, but config is read
+  // from the PR base branch, so that change has NO effect on THIS review — it takes effect once the
+  // PR is merged. Without this event a contributor who edits the config in their PR sees a review
+  // that ignored it and no explanation anywhere; with it, the audit trail says so.
+  //
+  // Emitted whether or not a base-branch config was FOUND: "a contributor adding `.review.yaml` for
+  // the first time" is exactly the case where the signal matters most, and that case has no base
+  // config by definition. Hence `base_sha` is `.max(64)` and NOT `.min(1)` — the fail-closed
+  // no-usable-base-SHA path carries an empty string.
+  //
+  // Detection is DIFF-DERIVED (the already-parsed changed-file list), so the event costs no extra
+  // provider call and never fetches the head file. `path` is bounded like every other untrusted
+  // string in this union; only the matched literal `.review.yaml` / `.review.yml` is ever recorded,
+  // and no file CONTENT is recorded at all (the WR-02 rule holds).
+  z
+    .object({
+      stage: z.literal('yaml_config_head_ignored'),
+      path: z.string().min(1).max(64),
+      base_sha: z.string().max(64),
+      head_sha: z.string().max(64),
+      timestamp: dateStringSchema,
+    })
+    .passthrough(),
 ]);
 export type JobAuditEvent = z.infer<typeof jobAuditEventSchema>;
 
@@ -1282,6 +1797,9 @@ export function normalizeRepoModelConfig(model: RepoConfig['model']): RepoConfig
 }
 
 export function normalizeRepoConfig(config: RepoConfig): RepoConfig {
+  // NOTE: This function does NOT inject Zod defaults for evidence or any other nested config keys.
+  // That responsibility is in config.ts's loadRepoConfig (which calls repoConfigSchema.parse() after
+  // model override) to ensure DB-loaded configs always get defaults for keys added post-storage.
   return {
     ...config,
     model: normalizeRepoModelConfig(config.model),
@@ -1385,6 +1903,23 @@ export const vcsCredentialStoreSchema = z
   })
   .strict();
 export type VcsCredentialStoreInput = z.infer<typeof vcsCredentialStoreSchema>;
+
+// --- VCS workspace-level bot-credential contracts (Phase 31, WS-01, D-01/D-02) ---
+// Mirrors vcsCredentialStatusSchema exactly, minus repoSlug -- this is a workspace-scoped
+// (not per-repo) credential. Redacted READ DTO -- never carries secrets/ciphertext (D-10 mirrored).
+export const vcsWorkspaceCredentialStatusSchema = z.object({
+  vcsProvider: z.literal('bitbucket'),
+  workspace: z.string(),
+  hasToken: z.boolean(),
+  hasWebhookSecret: z.boolean(),
+  tokenExpiresAt: dateStringSchema.nullable(),
+  label: z.string().nullable(),
+  status: credentialStatusSchema,
+  createdAt: dateStringSchema,
+  updatedAt: dateStringSchema,
+});
+export type VcsWorkspaceCredentialStatus = z.infer<typeof vcsWorkspaceCredentialStatusSchema>;
+
 export type StatsPayload = z.infer<typeof statsSchema>;
 
 export const defaultRepoConfig = repoConfigSchema.parse({});

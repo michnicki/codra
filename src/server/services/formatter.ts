@@ -115,9 +115,33 @@ export class FormatterService {
       body = body.slice(firstLine.length).replace(/^[\n\r]+/, '');
     }
 
+    // Phase 27 (SEC-XDIFF-01): render cross-reference links for cross-file findings.
+    // When a finding has cross_references, append an "Also affects:" line after the body
+    // with links to the referenced files. Format: `Also affects: \`path1\` (line N), \`path2\``
+    // When no cross_references exist (per-file findings), no extra line — NREG-01.
+    const crossRefLine = this.formatCrossReferences(comment.cross_references);
+
     // Escape the title only (defense-in-depth) — body is intentionally left as-is (sanitized
     // Markdown at every sink; escaping it would break rendering).
-    return `${this.severityIcon(comment.severity, options)} <strong>${escapeHtml(comment.title)}</strong>\n\n${body}`;
+    return `${this.severityIcon(comment.severity, options)} <strong>${escapeHtml(comment.title)}</strong>\n\n${body}${crossRefLine}`;
+  }
+
+  /**
+   * Phase 27 (SEC-XDIFF-01): render cross-reference links for a finding. Returns a markdown
+   * string starting with a newline (to separate from the body), or empty string when no
+   * cross_references exist. Format: `\n\nAlso affects: \`path1\` (line N), \`path2\``
+   */
+  private formatCrossReferences(
+    crossReferences?: Array<{ path: string; line?: number; relationship: string }>,
+  ): string {
+    if (!crossReferences || crossReferences.length === 0) return '';
+    const refs = crossReferences
+      .map((ref) => {
+        const lineSuffix = ref.line != null ? ` (line ${ref.line})` : '';
+        return `\`${ref.path}\`${lineSuffix}`;
+      })
+      .join(', ');
+    return `\n\nAlso affects: ${refs}`;
   }
 
   summarizeVerdict(comments: ParsedReviewComment[], hasFailures: boolean) {
@@ -322,6 +346,19 @@ OpenCodra can also answer questions or update the PR. Try commenting "@${botUser
           minutes: number;
         } | null;
       };
+      // Phase 27 (SEC-XDIFF-01): optional cross-file security section. When present, the
+      // walkthrough renders a dedicated section after the per-file coverage table. Omitted when
+      // absent — NREG-01 (default cross_file: false produces zero difference).
+      crossFileSection?: {
+        severityCounts: Record<ParsedReviewComment['severity'], number>;
+        filesAnalyzed: number;
+        findings: Array<{
+          path: string;
+          title: string;
+          severity: ParsedReviewComment['severity'];
+          crossReferences: Array<{ path: string; line?: number; relationship: string }>;
+        }>;
+      };
     },
     options?: FormatterOptions,
   ): string {
@@ -452,6 +489,32 @@ OpenCodra can also answer questions or update the PR. Try commenting "@${botUser
       }
 
       sections.push(`_${fileWord}_`);
+
+      // Phase 27 (SEC-XDIFF-01): render the optional "Cross-file Security" section. This section
+      // appears AFTER the per-file coverage table and BEFORE the assessment block. It includes
+      // per-severity counts, a file-coverage indicator, and a list of findings with cross-reference
+      // links. Omitted when no cross-file findings exist — NREG-01.
+      if (input.crossFileSection && input.crossFileSection.findings.length > 0) {
+        const cfs = input.crossFileSection;
+        const cfsCountsLine = reviewSeverities
+          .filter((sev) => (cfs.severityCounts?.[sev] ?? 0) > 0)
+          .map((sev) => `${this.severityIcon(sev, { provider: 'bitbucket' })} ×${cfs.severityCounts[sev]}`)
+          .join('  ');
+        const cfsFileWord = `${cfs.filesAnalyzed} file${cfs.filesAnalyzed === 1 ? '' : 's'} analyzed`;
+        sections.push(`**Cross-file Security** · ${cfsFileWord}`);
+        if (cfsCountsLine) sections.push(cfsCountsLine);
+        const findingLines = cfs.findings.map((finding) => {
+          const refs = finding.crossReferences
+            .map((ref) => {
+              const lineSuffix = ref.line != null ? ` (line ${ref.line})` : '';
+              return `\`${ref.path}\`${lineSuffix}`;
+            })
+            .join(', ');
+          const refSuffix = refs ? ` · Also affects: ${refs}` : '';
+          return `- ${this.severityIcon(finding.severity, { provider: 'bitbucket' })} **${escapeHtml(finding.title)}** (\`${finding.path}\`${refSuffix})`;
+        });
+        sections.push(findingLines.join('\n'));
+      }
 
       // Bottom assessment block (D-15) — independent of the row counter so the bottom line always
       // lands. Empty assessment means nothing is appended.

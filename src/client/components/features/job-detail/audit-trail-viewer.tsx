@@ -13,17 +13,45 @@ interface AuditTrailViewerProps {
 // `ensemble` (one per `ensemble.voted` event) and `walkthrough` (one per `walkthrough.enrichment`
 // event) — both are synthetic display stages that wrap a single bounded aggregate.
 const STAGE_LABELS: Record<AuditStageGroup['stage'], string> = {
+  // WR-03: these two schema stages previously had no STAGE_ORDER entry and were never rendered.
+  yaml_config_parse_failed: 'Config parse failed',
+  // Phase 34 WR-03/WR-07: which top-level config keys a repo's .review.yaml replaced (a WHOLESALE
+  // D-09 replacement, read from the maintainer-reviewed base branch) and which it declared but the
+  // schema ignored.
+  yaml_config_applied: 'Repo config applied',
+  // quick-k31 (WR-03): the PR itself edits .review.yaml, but config comes from the base branch —
+  // the edit is inert for this review and takes effect once merged.
+  yaml_config_head_ignored: 'Repo config change ignored',
   file_skipped: 'Files skipped',
+  // Phase 35 (PRD-06, D-09): the bounded agentic-context pass. Sentence case, matching every
+  // sibling label ('Cross-file security', 'Repo config applied', 'Evidence missing') — NOT title
+  // case, and not 'Agentic tool loop' / 'On-demand context': "loop" is an implementation detail the
+  // operator cannot act on, and the `agentic` wording keeps the `agentic_tools` config-key
+  // vocabulary the operator reads in `.review.yaml` and in the docs.
+  //
+  // This entry is STRUCTURALLY ATOMIC with the STAGE_ORDER entry in audit-grouping.ts: STAGE_LABELS
+  // is a `Record<AuditStageGroup['stage'], string>`, so adding the stage literal without this line
+  // fails `tsc`. It ships in the same commit for that reason.
+  agentic_context: 'Agentic context',
   drafted: 'Drafted',
   severity_adjusted: 'Severity adjusted',
   filtered: 'Filtered',
   deduped: 'Deduped',
   evidence_missing: 'Evidence missing',
+  learned_rule_suppressed: 'Learned rule suppressed',
+  // Phase 33 (PRD-02 / FR-153, D-08): FR-153 parse-drop aggregate event.
+  suggestion_dropped: 'Suggestions dropped',
   rounds: 'Rounds',
   threads: 'Threads',
   critic: 'Critic',
   ensemble: 'Ensemble',
   walkthrough: 'Walkthrough enrichment',
+  cross_file_security: 'Cross-file security',
+  // Phase 33 (PRD-01 / FR-031, D-03/D-04): posting-boundary aggregate event.
+  inline_comment_skipped: 'Inline comments skipped',
+  // WR-03 catch-all: any schema stage without a dedicated display group renders here instead of
+  // being silently discarded by groupAuditByStage's STAGE_ORDER filter.
+  other: 'Other',
 };
 
 // A count pill mirroring the job-findings-list / critic-panel count-badge idiom.
@@ -38,21 +66,33 @@ function CountBadge({ count }: { count: number }) {
 // A single producer-bounded sample identifier: { path, line?, title? }. Paths render mono + break-all
 // so a long file path wraps within the row instead of stretching the viewer (E6 long-text backstop).
 // All fields are plain React text nodes — auto-escaped, never dangerouslySetInnerHTML (T-16-06-01).
+// WR-01: `position` is a DIFF OFFSET, not a head-side line number, and the two are not
+// interchangeable (G-28-3). It renders as ` @pos N` — never as `:N` — so a GitHub skip is never
+// read as a line number the finding was not on. `line` still renders as `:N`.
 function SampleIdentifier({
   path,
   line,
+  position,
   title,
+  commentId,
 }: {
   path: string;
   line?: number | null;
+  position?: number | null;
   title?: string | null;
+  // WR-06: the persisted review_comments.id, rendered as `#id` so an operator can join a skipped
+  // entry straight back to its row. Only the inline_comment_skipped sample supplies it; the other
+  // aggregate samples still carry a (redacted) title.
+  commentId?: string | null;
 }) {
   return (
     <div className="text-xs leading-relaxed">
       <span className="font-mono break-all text-foreground/90">
         {path}
         {line != null ? `:${line}` : ''}
+        {line == null && position != null ? ` @pos ${position}` : ''}
       </span>
+      {commentId ? <span className="font-mono text-muted-foreground"> #{commentId}</span> : null}
       {title ? <span className="text-muted-foreground"> — {title}</span> : null}
     </div>
   );
@@ -167,6 +207,127 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
         <li className="rounded-md border border-border/40 bg-card/40 p-3">
           <MetricLine label="reason" value={event.reason} />
           <SampleIdentifier path={event.path} line={event.line} title={event.title} />
+        </li>
+      );
+    // Phase 24: evidence_missing_summary aggregate event — the operator sees file+pass as identifier,
+    // absentCount+notInHunkCount as metric lines, and up to 20 sample entries with path:line, title,
+    // and reason. No model_line_cap data is surfaced per D-03.
+    case 'evidence_missing_summary':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="file" value={event.file} />
+          <MetricLine label="pass" value={event.pass} />
+          <MetricLine label="absent" value={String(event.absentCount)} />
+          <MetricLine label="not in hunk" value={String(event.notInHunkCount)} />
+          {event.sample.length > 0 && (
+            <ul className="mt-2 flex flex-col gap-1.5 border-t border-border/30 pt-2">
+              {event.sample.map((s, i) => (
+                <li key={i}>
+                  <SampleIdentifier path={s.path} line={s.line} title={s.title} />
+                  <div className="text-[10px] text-muted-foreground/70 font-mono">{s.reason}</div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </li>
+      );
+    // Phase 26 (EVID-02): evidence_hard_dropped aggregate event — the operator sees file+pass as
+    // identifier, droppedCount as metric line, and up to 20 sample entries with path:line, title,
+    // and reason tag. Follows the evidence_missing_summary pattern exactly.
+    case 'evidence_hard_dropped':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="file" value={event.file} />
+          <MetricLine label="pass" value={event.pass} />
+          <MetricLine label="dropped" value={String(event.droppedCount)} />
+          {event.sample.length > 0 && (
+            <ul className="mt-2 flex flex-col gap-1.5 border-t border-border/30 pt-2">
+              {event.sample.map((s, i) => (
+                <li key={i}>
+                  <SampleIdentifier path={s.path} line={s.line} title={s.title} />
+                  <div className="text-[10px] text-muted-foreground/70 font-mono">{s.reason}</div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </li>
+      );
+    // Phase 28 (LRN-01) / gap G-28-4: learned_rule_suppressed aggregate event — one event per
+    // (file, pass) when learned-rule suppression removed >=1 finding in finalize. `droppedCount` is
+    // the FULL total, NOT the (max-20) sample length. Mirrors the evidence_hard_dropped row layout,
+    // but this event lands in its OWN 'Learned rule suppressed' group (a different gate — see the
+    // normalizer's Phase 28 note), and each sample names the matched rule id rather than a reason
+    // tag. The rule id renders IN FULL (never shortOpaqueRef): it is the key the operator uses to
+    // find the rule in the Learned Rules panel, so `break-all` wraps it inside the row instead.
+    case 'learned_rule_suppressed':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="file" value={event.file} />
+          <MetricLine label="pass" value={event.pass} />
+          <MetricLine label="suppressed" value={String(event.droppedCount)} />
+          {event.sample.length > 0 && (
+            <ul className="mt-2 flex flex-col gap-1.5 border-t border-border/30 pt-2">
+              {event.sample.map((s, i) => (
+                <li key={i}>
+                  <SampleIdentifier path={s.path} line={s.line} title={s.title} />
+                  <div className="text-[10px] text-muted-foreground/70 font-mono break-all">
+                    rule {s.matched_rule}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </li>
+      );
+    // Phase 33 (PRD-02 / FR-153, D-08): suggestion_dropped aggregate event — one event per
+    // (file, pass) when the FR-153 drop clause removed >=1 finding from the parse output.
+    // `droppedCount` is the FULL total, NOT the (max-20) sample length. Mirrors the
+    // learned_rule_suppressed row layout with a { path, line, title } sample (T-13-03-03
+    // identifiers only — titles already redacted at build time, AUD-01).
+    case 'suggestion_dropped':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="file" value={event.file} />
+          <MetricLine label="pass" value={event.pass} />
+          <MetricLine label="dropped" value={String(event.droppedCount)} />
+          {event.sample.length > 0 && (
+            <ul className="mt-2 flex flex-col gap-1.5 border-t border-border/30 pt-2">
+              {event.sample.map((s, i) => (
+                <li key={i}>
+                  <SampleIdentifier path={s.path} line={s.line} title={s.title} />
+                </li>
+              ))}
+            </ul>
+          )}
+        </li>
+      );
+    // Phase 33 (PRD-01 / FR-031, D-03/D-04): inline_comment_skipped aggregate event — one event
+    // per review round when inline comments were skipped (per-comment 422, budget exhaustion, or
+    // no usable anchor) at posting. `count` is the FULL total, NOT the (max-20) sample length.
+    // Mirrors the learned_rule_suppressed row layout but reports a plain count +
+    // { path, line, position, commentId } sample (T-13-03-03 identifiers only). WR-01: `position`
+    // is passed through separately so a GitHub diff offset is never rendered as a head-side line
+    // number. WR-06: the sample carries the persisted `review_comments.id` instead of a title —
+    // the old title was always the fixed `[title-redacted]` marker, so it identified nothing. The
+    // id is what an operator joins on: SELECT * FROM review_comments WHERE id = <commentId>.
+    case 'inline_comment_skipped':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="skipped" value={String(event.count)} />
+          {event.sample.length > 0 && (
+            <ul className="mt-2 flex flex-col gap-1.5 border-t border-border/30 pt-2">
+              {event.sample.map((s, i) => (
+                <li key={i}>
+                  <SampleIdentifier
+                    path={s.path}
+                    line={s.line}
+                    position={s.position}
+                    commentId={s.commentId}
+                  />
+                </li>
+              ))}
+            </ul>
+          )}
         </li>
       );
     // Phase 18 RND-01..05: every `rounds.*` sub-variant lands inside the normalized `Rounds`
@@ -322,9 +483,143 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
           {event.groupCount != null ? <MetricLine label="groups" value={String(event.groupCount)} /> : null}
         </li>
       );
-    default:
-      // drafted is handled by DraftedGroup; other variants are exhaustively handled above.
-      return null;
+    // WR-03: both variants existed in the schema but had no STAGE_ORDER entry, so
+    // `groupAuditByStage` discarded them and the viewer never rendered a row for either.
+    case 'cross_file_security':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="status" value={event.status} />
+          {event.reason ? <MetricLine label="reason" value={event.reason} /> : null}
+          {event.finding_count != null ? (
+            <MetricLine label="findings" value={String(event.finding_count)} />
+          ) : null}
+          {event.files_included != null ? (
+            <MetricLine label="files" value={String(event.files_included)} />
+          ) : null}
+        </li>
+      );
+    // Phase 35 (PRD-06 / FR-131, D-05/D-11): the bounded agentic-context pass. ONE aggregate row per
+    // non-silent exit, and the ONLY surface that shows this event — so an unrendered field is an
+    // invisible field. Row shell copied verbatim from the `cross_file_security` case above, its
+    // closest structural sibling (a whole-phase aggregate with status + optional reason + optional
+    // counts), so the row spaces and colours byte-identically in a vertically-scanned list.
+    //
+    // THE PRESENCE GATES BELOW ARE `!= null` / `!== undefined`, NEVER TRUTHINESS. This is the
+    // highest-value rule on this surface. `hops_used: 0`, `files_read: 0`, `greps_run: 0`,
+    // `bytes_gathered: 0`, `budget_headroom: 0`, `truncated: false` and `grep_supported: false` are
+    // all falsy AND all diagnostic: 35-AI-SPEC.md §7 samples `bytes_gathered == 0 && hops_used >= 2`
+    // at 100% (the "paid for nothing" shape), `grep_supported: false` is the entire D-05 degradation
+    // signal, and `budget_headroom: 0` is the `< 2` alert firing at its worst value. A truthy gate
+    // deletes the single most diagnostic reading from the only surface that shows it AND renders a
+    // stray literal `0` text node in its place. An ABSENT field omits its line entirely, with no
+    // placeholder — "the phase never got that far" is a different statement from zero, and
+    // conflating them makes the zero-yield alert unreadable.
+    //
+    // DELIBERATELY ACHROMATIC. Each of the following is a prohibition, not an omission — every one
+    // would actively mislead an operator:
+    //   - `status` is NOT colour-mapped. `failed` here means the loop yielded nothing and the job
+    //     proceeded anyway (D-11 fail-open); it is NOT a job failure, and rendering it in a
+    //     destructive token or with an icon tells the operator their review broke when it did not.
+    //   - `grep_supported: false` is NOT badged, coloured, or reworded to unsupported/unavailable/
+    //     error/missing. On Bitbucket it is the documented expected steady state (§7: must not
+    //     alert); on GitHub it is a real signal. This row cannot tell which provider the job ran on,
+    //     so any failure styling is wrong roughly half the time.
+    //   - The trail's warning tokens are NOT reused here: they belong to the truncation banner
+    //     below, and reusing them inside a row reads as a second trail-level warning. Token
+    //     utilities only, no inline style, so the row inverts correctly under `.dark`.
+    //   - NO `stage` metric line. This stage has its own dedicated display group holding exactly one
+    //     literal, so the group heading already names it — same as `cross_file_security` and
+    //     `yaml_config_applied`, neither of which renders one. A `stage` line belongs only to cases
+    //     that share a NORMALIZED group (`rounds.*`, `threads.*`, `walkthrough.enrichment`), where
+    //     the row must disclose which variant it is. Copying that case adds a redundant one.
+    //   - `hops` renders as a BARE INTEGER, never `3 / 6`. The arm carries no cap field, and
+    //     duplicating a server tuning constant into the client is exactly the drift the codebase's
+    //     constant-comment convention exists to prevent.
+    //   - The event is NOT rendered generically — no `Object.entries(event).map(…)`, no spread. The
+    //     arm is `.passthrough()`, so an event may legitimately carry unexpected keys; a generic
+    //     renderer would surface future fields into operator UI unreviewed and would break the
+    //     counts-not-content boundary T-35-21 depends on the moment a future field carried a path.
+    //     Exactly nine known fields, read by name; unknown keys render nothing and must not throw.
+    //   - `reason` renders VERBATIM (`unparseable_action`, not "the model produced an unparseable
+    //     tool call"). That literal is what §7's alert thresholds and an operator's SQL /
+    //     `wrangler tail` greps match on. Humanisation happens at the stage label only.
+    case 'agentic_context':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="status" value={event.status} />
+          {event.reason ? <MetricLine label="reason" value={event.reason} /> : null}
+          {event.hops_used != null ? (
+            <MetricLine label="hops" value={String(event.hops_used)} />
+          ) : null}
+          {event.files_read != null ? (
+            <MetricLine label="files read" value={String(event.files_read)} />
+          ) : null}
+          {event.greps_run != null ? (
+            <MetricLine label="greps run" value={String(event.greps_run)} />
+          ) : null}
+          {event.bytes_gathered != null ? (
+            <MetricLine label="bytes gathered" value={String(event.bytes_gathered)} />
+          ) : null}
+          {event.truncated !== undefined ? (
+            <MetricLine label="truncated" value={String(event.truncated)} />
+          ) : null}
+          {event.grep_supported !== undefined ? (
+            <MetricLine label="grep supported" value={String(event.grep_supported)} />
+          ) : null}
+          {event.budget_headroom != null ? (
+            <MetricLine label="budget headroom" value={String(event.budget_headroom)} />
+          ) : null}
+        </li>
+      );
+    case 'yaml_config_parse_failed':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="reason" value={event.reason} />
+        </li>
+      );
+    // Phase 34 WR-03/WR-07: `replaced` is the operator-visible record of which top-level config
+    // keys the base-branch YAML overrode wholesale; `ignored` names keys the schema stripped, so a
+    // typo'd `reveiw:` no longer produces a silent no-op.
+    case 'yaml_config_applied':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="source" value={event.source} />
+          <MetricLine
+            label="replaced"
+            value={event.replaced_keys.length > 0 ? event.replaced_keys.join(', ') : '(none)'}
+          />
+          {event.ignored_keys.length > 0 ? (
+            <MetricLine label="ignored" value={event.ignored_keys.join(', ')} />
+          ) : null}
+        </li>
+      );
+    // quick-k31 (WR-03): this row exists so a contributor reading the audit trail learns that repo
+    // config is applied from the BASE branch — their `.review.yaml` edit did nothing for this
+    // review and takes effect once the PR is merged. `base` renders `(none)` when the fail-closed
+    // no-usable-base-SHA path produced an empty sha, which is itself the explanation.
+    case 'yaml_config_head_ignored':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="path" value={event.path} />
+          <MetricLine label="base" value={event.base_sha ? event.base_sha.slice(0, 12) : '(none)'} />
+          <MetricLine label="head" value={event.head_sha.slice(0, 12)} />
+        </li>
+      );
+    default: {
+      // WR-03: the switch above is exhaustive over today's union, so TypeScript narrows `event` to
+      // the `drafted` variant here — hence the widening read. The runtime fallback below is
+      // deliberately kept for the drift case the WR-03 `other` display group exists to catch: a
+      // future schema variant added without a `case` would otherwise render as an empty group
+      // shell whose count badge disagrees with its visible rows.
+      const stage: string = (event as { stage: string }).stage;
+      // drafted is handled by DraftedGroup, so it stays a no-op here.
+      if (stage === 'drafted') return null;
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="stage" value={stage} />
+        </li>
+      );
+    }
   }
 }
 

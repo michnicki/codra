@@ -5,6 +5,9 @@ import {
   criticResultSchema,
   fileReviewPassSchema,
   fileReviewRecordSchema,
+  jobAuditEventSchema,
+  parseVcsCommitEntries,
+  vcsCommitEntrySchema,
   defaultRepoConfig,
 } from '@shared/schema';
 import { runReviewJob } from '@server/core/review';
@@ -84,6 +87,8 @@ describe('SC3: Phase-7 reviewConfig toggles default off; the three v1.2 always-o
     expect(cfg.review.severity_engine.enabled).toBe(true);
     expect(cfg.review.dedup.enabled).toBe(true);
     expect(cfg.review.file_selection.enabled).toBe(true);
+    // Phase 30 (ANNO-01, NREG-01): the Bitbucket Code Insights annotations toggle defaults off.
+    expect(cfg.review.bitbucket.annotations_enabled).toBe(false);
   });
 
   it('the exported defaultRepoConfig yields the same all-off values', () => {
@@ -94,6 +99,32 @@ describe('SC3: Phase-7 reviewConfig toggles default off; the three v1.2 always-o
     expect(defaultRepoConfig.review.interactive.commands.enabled).toBe(false);
     expect(defaultRepoConfig.review.interactive.qa.enabled).toBe(false);
     expect(defaultRepoConfig.review.interactive.commands.bitbucket_bot_account_id).toBeNull();
+    expect(defaultRepoConfig.review.bitbucket.annotations_enabled).toBe(false);
+  });
+
+  it('EVID-02: evidence.hard_drop defaults false and hard_drop_exempt_categories defaults to [security]', () => {
+    const cfg = repoConfigSchema.parse({});
+
+    expect(cfg.review.evidence.hard_drop).toBe(false);
+    expect(cfg.review.evidence.hard_drop_exempt_categories).toEqual(['security']);
+  });
+
+  it('EVID-02: hard_drop_exempt_categories enforces a max(20) array bound', () => {
+    const twentyItems = Array.from({ length: 20 }, (_, i) => `category-${i}`);
+    const twentyOneItems = Array.from({ length: 21 }, (_, i) => `category-${i}`);
+
+    const okResult = repoConfigSchema.safeParse({
+      review: { evidence: { hard_drop_exempt_categories: twentyItems } },
+    });
+    const overResult = repoConfigSchema.safeParse({
+      review: { evidence: { hard_drop_exempt_categories: twentyOneItems } },
+    });
+
+    expect(okResult.success).toBe(true);
+    if (okResult.success) {
+      expect(okResult.data.review.evidence.hard_drop_exempt_categories).toHaveLength(20);
+    }
+    expect(overResult.success).toBe(false);
   });
 
   it('CMD-07: bitbucket_bot_account_id round-trips a configured value', () => {
@@ -105,6 +136,179 @@ describe('SC3: Phase-7 reviewConfig toggles default off; the three v1.2 always-o
     // Other commands defaults remain inert alongside the configured id.
     expect(cfg.review.interactive.commands.enabled).toBe(false);
     expect(cfg.review.interactive.commands.bitbucket_allowed_account_ids).toEqual([]);
+  });
+
+  it('ANNO-01: bitbucket.annotations_enabled round-trips true while every other review field stays at its own default', () => {
+    const cfg = repoConfigSchema.parse({
+      review: { bitbucket: { annotations_enabled: true } },
+    });
+
+    expect(cfg.review.bitbucket.annotations_enabled).toBe(true);
+    // Every other review field remains at its own independent default.
+    expect(cfg.review.passes.security.enabled).toBe(false);
+    expect(cfg.review.passes.critic.enabled).toBe(false);
+    expect(cfg.review.walkthrough.enabled).toBe(false);
+    expect(cfg.review.interactive.commands.enabled).toBe(false);
+    expect(cfg.review.interactive.qa.enabled).toBe(false);
+    expect(cfg.review.severity_engine.enabled).toBe(true);
+    expect(cfg.review.dedup.enabled).toBe(true);
+    expect(cfg.review.file_selection.enabled).toBe(true);
+    expect(cfg.review.learning.enabled).toBe(false);
+  });
+});
+
+describe('Phase 34 (PRD-04/PRD-05): vcsCommitEntrySchema contract', () => {
+  it('validates a well-formed commit entry with filesAvailable defaulting to true', () => {
+    const result = vcsCommitEntrySchema.safeParse({
+      hash: 'abc1234',
+      message: 'fix: resolve race',
+      files: ['src/locks.ts'],
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.filesAvailable).toBe(true);
+    }
+  });
+
+  it('rejects a hash that is not exactly 7 characters', () => {
+    const result = vcsCommitEntrySchema.safeParse({
+      hash: 'ab',
+      message: 'fix',
+      files: [],
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts filesAvailable: false set explicitly by the Bitbucket provider', () => {
+    const result = vcsCommitEntrySchema.safeParse({
+      hash: 'def5678',
+      message: 'feat: add retry logic',
+      files: [],
+      filesAvailable: false,
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.filesAvailable).toBe(false);
+    }
+  });
+
+  // WR-09 (34-REVIEW): the schema is no longer decorative — parseVcsCommitEntries enforces it at
+  // the adapter-output and KV-round-trip boundaries. These pin that the contract is actually
+  // SATISFIABLE by what the producers emit (it was not: `message: z.string().min(1)` rejected the
+  // `''` both adapters legitimately produce for an empty commit subject), and that the enforcement
+  // is fail-open.
+  it('accepts the empty message both adapters legitimately produce for an empty commit subject', () => {
+    // Both adapters compute `message.split('\n')[0] ?? ''`, which is '' for a commit whose message
+    // is empty or starts with a newline — git permits both (`--allow-empty-message`).
+    const result = vcsCommitEntrySchema.safeParse({ hash: 'abc1234', message: '', files: [] });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts the EXACT shape the GitHub adapter emits (no files[] on the list-commits response)', () => {
+    // Mirrors core/github.ts getFileHistory's mapper against the real list-commits shape (CR-01).
+    const commits: Array<{ sha: string; commit: { message: string }; files?: Array<{ filename: string }> }> = [
+      { sha: 'abc1234567890abcdef', commit: { message: 'fix: resolve race\n\nbody' } },
+    ];
+    const emitted = commits.map((c) => {
+      const manifest = Array.isArray(c.files) ? c.files : null;
+      return {
+        hash: c.sha.slice(0, 7),
+        message: c.commit.message.split('\n')[0] ?? '',
+        files: (manifest ?? []).map((f) => f.filename),
+        filesAvailable: manifest !== null,
+      };
+    });
+
+    expect(parseVcsCommitEntries(emitted)).toEqual([
+      { hash: 'abc1234', message: 'fix: resolve race', files: [], filesAvailable: false },
+    ]);
+  });
+
+  it('accepts the EXACT shape the Bitbucket adapter emits', () => {
+    const values = [{ hash: 'def4567abcdef1234567', message: '' }];
+    const emitted = values.map((c) => ({
+      hash: c.hash.slice(0, 7),
+      message: c.message.split('\n')[0] ?? '',
+      files: [] as string[],
+      filesAvailable: false,
+    }));
+
+    expect(parseVcsCommitEntries(emitted)).toEqual([
+      { hash: 'def4567', message: '', files: [], filesAvailable: false },
+    ]);
+  });
+
+  it('parseVcsCommitEntries drops non-conforming entries fail-open instead of throwing', () => {
+    const drifted = [
+      { hash: 'abc1234', message: 'good', files: [] },
+      { hash: 'too-short-and-then-some', message: 'bad hash', files: [] },
+      { hash: 'def4567', message: 'bad files', files: 'not-an-array' },
+      null,
+      'nonsense',
+    ];
+
+    expect(parseVcsCommitEntries(drifted)).toEqual([
+      { hash: 'abc1234', message: 'good', files: [], filesAvailable: true },
+    ]);
+  });
+
+  it('parseVcsCommitEntries returns [] for a non-array (JSON.parse drift at the KV boundary)', () => {
+    expect(parseVcsCommitEntries(undefined)).toEqual([]);
+    expect(parseVcsCommitEntries({ not: 'an array' })).toEqual([]);
+    expect(parseVcsCommitEntries('[]')).toEqual([]);
+  });
+});
+
+describe('Phase 34 (PRD-05): review.yaml_config + review.file_history toggles default off (NREG-01 inertness)', () => {
+  it('repoConfigSchema.parse({}) yields both toggles at { enabled: false }', () => {
+    const cfg = repoConfigSchema.parse({});
+
+    expect(cfg.review.file_history.enabled).toBe(false);
+    expect(cfg.review.yaml_config.enabled).toBe(false);
+  });
+
+  it('the exported defaultRepoConfig mirrors both toggle defaults', () => {
+    expect(defaultRepoConfig.review.file_history.enabled).toBe(false);
+    expect(defaultRepoConfig.review.yaml_config.enabled).toBe(false);
+  });
+});
+
+describe('Phase 34 (PRD-05): yaml_config_parse_failed audit event arm', () => {
+  it('validates a hand-crafted yaml_config_parse_failed event against jobAuditEventSchema', () => {
+    const event = {
+      stage: 'yaml_config_parse_failed',
+      reason: 'Invalid YAML syntax',
+      timestamp: '2026-07-31T00:00:00.000Z',
+    };
+
+    const parsed = jobAuditEventSchema.safeParse(event);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.reason).toBe('Invalid YAML syntax');
+    }
+  });
+
+  it('rejects a reason longer than the 500-char bound', () => {
+    const event = {
+      stage: 'yaml_config_parse_failed',
+      reason: 'x'.repeat(501),
+      timestamp: '2026-07-31T00:00:00.000Z',
+    };
+
+    expect(jobAuditEventSchema.safeParse(event).success).toBe(false);
+  });
+
+  it('still rejects an unknown stage value (closed union vocabulary)', () => {
+    const event = {
+      stage: 'bogus',
+      reason: 'Invalid YAML syntax',
+      timestamp: '2026-07-31T00:00:00.000Z',
+    };
+
+    expect(jobAuditEventSchema.safeParse(event).success).toBe(false);
   });
 });
 
@@ -150,6 +354,139 @@ describe('D-07: fileReviewPassSchema value-set and fileReviewRecordSchema.pass d
     const result = fileReviewRecordSchema.parse(recordWithoutPass);
 
     expect(result.pass).toBe('main');
+  });
+});
+
+describe('D-07: config-default drift detection', () => {
+  // Per-field assertions for ALL leaf nodes of repoConfigSchema.parse({}). If a developer adds a
+  // new config key with a .default() at the field level but forgets to mirror it in the enclosing
+  // block .default({...}) or the top-level review.default({...}), this test catches the omission.
+
+  it('every top-level review leaf matches expected default', () => {
+    const cfg = repoConfigSchema.parse({});
+
+    // Top-level review scalars
+    expect(cfg.review.on).toEqual(['opened', 'synchronize', 'ready_for_review', 'reopened']);
+    expect(cfg.review.ignore_drafts).toBe(true);
+    expect(cfg.review.mention_trigger).toBe('@codra-app');
+    expect(cfg.review.skip_files).toEqual(['**/*.lock', 'dist/**', 'build/**', '.next/**', '*.generated.*', 'coverage/**']);
+    expect(cfg.review.max_files).toBe(150);
+    expect(cfg.review.large_file_threshold_lines).toBe(200);
+    expect(cfg.review.max_diff_lines_per_file).toBe(800);
+    expect(cfg.review.max_total_diff_chars).toBe(150_000);
+    expect(cfg.review.max_comments).toBe(10);
+    expect(cfg.review.min_severity).toBe('nit');
+    expect(cfg.review.min_confidence).toBe(0.7);
+    expect(cfg.review.focus).toEqual(['security', 'bugs', 'performance', 'correctness', 'quality']);
+    expect(cfg.review.custom_rules).toEqual([]);
+    expect(cfg.review.labels).toEqual({ p1: 'review: needs-attention', p2: 'review: approved', p3: 'review: approved' });
+  });
+
+  it('exec defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.exec.enabled).toBe(false);
+    expect(cfg.review.exec.on_file_types).toEqual(['.ts', '.tsx', '.js']);
+    expect(cfg.review.exec.command).toBe('npm run lint && npm run typecheck');
+  });
+
+  it('walkthrough defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.walkthrough.enabled).toBe(false);
+    expect(cfg.review.walkthrough.sequence_diagram.enabled).toBe(true);
+  });
+
+  it('passes.security defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.passes.security.enabled).toBe(false);
+    expect(cfg.review.passes.security.cross_file).toBe(false);
+  });
+
+  it('passes.critic defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.passes.critic.enabled).toBe(false);
+  });
+
+  it('passes.ensemble defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.passes.ensemble.runs).toBe(1);
+    expect(cfg.review.passes.ensemble.temperature).toBe(0.7);
+  });
+
+  it('interactive.commands defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.interactive.commands.enabled).toBe(false);
+    expect(cfg.review.interactive.commands.bitbucket_allowed_account_ids).toEqual([]);
+    expect(cfg.review.interactive.commands.bitbucket_bot_account_id).toBeNull();
+  });
+
+  it('interactive.qa defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.interactive.qa.enabled).toBe(false);
+    expect(cfg.review.interactive.qa.rate_limit_per_hour).toBe(10);
+  });
+
+  it('interactive.qa.index defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.interactive.qa.index.enabled).toBe(false);
+    expect(cfg.review.interactive.qa.index.max_files).toBe(500);
+    expect(cfg.review.interactive.qa.index.chunk_lines).toBe(50);
+    expect(cfg.review.interactive.qa.index.top_k).toBe(8);
+  });
+
+  it('severity_engine defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.severity_engine.enabled).toBe(true);
+  });
+
+  it('dedup defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.dedup.enabled).toBe(true);
+  });
+
+  it('file_selection defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.file_selection.enabled).toBe(true);
+  });
+
+  it('category_confidence defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.category_confidence).toEqual({});
+  });
+
+  it('threads defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.threads.verify_fixes).toBe(false);
+    expect(cfg.review.threads.auto_resolve).toBe(false);
+  });
+
+  it('rounds defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.rounds.incremental).toBe(false);
+    expect(cfg.review.rounds.escalate_floors).toBe(true);
+  });
+
+  it('evidence defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.evidence.hard_drop).toBe(false);
+    expect(cfg.review.evidence.hard_drop_exempt_categories).toEqual(['security']);
+  });
+
+  it('learning defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.learning.enabled).toBe(false);
+    expect(cfg.review.learning.learned_rules).toEqual([]);
+  });
+
+  it('bitbucket defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.review.bitbucket.annotations_enabled).toBe(false);
+  });
+
+  it('model defaults', () => {
+    const cfg = repoConfigSchema.parse({});
+    expect(cfg.model.main).toBeNull();
+    expect(cfg.model.fallbacks).toEqual([]);
+    expect(cfg.model.size_overrides).toEqual([]);
   });
 });
 

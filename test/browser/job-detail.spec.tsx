@@ -928,3 +928,198 @@ describe('JobDetailPage audit-trail viewer — Phase 20 ensemble + walkthrough',
     expect(screen.queryByText('groups')).not.toBeInTheDocument();
   });
 });
+
+// D-01 / D-02: the evidence_missing_summary aggregate audit event renders in the audit-trail
+// viewer's existing 'Evidence missing' group, with counts + bounded sample entries.
+describe('JobDetailPage audit-trail viewer — Phase 24 evidence_missing_summary', () => {
+  const okResponse = <T,>(data: T) => ({
+    status: 200 as const,
+    etag: null,
+    lastModified: null,
+    notModified: false as const,
+    data,
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('renders a populated evidence_missing_summary event with file, pass, counts, and sample entries in the Evidence missing group', async () => {
+    const user = userEvent.setup();
+    const audit: JobDetail['audit'] = [
+      {
+        stage: 'evidence_missing_summary',
+        file: 'src/test.ts',
+        pass: 'main',
+        absentCount: 17,
+        notInHunkCount: 42,
+        sample: [
+          { path: 'src/test.ts', line: 10, title: 'missing null check', reason: 'absent' },
+          { path: 'src/test.ts', line: 20, title: 'missing bounds check', reason: 'absent' },
+          { path: 'src/other.ts', line: 5, title: 'finding outside hunk', reason: 'not_in_hunk' },
+        ],
+        timestamp: new Date().toISOString(),
+      },
+    ];
+    vi.mocked(api.getJob).mockResolvedValue(okResponse({ job: { ...JOB, audit } }));
+
+    renderJobDetail();
+    const auditHeading = await screen.findByText('Audit trail');
+    await user.click(auditHeading);
+
+    // Group heading
+    expect(screen.getByText('Evidence missing')).toBeVisible();
+    // Metric lines for identifier and counts
+    expect(screen.getByText('src/test.ts')).toBeVisible();
+    expect(screen.getByText('main')).toBeVisible();
+    expect(screen.getByText('17')).toBeVisible();    // absentCount
+    expect(screen.getByText('42')).toBeVisible();    // notInHunkCount
+    // Sample entries with path:line, title, and reason
+    expect(screen.getByText(/missing null check/)).toBeVisible();
+    expect(screen.getByText(/missing bounds check/)).toBeVisible();
+    expect(screen.getByText(/finding outside hunk/)).toBeVisible();
+    // Reason text: 'absent' appears 3x (1 MetricLine label + 2 sample reasons)
+    expect(screen.getAllByText('absent').length).toBe(3);
+    // 'not_in_hunk' appears once (1 sample reason)
+    expect(screen.getByText('not_in_hunk')).toBeVisible();
+  });
+
+  it('renders an evidence_missing_summary event with counts but no sample when sample is empty', async () => {
+    const user = userEvent.setup();
+    const audit: JobDetail['audit'] = [
+      {
+        stage: 'evidence_missing_summary',
+        file: 'src/empty.ts',
+        pass: 'security',
+        absentCount: 0,
+        notInHunkCount: 0,
+        sample: [],
+        timestamp: new Date().toISOString(),
+      },
+    ];
+    vi.mocked(api.getJob).mockResolvedValue(okResponse({ job: { ...JOB, audit } }));
+
+    renderJobDetail();
+    const auditHeading = await screen.findByText('Audit trail');
+    await user.click(auditHeading);
+
+    // Group heading and identifier still visible
+    expect(screen.getByText('Evidence missing')).toBeVisible();
+    expect(screen.getByText('src/empty.ts')).toBeVisible();
+    // Counts render as zero (at least 2 MetricLine values = '0' across absentCount + notInHunkCount)
+    expect(screen.getAllByText('0').length).toBeGreaterThanOrEqual(2);
+    // No sample entries rendered
+    expect(screen.queryByText(/finding/)).not.toBeInTheDocument();
+  });
+
+  it('renders a not_in_hunk reason entry in the sample list', async () => {
+    const user = userEvent.setup();
+    const audit: JobDetail['audit'] = [
+      {
+        stage: 'evidence_missing_summary',
+        file: 'src/hunk.ts',
+        pass: 'main',
+        absentCount: 0,
+        notInHunkCount: 2,
+        sample: [
+          { path: 'src/hunk.ts', line: 30, title: 'finding outside hunk 1', reason: 'not_in_hunk' },
+          { path: 'src/hunk.ts', line: 45, title: 'finding outside hunk 2', reason: 'not_in_hunk' },
+        ],
+        timestamp: new Date().toISOString(),
+      },
+    ];
+    vi.mocked(api.getJob).mockResolvedValue(okResponse({ job: { ...JOB, audit } }));
+
+    renderJobDetail();
+    const auditHeading = await screen.findByText('Audit trail');
+    await user.click(auditHeading);
+
+    // Reason badge rendered per sample entry (appears 2x — one per sample entry)
+    expect(screen.getAllByText('not_in_hunk').length).toBe(2);
+    expect(screen.getByText(/finding outside hunk 1/)).toBeVisible();
+  });
+});
+
+// Phase 28 (LRN-01) / G-28-4: a learned_rule_suppressed event used to render as NOTHING (the
+// DecisionEvent switch had no case, so it fell through to `default: return null`) while still
+// inflating the unrelated 'Evidence missing' count badge (the normalizer collapsed it into that
+// display group). This block renders one evidence_hard_dropped event alongside one
+// learned_rule_suppressed event so the separation is observable in a single render.
+describe('JobDetailPage audit-trail viewer — Phase 28 learned_rule_suppressed (G-28-4)', () => {
+  const okResponse = <T,>(data: T) => ({
+    status: 200 as const,
+    etag: null,
+    lastModified: null,
+    notModified: false as const,
+    data,
+  });
+
+  // Full-length UUID-shaped rule id: asserted IN FULL so a later truncation change is caught.
+  // The rule id is the key the operator uses to find the rule in the Learned Rules panel, so it
+  // must never be routed through shortOpaqueRef.
+  const RULE_ID = '8f2c1d4e-6a7b-4c3d-9e0f-1a2b3c4d5e6f';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('renders the suppression row in its own group without inflating the Evidence missing badge', async () => {
+    const user = userEvent.setup();
+    const audit: JobDetail['audit'] = [
+      {
+        stage: 'evidence_hard_dropped',
+        file: 'src/server/core/review.ts',
+        pass: 'main',
+        droppedCount: 1,
+        sample: [
+          {
+            path: 'src/server/core/review.ts',
+            line: 120,
+            title: 'hallucinated line reference',
+            reason: 'absent',
+          },
+        ],
+        timestamp: new Date().toISOString(),
+      },
+      {
+        stage: 'learned_rule_suppressed',
+        file: 'src/client/lib/api.ts',
+        pass: 'main',
+        droppedCount: 2,
+        sample: [
+          {
+            path: 'src/client/lib/api.ts',
+            line: 44,
+            title: 'suppressed by an approved rule',
+            matched_rule: RULE_ID,
+          },
+        ],
+        timestamp: new Date().toISOString(),
+      },
+    ];
+    vi.mocked(api.getJob).mockResolvedValue(okResponse({ job: { ...JOB, audit } }));
+
+    renderJobDetail();
+    const auditHeading = await screen.findByText('Audit trail');
+    await user.click(auditHeading);
+
+    // (a) The group heading is reachable end to end (STAGE_ORDER entry + STAGE_LABELS entry +
+    // display group). PRE-FIX the group was never emitted, so this heading never rendered.
+    const suppressionHeading = screen.getByText('Learned rule suppressed');
+    expect(suppressionHeading).toBeVisible();
+
+    // (b) Scoped to the suppression group so the assertion cannot be satisfied by text rendered
+    // inside the evidence group. PROVES the DecisionEvent switch reaches the new case rather than
+    // `default: return null` — i.e. the row is not the empty shell G-28-4 describes.
+    const suppressionGroup = suppressionHeading.closest('div.rounded-md') as HTMLElement;
+    expect(within(suppressionGroup).getByText(`rule ${RULE_ID}`)).toBeVisible();
+    expect(within(suppressionGroup).getByText(/suppressed by an approved rule/)).toBeVisible();
+    // droppedCount is the FULL total (2), not the sample length (1).
+    expect(within(suppressionGroup).getByText('2')).toBeVisible();
+
+    // (c) Badge honesty at the DOM level, not just in the pure grouper: only the single
+    // evidence_hard_dropped event counts toward 'Evidence missing'. PRE-FIX this read
+    // 'Evidence missing2' because the suppression event was collapsed into that group.
+    expect(screen.getByText('Evidence missing').parentElement?.textContent).toBe('Evidence missing1');
+  });
+});

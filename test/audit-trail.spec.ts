@@ -1,10 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
 import { insertJob, getJobDetail, appendJobAuditEvents } from '@server/db/jobs';
 import * as jobsModule from '@server/db/jobs';
-import { buildFileSkipEvents, recordFileSkips, recordUnitAudit } from '@server/core/audit';
+import { buildFileSkipEvents, recordFileSkips, recordUnitAudit, buildEvidenceMissingSummary, buildInlineCommentSkippedEvent, buildSuggestionDroppedEvent } from '@server/core/audit';
 import type { FileDiff } from '@server/core/diff';
 import { queryRows } from '@server/db/client';
 import { defaultRepoConfig, type JobAuditEvent } from '@shared/schema';
+import { jobAuditEventSchema } from '@shared/schema';
 import { logger } from '@server/core/logger';
 import { createTestEnv, hasConfiguredTestDatabaseUrl } from './helpers';
 
@@ -291,6 +292,264 @@ describe('buildFileSkipEvents pure drop-event builder (PRIO-03, D-11/D-12)', () 
         expect(entry).not.toHaveProperty('codeSuggestion');
       }
     }
+  });
+});
+
+describe('buildEvidenceMissingSummary (EVID-03, D-05/D-06/D-07)', () => {
+  it('empty input returns null (D-05)', () => {
+    expect(buildEvidenceMissingSummary('a.ts', 'main', [])).toBeNull();
+  });
+
+  it('single entry still produces one aggregate (D-06)', () => {
+    const event = buildEvidenceMissingSummary('a.ts', 'main', [
+      { path: 'src/x.ts', line: 10, title: 'finding one', reason: 'absent' },
+    ])!;
+
+    expect(event.stage).toBe('evidence_missing_summary');
+    expect(event.absentCount).toBe(1);
+    expect(event.notInHunkCount).toBe(0);
+    expect(event.sample).toHaveLength(1);
+  });
+
+  it('mixed reasons produce correct counts', () => {
+    const event = buildEvidenceMissingSummary('a.ts', 'main', [
+      { path: 'src/x.ts', line: 10, title: 'finding one', reason: 'absent' },
+      { path: 'src/y.ts', line: 20, title: 'finding two', reason: 'not_in_hunk' },
+    ])!;
+
+    expect(event.absentCount).toBe(1);
+    expect(event.notInHunkCount).toBe(1);
+  });
+
+  it('sample capped at 20, counts reflect full total', () => {
+    const entries = Array.from({ length: 25 }, (_, i) => ({
+      path: `src/x/${i}.ts`,
+      line: i,
+      title: `finding ${i}`,
+      reason: (i < 15 ? 'absent' : 'not_in_hunk') as 'absent' | 'not_in_hunk',
+    }));
+
+    const event = buildEvidenceMissingSummary('a.ts', 'main', entries)!;
+
+    expect(event.sample).toHaveLength(20);
+    expect(event.absentCount).toBe(15);
+    expect(event.notInHunkCount).toBe(10);
+  });
+
+  it('model emission order preserved (D-07)', () => {
+    const event = buildEvidenceMissingSummary('a.ts', 'main', [
+      { path: 'src/a.ts', line: 1, title: 'first', reason: 'absent' },
+      { path: 'src/b.ts', line: 2, title: 'second', reason: 'not_in_hunk' },
+      { path: 'src/c.ts', line: 3, title: 'third', reason: 'absent' },
+    ])!;
+
+    expect(event.sample).toHaveLength(3);
+    expect(event.sample[0].reason).toBe('absent');
+    expect(event.sample[1].reason).toBe('not_in_hunk');
+    expect(event.sample[2].reason).toBe('absent');
+  });
+
+  it('title redacted via redactFindingTitle', () => {
+    const event = buildEvidenceMissingSummary('a.ts', 'main', [
+      { path: 'src/x.ts', line: 10, title: 'secret-finding', reason: 'absent' },
+    ])!;
+
+    expect(event.sample[0].title).toBe('[title-redacted]');
+  });
+
+  it('file+pass identity correct', () => {
+    const event = buildEvidenceMissingSummary('src/test.ts', 'main', [
+      { path: 'src/x.ts', line: 10, title: 'finding', reason: 'absent' },
+    ])!;
+
+    expect(event.file).toBe('src/test.ts');
+    expect(event.pass).toBe('main');
+  });
+
+  it('both main and security passes accepted', () => {
+    const mainEvent = buildEvidenceMissingSummary('a.ts', 'main', [
+      { path: 'src/x.ts', line: 10, title: 'finding', reason: 'absent' },
+    ])!;
+    const secEvent = buildEvidenceMissingSummary('a.ts', 'security', [
+      { path: 'src/x.ts', line: 10, title: 'finding', reason: 'absent' },
+    ])!;
+
+    expect(mainEvent.pass).toBe('main');
+    expect(secEvent.pass).toBe('security');
+  });
+
+  it('builder output round-trips through jobAuditEventSchema', () => {
+    const event = buildEvidenceMissingSummary('src/test.ts', 'main', [
+      { path: 'src/a.ts', line: 10, title: 'first', reason: 'absent' },
+      { path: 'src/b.ts', line: null, title: 'second', reason: 'not_in_hunk' },
+    ])!;
+
+    const result = jobAuditEventSchema.safeParse(event);
+    expect(result.success).toBe(true);
+  });
+});
+
+describe('buildInlineCommentSkippedEvent (PRD-01, D-03/D-04)', () => {
+  it('empty input returns null (no zero-count event for a clean round)', () => {
+    expect(buildInlineCommentSkippedEvent([])).toBeNull();
+  });
+
+  it('single skipped comment produces one aggregate with count 1 and the skipped identifier', () => {
+    const event = buildInlineCommentSkippedEvent([{ path: 'src/a.ts', line: 4, commentId: '77' }])!;
+
+    expect(event.stage).toBe('inline_comment_skipped');
+    expect(event.count).toBe(1);
+    // WR-01: `position` rides alongside `line` (null here — this entry carries a line, not a
+    // diff offset) so the two coordinates are never conflated.
+    expect(event.sample).toEqual([{ path: 'src/a.ts', line: 4, position: null, commentId: '77' }]);
+  });
+
+  it('carries a GitHub diff position separately from line, with line null (WR-01)', () => {
+    const event = buildInlineCommentSkippedEvent([
+      { path: 'src/a.ts', line: null, position: 3, commentId: '77' },
+    ])!;
+
+    expect(event.sample).toEqual([{ path: 'src/a.ts', line: null, position: 3, commentId: '77' }]);
+  });
+
+  it('absent position normalizes to null', () => {
+    const event = buildInlineCommentSkippedEvent([{ path: 'src/x.ts', line: 2, commentId: '77' }])!;
+
+    expect(event.sample[0].position).toBeNull();
+  });
+
+  // WR-06: the sample now identifies a skipped comment by its persisted review_comments.id. It
+  // previously carried a title routed through redactFindingTitle, which maps EVERY non-empty title
+  // to one fixed marker — so the sample always read '[title-redacted]' and identified nothing.
+  it('carries the persisted review_comments id and NO title (WR-06)', () => {
+    const event = buildInlineCommentSkippedEvent([
+      { path: 'src/x.ts', line: 10, commentId: '4242' },
+    ])!;
+
+    expect(event.sample[0].commentId).toBe('4242');
+    expect(event.sample[0]).not.toHaveProperty('title');
+  });
+
+  it('a bigint-range id survives as an exact string (WR-06)', () => {
+    // review_comments.id is BIGSERIAL. 2^53+1 is the first value a JSON number cannot represent —
+    // as a number it would come back as ...992 and point at a DIFFERENT comment.
+    const event = buildInlineCommentSkippedEvent([
+      { path: 'src/x.ts', line: 1, commentId: '9007199254740993' },
+    ])!;
+
+    expect(event.sample[0].commentId).toBe('9007199254740993');
+  });
+
+  it('absent commentId normalizes to null', () => {
+    const event = buildInlineCommentSkippedEvent([{ path: 'src/x.ts', line: 1 }])!;
+
+    expect(event.sample[0].commentId).toBeNull();
+  });
+
+  it('absent line normalizes to null', () => {
+    const event = buildInlineCommentSkippedEvent([{ path: 'src/x.ts', commentId: '77' }])!;
+
+    expect(event.sample[0].line).toBeNull();
+  });
+
+  it('count reflects the full total while the sample is capped at 20', () => {
+    const skipped = Array.from({ length: 25 }, (_, i) => ({
+      path: `src/x/${i}.ts`,
+      line: i,
+      commentId: String(i),
+    }));
+
+    const event = buildInlineCommentSkippedEvent(skipped)!;
+
+    expect(event.count).toBe(25);
+    expect(event.sample).toHaveLength(20);
+  });
+
+  it('builder output round-trips through jobAuditEventSchema', () => {
+    const event = buildInlineCommentSkippedEvent([
+      { path: 'src/a.ts', line: 4, commentId: '77' },
+      { path: 'src/b.ts', line: null, commentId: null },
+    ])!;
+
+    const result = jobAuditEventSchema.safeParse(event);
+    expect(result.success).toBe(true);
+  });
+
+  // WR-06 back-compat: audit rows persisted BEFORE this change carry `title` and no `commentId`.
+  // They must still parse — the nested sample object drops the now-unknown key rather than failing.
+  it('a pre-existing persisted row carrying `title` still parses (WR-06 back-compat)', () => {
+    const legacy = {
+      stage: 'inline_comment_skipped',
+      count: 1,
+      sample: [{ path: 'src/a.ts', line: 4, title: '[title-redacted]' }],
+      timestamp: '2026-01-01T00:00:00.000Z',
+    };
+
+    const result = jobAuditEventSchema.safeParse(legacy);
+    expect(result.success).toBe(true);
+  });
+
+  // IN-01: mirrors the sibling suggestion_dropped negative-droppedCount rejection test.
+  it('schema rejects a negative count (z.number().int().min(0))', () => {
+    const negative = {
+      stage: 'inline_comment_skipped',
+      count: -1,
+      sample: [],
+      timestamp: '2026-01-01T00:00:00.000Z',
+    };
+    expect(jobAuditEventSchema.safeParse(negative).success).toBe(false);
+  });
+});
+
+describe('buildSuggestionDroppedEvent (PRD-02, D-08)', () => {
+  it('empty input returns null (no zero-count event)', () => {
+    expect(buildSuggestionDroppedEvent('src/a.ts', 'main', [])).toBeNull();
+  });
+
+  it('single entry produces one aggregate with stage/file/pass/droppedCount and a redacted sample title', () => {
+    const event = buildSuggestionDroppedEvent('src/a.ts', 'main', [
+      { path: 'src/a.ts', line: 3, title: 'finding one' },
+    ])!;
+
+    expect(event.stage).toBe('suggestion_dropped');
+    expect(event.file).toBe('src/a.ts');
+    expect(event.pass).toBe('main');
+    expect(event.droppedCount).toBe(1);
+    expect(event.sample).toEqual([{ path: 'src/a.ts', line: 3, title: '[title-redacted]' }]);
+  });
+
+  it('count reflects the full total while the sample is capped at 20', () => {
+    const entries = Array.from({ length: 25 }, (_, i) => ({
+      path: `src/x/${i}.ts`,
+      line: i,
+      title: `finding ${i}`,
+    }));
+
+    const event = buildSuggestionDroppedEvent('src/a.ts', 'main', entries)!;
+
+    expect(event.droppedCount).toBe(25);
+    expect(event.sample).toHaveLength(20);
+  });
+
+  it('builder output round-trips through jobAuditEventSchema', () => {
+    const event = buildSuggestionDroppedEvent('src/a.ts', 'security', [
+      { path: 'src/a.ts', line: 3, title: 'finding one' },
+    ])!;
+
+    const result = jobAuditEventSchema.safeParse(event);
+    expect(result.success).toBe(true);
+  });
+
+  it('schema rejects a negative droppedCount (z.number().int().min(0))', () => {
+    const negative = {
+      stage: 'suggestion_dropped',
+      file: 'src/a.ts',
+      pass: 'main',
+      droppedCount: -1,
+      sample: [],
+      timestamp: '2026-01-01T00:00:00.000Z',
+    };
+    expect(jobAuditEventSchema.safeParse(negative).success).toBe(false);
   });
 });
 

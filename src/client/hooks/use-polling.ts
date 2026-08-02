@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 
-export function usePolling(callback: () => Promise<void> | void, delay = 10_000, deps: any[] = []) {
+export function usePolling(callback: () => Promise<void> | void, delay: number | null = 10_000, deps: any[] = []) {
   const savedCallback = useRef(callback);
 
   useEffect(() => {

@@ -10,6 +10,11 @@ export type RecordedGitHubCall = {
 
 export type ReviewResponseScript = Array<{ status: number; id?: number }>;
 
+/** Scripted status sequence for successive per-comment POSTs to /pulls/{n}/comments when the
+ * batch-422 fallback (FR-031) is under test. Mirrors the reviewResponses precedent; consumed only
+ * by the commit_id-discriminated branch of the shared comments route. */
+export type ReviewCommentResponseScript = Array<{ status: number; id?: number }>;
+
 /**
  * Body for any of the new mock fixtures (content/compare). `body` is whatever the adapter
  * expects to decode — a JSON object for `/contents`, a raw string for `/compare`.
@@ -52,6 +57,12 @@ export type GitHubFetchMockFixtures = {
   diff: string;
   /** Scripted status sequence for successive POST .../reviews calls. Defaults to a single 200. */
   reviewResponses?: ReviewResponseScript;
+  /** Scripted status sequence for successive per-comment POST .../pulls/{n}/comments calls when
+   * the batch-422 fallback (FR-031) is active. When supplied, the shared comments route reads the
+   * request body and discriminates: an `in_reply_to` body returns the reply default WITHOUT
+   * consuming the script (route discrimination keeps every existing reply spec byte-identical --
+   * REVIEWS R2/R11); a `commit_id` body consumes the script (last entry reused beyond the end). */
+  reviewCommentResponses?: ReviewCommentResponseScript;
   /** Comment id the POST /issues/{n}/comments route returns (and the PATCH default id). */
   commentId?: number;
   /** Comment id the net-new POST /pulls/{n}/comments (review-comment reply) route returns.
@@ -108,6 +119,86 @@ export type GitHubFetchMockFixtures = {
    * thread fixtures with `author.databaseId: GH_BOT_USER_ID (99999)` pass the immutable-id filter.
    */
   botUserId?: number;
+  /**
+   * Response for GET /repos/{owner}/{repo}/pulls/comments/{id} (LRN-01, G-28-3). `status` defaults
+   * to 200. `position` is GitHub's DIFF OFFSET — the coordinate `createReview` posts by — and is
+   * surfaced separately from `line` because the two diverge in practice. Use `status: 404` to
+   * exercise the deleted-comment branch (the client maps 404 to null).
+   *
+   * When this fixture is OMITTED the route is not registered at all and the request falls through
+   * to the terminal 404, so every other spec's behavior is byte-identical.
+   */
+  reviewCommentResponse?: {
+    status?: number;
+    path?: string;
+    line?: number | null;
+    position?: number | null;
+    body?: string;
+  };
+  /**
+   * Response for GET /repos/{owner}/{repo} (QA-IDX-01, D-09) -- the repository read that resolves
+   * the default branch. `status` defaults to 200. Supply `body: {}` to exercise the
+   * no-default-branch throw, or `{ master_branch: 'master' }` to exercise the legacy alias.
+   *
+   * Registered ONLY when supplied, so every pre-existing spec falls through to the terminal 404
+   * exactly as before (NREG-01).
+   */
+  repositoryResponse?: {
+    status?: number;
+    body?: { default_branch?: string; master_branch?: string };
+  };
+  /**
+   * Response for GET /repos/{owner}/{repo}/branches/{branch} (QA-IDX-01, D-12) -- the branch read
+   * that resolves the head COMMIT sha (the trees endpoint only echoes a TREE sha). `status` defaults
+   * to 200. Supply `body: {}` to exercise the missing-commit-sha throw, or `status: 404` for the
+   * no-such-branch path.
+   *
+   * Registered ONLY when supplied (NREG-01).
+   */
+  branchResponse?: {
+    status?: number;
+    body?: { commit?: { sha?: string } };
+  };
+  /**
+   * Response for GET /repos/{owner}/{repo}/git/trees/{treeIsh}?recursive=1 (QA-IDX-01, D-09).
+   * `status` defaults to 200. `truncated` flows straight through to the listing, and `tree` entries
+   * carry the real `type` discriminator so a spec can prove directories ('tree') and submodules
+   * ('commit') are dropped.
+   *
+   * Registered ONLY when supplied (NREG-01).
+   */
+  treeResponse?: {
+    status?: number;
+    sha?: string;
+    truncated?: boolean;
+    tree?: Array<{ path: string; type: 'blob' | 'tree' | 'commit'; sha?: string; size?: number }>;
+  };
+  /**
+   * PRD-04 (FR-114): response for GET /repos/{owner}/{repo}/commits?path=...&sha=...&per_page=...
+   * (per-touched-file commit history). `status` defaults to 200; `body` is the commit array.
+   *
+   * CR-01 (34-REVIEW): the REAL list-commits response entry is `{ sha, commit: { message }, ... }`
+   * with **NO `files[]` and no `stats`** — those fields exist only on the single-commit
+   * (`GET /commits/{ref}`) and compare endpoints. Fixtures MUST NOT fabricate `files` on this
+   * route unless the spec is deliberately exercising the "manifest present" branch; doing so
+   * hid the hardcoded `filesAvailable: true` defect in `GitHubClient.getFileHistory`.
+   *
+   * Registered ONLY when supplied, so every other spec's route table is byte-identical (NREG-01).
+   */
+  fileHistoryResponses?: BitbucketLikeMockResponse;
+  /**
+   * PRD-06 (FR-131): response for GET /search/code?q=...&per_page=... — the code-search endpoint
+   * backing `grep_repo`. `status` defaults to 200; `body` is the search envelope
+   * (`{ total_count, incomplete_results, items }`), returned verbatim so a spec can exercise the
+   * defensive mapping (an item with no `path`, a text match with no `fragment`, no `items` key at all).
+   *
+   * Supply `status: 403`/`429` for the rate-limit stand-down branch, `422` for the query-problem
+   * branch and `500` for the must-throw branch — the client treats those three as DISTINCT results,
+   * so a fixture that collapses them proves nothing.
+   *
+   * Registered ONLY when supplied, so every other spec's route table is byte-identical (NREG-01).
+   */
+  codeSearchResponses?: BitbucketLikeMockResponse;
 };
 
 /**
@@ -122,6 +213,8 @@ export function installGitHubFetchMock(fixtures: GitHubFetchMockFixtures) {
   const reviewsListPath = `${repoPrefix}/pulls/${fixtures.prNumber}/reviews`;
   const reviewResponses = fixtures.reviewResponses ?? [{ status: 200, id: 5150 }];
   let reviewCallIndex = 0;
+  const reviewCommentResponses = fixtures.reviewCommentResponses ?? [];
+  let reviewCommentCallIndex = 0;
 
   // Issue-comment fixtures (net-new routes). Defaults are chosen so commentUserId != any login
   // string, letting the adapter spec prove author.id comes from the immutable numeric user id.
@@ -206,6 +299,71 @@ export function installGitHubFetchMock(fixtures: GitHubFetchMockFixtures) {
       return new Response(JSON.stringify(fixture.body), { status, headers });
     }
 
+    // --- QA-IDX-01: GET /repos/{owner}/{repo} and GET .../git/trees/{treeIsh}?recursive=1 (D-09) ---
+    // Both are registered ONLY when their fixture is supplied so every other spec's route table is
+    // byte-identical. The tree route matches the literal `/git/trees/` segment, which cannot collide
+    // with any existing route.
+    if (method === 'GET' && fixtures.repositoryResponse && url.pathname === repoPrefix) {
+      const fixture = fixtures.repositoryResponse;
+      const status = fixture.status ?? 200;
+      if (status >= 400) {
+        return json({ message: `Repository read error ${status}` }, status);
+      }
+      return json(fixture.body ?? {}, status);
+    }
+
+    // --- PRD-04 (FR-114): GET /repos/{owner}/{repo}/commits (file history) ---
+    // Exact-match on the bare commits path — the path/ref/per_page operands ride the query string.
+    // Registered ONLY when the fixture is supplied so every other spec's route table is
+    // byte-identical (NREG-01); the final fallthrough 404 covers the unregistered case.
+    if (method === 'GET' && fixtures.fileHistoryResponses && url.pathname === `${repoPrefix}/commits`) {
+      const fixture = fixtures.fileHistoryResponses;
+      const status = fixture.status ?? 200;
+      if (status >= 400) {
+        return json({ message: `File history error ${status}` }, status);
+      }
+      return json(fixture.body ?? [], status);
+    }
+
+    // --- PRD-06 (FR-131): GET /search/code (code search backing grep_repo) ---
+    // This path lives OUTSIDE repoPrefix -- /search/code is a global endpoint that is repository-scoped
+    // only through the `repo:owner/name` qualifier inside `q` -- so it cannot collide with any
+    // repo-scoped route and its placement here is order-insensitive. Registered ONLY when the fixture
+    // is supplied, so every other spec falls through to the terminal 404 exactly as before (NREG-01).
+    if (method === 'GET' && fixtures.codeSearchResponses && url.pathname === '/search/code') {
+      const fixture = fixtures.codeSearchResponses;
+      const status = fixture.status ?? 200;
+      if (status >= 400) {
+        return json({ message: `Code search error ${status}` }, status);
+      }
+      return json(fixture.body ?? { total_count: 0, incomplete_results: false, items: [] }, status);
+    }
+
+    if (method === 'GET' && fixtures.branchResponse && url.pathname.startsWith(`${repoPrefix}/branches/`)) {
+      const fixture = fixtures.branchResponse;
+      const status = fixture.status ?? 200;
+      if (status >= 400) {
+        return json({ message: `Branch read error ${status}` }, status);
+      }
+      return json(fixture.body ?? { commit: { sha: 'commitsha000000000' } }, status);
+    }
+
+    if (method === 'GET' && fixtures.treeResponse && url.pathname.startsWith(`${repoPrefix}/git/trees/`)) {
+      const fixture = fixtures.treeResponse;
+      const status = fixture.status ?? 200;
+      if (status >= 400) {
+        return json({ message: `Tree read error ${status}` }, status);
+      }
+      return json(
+        {
+          sha: fixture.sha ?? 'treesha0000000000',
+          truncated: fixture.truncated ?? false,
+          tree: fixture.tree ?? [],
+        },
+        status,
+      );
+    }
+
     if (method === 'GET' && url.pathname === `${repoPrefix}/pulls/${fixtures.prNumber}`) {
       if (accept === 'application/vnd.github.v3.diff') {
         return text(fixtures.diff, 200);
@@ -264,8 +422,73 @@ export function installGitHubFetchMock(fixtures: GitHubFetchMockFixtures) {
     // PULLS comments route (distinct from the ISSUES comments route above). Returns the reply's own
     // id + authoring user, mirroring the issue-comment POST shape. Without this handler the shared
     // mock 404s this route (:below), so the reply adapter test cannot exercise the endpoint (Codex MEDIUM).
+    //
+    // Phase 33 (FR-031): when `reviewCommentResponses` is supplied, the route discriminates reply
+    // vs per-comment-fallback posts by reading the request body. A body with `in_reply_to` returns
+    // the reply default WITHOUT consuming the script (reply specs stay byte-identical -- REVIEWS
+    // R2/R11); a body with `commit_id` consumes the script. The body parse is try/catch-guarded so
+    // route discrimination can never throw the mock (Antigravity LOW mitigation).
     if (method === 'POST' && url.pathname === `${repoPrefix}/pulls/${fixtures.prNumber}/comments`) {
+      if (fixtures.reviewCommentResponses) {
+        let parsedBody: any = null;
+        try {
+          parsedBody = typeof init?.body === 'string' ? JSON.parse(init.body) : null;
+        } catch {
+          parsedBody = null;
+        }
+        if (parsedBody && typeof parsedBody === 'object' && 'in_reply_to' in parsedBody) {
+          return json({ id: replyCommentId, user: { id: commentUserId, login: commentUserLogin } }, 201);
+        }
+        if (parsedBody && typeof parsedBody === 'object' && 'commit_id' in parsedBody) {
+          // WR-08: `?? { status: 201 }` guards the `length === 0` case. An explicitly-supplied
+          // empty array passes the truthy gate above, and `Math.min(idx, -1)` is `-1`, so the
+          // unguarded lookup returned `undefined` and `script.status` threw a TypeError from
+          // inside the mock -- masking the real assertion failure in whichever spec supplied it.
+          // Same posture as the try/catch around `parsedBody`: route handling must never throw.
+          const script = reviewCommentResponses[
+            Math.min(reviewCommentCallIndex, reviewCommentResponses.length - 1)
+          ] ?? { status: 201 };
+          reviewCommentCallIndex += 1;
+          if (script.status >= 400) {
+            return json({ message: 'Unprocessable Entity' }, script.status);
+          }
+          return json({ id: script.id ?? replyCommentId, user: { id: commentUserId, login: commentUserLogin } }, script.status);
+        }
+        // Neither discriminator present (or unparseable body): fall back to the reply default
+        // without consuming the script -- route discrimination must never throw the mock.
+        return json({ id: replyCommentId, user: { id: commentUserId, login: commentUserLogin } }, 201);
+      }
       return json({ id: replyCommentId, user: { id: commentUserId, login: commentUserLogin } }, 201);
+    }
+
+    // GET single review comment by id (LRN-01, G-28-3). Matches the LITERAL `comments` segment so it
+    // can never shadow `pulls/{prNumber}` (exact-equality match above) or `pulls/{prNumber}/reviews`
+    // (exact-equality match above), and it is GET-only so the POST reply route above is untouched.
+    // Registered ONLY when the fixture is supplied; otherwise the request falls through to the
+    // terminal 404 and every pre-existing spec behaves byte-identically (NREG-01).
+    if (
+      method === 'GET' &&
+      fixtures.reviewCommentResponse &&
+      url.pathname.startsWith(`${repoPrefix}/pulls/comments/`) &&
+      /\/pulls\/comments\/\d+$/.test(url.pathname)
+    ) {
+      const fixture = fixtures.reviewCommentResponse;
+      const status = fixture.status ?? 200;
+      if (status === 404) {
+        return json({ message: 'Not Found' }, 404);
+      }
+      if (status >= 400) {
+        return json({ message: `Review comment fetch error ${status}` }, status);
+      }
+      return json(
+        {
+          path: fixture.path ?? 'src/example.ts',
+          line: fixture.line ?? null,
+          position: fixture.position ?? null,
+          body: fixture.body ?? 'default review comment body',
+        },
+        status,
+      );
     }
 
     // GET list: single-page fixture. commentListItems may include a user-less entry so a spec can

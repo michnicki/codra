@@ -1,6 +1,6 @@
 import { logger } from './logger';
 import { isSupportedGitHubWebhookEvent, type GitHubWebhookEventName, type GitHubWebhookPayload, type IssueCommentWebhookPayload, type PullRequestWebhookPayload } from '@shared/github';
-import { defaultRepoConfig, normalizeModelId, reviewUnitKey, type CriticResult, type FileReviewPass, type JobAuditEvent, type ParsedReviewComment, type RepoConfig, type ReviewJobMessage } from '@shared/schema';
+import { defaultRepoConfig, normalizeModelId, parseVcsCommitEntries, repoConfigSchema, reviewUnitKey, type CriticResult, type FileReviewPass, type JobAuditEvent, type ParsedReviewComment, type RepoConfig, type ReviewJobMessage, type VcsCommitEntry } from '@shared/schema';
 import { isTimeoutMessage, matchesAnyTransientSubstring } from '@shared/transient-errors';
 import type { AppBindings } from '@server/env';
 import { bulkInheritFileReviews, bulkMarkFilesFailed, getFileReviewsForJobs, recordRetryableFileReviewFailure, upsertFileReview } from '@server/db/file-reviews';
@@ -26,17 +26,24 @@ import {
   setJobWorkflowInstance,
   supersedeOlderJobs,
   updateJobCheckRun,
+  updateJobConfigSnapshot,
   updateJobCriticResult,
   updateJobStatusCheckRef,
   updateJobStep,
+  appendJobAuditEvents,
 } from '@server/db/jobs';
 import { getPrReviewState, setLastReviewedSha, type PrReviewStateKey } from '@server/db/pr-review-state';
-import { filterReviewableFiles, parseUnifiedDiff, partitionReviewableFiles, selectReviewableFiles, type FileDiff, type FileSelectionResult } from './diff';
+import { buildCrossFileDiff, CROSS_FILE_DIFF_MAX_LINES, CROSS_FILE_SENTINEL, filterReviewableFiles, parseUnifiedDiff, partitionReviewableFiles, selectReviewableFiles, type FileDiff, type FileSelectionResult } from './diff';
 import { insertSkippedFiles, listSkippedFilesForHead, type SkippedFilesHeadKey } from '@server/db/skipped-files';
 import { dedupeComposite, dedupeFindings } from './dedup';
+import { checkEvidence, type EvidenceDropEntry } from './evidence';
+import { suppressByLearnedRules } from './learned-rules';
 import { applyNoiseFilter, type NoiseFilterOptions } from './noise-filter';
-import { parseSummaryResponse, parseWalkthroughDiagram } from './model-output';
-import { buildCriticDecisionsAuditEvent, recordCriticAudit } from './audit';
+import { parseCrossFileSecurityResponse, parseSummaryResponse, parseWalkthroughDiagram } from './model-output';
+import { buildAgenticContextAuditEvent, buildCriticDecisionsAuditEvent, buildCrossFileSecurityAuditEvent, buildEvidenceHardDroppedEvent, buildLearnedRuleSuppressedEvent, recordAgenticContextAudit, recordCrossFileSecurityAudit, recordCriticAudit, type AgenticContextAuditReason } from './audit';
+// The audit boundary's error redactor (D-07). Used by the agentic-context fail-open handler so an
+// error-derived reason is one of MACHINE_ERROR_REASONS and never a provider response body.
+import { redactErrorMessage } from './audit-redact';
 import {
   CRITIC_REASON_BELOW_SKIP_THRESHOLD,
   CRITIC_REASON_OVER_CHAR_BUDGET,
@@ -56,13 +63,18 @@ import { updateFileReviewEnsembleResult } from '@server/db/file-reviews';
 import {
   buildFileSkipEvents,
   buildFinalizeDropEvents,
+  buildInlineCommentSkippedEvent,
   recordFileSkips,
   recordFinalizeDrops,
   recordRoundAudit,
   recordUnitAudit,
   recordVerifyFixesAudit,
+  recordYamlConfigApplied,
+  recordYamlConfigHeadIgnored,
+  recordYamlConfigParseFailed,
 } from './audit';
 import { runVerifyFixesPhase } from './verify-fixes';
+import { parseYaml } from './yaml-parse';
 import {
   buildRoundInputsFromConfig,
   buildRoundsAnchorSkippedEvent,
@@ -80,7 +92,7 @@ import {
 } from './rounds';
 
 import { VcsService } from '../services/vcs';
-import type { VcsProvider, VcsPullRequest, VcsReviewThread, VcsUpdateStatusCheckInput } from '../vcs/types';
+import type { VcsProvider, VcsPullRequest, VcsReviewThread, VcsUpdateStatusCheckInput, VcsPostedComment, VcsSkippedComment } from '../vcs/types';
 import { isRetryableModelError, ModelService } from '../services/model';
 import { FormatterService } from '../services/formatter';
 import { TokenTracker } from './token-tracker';
@@ -90,6 +102,18 @@ import { runWalkthroughEnrichmentPhase } from './walkthrough-enrichment';
 import { getWebhookDelivery } from '@server/db/webhook-deliveries';
 import { getReviewSettings } from '@server/db/app-settings';
 import { REVIEW_CONCURRENCY_LIMITS } from '@shared/schema';
+// PRD-06 (FR-131/FR-132): the pure agentic-context executor and its bounds. The D-14 index gate reads
+// the same two accessors `core/qa.ts` uses — findRepositoryIdByIdentity (a SELECT; NEVER
+// getOrCreateRepository, whose every branch INSERTs) and getCodeIndexState.
+import {
+  AGENTIC_BUDGET_RESERVE,
+  AGENTIC_MAX_GREP_HITS,
+  agenticContextBlobSchema,
+  executeAgenticLoop,
+  type AgenticLoopOutcome,
+} from './agentic-tools';
+import { findRepositoryIdByIdentity } from '@server/db/repositories';
+import { getCodeIndexState } from '@server/db/code-index';
 
 type PersistedReviewJob = ReturnType<typeof mapJob>;
 
@@ -110,7 +134,11 @@ export type ReviewJobRunResult =
   // hand off exactly like every other phase. The verify_fixes phase runs as its OWN fresh-budget
   // step between critic and finalize (or review and finalize when critic is off) — see
   // nextPhaseAfterCritic / nextPhaseAfterVerifyFixes below.
-  | { action: 'next_phase'; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment'; delaySeconds: number; jobId?: string; freshInstance?: boolean };
+  //
+  // Phase 35 (PRD-06, D-09) widens it again with 'agentic_context', the bounded tool-loop phase that
+  // sits between prepare and review. It also runs on its OWN fresh budget: six model calls plus their
+  // provider fetches do not fit alongside the prepare phase's own spend.
+  | { action: 'next_phase'; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' | 'cross_file_security' | 'agentic_context'; delaySeconds: number; jobId?: string; freshInstance?: boolean };
 
 const REVIEW_CHUNK_WALL_CLOCK_MS = 12 * 60 * 1000;
 const JOB_LEASE_SECONDS = 15 * 60;
@@ -204,6 +232,32 @@ const DIFF_CACHE_TTL_SECONDS = 6 * 60 * 60;
 // Raising it to ~10 to "absorb" the second pass would make floor(25/10) == 2 cap the slider to 2:
 // the second pass is absorbed by a longer unit list, never by a higher per-unit cost.
 export const ESTIMATED_SUBREQUESTS_PER_FILE = 5;
+
+// PRD-04 (FR-114) / WR-04 (34-REVIEW): bounds on the prepare-phase file-history fetch loop.
+//
+// The loop's only bound used to be `hasRemainingSafeBudget(1)`, i.e. it was allowed to fetch until
+// the tracker reached MAX_SUBREQUESTS - SAFE_MARGIN (50 - 25 = 25) and reserved NOTHING for the
+// rest of the phase. But SAFE_MARGIN is not spare change: token-tracker.ts documents it as the
+// reserve for the UNTRACKED Hyperdrive queries (~15 per chunk) the tracker cannot see. After this
+// loop, prepare still runs completePreparationStep, a lease heartbeat, postWalkthroughPlaceholder
+// (a provider POST when the walkthrough is on), the check-run cosmetics update and
+// enqueueJobPhase. A 25-file PR with file_history on could therefore spend the entire safe budget
+// on history and push the invocation past the hard 50 cap -> "Too many subrequests" thrown out of
+// prepare. Recoverable (the KV map means the retry skips the fetches) but it costs a failed
+// invocation for a purely advisory feature.
+//
+// Two independent bounds, both deliberately conservative — history is CONTEXT ENRICHMENT, never
+// worth risking the phase that does the actual work:
+//
+//   RESERVE (8): stop fetching while 8 safe-budget slots remain, sized to cover the walkthrough
+//   POST + check-run update + queue send with headroom, so the tail of prepare always completes.
+//
+//   HARD CAP (10): an absolute ceiling on fetches per prepare invocation, independent of what the
+//   tracker reports. This is the bound that holds if the per-request cost is ever mis-estimated
+//   (the real client spends 1 subrequest per fetch, so the reserve alone would permit ~17).
+//   Files past the cap simply review diff-only — the documented D-05 degradation.
+const FILE_HISTORY_BUDGET_RESERVE = 8;
+const MAX_FILE_HISTORY_FETCHES_PER_PREPARE = 10;
 
 /**
  * How many files a single review chunk may process concurrently: the configured concurrency
@@ -501,7 +555,7 @@ export async function runReviewJob(env: AppBindings, message: ReviewJobMessage):
 
   try {
     if (phase === 'prepare') {
-      await runPreparePhase(env, job, leaseOwner, vcs);
+      await runPreparePhase(env, job, leaseOwner, vcs, tracker);
     } else if (phase === 'finalize') {
       await runFinalizePhase(env, job, leaseOwner, vcs, formatter);
     } else if (phase === 'critic') {
@@ -522,6 +576,26 @@ export async function runReviewJob(env: AppBindings, message: ReviewJobMessage):
         config: configForEnrichment,
         model,
       });
+    } else if (phase === 'cross_file_security') {
+      // SEC-XDIFF-01: the cross-file security reasoning phase. Runs a whole-diff security model
+      // call on its own fresh-budget step. Fail-open: model errors persist a skipped row + audit
+      // event and hand off to the next phase.
+      const configForCrossFile = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
+      await runCrossFileSecurityPhase(env, job, configForCrossFile, model);
+    } else if (phase === 'agentic_context') {
+      // ROUTING ANCHOR 3. PRD-06 (FR-131, D-09): the bounded agentic-context phase. Runs up to
+      // AGENTIC_MAX_HOPS tool-calling model turns on its own fresh-budget step between prepare and
+      // review.
+      //
+      // Fail-open in every branch (D-11), and as of CR-02 (35-REVIEW.md) that is enforced rather than
+      // merely intended. Precisely what is guaranteed: the phase never reaches `failJobAndCheckRun`.
+      // A disabled toggle, an existing KV blob, a repository that already has a ready code index, a
+      // model failure, an unparseable model, a provider throw out of `read_file`/`grep_repo`, a failed
+      // seed read and an exhausted hop/byte/file budget ALL hand off to the next phase. The two
+      // exceptions that still propagate are not failures: JOB_SUPERSEDED (a newer push cancelled the
+      // job) and a subrequest-budget error (the outer catch reschedules THIS phase on a fresh budget).
+      const configForAgentic = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
+      await runAgenticContextPhase(env, job, configForAgentic, vcs, model, tracker);
     } else {
       await runReviewPhase(env, job, leaseOwner, vcs, model, tracker);
     }
@@ -538,16 +612,19 @@ export async function runReviewJob(env: AppBindings, message: ReviewJobMessage):
 
     if (error instanceof NextPhaseError) {
       await releaseJobLease(env, job.id, leaseOwner);
-      // Finalize AND critic AND verify_fixes AND walkthrough_enrichment each need a fresh instance
-      // for a clean subrequest budget: finalize posts the review (~20 subrequests at once), critic
-      // makes its single whole-set model call on its OWN budget (D-07 — the critic must never share
-      // finalize's budget), verify_fixes runs an unbounded number of file-content fetches + model
-      // calls + resolution calls on its OWN budget (D-01/D-02 — never share the prior phase's
-      // spent budget), and walkthrough_enrichment makes its single whole-set enrichment call on
-      // its OWN budget (D-13 — never share the prior phase's spent budget). Other phase transitions
-      // (e.g. the per-chunk review yield) stay in this instance and rely on the normal step.sleep
-      // hibernation to reset the budget.
-      const freshInstance = error.phase === 'finalize' || error.phase === 'critic' || error.phase === 'verify_fixes' || error.phase === 'walkthrough_enrichment';
+      // Finalize AND critic AND verify_fixes AND walkthrough_enrichment AND cross_file_security each
+      // need a fresh instance for a clean subrequest budget: finalize posts the review (~20
+      // subrequests at once), critic makes its single whole-set model call on its OWN budget (D-07),
+      // verify_fixes runs an unbounded number of file-content fetches + model calls on its OWN budget,
+      // walkthrough_enrichment makes its single whole-set enrichment call on its OWN budget (D-13),
+      // and cross_file_security makes its single whole-diff model call on its OWN budget (SEC-XDIFF-01),
+      // and agentic_context runs up to AGENTIC_MAX_HOPS model calls plus their provider fetches on its
+      // OWN budget (PRD-06, D-09).
+      //
+      // ROUTING ANCHOR 4 — NOT a `tsc` site. This is a plain boolean disjunction: omitting
+      // 'agentic_context' compiles cleanly and then runs the phase on an already-spent budget, where it
+      // trips "Too many subrequests" instead of gathering anything.
+      const freshInstance = error.phase === 'finalize' || error.phase === 'critic' || error.phase === 'verify_fixes' || error.phase === 'walkthrough_enrichment' || error.phase === 'cross_file_security' || error.phase === 'agentic_context';
       return { action: 'next_phase', phase: error.phase, delaySeconds: error.delaySeconds, jobId: job.id, freshInstance };
     }
 
@@ -599,7 +676,7 @@ async function continueOrFailWedgedJob(
   job: PersistedReviewJob,
   vcs: VcsProvider,
   leaseOwner: string,
-  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment',
+  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' | 'cross_file_security' | 'agentic_context',
   delaySeconds: number,
   reason: string,
 ): Promise<ReviewJobRunResult> {
@@ -611,7 +688,11 @@ async function continueOrFailWedgedJob(
   // review keeps the generous ceiling because it makes real per-file progress. (Critic and
   // verify_fixes never terminal-fail on exceed — they fail OPEN to finalize in the branches
   // below — but they still use the low ceiling to bound their fresh-instance retries.)
-  const ceiling = phase === 'finalize' || phase === 'critic' || phase === 'verify_fixes' || phase === 'walkthrough_enrichment'
+  //
+  // ROUTING ANCHOR 6 — NOT a `tsc` site. Omitting 'agentic_context' from this list compiles cleanly
+  // and then gives a wedged ADVISORY phase the generous review-sized ceiling, so it grinds for ~20
+  // minutes on fresh-instance retries instead of failing over in a few.
+  const ceiling = phase === 'finalize' || phase === 'critic' || phase === 'verify_fixes' || phase === 'walkthrough_enrichment' || phase === 'cross_file_security' || phase === 'agentic_context'
     ? MAX_FINALIZE_CONTINUATIONS
     : MAX_JOB_CONTINUATIONS;
 
@@ -696,6 +777,37 @@ async function continueOrFailWedgedJob(
       await resetJobContinuationCount(env, job.id);
       await releaseJobLease(env, job.id, leaseOwner);
       return { action: 'next_phase', phase: nextPhaseAfterVerifyFixes(configFromVerifyFixes), delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
+    } else if (phase === 'cross_file_security') {
+      // SEC-XDIFF-01 FAIL-OPEN: a wedged cross_file_security phase must NEVER terminal-fail the job.
+      // Reset the continuation counter and route through nextPhaseAfterCrossFileSecurity so the
+      // chain continues to verify_fixes / critic / walkthrough_enrichment / finalize. The cross-file
+      // security pass is advisory — its findings enrich the review but are never required.
+      const configFromCrossFile = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
+      logger.error(`cross_file_security phase exceeded the continuation ceiling; failing OPEN to configured post-cross-file successor (no cross-file findings applied): ${job.owner}/${job.repo} PR #${job.prNumber}`, {
+        phase,
+        continuationCount,
+        reason,
+        successor: nextPhaseAfterCrossFileSecurity(configFromCrossFile),
+      });
+      await resetJobContinuationCount(env, job.id);
+      await releaseJobLease(env, job.id, leaseOwner);
+      return { action: 'next_phase', phase: nextPhaseAfterCrossFileSecurity(configFromCrossFile), delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
+    } else if (phase === 'agentic_context') {
+      // ROUTING ANCHOR 7. PRD-06 FAIL-OPEN (D-11): a wedged agentic_context phase must NEVER
+      // terminal-fail the job. Reset the continuation counter and route through
+      // nextPhaseAfterAgenticContext so the review that does the actual work still runs. The agentic
+      // pass is purely advisory — its gathered context enriches the review prompt but is never
+      // required, and FR-131's own fallback is "review the diff alone".
+      const configFromAgentic = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
+      logger.error(`agentic_context phase exceeded the continuation ceiling; failing OPEN to review (no gathered context applied): ${job.owner}/${job.repo} PR #${job.prNumber}`, {
+        phase,
+        continuationCount,
+        reason,
+        successor: nextPhaseAfterAgenticContext(configFromAgentic),
+      });
+      await resetJobContinuationCount(env, job.id);
+      await releaseJobLease(env, job.id, leaseOwner);
+      return { action: 'next_phase', phase: nextPhaseAfterAgenticContext(configFromAgentic), delaySeconds: FRESH_INVOCATION_YIELD_SECONDS, jobId: job.id, freshInstance: true };
     } else {
       const message = `Review could not make progress after ${continuationCount} continuation attempts (${reason}). Failing the job to avoid an endless retry loop; re-run it once the underlying provider issue clears.`;
       logger.error(`Review job exceeded the continuation ceiling; failing terminally: ${job.owner}/${job.repo} PR #${job.prNumber}`, {
@@ -720,7 +832,10 @@ async function continueOrFailWedgedJob(
 async function resolveQueuedJob(
   env: AppBindings,
   message: ReviewJobMessage,
-): Promise<{ job: PersistedReviewJob; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' } | null> {
+// ROUTING ANCHOR 8 — the widened return union below belongs to THIS function, `resolveQueuedJob`
+// (declared immediately above). 35-RESEARCH.md's site table called it `resolveJobForPhase`; that name
+// does not exist anywhere in the tree, so do not go looking for it.
+): Promise<{ job: PersistedReviewJob; phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' | 'cross_file_security' | 'agentic_context' } | null> {
   // The WIRE contract (reviewJobMessageSchema.phase) includes 'critic' (D-07). Phase 10 DISPATCHES it
   // — but ONLY for a jobId-bearing message. A critic phase is only ever reached AFTER a job exists
   // (review→critic hands off keyed on the resolved jobId), so a phase:'critic' message WITHOUT a jobId
@@ -747,6 +862,23 @@ async function resolveQueuedJob(
     // spoof / premature delivery — REJECT it here so a stray queue message can never resolve a
     // job by webhook payload and run against it.
     logger.warn('Queue message ignored: phase "walkthrough_enrichment" requires a jobId (a jobId-less enrichment message is treated as a spoof).');
+    return null;
+  }
+  if (requestedPhase === 'cross_file_security' && !message.jobId) {
+    // SEC-XDIFF-01: cross_file_security is a jobId-only phase, same posture as critic /
+    // verify_fixes / walkthrough_enrichment. A phase:'cross_file_security' message WITHOUT a
+    // jobId is a spoof / premature delivery — REJECT it here.
+    logger.warn('Queue message ignored: phase "cross_file_security" requires a jobId (a jobId-less cross_file_security message is treated as a spoof).');
+    return null;
+  }
+  if (requestedPhase === 'agentic_context' && !message.jobId) {
+    // ROUTING ANCHOR 9 (PRD-06, T-35-06) — NOT a `tsc` site. agentic_context is a jobId-only phase,
+    // same posture as critic / verify_fixes / walkthrough_enrichment / cross_file_security: it is only
+    // ever reached AFTER prepare created the job row and handed off keyed on the resolved jobId, so a
+    // phase:'agentic_context' message WITHOUT a jobId is a spoof or a premature delivery. REJECT it
+    // here — omitting this guard compiles cleanly and lets a stray message resolve a job by webhook
+    // payload and run a tool loop against it.
+    logger.warn('Queue message ignored: phase "agentic_context" requires a jobId (a jobId-less agentic_context message is treated as a spoof).');
     return null;
   }
 
@@ -887,10 +1019,158 @@ async function runPreparePhase(
   job: PersistedReviewJob,
   leaseOwner: string,
   vcs: VcsProvider,
+  tracker: TokenTracker,
 ) {
   await updateJobStep(env, job.id, 'Preparation', { status: 'running' });
   const pr = await vcs.getPullRequest(job.owner, job.repo, job.prNumber);
-  const config = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
+  let config = (job.configSnapshot ?? defaultRepoConfig) as RepoConfig;
+
+  // Phase 34 (PRD-05): .review.yaml per-repo configuration discovery.
+  // Gated on review.yaml_config.enabled (D-15, default false). When on, fetches
+  // .review.yaml (then .review.yml — first found wins) from the PR BASE BRANCH TIP
+  // (`pr.baseSha`), parses with the inline YAML parser, validates against the existing
+  // Zod schema, and merges at top-level key boundaries (D-09). Parse/validation
+  // failures fall back to the DB config + record a yaml_config_parse_failed audit
+  // event (D-12). No file found → no action (D-14). When the toggle is off, zero
+  // subrequests, zero behavior change (NREG-01).
+  //
+  // WR-03 (quick-k31): THE BASE-BRANCH READ DELIBERATELY REVERSES THE HEAD HALF OF D-13.
+  // D-13's other half — re-read on EVERY review, never cached, first file found wins —
+  // stands unchanged. Do NOT "restore" the head read as a bug fix; it is the vector:
+  //
+  //   `pr.headSha` is a ref ANY PR AUTHOR CONTROLS, and the D-09 merge is wholesale at
+  //   top-level key boundaries. An author could commit `review: { skip_files: ["**"] }`
+  //   (or `max_comments: 0`, or `min_confidence: 1.0`) to their own branch and receive a
+  //   COMPLETED, GREEN review that examined nothing — review theater. The same file also
+  //   silently resets every operator-configured `review.*` sub-key to its Zod default
+  //   (passes.security.enabled → false, evidence.hard_drop → false, …), and that reset is
+  //   persisted to jobs.config_snapshot for every later phase.
+  //
+  //   An allow-list of "safe" sub-keys does NOT close this: `skip_files` is simultaneously
+  //   the most legitimately useful key in the file and the most effective neutering tool,
+  //   so any allow-list that keeps the feature useful keeps the bypass open.
+  //
+  //   Reading from the base branch makes the config MAINTAINER-REVIEWED CODE. An author may
+  //   still PROPOSE config changes in a PR; they take effect once merged. A contributor who
+  //   edits the file in their PR learns why it had no effect on that PR from the
+  //   `yaml_config_head_ignored` audit event emitted further below.
+  //
+  // The ref is the base branch TIP, not the merge base. Deliberate: we want the LATEST
+  // trusted config, not whatever the config looked like when the branch was cut.
+  let mergedConfig = config;
+  // The seam type declares `baseSha: string` (non-nullable, src/server/vcs/types.ts:29) and both
+  // adapters populate it from the provider API (GitHub `pr.base.sha`, Bitbucket
+  // `destination.commit.hash`). This guard is defensive against a provider returning an EMPTY
+  // string, not against the type. It FAILS CLOSED: no usable base ref means NO config discovery
+  // at all. There is NO fallback to `pr.headSha` under any circumstance — a fail-open here would
+  // restore the exact vector the base-branch read closes.
+  const yamlConfigEnabled = config.review.yaml_config?.enabled === true;
+  const yamlConfigRef = pr.baseSha;
+  const hasUsableYamlConfigRef = typeof yamlConfigRef === 'string' && yamlConfigRef.trim().length > 0;
+  if (yamlConfigEnabled && !hasUsableYamlConfigRef) {
+    logger.warn(
+      `Skipping .review.yaml config discovery for job ${job.id}: the PR has no usable base SHA. The DB config governs this review; the PR head is NEVER used as a fallback.`,
+    );
+  }
+  if (yamlConfigEnabled && hasUsableYamlConfigRef) {
+    for (const yamlPath of ['.review.yaml', '.review.yml']) {
+      // WR-01 (34-REVIEW): the FETCH gets its own try/catch, separate from parse/validation.
+      // A transient provider failure (GitHubError 500/403/429 after retries, TimeoutError) is an
+      // INFRASTRUCTURE problem, not a config-syntax problem. Folding it into the parse catch (a)
+      // emitted a yaml_config_parse_failed event blaming the operator's YAML for an API hiccup —
+      // D-12 scopes that event to parse/validation failure — and (b) `break`ed, so a repo that
+      // uses `.review.yml` silently lost its config whenever the `.review.yaml` probe 500'd.
+      // Log and CONTINUE to the next candidate filename instead.
+      let rawYaml: string | null;
+      try {
+        rawYaml = await vcs.getFileContent(job.owner, job.repo, yamlPath, yamlConfigRef);
+      } catch (error) {
+        logger.warn(
+          `Failed to fetch ${yamlPath} for ${job.owner}/${job.repo}; trying the next candidate filename`,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+        continue;
+      }
+      if (rawYaml === null) continue; // no such file (D-14) — try the next candidate
+
+      try {
+        const yamlObject = parseYaml(rawYaml); // plain JS object — ONLY the keys the file declares
+        repoConfigSchema.parse(yamlObject); // D-10 standalone validation: type-checks + fills defaults; throws on bad YAML
+        // Merge at top-level key boundaries (D-09, contract locked by 34-01 Task 3):
+        // overlay ONLY the top-level keys the YAML actually declares onto the DB config,
+        // then re-validate. A declared key replaces the DB key WHOLESALE — its sub-keys
+        // revert to Zod schema defaults (e.g. review.max_files → 150, never the DB's
+        // value); top-level keys the YAML does not declare keep their DB values.
+        // NOTE: overlay `yamlObject` (the raw declared keys), NOT the fully-defaulted
+        // parse() result — spreading the latter would clobber undeclared top-level
+        // keys (e.g. model) with Zod defaults.
+        mergedConfig = repoConfigSchema.parse({
+          ...config,
+          ...yamlObject,
+        });
+
+        // WR-03 / WR-07 (34-REVIEW): make the merge OBSERVABLE.
+        //
+        // WR-03: the TAMPERING VECTOR IS CLOSED by the base-branch read above — this file came
+        // from `pr.baseSha`, so its content is maintainer-reviewed code, not something the PR
+        // author can set for their own review. `replaced_keys` therefore records which top-level
+        // keys a MAINTAINER-REVIEWED config replaced. That is still worth auditing, because the
+        // D-09 replacement remains WHOLESALE: a declared top-level key reverts its unspecified
+        // sub-keys to their Zod defaults (passes.security.enabled → false, evidence.hard_drop →
+        // false, learning.learned_rules → [], …), and the merged config is persisted to
+        // jobs.config_snapshot where every later phase observes it. An operator who wonders why
+        // the security pass was off for a review can read the answer here.
+        //
+        // Verified out of scope: this cannot reach command authorization (`authorizeActor` reads
+        // the webhook's DB config, not jobs.config_snapshot).
+        //
+        // WR-07: `repoConfigSchema` is non-strict, so a typo'd top-level key (`reveiw:`) is
+        // stripped by Zod and the merge becomes an identity — previously with no warning and no
+        // event at all. `ignored_keys` (plus the warn below) is that missing signal.
+        const declaredKeys = Object.keys(yamlObject);
+        const knownKeys = new Set(Object.keys(repoConfigSchema.shape));
+        const replacedKeys = declaredKeys.filter((key) => knownKeys.has(key));
+        const ignoredKeys = declaredKeys.filter((key) => !knownKeys.has(key));
+        if (ignoredKeys.length > 0) {
+          logger.warn(
+            `Ignored ${ignoredKeys.length} unknown top-level key(s) in ${yamlPath} for ${job.owner}/${job.repo}`,
+            // Key NAMES only — never values, and never the raw file (untrusted PR-head content).
+            { ignoredKeys: ignoredKeys.slice(0, 20) },
+          );
+        }
+        await recordYamlConfigApplied(env, job.id, yamlPath, replacedKeys, ignoredKeys); // best-effort
+      } catch (error) {
+        logger.warn(
+          `Failed to parse ${yamlPath} for ${job.owner}/${job.repo}`,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+        const reasonText = error instanceof Error ? error.message : String(error);
+        await recordYamlConfigParseFailed(env, job.id, reasonText); // best-effort, never throws (D-12)
+      }
+      // First file FOUND wins — parse outcome does not change the discovery stop. This half of
+      // D-13 (first-found-wins, re-read every review, never cached) stands unchanged; only the
+      // head-vs-base half of D-13 was reversed (see the block comment above).
+      break;
+    }
+  }
+  const yamlMerged = mergedConfig !== config; // captured BEFORE the reassignment below
+  config = mergedConfig;
+  if (yamlMerged) {
+    // review HIGH-2: persist the merged config so review/finalize/critic/verify-fixes all
+    // observe YAML overrides (every downstream phase reloads config from the job row).
+    // Mirror it in-memory so THIS invocation's remaining code observes it. The DB write is
+    // fail-open (D-12 posture): a persistence failure logs + continues — the in-memory
+    // merged config still governs the current invocation.
+    job.configSnapshot = mergedConfig;
+    try {
+      await updateJobConfigSnapshot(env, job.id, mergedConfig);
+    } catch (error) {
+      logger.warn(
+        `Failed to persist merged YAML config snapshot for job ${job.id}; in-memory merged config governs this invocation`,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+  }
 
   // Refresh the cached PR title/author from the live PR: these are snapshotted at job creation and
   // copied onto retries, so a title edited on GitHub afterwards would otherwise stay stale.
@@ -993,6 +1273,10 @@ async function runPreparePhase(
   // NO file_skipped events (a review-rest job consumes prior skips, it does not re-record drops).
   let files: FileDiff[];
   let dropped: FileSelectionResult['dropped'] | null = null;
+  // quick-k31 (WR-03): the changed-path list the `yaml_config_head_ignored` notice reads. Populated
+  // from data BOTH branches below already compute, so the head-ignored detection costs ZERO extra
+  // subrequests — it never fetches the head file to compare.
+  let changedPathsForConfigNotice: string[] = [];
   // Phase 18 Plan 02 (RND-02): the durable, immutable diff-selection descriptor. Persisted on
   // the job row IMMEDIATELY after the prepare-time resolver + compare-fetch + selectDiffForRound
   // classify the diff source so review/finalize can re-fetch the EXACT same compare range on
@@ -1002,6 +1286,7 @@ async function runPreparePhase(
   let selectionDescriptor: DiffSelectionDescriptor | null = null;
   if (job.reviewScope === 'rest') {
     files = await getJobDiffFiles(env, job, vcs, config);
+    changedPathsForConfigNotice = files.map((file) => file.path);
   } else {
     // Build the descriptor against the prepare-time round context. The full diff is fetched on
     // 'full' (the default round 1 path) AND on the thrown-compare fallback path for 'incremental'.
@@ -1111,9 +1396,16 @@ async function runPreparePhase(
     // Use the SELECTED raw diff for the file selection. The KV cache is keyed on the SELECTED
     // mode + range so a cache miss never silently substitutes a different source (Codex HIGH).
     const rawDiff = selectDiffForSelection(selectionDescriptor, compareDiff, fullDiff);
-    const selection = selectReviewableFiles(parseUnifiedDiff(rawDiff, config.review), config.review);
+    // quick-k31 (WR-03): the parse is HOISTED (a rename, not an extra parse) so the UNFILTERED
+    // parsed list is nameable for the head-ignored notice below. The unfiltered output is the right
+    // source: `parseUnifiedDiff` still emits a `FileDiff` entry for a path the review skips
+    // (`isIgnored` only suppresses hunk accumulation — see core/diff.ts:147), so a `.review.yaml`
+    // change stays visible here even when `skip_files` excludes it from review.
+    const parsedSelectedFiles = parseUnifiedDiff(rawDiff, config.review);
+    const selection = selectReviewableFiles(parsedSelectedFiles, config.review);
     files = selection.kept;
     dropped = selection.dropped;
+    changedPathsForConfigNotice = parsedSelectedFiles.map((file) => file.path);
   }
 
   // CMD-02 / D-10 skipped-for-size producer: when the commands feature is active, persist the files
@@ -1152,6 +1444,97 @@ async function runPreparePhase(
     await recordFileSkips(env, job.id, buildFileSkipEvents(dropped));
   }
 
+  // quick-k31 (WR-03): tell a contributor who edited `.review.yaml` in THIS PR why it had no
+  // effect. Config is read from the base branch (see the discovery block above), so a head-side
+  // edit is inert until the PR merges — without this event, that is silent.
+  //
+  // Two non-obvious properties:
+  //   (i)  The event is emitted whether or not a base-branch config was FOUND. "A contributor is
+  //        adding `.review.yaml` for the first time" is exactly when the signal matters most, and
+  //        that case has no base config by definition.
+  //   (ii) The `no_changes` short-circuit above RETURNS before this point. That is correct: that
+  //        round reviewed no diff at all, so there is no config change in the reviewed diff.
+  //
+  // Gated on the feature toggle: with `yaml_config` off the config file has no effect on ANY
+  // review, so an "ignored" notice would be noise — and emitting it would break NREG-01's
+  // byte-identical disabled path. Detection reads the already-parsed changed-file list (exact,
+  // repo-root-relative match — discovery only reads root-level files), so it costs zero extra
+  // subrequests and never fetches the head file. Best-effort: the recorder swallows its own
+  // failures and never throws.
+  if (config.review.yaml_config?.enabled === true) {
+    const touchedConfigPath = changedPathsForConfigNotice.find(
+      (path) => path === '.review.yaml' || path === '.review.yml',
+    );
+    if (touchedConfigPath) {
+      await recordYamlConfigHeadIgnored(env, job.id, touchedConfigPath, pr.baseSha ?? '', pr.headSha ?? '');
+    }
+  }
+
+  // Phase 34 (PRD-04): per-file commit history for decision archaeology.
+  // Fetch happens ONCE here in prepare (budget-capped via TokenTracker) and is
+  // persisted to KV under `file-history:${jobId}`. The review phase loads from KV
+  // only — never re-fetching over REST on chunk/retry invocations (review HIGH-3).
+  // KV-read-first: a prepare retry (job recovery) reuses the persisted map.
+  // Fetch failures are fail-open (D-06): skip that file's history, proceed with
+  // the diff-only prompt. When the toggle is off, the entire block is skipped (NREG-01).
+  // EMPTY ARRAYS ARE PRESERVED: a zero-history (new) file persists as [] so the review
+  // phase passes [] to the prompt builder and the D-08 "(no prior history — new file)"
+  // block renders. Only a missing method (undefined) or a fetch failure (catch below)
+  // leaves a file out of the map — the review phase treats that as "no history
+  // available" (no appendix block).
+  const fileHistoryMap = new Map<string, VcsCommitEntry[]>();
+  if (config.review.file_history?.enabled === true) {
+    try {
+      const raw = await env.APP_KV.get(`file-history:${job.id}`, 'text');
+      if (raw) {
+        // WR-09: validate the KV round-trip instead of casting it. A map persisted by an earlier
+        // deploy (entries live for the 1-hour TTL) that no longer matches the contract used to
+        // surface as a TypeError inside buildFileHistoryBlock during prompt construction; now
+        // non-conforming entries are dropped fail-open.
+        for (const [path, entries] of Object.entries(JSON.parse(raw) as Record<string, unknown>)) {
+          fileHistoryMap.set(path, parseVcsCommitEntries(entries)); // preserve [] (D-08) — never `if (entries.length > 0)`
+        }
+      }
+    } catch {
+      // best-effort KV read; fall through to fetching
+    }
+    let historyFetches = 0;
+    for (const file of files) {
+      if (fileHistoryMap.has(file.path)) continue;
+      // WR-04: two bounds (see the constants above). The hard cap is checked first so it holds
+      // even if the tracker under-reports; the reserve keeps the tail of prepare (walkthrough
+      // POST, check-run update, enqueue) inside the budget.
+      if (historyFetches >= MAX_FILE_HISTORY_FETCHES_PER_PREPARE) break;
+      if (!tracker.hasRemainingSafeBudget(FILE_HISTORY_BUDGET_RESERVE)) break; // D-05: budget cap
+      historyFetches += 1; // count ATTEMPTS: a failed fetch still spent its subrequest
+      try {
+        // The GitHub/Bitbucket clients self-increment the tracker per request, so
+        // hasRemainingSafeBudget(...) above is the correct AND only guard — never call
+        // tracker.incrementSubrequests() manually here.
+        const history = await vcs.getFileHistory?.(job.owner, job.repo, file.path, pr.headSha, 5);
+        // WR-09: run ADAPTER OUTPUT through the schema too — it is the documented contract, and
+        // until now nothing enforced it. `undefined` still means "provider has no support" and is
+        // distinct from `[]` ("no history"), so the check stays outside the validator (D-08).
+        if (history !== undefined) fileHistoryMap.set(file.path, parseVcsCommitEntries(history)); // keep [] (D-08); undefined = no support
+      } catch (error) {
+        logger.warn(
+          `Failed to fetch history for ${file.path} in job ${job.id}`,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      }
+    }
+    if (fileHistoryMap.size > 0) {
+      const serializable = Object.fromEntries(fileHistoryMap);
+      try {
+        await env.APP_KV.put(`file-history:${job.id}`, JSON.stringify(serializable), {
+          expirationTtl: 3600, // 1-hour TTL — history is bounded to this job's lifespan
+        });
+      } catch (error) {
+        logger.warn(`Failed to persist file history map to KV for job ${job.id}`, error instanceof Error ? error : new Error(String(error)));
+      }
+    }
+  }
+
   await completePreparationStep(env, job.id, files.length);
   await heartbeatJobLease(env, job.id, leaseOwner, JOB_LEASE_SECONDS);
 
@@ -1187,7 +1570,12 @@ async function runPreparePhase(
       logger.warn(`Failed to update initial progress check run for job ${job.id}; continuing to the review phase anyway`, error instanceof Error ? error : new Error(String(error)));
     }
   }
-  await enqueueJobPhase(env, job.id, 'review');
+  // ROUTING ANCHOR 10. PRD-06 (D-09): the prepare hand-off is no longer hard-coded to 'review' — the
+  // selector inserts the agentic_context hop when `review.agentic_tools.enabled` is on, and returns
+  // 'review' at defaults so this line stays byte-identical in behavior (NREG-01). The zero-reviewable-
+  // files early return above deliberately still goes STRAIGHT to 'finalize': there is nothing to gather
+  // context for.
+  await enqueueJobPhase(env, job.id, nextPhaseAfterPrepare(config));
 }
 
 async function runReviewPhase(
@@ -1199,7 +1587,7 @@ async function runReviewPhase(
   tracker: TokenTracker,
 ) {
   if (!hasCompletedStep(job, 'Preparation')) {
-    await runPreparePhase(env, job, leaseOwner, vcs);
+    await runPreparePhase(env, job, leaseOwner, vcs, tracker);
     return;
   }
 
@@ -1214,6 +1602,60 @@ async function runReviewPhase(
     return failureModelProviderPromise;
   };
   const files = await getJobDiffFiles(env, job, vcs, config);
+  // Phase 34 (PRD-04): load the file-history map persisted by the prepare phase.
+  // KV-read-only — no REST fetches here, so chunk/retry invocations cost one KV
+  // read at most (review HIGH-3). [] entries survive JSON.parse, so zero-history
+  // files still render the D-08 "(no prior history — new file)" block.
+  //
+  // WR-05 (34-REVIEW): gated on the SAME toggle the prepare block uses. Ungated, every review
+  // invocation — one per chunk, per fresh-instance handoff, per retry — issued a KV read that can
+  // only ever miss when the feature is off, contradicting NREG-01 ("when off, zero subrequests,
+  // zero behavior change") and spending per-invocation binding budget the surrounding code treats
+  // as scarce, invisibly to the TokenTracker.
+  let persistedHistory: Record<string, VcsCommitEntry[]> | null = null;
+  if (config.review.file_history?.enabled === true) {
+    try {
+      const raw = await env.APP_KV.get(`file-history:${job.id}`, 'text');
+      if (raw) {
+        // WR-09: validated, not cast — see the matching prepare-phase read. Drift in a map written
+        // by an earlier deploy is dropped fail-open instead of throwing inside the prompt builder.
+        persistedHistory = Object.fromEntries(
+          Object.entries(JSON.parse(raw) as Record<string, unknown>).map(([path, entries]) => [
+            path,
+            parseVcsCommitEntries(entries),
+          ]),
+        );
+      }
+    } catch {
+      // best-effort: no history on KV failure (fail-open, D-06)
+    }
+  }
+  // Phase 35 (PRD-06, D-10): load the context blob the agentic_context phase persisted.
+  //
+  // Gated on the SAME toggle the phase itself uses, for the WR-05 reason spelled out above: an ungated
+  // read can only ever MISS when the feature is off, and it would be paid once per chunk, per
+  // fresh-instance handoff and per retry — invisibly to the TokenTracker — contradicting NREG-01's
+  // "when off, zero subrequests, zero behavior change".
+  //
+  // Parsed with safeParse, never cast (WR-09): a blob written by an earlier deploy is still live for its
+  // 1-hour TTL, and a shape drift must be dropped fail-open here rather than throwing inside the prompt
+  // builder mid-review.
+  let agenticContext: string | undefined;
+  if (config.review.agentic_tools?.enabled === true) {
+    try {
+      const raw = await env.APP_KV.get(agenticContextCacheKey(job.id), 'text');
+      if (raw) {
+        const parsedBlob = agenticContextBlobSchema.safeParse(JSON.parse(raw));
+        if (parsedBlob.success && parsedBlob.data.context.length > 0) {
+          agenticContext = parsedBlob.data.context;
+        } else if (!parsedBlob.success) {
+          logger.warn(`Persisted agentic context for job ${job.id} does not match the current contract; reviewing diff-only`);
+        }
+      }
+    } catch {
+      // best-effort: no gathered context on KV/JSON failure (fail-open, D-11)
+    }
+  }
   const totalLineCount = files.reduce((sum, file) => sum + file.lineCount, 0);
   const { concurrencyLevel } = await getReviewSettings(env);
   const configuredChunkFileLimit = REVIEW_CONCURRENCY_LIMITS[concurrencyLevel];
@@ -1234,7 +1676,9 @@ async function runReviewPhase(
   // model call. With security off the list is main-only and every downstream path (scheduling,
   // skip, inherit, completion) is byte-identical to v1.0 (NREG-01).
   const securityPassEnabled = config.review.passes?.security?.enabled ?? false;
-  const units: Array<{ file: (typeof files)[number]; pass: FileReviewPass }> = [];
+  // The per-file review loop only runs 'main' and 'security' passes. 'cross_file_security' is a
+  // whole-diff phase that runs separately in runCrossFileSecurityPhase (never here).
+  const units: Array<{ file: (typeof files)[number]; pass: 'main' | 'security' }> = [];
   for (const file of files) {
     units.push({ file, pass: 'main' });
     if (securityPassEnabled) units.push({ file, pass: 'security' });
@@ -1310,6 +1754,11 @@ async function runReviewPhase(
 
     const inherited = parentReviews.get(unitKey);
     const reviewTask = async () => {
+      // Phase 34 (PRD-04): per-file commit history from the KV-persisted map. A file absent
+      // from the map (fetch failure D-06, budget exhaustion D-05, or provider without
+      // getFileHistory) is undefined → the 34-02 toggle-aware builder renders no appendix;
+      // a new file persisted as [] → the D-08 "(no prior history — new file)" block renders.
+      const fileHistory = persistedHistory?.[file.path];
       // (0) Poll an already-submitted async batch review. Only the main pass ever submits to the
       // async batch queue (see below), so awaitingReview is main-only; the pass is threaded anyway.
       if (awaitingReview) {
@@ -1320,9 +1769,13 @@ async function runReviewPhase(
           // thread config so the async-batch parse path resolves the severity_engine.enabled escape
           // hatch from this repo's config, matching the sync path (13-04)
           config,
+          // D-04, D-05: use persisted submit-time value when available. Retain compactPrompt
+          // alongside for legacy rows where model_line_cap is NULL (consensus #1).
+          modelLineCap: awaitingReview.model_line_cap ?? undefined,
           // EVID-01 (Codex 15-04 HIGH): the same compact-prompt derivation submitReviewBatch used, so
           // pollReviewBatch reconstructs the EXACT bounded (truncated) file the model saw before the
           // evidence gate builds its haystack — truncated-away evidence correctly emits not_in_hunk.
+          // RETAINED alongside modelLineCap for legacy rows with NULL model_line_cap.
           compactPrompt: (awaitingReview.transient_error_count ?? existingReview?.transient_error_count ?? 0) > 0,
         });
         if (poll.status === 'pending') {
@@ -1334,7 +1787,7 @@ async function runReviewPhase(
           logger.warn(`Async batch poll failed for ${file.path}; falling back to synchronous review`, {
             error: poll.error instanceof Error ? poll.error.message : String(poll.error),
           });
-          await reviewAndPersistFile(env, job, file, pr, config, totalLineCount, model, resolveFailureModelProvider, existingReview, pass);
+          await reviewAndPersistFile(env, job, file, pr, config, totalLineCount, model, resolveFailureModelProvider, existingReview, pass, fileHistory, agenticContext);
           terminalProgress += 1;
           return;
         }
@@ -1354,6 +1807,8 @@ async function runReviewPhase(
             prDescription: pr.body ?? null,
             config,
             totalLineCount,
+            fileHistory,
+            agenticContext,
             compactPrompt: (existingReview?.transient_error_count ?? 0) > 0,
           });
           if (submitted) {
@@ -1377,6 +1832,7 @@ async function runReviewPhase(
               errorMessage: null,
               asyncRequestId: submitted.requestId,
               asyncModel: submitted.model,
+              modelLineCap: submitted.modelLineCap,
             });
             awaitingAsync += 1;
             return;
@@ -1398,20 +1854,22 @@ async function runReviewPhase(
               model,
               resolveFailureModelProvider,
               existingReview,
+              fileHistory,
+              agenticContext,
               { runs: ensembleConfig.runs, temperature: ensembleConfig.temperature ?? 0.7 },
             );
             terminalProgress += 1;
             return;
           }
         }
-        await reviewAndPersistFile(env, job, file, pr, config, totalLineCount, model, resolveFailureModelProvider, existingReview, pass);
+        await reviewAndPersistFile(env, job, file, pr, config, totalLineCount, model, resolveFailureModelProvider, existingReview, pass, fileHistory, agenticContext);
         terminalProgress += 1;
         return;
       }
 
       if (!canInheritParentFileReview(config, inherited)) {
         logger.info(`Ignoring inherited review for ${file.path} (${pass}); parent model ${inherited.model_used} is not in the current model strategy`);
-        await reviewAndPersistFile(env, job, file, pr, config, totalLineCount, model, resolveFailureModelProvider, existingReview, pass);
+        await reviewAndPersistFile(env, job, file, pr, config, totalLineCount, model, resolveFailureModelProvider, existingReview, pass, fileHistory, agenticContext);
         terminalProgress += 1;
       } else {
         await upsertFileReview(env, job.id, {
@@ -1671,8 +2129,17 @@ async function reviewAndPersistFile(
   // Which review PASS this call persists. Defaults to 'main' (NREG-01: existing behavior). 'security'
   // routes the SAME resolved model through the security prompt (10-04) and persists a row keyed on
   // (job_id, file_path, 'security'); all failure bookkeeping below is threaded with this pass so a
-  // security-unit failure never touches the main row.
-  pass: FileReviewPass = 'main',
+  // security-unit failure never touches the main row. Note: 'cross_file_security' is NOT valid here
+  // — that pass uses callVerifierRaw directly in runCrossFileSecurityPhase.
+  pass: 'main' | 'security' = 'main',
+  // Phase 34 (PRD-04): per-file commit history for the main-review prompt. The security pass
+  // intentionally ignores it (D-04 — file history is main-pass only; the model layer comments
+  // the same). undefined = no history available; [] = new file (D-08 block renders).
+  fileHistory?: VcsCommitEntry[],
+  // Phase 35 (PRD-06, D-10): the job-scoped agentic-context blob. ONE string for every file (the blob
+  // is job-scoped, not per-path). undefined = never gathered → the prompt is byte-identical to today.
+  // Like fileHistory, the security pass ignores it: buildSecurityReviewPrompts does not consume it.
+  agenticContext?: string,
 ) {
   const startedAt = Date.now();
   const compactPrompt = (previousReview?.transient_error_count ?? 0) > 0;
@@ -1685,6 +2152,8 @@ async function reviewAndPersistFile(
       totalLineCount,
       compactPrompt,
       pass,
+      fileHistory,
+      agenticContext,
     });
 
     await upsertFileReview(env, job.id, {
@@ -1829,6 +2298,12 @@ async function reviewAndPersistFileWithEnsemble(
   model: ModelService,
   resolveFailureModelProvider: () => Promise<string | null>,
   previousReview: { transient_error_count: number } | undefined,
+  // Phase 34 (PRD-04): per-file commit history for the main-review prompt (D-04 — file history
+  // is main-pass only; undefined = no history, [] = new file D-08 block).
+  fileHistory: VcsCommitEntry[] | undefined,
+  // Phase 35 (PRD-06, D-10): the job-scoped agentic-context blob, threaded to every ensemble sample so
+  // all runs see the same gathered context (undefined = never gathered, prompt byte-identical).
+  agenticContext: string | undefined,
   // The ensemble config drives the fan-out; defaults to runs:1 to keep the function safe for
   // any unexpected caller (the main scheduling site is the only writer).
   ensembleConfig: { runs: number; temperature: number },
@@ -1849,6 +2324,8 @@ async function reviewAndPersistFileWithEnsemble(
       totalLineCount,
       compactPrompt,
       pass: 'main',
+      fileHistory,
+      agenticContext,
       runs: ensembleConfig.runs,
       ensembleTemperature: ensembleConfig.temperature,
     });
@@ -2095,6 +2572,10 @@ async function runFinalizePhase(
       return units;
     },
   );
+  // __cross_file__ is NOT in expectedUnits — it's a synthetic aggregate row from
+  // cross_file_security (Phase 27), not a real file from getJobDiffFiles. A missing sentinel
+  // won't trigger the "missing units" backfill. This is correct: the cross-file pass writes its
+  // own row via upsertFileReview and is checked idempotently by runCrossFileSecurityPhase.
 
   if (reviews.length < expectedUnits.length) {
     const presentUnitKeys = new Set(reviews.map((review) => reviewUnitKey(review.file_path, review.pass)));
@@ -2134,6 +2615,13 @@ async function runFinalizePhase(
   // "In progress" on a job that's actually done. updateJobStep keeps the first finish time, so this
   // no-ops the timestamp when the review phase already marked it done.
   await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+
+  // REVIEWS CRITICAL FIX #2: moved from line 2410 so the EVID-02 evidence block (inserted below)
+  // can use the persisted finalizeRetriedPastPost gate for at-most-once audit emission. Computing this
+  // early is safe because job.steps is immutable after job creation — the Workflow steps are set once.
+  const finalizeRetriedPastPost = job.steps.some(
+    (step) => step.name === 'Completing' && (step.status === 'running' || step.status === 'done'),
+  );
 
   // D-09 / MP-04: resolve the finalize candidate set that feeds the (untouched) deterministic floor
   // block below. Precedence:
@@ -2176,6 +2664,82 @@ async function runFinalizePhase(
   } else {
     reviewedComments = reviews.flatMap((review) => review.parsed_comments as ParsedReviewComment[]);
   }
+  // __cross_file__ findings (Phase 27) are included automatically — they flow via
+  // reviews.flatMap / criticResult.kept like any other file_review row. No manual append needed.
+  // The sentinel row is loaded by getFileReviewsForJobs alongside real file rows, and its
+  // parsed_comments participate in the candidate set / critic grading / dedup identically.
+
+  // EVID-02: evidence hard-drop gate (Plan 26-02). Runs BEFORE dedup (D-01) so a hallucinated-evidence
+  // finding never participates in merging. Only active when config.evidence.hard_drop is true (NREG-01).
+  // Uses the shared checkEvidence function (same EVID-01 haystack algorithm) to re-check existingCode
+  // against the diff.
+  if (config.review.evidence?.hard_drop ?? false) {
+    const exemptCategories = config.review.evidence?.hard_drop_exempt_categories ?? ['security'];
+    const evidenceResult = checkEvidence(files, reviewedComments, exemptCategories);
+    reviewedComments = evidenceResult.kept;
+
+    // At-most-once audit emission: gated on !finalizeRetriedPastPost so a retry that already reached
+    // 'Completing' does not re-append evidence_hard_dropped events (same pattern as recordFinalizeDrops
+    // at the later gate). The gate is the persisted job.steps check, NOT an in-memory variable (REVIEWS
+    // CRITICAL FIX #2 — an in-memory guard resets on workflow retry).
+    if (evidenceResult.entries.length > 0 && !finalizeRetriedPastPost) {
+      const evidenceEvents: JobAuditEvent[] = [];
+      // Group entries by (file, pass). Pass association comes from the `review.pass` field on the
+      // FileReview DB row (the FileReview record carries review.pass, not ParsedReviewComment — the
+      // comment object has no `.pass` property). The grouping uses `review.file_path` to match
+      // entries to their originating review unit.
+      for (const review of reviews) {
+        const reviewEntries = evidenceResult.entries.filter(
+          (e) => e.path === review.file_path,
+        );
+        if (reviewEntries.length === 0) continue;
+        const event = buildEvidenceHardDroppedEvent(review.file_path, review.pass, reviewEntries);
+        if (event) evidenceEvents.push(event);
+      }
+      // REVIEWS FINDING #13 (Antigravity Suggestion): batch ALL evidence events into a single
+      // appendJobAuditEvents call to preserve subrequest budget. Never emit per-(file, pass).
+      try {
+        await appendJobAuditEvents(env, job.id, evidenceEvents);
+      } catch (error) {
+        // Best-effort: log and continue (same posture as recordUnitAudit).
+        logger.warn(`Failed to record evidence_hard_dropped events for job ${job.id}`, error);
+      }
+    }
+  }
+
+  // LRN-01: learned-rule suppression gate (Plan 28-02). Runs AFTER EVID-02 hard-drop (D-14)
+  // so a finding that fails evidence is dropped by the stricter gate first. Only active when
+  // config.review.learning.enabled is true (NREG-01 — default off, byte-identical when disabled).
+  // Matching is category (case-insensitive) + file_pattern (picomatch glob). Active rules only —
+  // pending and disabled rules have no effect.
+  if (config.review.learning?.enabled ?? false) {
+    const activeRules = (config.review.learning?.learned_rules ?? []).filter(
+      (r) => r.status === 'active',
+    );
+    if (activeRules.length > 0) {
+      const lrResult = suppressByLearnedRules(reviewedComments, activeRules);
+      reviewedComments = lrResult.kept;
+
+      // At-most-once audit emission: gated on !finalizeRetriedPastPost so a retry that already
+      // reached 'Completing' does not re-append learned_rule_suppressed events (same gate as
+      // EVID-02 above).
+      if (lrResult.entries.length > 0 && !finalizeRetriedPastPost) {
+        const lrEvents: JobAuditEvent[] = [];
+        for (const review of reviews) {
+          const reviewEntries = lrResult.entries.filter((e) => e.path === review.file_path);
+          if (reviewEntries.length === 0) continue;
+          const event = buildLearnedRuleSuppressedEvent(review.file_path, review.pass, reviewEntries);
+          if (event) lrEvents.push(event);
+        }
+        try {
+          await appendJobAuditEvents(env, job.id, lrEvents);
+        } catch (error) {
+          logger.warn(`Failed to record learned_rule_suppressed events for job ${job.id}`, error);
+        }
+      }
+    }
+  }
+
   // Pitfall 3 (NREG): split the reviews into the main pass for every Phase-9 surface. mainReviews
   // feeds fileSummaries, the verdict aggregation, successfulReviews/confidence/correctness, and the
   // walkthrough — so toggling passes.security/critic never changes the summary narrative inputs, the
@@ -2398,13 +2962,6 @@ async function runFinalizePhase(
     { provider: vcs.name },
   );
 
-  // If a prior finalize attempt already reached the posting stage (the 'Completing' step was
-  // started) and then died before completeJob recorded the review id, the review may already be on
-  // GitHub. Re-posting would duplicate it, so reuse the existing one. This GitHub read is only paid
-  // on an actual finalize re-run, never on the common first pass.
-  const finalizeRetriedPastPost = job.steps.some(
-    (step) => step.name === 'Completing' && (step.status === 'running' || step.status === 'done'),
-  );
   await updateJobStep(env, job.id, 'Completing', { status: 'running' });
 
   // FILT-04 / review finding #7: emit finalize drop audit events on the POSTING path ONLY and
@@ -2449,7 +3006,14 @@ async function runFinalizePhase(
   const existingReview = finalizeRetriedPastPost
     ? await vcs.findExistingReviewForCommit(job.owner, job.repo, job.prNumber, pr.headSha)
     : null;
-  const review = existingReview ?? await vcs.submitReview(job.owner, job.repo, job.prNumber, {
+  // Explicit type annotation (Rule 1 fix, Plan 30-04): without it, TS's union-reduction collapses
+  // `{ ref: string } | { ref: string; postedComments?: VcsPostedComment[] }` down to just
+  // `{ ref: string }` -- the second member is structurally a subtype of the first (an optional
+  // property's absence is always assignable), so TS drops it from the union entirely. That defeats
+  // even an `'postedComments' in review` guard below (it types the accessed property `unknown`,
+  // not `VcsPostedComment[] | undefined`). Annotating the declaration keeps postedComments visible
+  // on the inferred type without changing runtime behavior in any way.
+  const review: { ref: string; postedComments?: VcsPostedComment[]; skippedComments?: VcsSkippedComment[] } = existingReview ?? await vcs.submitReview(job.owner, job.repo, job.prNumber, {
     commitSha: pr.headSha,
     verdict: verdictSummary.verdict,
     summaryBody: formattedSummary,
@@ -2457,9 +3021,23 @@ async function runFinalizePhase(
     comments: finalComments.map(comment => ({
       path: comment.path,
       position: comment.position ?? undefined,
+      // WR-06: the persisted review_comments.id, threaded so a comment the provider refuses to post
+      // can be joined back to its row from the audit trail. `finalComments` originates from
+      // `getFileReviewsForJobs`' parsed_comments projection, which now selects `rc.id::text`, so the
+      // id is present on every finalize read. It is NEVER sent to the provider.
+      commentId: comment.commentId,
       body: formatter.formatInlineComment(comment, { provider: vcs.name }),
     })),
   });
+
+  // Phase 33 (PRD-01 / FR-031, D-03/D-04): ONE aggregate inline_comment_skipped event per review
+  // round, recorded immediately after the review assignment and BEFORE the suppression audit and
+  // walkthrough edit (REVIEWS R9). A clean round (no skips) records nothing; the existingReview
+  // branch never carries skippedComments, so a finalize retry past posting emits no skip event.
+  if (review.skippedComments?.length) {
+    const skipEvent = buildInlineCommentSkippedEvent(review.skippedComments);
+    if (skipEvent) await recordRoundAudit(env, job.id, [skipEvent]);
+  }
 
   // Emit rounds.suppressed only after a successful posting boundary and at most once. A finalize
   // retry that already entered Completing reuses the posted review and skips this append, matching
@@ -2592,11 +3170,17 @@ async function runFinalizePhase(
             effort: job.walkthroughEnrichment.effort ?? null,
           }
         : null;
+      // Phase 27 (SEC-XDIFF-01): identify cross-file findings by cross_references presence
+      // (NOT by path === '__cross_file__'). These get a dedicated "Cross-file Security" section
+      // in the walkthrough. When cross_file is off, no findings carry cross_references, so
+      // crossFileComments is empty and the section is omitted — NREG-01.
+      const crossFileComments = finalComments.filter((c) => Boolean(c.cross_references?.length));
       const data = buildWalkthroughData({
         reviews: mainReviews,
         finalComments: mainFinalComments,
         threadVerification: job.threadVerification,
         enrichment,
+        ...(crossFileComments.length > 0 ? { crossFileComments } : {}),
       });
       // (d) single in-place edit (delete-recovery + bounded transient retry live in the helper). The
       // mermaid fence is added GitHub-only by formatWalkthrough (Plan 01), filling the Plan 02 seam.
@@ -2606,6 +3190,31 @@ async function runFinalizePhase(
     // (d) Best-effort: the review is posted; a persistent walkthrough failure logs a warn and the
     // job still completes. The block MUST NOT re-throw.
     logger.warn(`Walkthrough edit failed for job ${job.id}; review is posted, leaving it best-effort`, error instanceof Error ? error : new Error(String(error)));
+  }
+
+  // Phase 30 (ANNO-01): Bitbucket Code Insights per-line annotations. Runs strictly AFTER
+  // submitReview resolves (D-11) so postedComments/links exist before buildAnnotation runs, and
+  // BEFORE completeJob so it never delays the must-not-lose write. Mirrors the vcs.labels
+  // optional-feature-detect gate below exactly -- no separate vcs.name check needed, since
+  // postAnnotations is undefined on every non-Bitbucket adapter (NREG-02 by exclusion).
+  //
+  // `review`'s declaration above is explicitly typed so `postedComments` is visible on it even
+  // on the finalizeRetriedPastPost branch (existingReview short-circuits submitReview, so
+  // postedComments is simply undefined there); buildAnnotation already omits the link rather
+  // than fabricating one when a match is absent, so this degrades safely (Pitfall 4).
+  const postedComments = review.postedComments;
+  if (config.review.bitbucket.annotations_enabled && vcs.postAnnotations) {
+    try {
+      await vcs.postAnnotations(job.owner, job.repo, job.prNumber, {
+        commitSha: pr.headSha,
+        findings: finalComments,
+        postedComments,
+      });
+    } catch (error) {
+      // Fail-open (T-30-04-02): an annotation-posting failure must never block, delay, or fail an
+      // already-successfully-posted review. logger.warn only -- never logger.error, never rethrow.
+      logger.warn(`Annotation posting failed for job ${job.id}; review is posted, leaving it best-effort`, error instanceof Error ? error : new Error(String(error)));
+    }
   }
 
   await completeJob(env, job.id, {
@@ -3000,6 +3609,527 @@ async function heartbeatAndCheckSuperseded(env: AppBindings, jobId: string, leas
   }
 }
 
+// SEC-XDIFF-01: the cross-file security reasoning phase. Runs a single whole-diff security model
+// call on its own fresh-budget invocation. Fail-open: model errors persist a skipped row + audit
+// event and hand off to the next phase.
+//
+// Phase routing: review → cross_file_security → (verify_fixes | critic | walkthrough_enrichment | finalize).
+// The nextPhaseAfterCrossFileSecurity selector unconditionally hands off to the existing chain
+// without re-checking the cross_file toggle (Pitfall 1: re-checking would skip downstream phases
+// when cross_file is toggled off mid-job, breaking the in-flight chain).
+//
+// Idempotent on re-entry: a persisted `__cross_file__` / `cross_file_security` row means a prior
+// invocation already ran (or was skipped). Skip the model call and hand off directly.
+//
+// NREG-01: disabled default emits no new call / write / event. A drift (the toggle off but the
+// phase somehow reached) degrades to a silent hand-off.
+async function runCrossFileSecurityPhase(
+  env: AppBindings,
+  job: PersistedReviewJob,
+  config: RepoConfig,
+  model: ModelService,
+): Promise<void> {
+  // NREG-01: disabled toggle — fail open silently.
+  if (!config.review.passes?.security?.cross_file) {
+    logger.info(`Cross-file security phase reached for job ${job.id} but passes.security.cross_file is off; failing open.`);
+    throw new NextPhaseError(nextPhaseAfterCrossFileSecurity(config), FRESH_INVOCATION_YIELD_SECONDS);
+  }
+
+  // Idempotent re-entry: a persisted `__cross_file__` row means a prior invocation already ran.
+  const existingReviews = await getFileReviewsForJobs(env, [job.id]);
+  const existingCrossFile = existingReviews.find(
+    (r) => r.file_path === CROSS_FILE_SENTINEL && r.pass === 'cross_file_security',
+  );
+  if (existingCrossFile) {
+    logger.info(`Cross-file security already persisted for job ${job.id}; skipping the model call and transitioning onward.`);
+    throw new NextPhaseError(nextPhaseAfterCrossFileSecurity(config), FRESH_INVOCATION_YIELD_SECONDS);
+  }
+
+  // Read the main-pass reviews to build the whole-diff input. Only completed (done) reviews
+  // contribute to the cross-file diff — failed/skipped files have no meaningful diff content.
+  const mainReviews = existingReviews.filter(
+    (r) => r.pass === 'main' && r.file_status === 'done' && r.diff_input,
+  );
+
+  if (mainReviews.length === 0) {
+    logger.info(`No completed main-pass reviews with diff input for job ${job.id}; skipping cross-file security.`);
+    // Persist a skipped row so the idempotency guard short-circuits on re-entry.
+    await upsertFileReview(env, job.id, {
+      filePath: CROSS_FILE_SENTINEL,
+      pass: 'cross_file_security',
+      fileStatus: 'skipped',
+      modelUsed: 'none',
+      diffLineCount: 0,
+      diffInput: null,
+      rawAiOutput: null,
+      parsedComments: [],
+      inputTokens: null,
+      outputTokens: null,
+      durationMs: null,
+      verdict: null,
+      fileSummary: 'No completed file reviews with diff input',
+      errorMessage: null,
+    });
+    const auditEvent = buildCrossFileSecurityAuditEvent('skipped', {
+      reason: 'no_diff_input',
+      findingCount: 0,
+      filesIncluded: 0,
+    });
+    await recordCrossFileSecurityAudit(env, job.id, [auditEvent]);
+    throw new NextPhaseError(nextPhaseAfterCrossFileSecurity(config), FRESH_INVOCATION_YIELD_SECONDS);
+  }
+
+  // Build the cross-file diff from the main-pass diff inputs. Re-parse each file's stored diff
+  // into FileDiff objects so buildCrossFileDiff can sort by security priority and truncate by line
+  // budget when the concatenated diff exceeds CROSS_FILE_DIFF_MAX_LINES.
+  const fileDiffs: FileDiff[] = [];
+  for (const review of mainReviews) {
+    try {
+      const parsed = parseUnifiedDiff(review.diff_input!);
+      fileDiffs.push(...parsed);
+    } catch {
+      // A malformed diff for a single file is silently excluded rather than failing the phase.
+      logger.warn(`Failed to parse diff for ${review.file_path} in cross-file security phase; skipping file.`);
+    }
+  }
+
+  if (fileDiffs.length === 0) {
+    logger.info(`All file diffs failed to parse for job ${job.id}; skipping cross-file security.`);
+    await upsertFileReview(env, job.id, {
+      filePath: CROSS_FILE_SENTINEL,
+      pass: 'cross_file_security',
+      fileStatus: 'skipped',
+      modelUsed: 'none',
+      diffLineCount: 0,
+      diffInput: null,
+      rawAiOutput: null,
+      parsedComments: [],
+      inputTokens: null,
+      outputTokens: null,
+      durationMs: null,
+      verdict: null,
+      fileSummary: 'All file diffs failed to parse',
+      errorMessage: null,
+    });
+    const auditEvent = buildCrossFileSecurityAuditEvent('skipped', {
+      reason: 'all_diffs_unparseable',
+      findingCount: 0,
+      filesIncluded: 0,
+    });
+    await recordCrossFileSecurityAudit(env, job.id, [auditEvent]);
+    throw new NextPhaseError(nextPhaseAfterCrossFileSecurity(config), FRESH_INVOCATION_YIELD_SECONDS);
+  }
+
+  // Build the priority-sorted, truncated cross-file diff.
+  const crossFileDiff = buildCrossFileDiff(fileDiffs, CROSS_FILE_DIFF_MAX_LINES);
+  const filesIncluded = new Set(
+    crossFileDiff.split('\n')
+      .filter((line) => line.startsWith('+++ b/'))
+      .map((line) => line.slice(6)),
+  ).size;
+
+  // Build prompts.
+  const { buildCrossFileSecuritySystemPrompt, buildCrossFileSecurityUserPrompt } = await import('@server/prompts/cross-file-security-review');
+  const systemPrompt = buildCrossFileSecuritySystemPrompt();
+  const userPrompt = buildCrossFileSecurityUserPrompt({
+    prTitle: job.prTitle ?? null,
+    concatenatedDiff: crossFileDiff,
+    fileCount: fileDiffs.length,
+  });
+
+  // Make the model call. This is the single outbound call for the phase — stays inside the
+  // per-invocation subrequest budget.
+  let response: { rawText: string; modelUsed: string; inputTokens: number; outputTokens: number };
+  try {
+    response = await model.callVerifierRaw({
+      systemPrompt,
+      userPrompt,
+      config,
+    });
+  } catch (error) {
+    // Whole-call LLM failure: persist a skipped row + audit event and fail open. The downstream
+    // chain (verify_fixes → critic → walkthrough → finalize) must still run.
+    logger.warn(
+      `Cross-file security model call failed for job ${job.id}; failing open`,
+      error instanceof Error ? error : new Error(String(error)),
+    );
+    await upsertFileReview(env, job.id, {
+      filePath: CROSS_FILE_SENTINEL,
+      pass: 'cross_file_security',
+      fileStatus: 'failed',
+      modelUsed: 'none',
+      diffLineCount: crossFileDiff.split('\n').length,
+      diffInput: crossFileDiff,
+      rawAiOutput: null,
+      parsedComments: [],
+      inputTokens: null,
+      outputTokens: null,
+      durationMs: null,
+      verdict: null,
+      fileSummary: 'Model call failed',
+      errorMessage: error instanceof Error ? error.message : String(error),
+    });
+    const auditEvent = buildCrossFileSecurityAuditEvent('failed', {
+      reason: 'model_call_failed',
+      findingCount: 0,
+      filesIncluded,
+    });
+    await recordCrossFileSecurityAudit(env, job.id, [auditEvent]);
+    throw new NextPhaseError(nextPhaseAfterCrossFileSecurity(config), FRESH_INVOCATION_YIELD_SECONDS);
+  }
+
+  // Parse the response. Tolerant: individual findings that fail schema validation are silently
+  // dropped; a whole-call parse failure persists as 'skipped' (fail-open).
+  const parsed = parseCrossFileSecurityResponse(response.rawText);
+
+  let findings: ParsedReviewComment[];
+  let auditStatus: 'completed' | 'skipped';
+  let auditReason: string | undefined;
+
+  if (parsed.kind === 'fail_open') {
+    findings = [];
+    auditStatus = 'skipped';
+    auditReason = parsed.reason;
+  } else {
+    // Map model findings to ParsedReviewComment shape. The model returns title/body/severity/path/
+    // line/confidence/cross_references; the schema's existingCode/codeSuggestion/category fields
+    // are not populated by the cross-file pass (they're per-file concepts).
+    findings = parsed.findings.map((f) => ({
+      path: f.path,
+      line: f.line ?? null,
+      position: null,
+      severity: f.severity,
+      category: 'security' as const,
+      title: f.title,
+      body: f.body,
+      codeSuggestion: null,
+      existingCode: null,
+      confidence: f.confidence ?? null,
+      cross_references: f.cross_references,
+    }));
+    auditStatus = 'completed';
+  }
+
+  // Persist the synthetic file_review row. The `__cross_file__` sentinel path + `cross_file_security`
+  // pass uniquely identifies this row (ON CONFLICT (job_id, file_path, pass) arbiter).
+  await upsertFileReview(env, job.id, {
+    filePath: CROSS_FILE_SENTINEL,
+    pass: 'cross_file_security',
+    fileStatus: parsed.kind === 'fail_open' ? 'skipped' : 'done',
+    modelUsed: response.modelUsed,
+    diffLineCount: crossFileDiff.split('\n').length,
+    diffInput: crossFileDiff,
+    rawAiOutput: response.rawText,
+    parsedComments: findings,
+    inputTokens: response.inputTokens,
+    outputTokens: response.outputTokens,
+    durationMs: null,
+    verdict: findings.length > 0 ? 'comment' : 'approve',
+    fileSummary: parsed.kind === 'fail_open'
+      ? `Cross-file security: ${parsed.reason}`
+      : `Cross-file security: ${findings.length} finding(s)`,
+    errorMessage: parsed.kind === 'fail_open' ? parsed.reason : null,
+  });
+
+  // Record audit event (best-effort, never rethrows).
+  const auditEvent = buildCrossFileSecurityAuditEvent(auditStatus, {
+    reason: auditReason,
+    findingCount: findings.length,
+    filesIncluded,
+  });
+  await recordCrossFileSecurityAudit(env, job.id, [auditEvent]);
+
+  logger.info(`Cross-file security phase completed for job ${job.id}: ${findings.length} finding(s), ${filesIncluded} file(s) included.`);
+
+  // Hand off to the next phase unconditionally (Pitfall 1: do NOT re-check the cross_file toggle).
+  throw new NextPhaseError(nextPhaseAfterCrossFileSecurity(config), FRESH_INVOCATION_YIELD_SECONDS);
+}
+
+// PRD-06 (FR-131/FR-132, D-06/D-09/D-11/D-12/D-14): the bounded agentic-context phase.
+//
+// A structural clone of runCrossFileSecurityPhase above, in that function's EXACT gate order —
+// toggle gate → idempotency gate → input gate → drive the model → persist → hand off. Deviating from
+// the order is how this phase would re-acquire the Phase 27 bugs the clone exists to avoid.
+//
+// Phase routing: prepare → agentic_context → review. The nextPhaseAfterAgenticContext selector hands
+// off UNCONDITIONALLY without re-checking the agentic_tools toggle (a re-check would strand a job whose
+// config was toggled off mid-flight).
+//
+// There is NO terminal failure path (D-11): the pass is advisory, and FR-131's own documented
+// fallback is "review the diff alone". A model failure, an exhausted hop/byte/file budget, an
+// unparseable model, a provider throw out of read_file/grep_repo, a failed seed read, a missing
+// repository row and a KV failure all land on the same NextPhaseError hand-off.
+//
+// CR-02 (35-REVIEW.md) is why that is now a description of the code rather than of the intent. This
+// header used to claim "there is no other throw out of this phase", and it was false: the seed reads
+// and the two loop callbacks were awaited bare, so a GitHubError — from something as ordinary as the
+// model asking to read a directory — escaped into `runReviewJob`'s `failJobAndCheckRun`. TWO throws
+// are still deliberately allowed OUT, and neither is a failure of this phase:
+//   - `JOB_SUPERSEDED` — a newer push cancelled the job; the outer catch acks it.
+//   - a subrequest-budget error — the outer catch reschedules THIS phase on a fresh budget.
+// If you add an `await` to this function, it belongs inside the try/catch below or behind a
+// best-effort wrapper of its own. Nothing else may leave.
+//
+// NREG-01: with the toggle off (the default, D-13) gate 1 hits FIRST and does nothing at all — no audit
+// row, no KV touch, no model call, no extra subrequest — so an instance that has not opted in behaves
+// byte-identically to the previous release.
+async function runAgenticContextPhase(
+  env: AppBindings,
+  job: PersistedReviewJob,
+  config: RepoConfig,
+  vcs: VcsProvider,
+  model: ModelService,
+  tracker: TokenTracker,
+): Promise<void> {
+  // GATE 1 (NREG-01 / D-13): disabled toggle — fail open SILENTLY. This branch is what makes the
+  // default state byte-identical, so nothing observable may be added to it.
+  if (config.review.agentic_tools?.enabled !== true) {
+    logger.info(`Agentic-context phase reached for job ${job.id} but review.agentic_tools.enabled is off; failing open.`);
+    throw new NextPhaseError(nextPhaseAfterAgenticContext(config), FRESH_INVOCATION_YIELD_SECONDS);
+  }
+
+  // GATE 2 (D-12): idempotent re-entry. An existing blob means a prior invocation already ran this
+  // phase for this job (a lease-recovery retry, a fresh-instance handoff, a redelivered queue message),
+  // so hand off without a single model call or provider fetch.
+  try {
+    const existing = await env.APP_KV.get(agenticContextCacheKey(job.id), 'text');
+    if (existing) {
+      logger.info(`Agentic context already gathered for job ${job.id}; skipping the loop and transitioning onward.`);
+      throw new NextPhaseError(nextPhaseAfterAgenticContext(config), FRESH_INVOCATION_YIELD_SECONDS);
+    }
+  } catch (error) {
+    // A NextPhaseError from the idempotent branch above is control flow, not a KV failure — rethrow it.
+    if (error instanceof NextPhaseError) throw error;
+    // Best-effort KV read: on a real KV failure fall through and gather. Re-gathering costs model
+    // calls but is harmless; refusing to gather because KV blinked would silently disable the feature.
+    logger.warn(`Failed to read the gathered agentic context for job ${job.id}; gathering again`, error instanceof Error ? error : new Error(String(error)));
+  }
+
+  // GATE 3 (D-14): a repository that already has a READY code index does not need this pass — the
+  // index-backed retrieval path is cheaper and broader, so spending six model calls to re-derive a
+  // subset of it would be pure waste. Read-only, and shaped exactly like the qa.ts precedent:
+  // findRepositoryIdByIdentity is a SELECT (getOrCreateRepository's every branch INSERTs, so merely
+  // routing a review must never call it), a null repositoryId is a NORMAL absence, and 'ready' is the
+  // ONLY status that means a queryable index — 'building', 'failed' and a missing row all mean no
+  // index, so the loop RUNS.
+  try {
+    const repositoryId = await findRepositoryIdByIdentity(env, {
+      vcsProvider: (job.repositoryVcsProvider ?? 'github') as 'github' | 'bitbucket',
+      ownerOrWorkspace: job.repositoryWorkspace ?? job.owner,
+      repo: job.repo,
+    });
+    if (repositoryId !== null) {
+      const indexState = await getCodeIndexState(env, { repositoryId });
+      if (indexState !== null && indexState.status === 'ready') {
+        logger.info(`Job ${job.id} targets a repository with a ready code index; skipping the agentic-context pass (D-14).`);
+        // The D-14 gate is a DECISION, not a non-event: without this row an operator looking at a
+        // toggle-on job that spent nothing cannot tell "the index made this unnecessary" from "the
+        // feature is broken". Best-effort, so a failing append cannot fail the job (T-35-19).
+        await recordAgenticContextAudit(env, job.id, [
+          buildAgenticContextAuditEvent('skipped', {
+            reason: 'index_present',
+            budgetHeadroom: tracker.remainingSafeBudget(),
+          }),
+        ]);
+        throw new NextPhaseError(nextPhaseAfterAgenticContext(config), FRESH_INVOCATION_YIELD_SECONDS);
+      }
+    }
+  } catch (error) {
+    if (error instanceof NextPhaseError) throw error;
+    // A database failure on an advisory gate degrades to "no index" and lets the loop run, rather than
+    // failing a phase that is not allowed to fail.
+    logger.warn(`Failed to resolve the code-index state for job ${job.id}; treating the repository as unindexed`, error instanceof Error ? error : new Error(String(error)));
+  }
+
+  // CR-02 (35-REVIEW.md) / D-11: the seed reads and the loop are the LAST places this phase could
+  // throw something that is not a phase transition, and the header above promises it cannot. Both
+  // `vcs.getPullRequest` and `getJobDiffFiles` throw on any non-2xx, and neither a GitHubError nor a
+  // BitbucketError is a NextPhaseError, `isRetryableModelError` or `isSubrequestBudgetError` — so
+  // before this catch each of them walked out of an ADVISORY pass straight into
+  // `failJobAndCheckRun`, terminally failing a review that would have succeeded with the toggle off.
+  //
+  // The tool-dispatch guard inside `executeAgenticLoop` covers `readFile`/`searchCode`; this covers
+  // everything else, which is what makes "fail-open in every branch" a fact rather than an intention.
+  let outcome: AgenticLoopOutcome;
+  try {
+    // Seed: the pull request and its touched paths. Two subrequests, spent before the loop so the
+    // reserve guard sees their cost.
+    const pr = await vcs.getPullRequest(job.owner, job.repo, job.prNumber);
+    const files = await getJobDiffFiles(env, job, vcs, config);
+    const touchedPaths = files.map((file) => file.path);
+
+    outcome = await executeAgenticLoop(
+      {
+        // The four real callbacks and nothing else — this is the whole I/O surface of the loop.
+        callModel: async (systemPrompt, userPrompt) => {
+          // NO `temperature` IS PASSED, AND THAT IS A DECISION, NOT AN OVERSIGHT (35-REVIEWS.md,
+          // OpenCode Concern #2 + Suggestion #3, which proposed forwarding `temperature: 0` for
+          // deterministic tool use). Both existing raw-call sites — runCrossFileSecurityPhase above and
+          // verify-fixes.ts — omit it and let each provider's own default stand; the parameter is
+          // genuinely optional on callVerifierRaw; and forwarding an explicit 0 through callResolvedModel
+          // to four heterogeneous adapters (Workers AI the weakest) is an unvalidated behaviour change on
+          // every provider at once, for a loop whose non-determinism D-03's corrective hop already
+          // absorbs. REMEDY IF NEEDED, so the next maintainer does not have to re-derive it: if the
+          // flywheel ever shows `unparseable_action` clustering on one model id, adding `temperature: 0`
+          // to this one call is the one-line fix, behind this same seam.
+          const response = await model.callVerifierRaw({ systemPrompt, userPrompt, config });
+          return response.rawText;
+        },
+        // D-06: read at the PULL REQUEST HEAD SHA. This is deliberately NOT the base-branch rule quick
+        // task k31 applied to `.review.yaml` — that rule protects config a pull request must not be able
+        // to rewrite, whereas reading the pull request's OWN head content is precisely the feature here.
+        // Do not "fix" this to match k31.
+        //
+        // A rejection here is ABSORBED BY THE LOOP (CR-02), not by a try/catch at this seam: the loop
+        // owns the "tell the model the call failed and keep going" behaviour, and keeping the failure
+        // path in the pure module is what lets `test/agentic-tools.spec.ts` pin it with no bindings.
+        readFile: async (path) => vcs.getFileContent(job.owner, job.repo, path, pr.headSha),
+        // D-05: `?.` + `?? null` is a THREE-WAY coercion, and all three arms are live. On GitHub
+        // (35-03) the adapter implements searchCode, so grep_repo returns real matches; a rate-limited
+        // 403/429 comes back as null and permanently downgrades the capability for this invocation. On a
+        // provider whose adapter does NOT implement it, the optional call resolves to undefined, is
+        // coerced to null, and grep_repo reports itself unavailable to the model — the DESIGNED
+        // degradation path, exercised end-to-end from wave 1, not a stub. A THROW is the fourth arm and
+        // the loop maps it onto the same downgrade.
+        searchCode: async (query) => (await vcs.searchCode?.(job.owner, job.repo, query, AGENTIC_MAX_GREP_HITS)) ?? null,
+        // The provider clients self-increment the tracker per request, so the reserve check is the
+        // correct AND only guard — never call tracker.incrementSubrequests() from the loop.
+        hasBudget: (reserve) => tracker.hasRemainingSafeBudget(reserve),
+      },
+      {
+        prTitle: job.prTitle ?? pr.title ?? null,
+        touchedPaths,
+        headSha: pr.headSha,
+        // G-11: the repository's own exclusion globs are the privacy refusal list.
+        skipFiles: config.review.skip_files,
+      },
+    );
+  } catch (error) {
+    // Three classes are control flow or resumable state, NOT failures, and must survive this catch:
+    //   - NextPhaseError — a transition something inside the try already decided.
+    //   - JOB_SUPERSEDED — a newer push cancelled this job; the outer catch acks it (:597). Matched by
+    //     message because it is thrown as a plain Error (:3598).
+    //   - a subrequest-budget error — the invocation is out of budget and the outer catch reschedules
+    //     THIS phase on a fresh one. Absorbing it would discard a gather that would have succeeded.
+    if (error instanceof NextPhaseError) throw error;
+    if (error instanceof Error && error.message === 'JOB_SUPERSEDED') throw error;
+    if (isSubrequestBudgetError(error)) throw error;
+
+    logger.warn(
+      `Agentic-context phase failed for job ${job.id}; failing open to the next phase with no gathered context`,
+      error instanceof Error ? error : new Error(String(error)),
+    );
+    // The FIRST error-driven producer for this event, and the reason `MACHINE_ERROR_REASONS` is in
+    // AGENTIC_CONTEXT_AUDIT_REASONS at all (IN-06): the reason is routed through `redactErrorMessage`
+    // so the closed machine vocabulary holds and no provider text reaches `jobs.audit`. Zero counts
+    // are the honest record — nothing was gathered and nothing was persisted.
+    await recordAgenticContextAudit(env, job.id, [
+      buildAgenticContextAuditEvent('failed', {
+        reason: redactErrorMessage(error instanceof Error ? error : String(error)),
+        hopsUsed: 0,
+        filesRead: 0,
+        grepsRun: 0,
+        bytesGathered: 0,
+        truncated: false,
+        grepSupported: false,
+        budgetHeadroom: tracker.remainingSafeBudget(),
+      }),
+    ]);
+    throw new NextPhaseError(nextPhaseAfterAgenticContext(config), FRESH_INVOCATION_YIELD_SECONDS);
+  }
+
+  logger.info(`Agentic-context phase completed for job ${job.id}`, {
+    hopsUsed: outcome.hopsUsed,
+    filesRead: outcome.filesRead,
+    grepsRun: outcome.grepsRun,
+    bytesGathered: outcome.bytesGathered,
+    truncated: outcome.truncated,
+    grepSupported: outcome.grepSupported,
+    stopReason: outcome.stopReason,
+  });
+
+  // Persist only a non-empty outcome: an empty blob would satisfy gate 2 on re-entry while carrying
+  // nothing, turning a transient failure into a permanently context-free review for this job.
+  if (outcome.context.length > 0) {
+    try {
+      await env.APP_KV.put(agenticContextCacheKey(job.id), JSON.stringify(outcome), {
+        expirationTtl: 3600, // 1-hour TTL — the gathered context is bounded to this job's lifespan
+      });
+    } catch (error) {
+      logger.warn(`Failed to persist the gathered agentic context to KV for job ${job.id}`, error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  // The operator-visible trace (PRD-06). ONE event per non-silent exit, carrying the counts every
+  // 35-AI-SPEC.md §7 metric and alert reads. Best-effort: `recordAgenticContextAudit` never rethrows,
+  // so a failing append degrades to a log line rather than turning this advisory phase into a failed
+  // review (T-35-19) — which is why it is safe to sit on the critical path here.
+  const audit = mapAgenticOutcomeToAudit(outcome);
+  await recordAgenticContextAudit(env, job.id, [
+    buildAgenticContextAuditEvent(audit.status, {
+      reason: audit.reason,
+      hopsUsed: outcome.hopsUsed,
+      filesRead: outcome.filesRead,
+      grepsRun: outcome.grepsRun,
+      bytesGathered: outcome.bytesGathered,
+      truncated: outcome.truncated,
+      grepSupported: outcome.grepSupported,
+      // Captured HERE — at the audit write, AFTER the KV put — not at loop exit. §7 alerts on
+      // `budget_headroom < 2` precisely to catch a phase TAIL running on fumes, so a value sampled
+      // before the tail's own spend would report the number that cannot fail.
+      budgetHeadroom: tracker.remainingSafeBudget(),
+    }),
+  ]);
+
+  // The ONLY exit (D-11). Note what is deliberately absent: no upsertFileReview, no file_reviews row,
+  // and no migration — see agenticContextCacheKey for why (migration 017's recorded regression).
+  throw new NextPhaseError(nextPhaseAfterAgenticContext(config), FRESH_INVOCATION_YIELD_SECONDS);
+}
+
+// The three loop exits that are D-11 FAIL-OPEN events rather than the loop deciding it was finished.
+// `budget_exhausted` and `model_call_failed` are self-explanatory; `unparseable_action` lands here
+// because it is only ever reached after D-03's single corrective hop was already spent, i.e. the
+// model failed the protocol twice. The other stop reasons (`done`, `hop_cap_reached`,
+// `byte_cap_reached`, `file_cap_reached`) are the loop or a bound working exactly as designed.
+const AGENTIC_FAIL_OPEN_STOP_REASONS: ReadonlySet<AgenticLoopOutcome['stopReason']> = new Set([
+  'budget_exhausted',
+  'model_call_failed',
+  'unparseable_action',
+]);
+
+/**
+ * PURE outcome → audit status/reason mapping (PRD-06). The status axis answers ONE operator
+ * question that no single field answers on its own: *did this run leave anything behind?*
+ *
+ *   gathered + clean exit    -> `completed`
+ *   gathered + fail-open     -> `partial`   (a bound or a provider cut it short; the review still
+ *                                            gets the context that was gathered)
+ *   nothing  + clean exit    -> `skipped`   with `no_content` — FR-131's documented fallback
+ *                                            ("review the diff alone"), not a malfunction
+ *   nothing  + fail-open     -> `failed`    the run cost model calls and yielded nothing
+ *
+ * The `partial` / `failed` split is the whole point: 35-AI-SPEC.md §7 alerts on
+ * `status: 'failed' > 5%` and deliberately does NOT alert on `partial`, because fail-open working
+ * as designed must not read as an incident. NEITHER status is a job failure — this phase cannot
+ * fail the job (D-11).
+ *
+ * `bytesGathered` is the gathered test rather than `context.length` so it agrees byte-for-byte with
+ * the `bytes_gathered` field the same event carries: a reader must never see `status: 'skipped'`
+ * next to a non-zero byte count.
+ */
+function mapAgenticOutcomeToAudit(outcome: AgenticLoopOutcome): {
+  status: 'completed' | 'partial' | 'skipped' | 'failed';
+  reason: AgenticContextAuditReason;
+} {
+  const failedOpen = AGENTIC_FAIL_OPEN_STOP_REASONS.has(outcome.stopReason);
+  if (outcome.bytesGathered > 0) {
+    return { status: failedOpen ? 'partial' : 'completed', reason: outcome.stopReason };
+  }
+  return failedOpen
+    ? { status: 'failed', reason: outcome.stopReason }
+    : { status: 'skipped', reason: 'no_content' };
+}
+
 export { NextPhaseError } from './next-phase-error';
 
 // Phase 20.1 (BLOCKER 2 + BLOCKER 3): the four phase selectors live in `./phase-routing` so
@@ -3007,15 +4137,21 @@ export { NextPhaseError } from './next-phase-error';
 // (review.ts → verify-fixes.ts already exists, so the cycle is broken by hoisting the selectors).
 import {
   maybeRouteToWalkthroughEnrichment,
+  nextPhaseAfterAgenticContext,
   nextPhaseAfterCritic,
+  nextPhaseAfterCrossFileSecurity,
+  nextPhaseAfterPrepare,
   nextPhaseAfterReview,
   nextPhaseAfterVerifyFixes,
 } from './phase-routing';
 
+// ROUTING ANCHOR 11 — the phase parameter union below, plus BOTH new selectors imported above
+// (`nextPhaseAfterPrepare`, which is the only thing that can route a job into agentic_context, and
+// `nextPhaseAfterAgenticContext`, which unconditionally hands off to review).
 async function enqueueJobPhase(
   env: AppBindings,
   jobId: string,
-  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment',
+  phase: 'prepare' | 'review' | 'finalize' | 'critic' | 'verify_fixes' | 'walkthrough_enrichment' | 'cross_file_security' | 'agentic_context',
   delaySeconds = 0,
 ) {
   await markJobContinuationQueued(env, jobId, delaySeconds);
@@ -3028,6 +4164,15 @@ function hasCompletedStep(job: PersistedReviewJob, stepName: string) {
 
 function diffCacheKey(jobId: string) {
   return `diff:${jobId}`;
+}
+
+// PRD-06 (D-12): the gathered-context blob's KV key, following the same `<domain>:<jobId>` convention
+// as diffCacheKey above and `file-history:${jobId}`. KV, deliberately NOT a file_reviews row: migration
+// 017_cross_file_security_pass.sql:9-12 records that exactly such a fail-open write violated
+// `file_reviews_pass_check` and terminal-failed a phase designed to degrade gracefully. This phase adds
+// ZERO migrations.
+export function agenticContextCacheKey(jobId: string) {
+  return `agentic-context:${jobId}`;
 }
 
 /**

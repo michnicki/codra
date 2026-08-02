@@ -5,9 +5,15 @@ import type {
   CodeInsightsReport,
   CommitBuildStatus,
   PrComment,
+  ReportAnnotation,
 } from '@shared/bitbucket';
-import type { VcsPullRequest } from '@server/vcs/types';
+// PRD-06 (FR-131): `VcsCodeSearchHit` is imported, never re-declared — `searchCode`'s return type IS
+// the seam's return type (vcs/types.ts) rather than a parallel shape that could drift from it.
+import type { VcsCodeSearchHit, VcsPullRequest } from '@server/vcs/types';
 import type { BotIdentityResolver } from '@server/core/bot-identity';
+// Phase 34 (PRD-04 / FR-114): Wave-1 contract from @shared/schema (34-01). Imported, never
+// re-defined — the shape is shared with the prompt builder and both providers' adapters.
+import type { VcsCommitEntry } from '@shared/schema';
 
 // BB-01 deliberately mirrors the hand-rolled GitHub client: Workers-native fetch keeps the REST
 // surface small and avoids an SDK. The methods below own Bitbucket-specific mappings for PR fields,
@@ -135,11 +141,71 @@ type BitbucketCommentRecord = {
   // self-filter key (NREG-02); `nickname` is the renameable @mention handle. Bitbucket comment
   // authors have NO `username` field (removed from the API in 2019) — never read it (Pitfall 4).
   user?: { account_id?: string; nickname?: string; display_name?: string };
+  // Additive permalink block (Phase 30, Pitfall 2). `html.href` is the comment's PR-visible
+  // permalink Bitbucket already returns; carried through so Plan 30-03's dedup-index widening can
+  // read it without an `as any` cast. Optional — absent fields are treated as undefined (NREG-01).
+  links?: { html?: { href?: string } };
 };
 
 function repositoryPath(workspace: string, repoSlug: string) {
   return `/repositories/${encodeURIComponent(workspace)}/${encodeURIComponent(repoSlug)}`;
 }
+
+// Phase 31 (WS-01, D-05): the workspace-level repo listing lives at `/repositories/{workspace}`,
+// one segment shallower than `repositoryPath`'s repo-scoped path.
+function workspaceRepositoriesPath(workspace: string) {
+  return `/repositories/${encodeURIComponent(workspace)}`;
+}
+
+// Phase 31 (WS-01, finalize): the workspace-level webhook-subscription collection. Used by the
+// finalize endpoint's list-then-create-if-missing idempotency check (T-31-03-04).
+function workspaceHooksPath(workspace: string) {
+  return `/workspaces/${encodeURIComponent(workspace)}/hooks`;
+}
+
+// PRD-06 (FR-131): the WORKSPACE-scoped code-search collection. Bitbucket's code search is scoped to
+// a workspace, not a repository — the repository is narrowed with a `repo:` qualifier inside
+// `search_query` instead. Atlassian's changelog also names a repo-scoped
+// `/repositories/{workspace}/{repo_slug}/search/code`, but it is ABSENT from the public swagger and
+// is deprecated on the same schedule, so it is deliberately not wired (35-RESEARCH.md R-6).
+function workspaceSearchCodePath(workspace: string) {
+  return `/workspaces/${encodeURIComponent(workspace)}/search/code`;
+}
+
+// PRD-06 (D-07): the ref LABEL every code-search hit carries. A fixed string, not a resolved branch
+// name: Bitbucket indexes the workspace's default-branch content, and resolving the real branch name
+// would cost a second subrequest per grep for a string the model only uses as a staleness warning.
+// The executor renders it as `repository default branch (default branch)`. Symmetric with
+// `GITHUB_CODE_SEARCH_REF_LABEL` in core/github.ts — do not "improve" either into an extra API call.
+const BITBUCKET_CODE_SEARCH_REF_LABEL = 'default branch';
+
+/**
+ * Segment-wise path encoding for the `/src/{ref}/{path}` family. `encodeURIComponent` over a WHOLE
+ * slash-bearing path would percent-encode the slashes and collapse `src/server/x.ts` into a single
+ * literal filename segment, so the delimiters must survive the encode. Extracted verbatim from
+ * `getFileContent` (which now calls it) so the tree walk cannot drift from the file read.
+ */
+function encodeSrcPathSegments(path: string) {
+  return path.split('/').map((segment) => encodeURIComponent(segment)).join('/');
+}
+
+// QA-IDX-01 (D-09): `max_depth` makes the `/src` listing perform a BREADTH-FIRST descent, so one
+// request can cover many directories instead of one request per directory [community.atlassian.com:
+// "performs a breadth-first search to return the contents of subdirectories up to the depth
+// specified"]. IMPORTANT: this parameter shape is COMMUNITY-SOURCED, not confirmed by the official
+// Atlassian API reference, and the same source reports that too large a value makes the call time out
+// and return HTTP 555. The walk therefore treats depth as an OPTIMIZATION WITH A FALLBACK rather than
+// a requirement: on 555 it retries the same directory once at SRC_TREE_FALLBACK_MAX_DEPTH, and if the
+// parameter turned out to be ignored entirely the walk still terminates correctly (it would simply
+// enqueue every subdirectory and cost more pages).
+const SRC_TREE_MAX_DEPTH = 10;
+const SRC_TREE_FALLBACK_MAX_DEPTH = 2;
+// The undocumented status Bitbucket is reported to return when a `max_depth` request times out.
+// Named because a bare `555` in a status comparison reads as a typo.
+const SRC_TREE_DEPTH_TIMEOUT_STATUS = 555;
+// Matches the existing paginated walks (listRawPullRequestComments / listPullRequestComments) so the
+// per-page entry count stays one number across the client.
+const SRC_TREE_PAGE_LEN = 100;
 
 export class BitbucketClient {
   constructor(
@@ -154,19 +220,89 @@ export class BitbucketClient {
     body?: unknown,
     accept = 'application/json',
   ): Promise<Response> {
-    return withRetry(`${method} ${path}`, async () => {
+    return withRetry(`${method} ${path}`, () => this.requestOnce(method, path, body, accept));
+  }
+
+  /**
+   * PRD-06 (FR-131): exactly ONE attempt of `request()` — byte-identical headers, timeout,
+   * subrequest tracking and `BitbucketError`-on-any-non-2xx behavior, with the `withRetry` wrapper
+   * lifted out. `request()` is now this method wrapped in `withRetry`, so every existing caller's
+   * behavior is unchanged; this is a pure extraction, not a new transport path.
+   *
+   * WHY IT EXISTS: `searchCode` must NOT retry (see its own doc block). `withRetry` retries a 429
+   * and any 5xx with a 2s/4s backoff, which on a DEPRECATED endpoint with no documented numeric
+   * rate limit would spend the invocation's remaining subrequest budget on a refusal that cannot
+   * clear inside one job (T-35-12). Keeping `request()` intact for the ~40 methods that DO want
+   * retry, and opting out here, is the Bitbucket equivalent of `GitHubClient.searchCode`'s
+   * documented `withRetry` omission — on that client `request()` is already retry-free and each
+   * method opts IN, so the opt-out has to be explicit on this one.
+   *
+   * Do NOT route ordinary reads through this method: a transient 429/5xx on a normal call SHOULD be
+   * retried, and this method deliberately gives that up.
+   */
+  private async requestOnce(
+    method: string,
+    path: string,
+    body?: unknown,
+    accept = 'application/json',
+  ): Promise<Response> {
+    this.tracker?.incrementSubrequests(1);
+    const response = await withTimeout(`Bitbucket ${method} ${path}`, BITBUCKET_TIMEOUT_MS, (signal) =>
+      globalThis.fetch(`${BITBUCKET_API_BASE_URL}${path}`, {
+        method,
+        signal,
+        headers: {
+          Accept: accept,
+          Authorization: `Bearer ${this.token}`,
+          'User-Agent': this.env.BOT_USERNAME ?? 'codra-bot',
+          ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      }),
+    );
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new BitbucketError(
+        response.status,
+        errorBody,
+        path,
+        `Bitbucket API ${method} ${path} failed with ${response.status}`,
+        retryAfterMs(response),
+      );
+    }
+
+    return response;
+  }
+
+  /**
+   * Phase 31 (WS-01): same retry/timeout/tracker machinery as `request()`, but takes a FULL,
+   * ALREADY-ABSOLUTE url instead of a relative path. `request()` always re-prefixes its argument
+   * with `BITBUCKET_API_BASE_URL`, which would double-prefix a response-supplied `next` link (that
+   * link already carries the api base). This is the ONE difference from `request()` -- every other
+   * behavior (429/5xx retry, timeout, subrequest tracking, thrown `BitbucketError` on !ok) is
+   * identical, unlike `listSrcTree`'s bare `fetchPage`.
+   *
+   * WHY THIS DIFFERS FROM `listSrcTree`'s bare `globalThis.fetch`-based `fetchPage`: `listSrcTree`
+   * deliberately tolerates a PARTIAL result on page-cap/budget exhaustion (fail-open -- a partial
+   * tree is still a usable index), so losing retry there was an already-shipped, acceptable
+   * tradeoff. `listWorkspaceRepositories` (below) instead fails CLOSED on any page failure, so
+   * silently dropping retry would turn a transient 429/5xx into an avoidable hard discovery failure
+   * -- this is the concrete fix for OpenCode's HIGH review finding (Phase 31 REVIEWS.md) that the
+   * original absolute-URL-fetch approach lost `request()`'s retry/timeout/tracker parity.
+   */
+  private async requestRaw(url: string): Promise<Response> {
+    return withRetry(`GET ${url}`, async () => {
       this.tracker?.incrementSubrequests(1);
-      const response = await withTimeout(`Bitbucket ${method} ${path}`, BITBUCKET_TIMEOUT_MS, (signal) =>
-        globalThis.fetch(`${BITBUCKET_API_BASE_URL}${path}`, {
-          method,
+      const response = await withTimeout(`Bitbucket GET ${new URL(url).pathname}`, BITBUCKET_TIMEOUT_MS, (signal) =>
+        globalThis.fetch(url, {
+          method: 'GET',
           signal,
           headers: {
-            Accept: accept,
+            Accept: 'application/json',
             Authorization: `Bearer ${this.token}`,
             'User-Agent': this.env.BOT_USERNAME ?? 'codra-bot',
-            ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
           },
-          body: body === undefined ? undefined : JSON.stringify(body),
         }),
       );
 
@@ -175,14 +311,109 @@ export class BitbucketClient {
         throw new BitbucketError(
           response.status,
           errorBody,
-          path,
-          `Bitbucket API ${method} ${path} failed with ${response.status}`,
+          new URL(url).pathname,
+          `Bitbucket API GET ${new URL(url).pathname} failed with ${response.status}`,
           retryAfterMs(response),
         );
       }
 
       return response;
     });
+  }
+
+  // Phase 31 (WS-01, D-05/OpenCode review, MEDIUM): named page cap mirroring
+  // `MAX_SRC_TREE_PAGES`/`MAX_THREAD_LIST_PAGES`'s convention. At `pagelen=100`, this caps workspace
+  // discovery at 5,000 repositories -- a workspace that large hits the fail-closed page-cap error
+  // below rather than silently truncating. This is a DOCUMENTED, accepted limitation for this phase
+  // (see `threat_model` T-31-01-05), not an unhandled edge case; no dedicated UI copy names the
+  // exact number because the existing generic discovery-failure copy already covers this path.
+  static readonly MAX_WORKSPACE_REPOS_PAGES = 50;
+
+  /**
+   * Phase 31 (WS-01, D-05): enumerate a workspace's repositories via the paginated
+   * `/repositories/{workspace}` listing. FAILS CLOSED -- unlike `listSrcTree`'s tolerated partial
+   * result, a partial repo list here would silently hide real repos from the onboarding picker,
+   * which is worse than a loud failure. Every page (first AND subsequent) is fetched through
+   * `requestRaw`, which is what preserves retry/timeout/tracking across the WHOLE paginated walk,
+   * not just page 1 (OpenCode review finding, HIGH).
+   */
+  async listWorkspaceRepositories(workspace: string): Promise<{ slug: string; name: string }[]> {
+    const maxPages = BitbucketClient.MAX_WORKSPACE_REPOS_PAGES;
+    const results: { slug: string; name: string }[] = [];
+    const seenNextUrls = new Set<string>();
+    let nextUrl: string | null =
+      `${BITBUCKET_API_BASE_URL}${workspaceRepositoriesPath(workspace)}?pagelen=100`;
+    let isLocallyBuiltUrl = true;
+
+    for (let page = 0; page < maxPages; page += 1) {
+      if (!isLocallyBuiltUrl && !isValidBitbucketNextUrl(nextUrl, seenNextUrls)) {
+        // A response-supplied link is untrusted INPUT, not a trusted continuation (T-17-02-03 /
+        // R-9 precedent). Off-origin, off-path, or a repeated (cyclic) link FAILS the walk closed.
+        throw new BitbucketError(
+          502,
+          `Bitbucket next-link did not pass origin/path validation`,
+          '/repositories/{workspace}',
+          `Bitbucket workspace-repositories pagination next URL failed SSRF validation`,
+        );
+      }
+
+      const response = await this.requestRaw(nextUrl as string);
+      const body = (await response.json()) as {
+        values?: Array<{ slug?: unknown; name?: unknown }>;
+        next?: string | null;
+      };
+      for (const value of body.values ?? []) {
+        if (typeof value?.slug !== 'string' || typeof value?.name !== 'string') continue;
+        results.push({ slug: value.slug, name: value.name });
+      }
+
+      if (!body.next) {
+        return results;
+      }
+      seenNextUrls.add(nextUrl as string);
+      nextUrl = body.next;
+      isLocallyBuiltUrl = false;
+    }
+
+    // Cap reached while `body.next` was still populated -- FAIL CLOSED (never a partial array).
+    throw new BitbucketError(
+      503,
+      `Bitbucket workspace-repositories pagination exceeded MAX_WORKSPACE_REPOS_PAGES (${maxPages}); aborting partial traversal`,
+      '/repositories/{workspace}',
+      `Bitbucket workspace repositories listing exceeded MAX_WORKSPACE_REPOS_PAGES=${maxPages}`,
+    );
+  }
+
+  /**
+   * Phase 31 (WS-01, finalize): list a workspace's webhook subscriptions. This is the READ half of
+   * the finalize endpoint's list-then-create-if-missing idempotency check -- a resubmission for
+   * the same workspace must never create a second subscription for the same URL
+   * (T-31-03-04). Non-paginated: simple, single-page call via the existing `request()` helper,
+   * unlike `listWorkspaceRepositories` (which can legitimately span thousands of repos).
+   */
+  async listWorkspaceWebhooks(workspace: string): Promise<Array<{ uuid: string; url: string }>> {
+    const response = await this.request('GET', workspaceHooksPath(workspace));
+    const body = (await response.json()) as { values?: Array<{ uuid?: string; url?: string }> };
+    return (body.values ?? []).map((value) => ({ uuid: value.uuid ?? '', url: value.url ?? '' }));
+  }
+
+  /**
+   * Phase 31 (WS-01, finalize): create a workspace-level webhook subscription. Called ONLY after
+   * `listWorkspaceWebhooks` has confirmed no existing hook already matches the derived webhook
+   * URL -- see the finalize handler's idempotency comment (T-31-03-04/T-31-03-05).
+   */
+  async createWorkspaceWebhook(
+    workspace: string,
+    input: { url: string; secret: string; events: string[] },
+  ): Promise<{ uuid: string }> {
+    const response = await this.request('POST', workspaceHooksPath(workspace), {
+      description: 'Codra review webhook',
+      url: input.url,
+      active: true,
+      secret: input.secret,
+      events: input.events,
+    });
+    return (await response.json()) as { uuid: string };
   }
 
   async getPullRequest(workspace: string, repoSlug: string, prNumber: number): Promise<VcsPullRequest> {
@@ -214,7 +445,7 @@ export class BitbucketClient {
   // delimiters survive (`encodeURIComponent` on the whole path would lose them). 404 -> null
   // (D-08 delete-at-head); any other non-2xx throws BitbucketError.
   async getFileContent(workspace: string, repoSlug: string, ref: string, path: string): Promise<string | null> {
-    const encodedPath = path.split('/').map((segment) => encodeURIComponent(segment)).join('/');
+    const encodedPath = encodeSrcPathSegments(path);
     const apiPath = `${repositoryPath(workspace, repoSlug)}/src/${encodeURIComponent(ref)}/${encodedPath}`;
     try {
       const response = await this.request('GET', apiPath, undefined, 'text/plain');
@@ -238,6 +469,378 @@ export class BitbucketClient {
     const path = `${repositoryPath(workspace, repoSlug)}/diff/${spec}?context=3&topic=true`;
     const response = await this.request('GET', path, undefined, 'text/plain');
     return response.text();
+  }
+
+  /**
+   * PRD-04 (FR-114): fetch recent commits touching a single file.
+   *
+   * NOTE: parameter order deliberately deviates from `getFileContent` (:402, which takes
+   * ref BEFORE path) — this method takes `path` BEFORE `ref` to mirror the VcsProvider
+   * interface signature `getFileHistory?(owner, repo, path, ref, maxCommits)` (vcs/types.ts)
+   * that the adapter delegates against, keeping the adapter a pure passthrough.
+   */
+  async getFileHistory(workspace: string, repoSlug: string, path: string, ref: string, maxCommits: number): Promise<VcsCommitEntry[]> {
+    const encodedPath = encodeSrcPathSegments(path);
+    const apiPath = `${repositoryPath(workspace, repoSlug)}/commits/${encodeURIComponent(ref)}?path=${encodedPath}&pagelen=${maxCommits}`;
+    const response = await this.request('GET', apiPath);
+    const body = (await response.json()) as { values?: Array<{ hash: string; message: string }> };
+    return (body.values ?? []).map((c) => ({
+      hash: c.hash.slice(0, 7),
+      message: c.message.split('\n')[0] ?? '',
+      files: [], // Bitbucket Cloud commit-list endpoint omits the file manifest
+      filesAvailable: false, // Tells prompt builder to render "(files list not available)"
+    }));
+  }
+
+  /**
+   * PRD-06 (FR-131, D-05): Bitbucket workspace code search, backing the agentic `grep_repo` tool.
+   *
+   * LOAD-BEARING CAVEAT, not a footnote — read this before assuming the method works:
+   *
+   *  1. **The endpoint is DEPRECATED with a REMOVAL DATE OF 2026-11-01.** Atlassian's live swagger
+   *     marks it `"deprecated": true` ("This API will be deprecated on November 1, 2026"), the
+   *     changelog gives deprecation 2026-05-01 and removal 2026-11-01, and NO replacement API has
+   *     been published. After that date this method will start returning 404 or 410, which this code
+   *     already maps to `null` — so the failure mode on removal day is a silent, correct degradation
+   *     rather than a broken job. If you are reading this after 2026-11-01, that is why `grep_repo`
+   *     is unavailable on Bitbucket, and the replacement API is the work item.
+   *  2. **Atlassian has confirmed it does NOT accept Workspace or Repository Access Tokens**
+   *     (feature request BCLOUD-22586: "We currently don't support WAT for code search"). That is
+   *     precisely and only the credential class Codra stores and sends — `resolveBitbucketBotCredential`
+   *     resolves a per-repo or per-workspace Access Token and this client sends it as a bearer token.
+   *     OAuth 2, Basic-with-app-password and `api_token` credentials DO work, so an operator using
+   *     one of those gets real matches.
+   *
+   * In practice this method is therefore expected to return `null` on most installs, and `null` is
+   * the DESIGNED degradation (D-05), not a bug: the executor flips `grepSupported` false, TELLS the
+   * model that repository-wide search is unavailable for this repository, stops offering the tool,
+   * and `read_file` carries the phase. `grep_supported: false` on a Bitbucket job is a pre-declared
+   * expected outcome of Phase 35, not a regression.
+   *
+   * Status mapping — four DISTINCT capability answers plus a rethrow, deliberately not merged:
+   *   - 401 / 403 -> `null`. The BCLOUD-22586 credential refusal.
+   *   - 404       -> `null`. The DOCUMENTED "search is not enabled for the requested workspace",
+   *                  which is a capability answer and not an error. (Also what removal will look like.)
+   *   - 429       -> `null`. Rate limiting. The capability stands DOWN for the rest of the invocation
+   *                  instead of retrying an endpoint with no documented numeric limit (T-35-12).
+   *   - 400       -> `[]`. A malformed query (reason key at `error.data.key`) is a QUERY problem, not
+   *                  a capability problem; returning `null` would kill grep_repo for the whole run
+   *                  over one bad query.
+   *   - anything else, INCLUDING 5xx -> rethrow, so a genuine Bitbucket outage is never reported to
+   *                  an operator (or to the model) as "search unavailable for this workspace" (T-35-13).
+   *
+   * Issued through `requestOnce`, NOT `request`: no retry (see `requestOnce`'s own doc block). One
+   * subrequest per call, self-incremented there — never increment the tracker here as well.
+   */
+  async searchCode(
+    workspace: string,
+    repo: string,
+    query: string,
+    maxHits: number,
+  ): Promise<VcsCodeSearchHit[] | null> {
+    // T-35-07: the repository-scoping qualifier is built from the PINNED repo slug the job already
+    // resolved and is NEVER model-supplied. `query` is the only model-supplied part, and it arrives
+    // already length-clamped and newline-stripped by the executor (AGENTIC_MAX_QUERY_CHARS = 120).
+    const searchQuery = `${query} repo:${repo}`;
+    // Bitbucket's `pagelen` is a closed 1..100 range. Sent EXPLICITLY because the provider default is
+    // 10 — omitting it would silently cap every grep at 10 hits regardless of AGENTIC_MAX_GREP_HITS.
+    const pagelen = Math.min(Math.max(maxHits, 1), 100);
+    const path =
+      `${workspaceSearchCodePath(workspace)}` +
+      `?search_query=${encodeURIComponent(searchQuery)}&pagelen=${pagelen}`;
+
+    let response: Response;
+    try {
+      response = await this.requestOnce('GET', path);
+    } catch (error) {
+      // `requestOnce` throws BitbucketError on ANY non-2xx, so the status branches have to be
+      // resolved HERE, before the error escapes into the executor's fail-open path.
+      if (!(error instanceof BitbucketError)) {
+        // A timeout or a transport failure. Not a capability answer — let it propagate.
+        throw error;
+      }
+      if (error.status === 401 || error.status === 403) {
+        // BCLOUD-22586: the stored Access Token cannot call this endpoint at all. The expected
+        // steady state on this deployment.
+        return null;
+      }
+      if (error.status === 404) {
+        // Documented: "Search is not enabled for the requested workspace." Also what the
+        // 2026-11-01 removal will look like on the wire.
+        return null;
+      }
+      if (error.status === 429) {
+        // Rate limited with no documented numeric limit to back off against. Stand the capability
+        // down for the invocation rather than spending more subrequests on it (T-35-12).
+        return null;
+      }
+      if (error.status === 400) {
+        // A malformed query, reason key at `error.data.key`. `[]` keeps the capability INTACT so the
+        // model can try a different query — this branch must never be merged into the `null` ones.
+        return [];
+      }
+      throw error;
+    }
+
+    // T-35-11: an untrusted provider payload is being flattened into a type that reaches a prompt.
+    // Only `file.path`, `line` and the `segments` text values are read, every one of them is
+    // type-checked before use, and a malformed entry is SKIPPED rather than trusted — no provider
+    // payload shape escapes this method into `core/`. `segments` is declared `unknown` on purpose so
+    // `tsc` itself forces the array guard below rather than letting a lying type erase it.
+    const data = (await response.json()) as {
+      values?: Array<{
+        file?: { path?: unknown };
+        content_matches?: Array<{ lines?: Array<{ line?: unknown; segments?: unknown }> }>;
+      }>;
+    };
+
+    const hits: VcsCodeSearchHit[] = [];
+    for (const value of data.values ?? []) {
+      const path = value?.file?.path;
+      if (typeof path !== 'string') continue;
+      for (const contentMatch of value.content_matches ?? []) {
+        for (const matchedLine of contentMatch?.lines ?? []) {
+          // Checked BEFORE the reassembly and BEFORE the push, so a `maxHits` of 0 returns an empty
+          // array rather than one hit — the `pagelen` clamp above is a REQUEST-operand clamp and
+          // must not leak into the returned array length.
+          if (hits.length >= maxHits) return hits;
+          // Bitbucket splits each matched line into segments; `match: true` marks the highlighted
+          // span, which is a UI concern the model does not need. Reassembling the plain text is all
+          // it wants. Every level of this walk is guarded (35-REVIEWS.md, Antigravity Suggestion #3):
+          // the `segments` array access is optional-chained AND array-checked (a non-array `segments`
+          // would make `.map` throw), and each segment's `text` is coalesced to '' when it is
+          // missing or not a string — otherwise `undefined` would stringify into the fragment. This
+          // matters because the agentic phase is FAIL-OPEN: a provider payload-shape change must
+          // degrade to fewer hits, never to an exception.
+          const rawSegments: unknown[] = Array.isArray(matchedLine?.segments) ? matchedLine.segments : [];
+          const fragment = rawSegments
+            .map((segment) => {
+              const text = (segment as { text?: unknown } | null)?.text;
+              return typeof text === 'string' ? text : '';
+            })
+            .join('');
+          if (fragment.trim() === '') continue;
+          hits.push({
+            path,
+            // UNTRUNCATED ON PURPOSE. The FR-132 240-bytes-per-hit bound is applied exactly once, in
+            // `core/agentic-tools.ts`'s executor, so the bound lives in ONE testable place instead of
+            // being re-implemented per adapter. Do not slice here.
+            fragment,
+            // The provider's own line number when it supplied one, `null` otherwise. A fabricated
+            // line would be worse than an absent one — the model would cite a line Bitbucket never
+            // reported. Never guess it.
+            line: typeof matchedLine?.line === 'number' ? matchedLine.line : null,
+            // D-07: the default-branch label, never a SHA and never the pull-request head.
+            ref: BITBUCKET_CODE_SEARCH_REF_LABEL,
+          });
+        }
+      }
+    }
+    return hits;
+  }
+
+  // QA-IDX-01 (D-09): repository metadata read, used ONLY to resolve the default branch for the index
+  // build. Narrowed to `mainbranch` on purpose -- the endpoint returns a large object and the seam has
+  // no business carrying any of the rest. Note Bitbucket's repository payload carries the branch NAME
+  // but no commit hash, which is why `getBranchCommitSha` exists as a separate read.
+  async getRepositoryMetadata(workspace: string, repoSlug: string): Promise<{ mainbranch?: { name?: string } }> {
+    const response = await this.request('GET', repositoryPath(workspace, repoSlug));
+    return (await response.json()) as { mainbranch?: { name?: string } };
+  }
+
+  // QA-IDX-01 (D-12): resolve a branch name to the commit it points at, so the adapter can report a
+  // REAL commit sha for `indexed_sha` instead of persisting a branch name that moves under it.
+  // Returns null when the branch does not exist (404) so the adapter can distinguish "no such branch"
+  // from a transport failure; any other non-2xx throws.
+  async getBranchCommitSha(workspace: string, repoSlug: string, branch: string): Promise<string | null> {
+    const path = `${repositoryPath(workspace, repoSlug)}/refs/branches/${encodeSrcPathSegments(branch)}`;
+    try {
+      const response = await this.request('GET', path);
+      const body = (await response.json()) as { target?: { hash?: string } };
+      const hash = body.target?.hash;
+      return typeof hash === 'string' && hash.length > 0 ? hash : null;
+    } catch (error) {
+      if (error instanceof BitbucketError && error.status === 404) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * QA-IDX-01 (D-09): enumerate the blob paths under `ref` via the paginated `/src` listing.
+   *
+   * Modelled DIRECTLY on `listRawPullRequestComments` below, and it keeps all five of that walk's
+   * mechanisms verbatim in behavior:
+   *   1. the FIRST url of every directory is built LOCALLY and is the only TRUSTED url;
+   *   2. every `next` url from a response body is UNTRUSTED and must pass
+   *      `isValidBitbucketNextUrl` (origin + `/2.0/` path prefix) before it is fetched (T-29-03-01);
+   *   3. a `seenNextUrls` set guards cycles;
+   *   4. `tracker.hasRemainingSafeBudget(1)` is consulted BEFORE issuing each page (T-29-03-02);
+   *   5. the total page count is bounded by the named cap `MAX_SRC_TREE_PAGES`.
+   *
+   * ONE DELIBERATE DIVERGENCE from the thread-list template: cap (or budget) exhaustion returns a
+   * PARTIAL result flagged `truncated: true` instead of throwing. A partial TREE is still a usable
+   * index -- the consumer applies a max-files cap to it anyway -- whereas a partial THREAD LIST is
+   * not (a missing thread is silently treated as resolved, which is why Phase 17 chose fail-closed
+   * there). That fail-closed choice was correct for its own caller and is intentionally NOT copied.
+   *
+   * Directory handling: entries are `{ path, type: 'commit_file' | 'commit_directory' }` with `path`
+   * already absolute from the repo root. `commit_file` entries become paths; `commit_directory`
+   * entries are re-enqueued ONLY when the depth-limited response did not already return their
+   * contents, so no subtree is silently dropped and no directory is walked twice.
+   */
+  static readonly MAX_SRC_TREE_PAGES = 50;
+
+  async listSrcTree(
+    workspace: string,
+    repoSlug: string,
+    ref: string,
+    tracker?: { hasRemainingSafeBudget?(needed?: number): boolean },
+  ): Promise<{ paths: string[]; truncated: boolean }> {
+    const maxPages = BitbucketClient.MAX_SRC_TREE_PAGES;
+    const paths: string[] = [];
+    const seenPaths = new Set<string>();
+    const seenNextUrls = new Set<string>();
+    // Directory queue seeded with the repository ROOT (the empty path). `queuedDirectories` doubles
+    // as the cycle guard for the directory dimension of the walk.
+    const pendingDirectories: string[] = [''];
+    const queuedDirectories = new Set<string>(['']);
+    let pagesFetched = 0;
+
+    const buildDirectoryUrl = (directory: string, depth: number) => {
+      const encodedDirectory = encodeSrcPathSegments(directory);
+      return (
+        `${BITBUCKET_API_BASE_URL}${repositoryPath(workspace, repoSlug)}` +
+        `/src/${encodeURIComponent(ref)}/${encodedDirectory}` +
+        `?max_depth=${depth}&pagelen=${SRC_TREE_PAGE_LEN}`
+      );
+    };
+
+    // Pages are fetched with the ABSOLUTE url directly (NOT through `request()`, which would
+    // re-prefix the api base), mirroring `listRawPullRequestComments`. Same auth/timeout/tracking.
+    const fetchPage = (url: string) => {
+      const headers: Record<string, string> = {
+        Accept: 'application/json',
+        Authorization: `Bearer ${this.token}`,
+        'User-Agent': this.env.BOT_USERNAME ?? 'codra-bot',
+      };
+      this.tracker?.incrementSubrequests(1);
+      return withTimeout(`Bitbucket GET ${new URL(url).pathname}`, BITBUCKET_TIMEOUT_MS, (signal) =>
+        globalThis.fetch(url, { method: 'GET', signal, headers }),
+      );
+    };
+
+    while (pendingDirectories.length > 0) {
+      const directory = pendingDirectories.shift() as string;
+      const entries: Array<{ path: string; isDirectory: boolean }> = [];
+      let depth = SRC_TREE_MAX_DEPTH;
+      let nextUrl: string | null = buildDirectoryUrl(directory, depth);
+      // True while `nextUrl` is a url THIS code built. Flipped off the moment a response-supplied
+      // `next` link is adopted, which is what gates the SSRF/cycle checks below.
+      let isLocallyBuiltUrl = true;
+
+      while (nextUrl !== null) {
+        if (pagesFetched >= maxPages) {
+          // Cap reached with work outstanding: partial listing, flagged. See the divergence note.
+          return { paths, truncated: true };
+        }
+        if (tracker?.hasRemainingSafeBudget && !tracker.hasRemainingSafeBudget(1)) {
+          // Same disposition as the page cap, for the same reason: a build invocation that spent its
+          // subrequest budget enumerating should hand back what it has rather than throw away the
+          // pages it already paid for.
+          return { paths, truncated: true };
+        }
+        if (!isLocallyBuiltUrl) {
+          if (seenNextUrls.has(nextUrl)) {
+            // Cycle: the server handed back a link we already followed. STOP the walk (the listing is
+            // incomplete, so it is flagged) rather than loop until the page cap absorbs it.
+            return { paths, truncated: true };
+          }
+          if (!isValidBitbucketNextUrl(nextUrl, seenNextUrls)) {
+            // A response-supplied link is untrusted INPUT, not a trusted continuation (T-29-03-01).
+            // Off-origin or off-path FAILS the walk -- it is not a degradation, it is an attack or a
+            // provider bug, and either way it must be loud.
+            throw new BitbucketError(
+              502,
+              `Bitbucket next-link did not pass origin/path validation`,
+              '/src/{ref}/{path}',
+              `Bitbucket src-tree pagination next URL failed SSRF validation`,
+            );
+          }
+        }
+
+        pagesFetched += 1;
+        const response = await fetchPage(nextUrl);
+        if (!response.ok) {
+          if (
+            response.status === SRC_TREE_DEPTH_TIMEOUT_STATUS &&
+            isLocallyBuiltUrl &&
+            depth > SRC_TREE_FALLBACK_MAX_DEPTH
+          ) {
+            // Reported `max_depth` timeout. Retry THIS directory once at a smaller depth rather than
+            // failing the whole build. Restricted to a locally-built url (page 1 of the directory) so
+            // the retry cannot double-count entries already collected from earlier pages.
+            depth = SRC_TREE_FALLBACK_MAX_DEPTH;
+            nextUrl = buildDirectoryUrl(directory, depth);
+            continue;
+          }
+          const errorBody = await response.text();
+          throw new BitbucketError(
+            response.status,
+            errorBody,
+            new URL(nextUrl).pathname,
+            `Bitbucket API GET ${new URL(nextUrl).pathname} failed with ${response.status}`,
+            retryAfterMs(response),
+          );
+        }
+
+        const body = (await response.json()) as {
+          values?: Array<{ path?: unknown; type?: unknown }>;
+          next?: string | null;
+        };
+        for (const value of body.values ?? []) {
+          if (typeof value?.path !== 'string' || value.path.length === 0) continue;
+          if (value.type === 'commit_file') {
+            entries.push({ path: value.path, isDirectory: false });
+            // Committed to `paths` IMMEDIATELY, not after this directory's pagination finishes: every
+            // early return below (page cap, budget exhaustion, cycle) must hand back the pages it has
+            // already paid for. Flushing at the end of the directory loop instead would silently throw
+            // away a whole in-flight directory on exactly the degradation paths that exist to preserve
+            // partial work.
+            if (!seenPaths.has(value.path)) {
+              seenPaths.add(value.path);
+              paths.push(value.path);
+            }
+          } else if (value.type === 'commit_directory') {
+            entries.push({ path: value.path, isDirectory: true });
+          }
+          // Any other `type` is dropped: only blobs are indexable and only directories are walkable.
+        }
+
+        if (!body.next) break;
+        seenNextUrls.add(nextUrl);
+        nextUrl = body.next;
+        isLocallyBuiltUrl = false;
+      }
+
+      for (const entry of entries) {
+        if (!entry.isDirectory) continue;
+        // A directory whose contents the depth-limited response ALREADY returned needs no second
+        // request; one at the depth boundary is listed without its children and must be enqueued or
+        // its whole subtree vanishes from the index silently.
+        const childPrefix = `${entry.path}/`;
+        const contentsAlreadyReturned = entries.some(
+          (other) => other !== entry && other.path.startsWith(childPrefix),
+        );
+        if (contentsAlreadyReturned) continue;
+        if (queuedDirectories.has(entry.path)) continue;
+        queuedDirectories.add(entry.path);
+        pendingDirectories.push(entry.path);
+      }
+    }
+
+    return { paths, truncated: false };
   }
 
   /**
@@ -373,10 +976,11 @@ export class BitbucketClient {
 
     return (page.values ?? []).map((comment) => ({
       // id, body, inline stay byte-identical — submitReview dedup depends on this exact shape
-      // (Pitfall 2, NREG-01). `author` is purely ADDITIVE.
+      // (Pitfall 2, NREG-01). `author` and `links` are purely ADDITIVE.
       id: comment.id,
       body: comment.content?.raw ?? '',
       inline: comment.inline,
+      links: comment.links,
       // author.id is `string | undefined` — a comment missing an immutable account_id must NOT be
       // minted as '' here (a false identity would defeat the Phase 11 self-filter, review F5). The
       // drop-missing-author policy lives in the ADAPTER (vcs/bitbucket.ts), not this shared client
@@ -394,7 +998,7 @@ export class BitbucketClient {
     repoSlug: string,
     prNumber: number,
     comment: PrComment,
-  ): Promise<{ id: number }> {
+  ): Promise<{ id: number; links?: { html?: { href?: string } } }> {
     const path = `${repositoryPath(workspace, repoSlug)}/pullrequests/${prNumber}/comments`;
     // `line_type` is Codra's internal classification. Bitbucket's OpenAPI accepts only path and
     // to/from on the wire: removed lines anchor with `from`, while added/context lines use `to`.
@@ -408,7 +1012,7 @@ export class BitbucketClient {
         }
       : { content: { raw: comment.content.raw } };
     const response = await this.request('POST', path, body);
-    return (await response.json()) as { id: number };
+    return (await response.json()) as { id: number; links?: { html?: { href?: string } } };
   }
 
   // Net-new threaded reply (Phase 12, D-01). Mirrors postPullRequestComment's content-only branch
@@ -451,6 +1055,28 @@ export class BitbucketClient {
     }
   }
 
+  // Phase 28 (LRN-01): fetch a single pull request comment by id. Returns the comment record
+  // including inline path/line and content, or null on 404 (deleted comment). Uses the same
+  // error-handling pattern as editPullRequestComment: catches BitbucketError 404/410 → null,
+  // rethrows any other error.
+  async getPullRequestComment(
+    workspace: string,
+    repoSlug: string,
+    prNumber: number,
+    commentId: number,
+  ): Promise<BitbucketCommentRecord | null> {
+    const path = `${repositoryPath(workspace, repoSlug)}/pullrequests/${prNumber}/comments/${commentId}`;
+    try {
+      const response = await this.request('GET', path);
+      return (await response.json()) as BitbucketCommentRecord;
+    } catch (e) {
+      if (e instanceof BitbucketError && (e.status === 404 || e.status === 410)) {
+        return null;
+      }
+      throw e;
+    }
+  }
+
   async approvePullRequest(workspace: string, repoSlug: string, prNumber: number): Promise<void> {
     const path = `${repositoryPath(workspace, repoSlug)}/pullrequests/${prNumber}/approve`;
     await this.request('POST', path);
@@ -461,9 +1087,49 @@ export class BitbucketClient {
     repoSlug: string,
     commit: string,
     report: CodeInsightsReport,
+    // Phase 30 (ANNO-01, D-01): optional 5th param, default 'codra-review' so every EXISTING call
+    // site (createStatusCheck/updateStatusCheck, vcs/bitbucket.ts) stays byte-identical (NREG-01).
+    // Plan 30-03's postAnnotations always passes the compile-time-pinned ANNOTATION_REPORT_ID.
+    reportId: string = 'codra-review',
   ): Promise<void> {
-    const path = `${repositoryPath(workspace, repoSlug)}/commit/${encodeURIComponent(commit)}/reports/codra-review`;
+    const path = `${repositoryPath(workspace, repoSlug)}/commit/${encodeURIComponent(commit)}/reports/${encodeURIComponent(reportId)}`;
     await this.request('PUT', path, report);
+  }
+
+  // Phase 30 (ANNO-01, D-09): delete-whole-report primitive. Mirrors editPullRequestComment's
+  // try/catch-on-BitbucketError.status 404-swallow idiom, but ONLY for 404 (round 1, no prior
+  // report) -- Bitbucket's DELETE report endpoint is not documented to also return 410. Any other
+  // error rethrows unchanged. No accumulate-across-rounds mechanism exists at this layer (D-09
+  // prohibition) -- this is a plain delete-then-recreate primitive, not a diff/upsert.
+  async deleteCodeInsightsReport(
+    workspace: string,
+    repoSlug: string,
+    commit: string,
+    reportId: string,
+  ): Promise<void> {
+    const path = `${repositoryPath(workspace, repoSlug)}/commit/${encodeURIComponent(commit)}/reports/${encodeURIComponent(reportId)}`;
+    try {
+      await this.request('DELETE', path);
+    } catch (e) {
+      if (e instanceof BitbucketError && e.status === 404) {
+        return;
+      }
+      throw e;
+    }
+  }
+
+  // Phase 30 (ANNO-01, D-09): bulk-create-or-update annotations. POSTs the caller-supplied array
+  // VERBATIM -- no batching or validation happens inside the client; chunking at
+  // ANNOTATION_BATCH_SIZE is Plan 30-03's postAnnotations responsibility.
+  async bulkUpsertAnnotations(
+    workspace: string,
+    repoSlug: string,
+    commit: string,
+    reportId: string,
+    annotations: ReportAnnotation[],
+  ): Promise<void> {
+    const path = `${repositoryPath(workspace, repoSlug)}/commit/${encodeURIComponent(commit)}/reports/${encodeURIComponent(reportId)}/annotations`;
+    await this.request('POST', path, annotations);
   }
 
   async postCommitBuildStatus(

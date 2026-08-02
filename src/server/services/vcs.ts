@@ -18,6 +18,19 @@ export class NotImplementedError extends Error {
 }
 
 /**
+ * WR-07: the subrequest tracker shape both factory entry points accept, kept IDENTICAL to the shape
+ * `GithubAdapter` / `GitHubService` / `GitHubClient` and `BitbucketAdapter` declare. `forRepo` and
+ * `forProvider` are the only construction sites, so any field missing here is silently dropped on
+ * the way into the adapter with no compile error -- which is precisely how the
+ * `hasRemainingSafeBudget` budget guard could be defeated (`undefined === false` never fires).
+ * Widen this alias, never one of the two signatures alone.
+ */
+export type TrackerLike = {
+  incrementSubrequests(count?: number): void;
+  hasRemainingSafeBudget?(needed?: number): boolean;
+};
+
+/**
  * The single branch point every VCS operation in `core/review.ts` dispatches through (FND-05),
  * structurally mirroring the `ModelService` strategy pattern in `services/model.ts` but shaped as
  * a factory (D-05) rather than an instantiable class: there is nothing to resolve/fallback across
@@ -56,7 +69,13 @@ export class VcsService {
       headSha?: string | null;
       commitSha?: string | null;
     },
-    tracker?: { incrementSubrequests(count?: number): void },
+    // WR-07: MUST include `hasRemainingSafeBudget?`. `forRepo`/`forProvider` are the ONLY places an
+    // adapter is constructed, so a narrower type here silently discards the method on the way
+    // through -- `GitHubClient`'s guard `this.tracker?.hasRemainingSafeBudget?.(1) === false` then
+    // evaluates `undefined === false`, the per-comment fallback loop never stops, and the SAFE_MARGIN
+    // rationale in core/github.ts becomes false with NO compile error. Same silent-forwarding
+    // regression the comment at vcs/github.ts:52-53 warns about, one layer up.
+    tracker?: TrackerLike,
   ): Promise<VcsProvider> {
     if (job.repositoryVcsProvider === 'bitbucket') {
       // Prefer an explicit headSha; fall back to the mapped job's commitSha (both are the PR head
@@ -100,7 +119,8 @@ export class VcsService {
       repo?: string;
       headSha?: string;
     },
-    tracker?: { incrementSubrequests(count?: number): void },
+    // WR-07: same widening as `forRepo` -- see the note there.
+    tracker?: TrackerLike,
   ): Promise<VcsProvider> {
     if (opts.provider === 'bitbucket') {
       if (!opts.workspace || !opts.repo) {

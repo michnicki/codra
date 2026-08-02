@@ -79,9 +79,10 @@ export type WalkthroughReviewRow = {
   // NULLABLE in the DB (001_initial.sql:83) even though getFileReviewsForJobs types it `number`;
   // the sort tiebreak uses `?? 0` (cross-AI LOW).
   diff_line_count: number | null;
-  // file_reviews is unique on (job_id, file_path, pass); Phase 10 adds security-pass rows, so the
-  // walkthrough filters pass === 'main' to keep exactly one row per file_path (D-02, forward-compat).
-  pass: 'main' | 'security';
+  // file_reviews is unique on (job_id, file_path, pass); Phase 10 adds security-pass rows, Phase 27
+  // adds cross_file_security rows, so the walkthrough filters pass === 'main' to keep exactly one
+  // row per file_path (D-02, forward-compat).
+  pass: 'main' | 'security' | 'cross_file_security';
 };
 
 /** Durable thread-verification data projected into the PR walkthrough. */
@@ -103,6 +104,14 @@ export type WalkthroughAssessment = {
   effort: WalkthroughEffort | null;
 };
 
+/** Phase 27 (SEC-XDIFF-01): a single cross-file finding in the walkthrough's dedicated section. */
+export type WalkthroughCrossFileFinding = {
+  path: string;
+  title: string;
+  severity: Severity;
+  crossReferences: Array<{ path: string; line?: number; relationship: string }>;
+};
+
 /** Deterministic, provider-agnostic payload consumed by FormatterService.formatWalkthrough. */
 export type WalkthroughData = {
   files: Array<{ path: string; summary: string; counts: Record<Severity, number> }>;
@@ -115,6 +124,15 @@ export type WalkthroughData = {
   // (NREG-01) — the formatter detects groups presence and branches internally.
   groups?: WalkthroughGroupSection[];
   assessment?: WalkthroughAssessment;
+  // Phase 27 (SEC-XDIFF-01): when present, the walkthrough renders a dedicated "Cross-file
+  // Security" section after the per-file coverage table. Identified by cross_references presence
+  // on finalComments (NOT by pass === 'main' or path === '__cross_file__'). Omitted when no
+  // cross-file findings exist — NREG-01 (default cross_file: false produces zero difference).
+  crossFileSection?: {
+    severityCounts: Record<Severity, number>;
+    filesAnalyzed: number;
+    findings: WalkthroughCrossFileFinding[];
+  };
 };
 
 /** The subset of a PersistedReviewJob these helpers read. */
@@ -368,8 +386,13 @@ export function buildWalkthroughData(params: {
     confidence: WalkthroughConfidence | null;
     effort: WalkthroughEffort | null;
   } | null;
+  // Phase 27 (SEC-XDIFF-01): optional cross-file comments. When supplied and non-empty, the
+  // walkthrough includes a dedicated "Cross-file Security" section. Identified by cross_references
+  // presence on each comment (NOT by path === '__cross_file__'). Omitted when absent or empty —
+  // NREG-01 (default cross_file: false produces zero difference).
+  crossFileComments?: ParsedReviewComment[];
 }): WalkthroughData {
-  const { reviews, finalComments, threadVerification, enrichment } = params;
+  const { reviews, finalComments, threadVerification, enrichment, crossFileComments } = params;
 
   // Filter to the main pass BEFORE aggregating (cross-AI MEDIUM, WT-04 adjacency).
   const mainReviews = reviews.filter((review) => review.pass === 'main');
@@ -421,11 +444,44 @@ export function buildWalkthroughData(params: {
   const flatFiles = files.map(({ path, summary, counts }) => ({ path, summary, counts }));
   const threadVerificationSummary = projectThreadVerification(threadVerification);
 
+  // Phase 27 (SEC-XDIFF-01): build the optional "Cross-file Security" section. Cross-file
+  // findings are identified by cross_references presence (NOT by path === '__cross_file__').
+  // The section is omitted when no cross-file comments exist — NREG-01.
+  let crossFileSection: WalkthroughData['crossFileSection'];
+  if (crossFileComments && crossFileComments.length > 0) {
+    const crossFileSevCounts = emptyCounts();
+    const crossFileFindings: WalkthroughCrossFileFinding[] = [];
+    const uniquePaths = new Set<string>();
+    for (const comment of crossFileComments) {
+      crossFileSevCounts[comment.severity] = (crossFileSevCounts[comment.severity] ?? 0) + 1;
+      crossFileFindings.push({
+        path: comment.path,
+        title: comment.title,
+        severity: comment.severity,
+        crossReferences: (comment.cross_references ?? []).map((ref) => ({
+          path: ref.path,
+          ...(ref.line != null ? { line: ref.line } : {}),
+          relationship: ref.relationship,
+        })),
+      });
+      uniquePaths.add(comment.path);
+      for (const ref of comment.cross_references ?? []) {
+        uniquePaths.add(ref.path);
+      }
+    }
+    crossFileSection = {
+      severityCounts: crossFileSevCounts,
+      filesAnalyzed: uniquePaths.size,
+      findings: crossFileFindings,
+    };
+  }
+
   const result: WalkthroughData = {
     files: flatFiles,
     severityCounts,
     filesReviewed: mainReviews.length,
     ...(threadVerificationSummary ? { threadVerification: threadVerificationSummary } : {}),
+    ...(crossFileSection ? { crossFileSection } : {}),
   };
 
   // Phase 19 Plan 19-08: optional enrichment projection. Runs only when the caller supplied a
