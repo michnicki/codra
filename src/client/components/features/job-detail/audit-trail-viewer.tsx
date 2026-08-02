@@ -498,6 +498,79 @@ function DecisionEvent({ event }: { event: JobAuditEvent }) {
           ) : null}
         </li>
       );
+    // Phase 35 (PRD-06 / FR-131, D-05/D-11): the bounded agentic-context pass. ONE aggregate row per
+    // non-silent exit, and the ONLY surface that shows this event — so an unrendered field is an
+    // invisible field. Row shell copied verbatim from the `cross_file_security` case above, its
+    // closest structural sibling (a whole-phase aggregate with status + optional reason + optional
+    // counts), so the row spaces and colours byte-identically in a vertically-scanned list.
+    //
+    // THE PRESENCE GATES BELOW ARE `!= null` / `!== undefined`, NEVER TRUTHINESS. This is the
+    // highest-value rule on this surface. `hops_used: 0`, `files_read: 0`, `greps_run: 0`,
+    // `bytes_gathered: 0`, `budget_headroom: 0`, `truncated: false` and `grep_supported: false` are
+    // all falsy AND all diagnostic: 35-AI-SPEC.md §7 samples `bytes_gathered == 0 && hops_used >= 2`
+    // at 100% (the "paid for nothing" shape), `grep_supported: false` is the entire D-05 degradation
+    // signal, and `budget_headroom: 0` is the `< 2` alert firing at its worst value. A truthy gate
+    // deletes the single most diagnostic reading from the only surface that shows it AND renders a
+    // stray literal `0` text node in its place. An ABSENT field omits its line entirely, with no
+    // placeholder — "the phase never got that far" is a different statement from zero, and
+    // conflating them makes the zero-yield alert unreadable.
+    //
+    // DELIBERATELY ACHROMATIC. Each of the following is a prohibition, not an omission — every one
+    // would actively mislead an operator:
+    //   - `status` is NOT colour-mapped. `failed` here means the loop yielded nothing and the job
+    //     proceeded anyway (D-11 fail-open); it is NOT a job failure, and rendering it in a
+    //     destructive token or with an icon tells the operator their review broke when it did not.
+    //   - `grep_supported: false` is NOT badged, coloured, or reworded to unsupported/unavailable/
+    //     error/missing. On Bitbucket it is the documented expected steady state (§7: must not
+    //     alert); on GitHub it is a real signal. This row cannot tell which provider the job ran on,
+    //     so any failure styling is wrong roughly half the time.
+    //   - The trail's warning tokens are NOT reused here: they belong to the truncation banner
+    //     below, and reusing them inside a row reads as a second trail-level warning. Token
+    //     utilities only, no inline style, so the row inverts correctly under `.dark`.
+    //   - NO `stage` metric line. This stage has its own dedicated display group holding exactly one
+    //     literal, so the group heading already names it — same as `cross_file_security` and
+    //     `yaml_config_applied`, neither of which renders one. A `stage` line belongs only to cases
+    //     that share a NORMALIZED group (`rounds.*`, `threads.*`, `walkthrough.enrichment`), where
+    //     the row must disclose which variant it is. Copying that case adds a redundant one.
+    //   - `hops` renders as a BARE INTEGER, never `3 / 6`. The arm carries no cap field, and
+    //     duplicating a server tuning constant into the client is exactly the drift the codebase's
+    //     constant-comment convention exists to prevent.
+    //   - The event is NOT rendered generically — no `Object.entries(event).map(…)`, no spread. The
+    //     arm is `.passthrough()`, so an event may legitimately carry unexpected keys; a generic
+    //     renderer would surface future fields into operator UI unreviewed and would break the
+    //     counts-not-content boundary T-35-21 depends on the moment a future field carried a path.
+    //     Exactly nine known fields, read by name; unknown keys render nothing and must not throw.
+    //   - `reason` renders VERBATIM (`unparseable_action`, not "the model produced an unparseable
+    //     tool call"). That literal is what §7's alert thresholds and an operator's SQL /
+    //     `wrangler tail` greps match on. Humanisation happens at the stage label only.
+    case 'agentic_context':
+      return (
+        <li className="rounded-md border border-border/40 bg-card/40 p-3">
+          <MetricLine label="status" value={event.status} />
+          {event.reason ? <MetricLine label="reason" value={event.reason} /> : null}
+          {event.hops_used != null ? (
+            <MetricLine label="hops" value={String(event.hops_used)} />
+          ) : null}
+          {event.files_read != null ? (
+            <MetricLine label="files read" value={String(event.files_read)} />
+          ) : null}
+          {event.greps_run != null ? (
+            <MetricLine label="greps run" value={String(event.greps_run)} />
+          ) : null}
+          {event.bytes_gathered != null ? (
+            <MetricLine label="bytes gathered" value={String(event.bytes_gathered)} />
+          ) : null}
+          {event.truncated !== undefined ? (
+            <MetricLine label="truncated" value={String(event.truncated)} />
+          ) : null}
+          {event.grep_supported !== undefined ? (
+            <MetricLine label="grep supported" value={String(event.grep_supported)} />
+          ) : null}
+          {event.budget_headroom != null ? (
+            <MetricLine label="budget headroom" value={String(event.budget_headroom)} />
+          ) : null}
+        </li>
+      );
     case 'yaml_config_parse_failed':
       return (
         <li className="rounded-md border border-border/40 bg-card/40 p-3">
