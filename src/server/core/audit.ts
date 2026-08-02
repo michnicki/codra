@@ -7,7 +7,12 @@ import type { EnsembleReconciliation } from './ensemble';
 import type { EvidenceDropEntry } from './evidence';
 import type { LearnedRuleSuppressionEntry } from './learned-rules';
 import { logger, scrubEmbeddedSecrets } from './logger';
-import { redactFindingTitle } from './audit-redact';
+import { MACHINE_ERROR_REASONS, redactFindingTitle } from './audit-redact';
+// PRD-06: the loop's own closed stop-reason union is imported as a VALUE, not re-typed by hand, so
+// the agentic audit vocabulary below widens automatically when a stop reason is added and cannot
+// drift out of sync with the thing it describes. No cycle: `core/agentic-tools` imports only zod,
+// picomatch, the prompt module and erased `import type`s — nothing that reaches back here.
+import { agenticStopReasons } from './agentic-tools';
 
 /**
  * AUD-01 audit-trail recorder. A SINGLE best-effort recorder for one completed (file, pass) review
@@ -1109,5 +1114,143 @@ export async function recordCrossFileSecurityAudit(
     await appendJobAuditEvents(env, jobId, stamped);
   } catch (error) {
     logger.warn(`Failed to record cross-file security audit events for job ${jobId}`, error);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PRD-06 (FR-131 / FR-132, D-05/D-09/D-11/D-14) — the agentic-context audit builder + best-effort
+// recorder. The operator-visible trace of the bounded tool loop, and the substrate every metric and
+// alert in 35-AI-SPEC.md §7 reads from.
+//
+// Status semantics (35-RESEARCH.md:583-594):
+//   - `completed` — the loop terminated by its own decision or on a bound, HAVING gathered content.
+//   - `partial`   — a D-11 fail-open exit (budget exhaustion, a model-call failure, a second
+//                   unparseable action) that still gathered something. NOT a job failure.
+//   - `skipped`   — a gate declined the pass (a ready code index, D-14), or the loop ran and
+//                   yielded nothing. NOT a job failure either.
+//   - `failed`    — a hard error that yielded nothing at all. STILL not a job failure: the phase's
+//                   whole contract is that it cannot fail the review (D-11). The status exists so
+//                   an operator can tell "gathered something then stopped" from "yielded nothing",
+//                   which is the discriminator §7's `status: 'failed' > 5%` alert reads.
+//
+// The toggle-off branch emits NO EVENT AT ALL — see `toggle_off` below.
+// ---------------------------------------------------------------------------
+
+export type AgenticContextAuditEvent = Extract<JobAuditEvent, { stage: 'agentic_context' }>;
+
+/**
+ * The CLOSED machine-token reason vocabulary. Composed rather than hand-listed so it cannot drift:
+ *
+ *   - `agenticStopReasons` — every way the loop itself can exit (`done`, `hop_cap_reached`,
+ *     `byte_cap_reached`, `file_cap_reached`, `budget_exhausted`, `unparseable_action`,
+ *     `model_call_failed`). Imported from the executor, so a seventh stop reason widens this set
+ *     automatically instead of silently producing an off-vocabulary token.
+ *   - `toggle_off` — declared for completeness and DELIBERATELY NEVER EMITTED. The toggle-off
+ *     branch must stay completely silent or NREG-01 is broken by an audit write; the token exists
+ *     so a future reader does not "helpfully" add the emission thinking the vocabulary implies one.
+ *   - `index_present` — the D-14 gate: the repository already has a ready code index, so the
+ *     index-backed retrieval path is cheaper and broader and this pass would be pure waste.
+ *   - `no_content` — the loop ran and gathered nothing (FR-131's documented fallback: review the
+ *     diff alone).
+ *   - `MACHINE_ERROR_REASONS` — every value `redactErrorMessage` can return. Any error-derived
+ *     reason MUST be routed through that redactor first; including its outputs here is what makes
+ *     "the vocabulary is closed" and "errors are recordable" both true at once.
+ *
+ * Nothing else is admissible. These literals are what 35-AI-SPEC.md §7's alert thresholds and an
+ * operator's SQL / `wrangler tail` greps match on, and the viewer renders them verbatim — so a free
+ * -text reason would be simultaneously a privacy risk (T-35-21) and an unmatchable signal.
+ */
+export const AGENTIC_CONTEXT_AUDIT_REASONS = [
+  ...agenticStopReasons,
+  'toggle_off',
+  'index_present',
+  'no_content',
+  ...MACHINE_ERROR_REASONS,
+] as const;
+
+export type AgenticContextAuditReason = (typeof AGENTIC_CONTEXT_AUDIT_REASONS)[number];
+
+const AGENTIC_CONTEXT_AUDIT_REASON_SET: ReadonlySet<string> = new Set<string>(
+  AGENTIC_CONTEXT_AUDIT_REASONS,
+);
+
+/** Runtime membership test for the closed vocabulary. Pure, never throws. */
+export function isAgenticContextAuditReason(value: string): value is AgenticContextAuditReason {
+  return AGENTIC_CONTEXT_AUDIT_REASON_SET.has(value);
+}
+
+export interface AgenticContextAuditOptions {
+  reason?: AgenticContextAuditReason;
+  hopsUsed?: number;
+  filesRead?: number;
+  grepsRun?: number;
+  bytesGathered?: number;
+  truncated?: boolean;
+  grepSupported?: boolean;
+  /** `tracker.remainingSafeBudget()` at the audit write — NOT at loop exit (§7 alerts on `< 2`). */
+  budgetHeadroom?: number;
+}
+
+/**
+ * PURE agentic-context audit builder (PRD-06). Derives ONE `agentic_context` event from the run
+ * status plus the counts and flags the loop outcome carries. Mirrors
+ * `buildCrossFileSecurityAuditEvent` exactly, including its omit-absent-fields behaviour.
+ *
+ * Two properties are load-bearing and must survive any refactor:
+ *
+ *   1. AN ABSENT FIELD IS OMITTED, A PRESENT ZERO IS KEPT. Every numeric gate is `!= null` and
+ *      every boolean gate is `!== undefined`, never truthiness. `hops_used: 0`, `bytes_gathered: 0`,
+ *      `budget_headroom: 0`, `truncated: false` and `grep_supported: false` are all falsy AND all
+ *      diagnostic — 35-AI-SPEC.md §7 samples `bytes_gathered == 0 && hops_used >= 2` at 100%, and
+ *      `grep_supported: false` is the whole D-05 signal. A truthy gate here would delete exactly
+ *      the readings the fields exist for.
+ *   2. AN OFF-VOCABULARY REASON IS DROPPED, NEVER WRITTEN THROUGH. The parameter type already
+ *      forbids it, but this builder is the audit boundary: an untyped call site (a cast, a future
+ *      refactor) must not be able to smuggle provider text or a repository path into a durable,
+ *      operator-facing record (T-35-21).
+ */
+export function buildAgenticContextAuditEvent(
+  status: 'completed' | 'partial' | 'skipped' | 'failed',
+  opts?: AgenticContextAuditOptions,
+): AgenticContextAuditEvent {
+  const event: AgenticContextAuditEvent = {
+    stage: 'agentic_context',
+    status,
+    timestamp: new Date().toISOString(),
+  };
+  if (opts?.reason != null && isAgenticContextAuditReason(opts.reason)) {
+    event.reason = opts.reason;
+  }
+  if (opts?.hopsUsed != null) event.hops_used = opts.hopsUsed;
+  if (opts?.filesRead != null) event.files_read = opts.filesRead;
+  if (opts?.grepsRun != null) event.greps_run = opts.grepsRun;
+  if (opts?.bytesGathered != null) event.bytes_gathered = opts.bytesGathered;
+  if (opts?.truncated !== undefined) event.truncated = opts.truncated;
+  if (opts?.grepSupported !== undefined) event.grep_supported = opts.grepSupported;
+  if (opts?.budgetHeadroom != null) event.budget_headroom = opts.budgetHeadroom;
+  return event;
+}
+
+/**
+ * Best-effort recorder for the `agentic_context` variant. Mirrors `recordCrossFileSecurityAudit`
+ * EXACTLY: try/catch, defensive timestamp stamping, logs with the error value and NEVER rethrows.
+ *
+ * T-35-19: this runs inside a phase whose entire contract is that it cannot fail the job (D-11), so
+ * a rethrow here would convert an advisory pass into a failed review — the precise failure mode the
+ * fail-open design exists to prevent, arriving through the telemetry meant to watch for it.
+ */
+export async function recordAgenticContextAudit(
+  env: Pick<AppBindings, 'HYPERDRIVE'>,
+  jobId: string,
+  events: JobAuditEvent[],
+): Promise<void> {
+  try {
+    if (events.length === 0) return;
+    const stamped = events.map((event) =>
+      event.timestamp ? event : { ...event, timestamp: new Date().toISOString() },
+    );
+    await appendJobAuditEvents(env, jobId, stamped);
+  } catch (error) {
+    logger.warn(`Failed to record agentic-context audit events for job ${jobId}`, error);
   }
 }
