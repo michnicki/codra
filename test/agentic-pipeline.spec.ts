@@ -85,6 +85,11 @@ const mocks = vi.hoisted(() => ({
   verifierScript: [] as Array<string | Error>,
   verifierCalls: [] as Array<{ systemPrompt: string; userPrompt: string }>,
   fileContents: new Map<string, string>(),
+  // CR-02 (IN-07): before this the mock could only RESOLVE, so no test in the suite could drive a
+  // provider throw through the phase and the defect was invisible. A path in this map makes
+  // `getRepoFileContent` reject with that message, exactly as `GitHubClient.getRepoFileOrNull` does
+  // on any non-404 status.
+  fileContentErrors: new Map<string, string>(),
   fileContentCalls: [] as Array<{ owner: string; repo: string; path: string; ref: string }>,
   reviewFileCalls: [] as Array<{ path: string; agenticContext?: string; userPrompt: string }>,
   getPullRequestDiff: vi.fn(),
@@ -144,6 +149,8 @@ vi.mock('@server/services/github', () => {
       async getRepoFileContent(owner: string, repo: string, path: string, ref: string) {
         this.tracker?.incrementSubrequests(1);
         mocks.fileContentCalls.push({ owner, repo, path, ref });
+        const failure = mocks.fileContentErrors.get(path);
+        if (failure !== undefined) throw new Error(failure);
         return mocks.fileContents.get(path) ?? null;
       }
       async getRepoFileOrNull() {
@@ -284,6 +291,7 @@ dbDescribe('Phase 35 (35-02): agentic-context pipeline', () => {
     mocks.reviewFileCalls.length = 0;
     mocks.trackers.length = 0;
     mocks.fileContents.clear();
+    mocks.fileContentErrors.clear();
     mocks.searchCodeCalls.length = 0;
     mocks.searchCodeResult = null;
     mocks.subrequestsPerGetPullRequest = 1;
@@ -783,6 +791,79 @@ dbDescribe('Phase 35 (35-02): agentic-context pipeline', () => {
     expect(event.hops_used).toBe(2);
     expect(event.files_read).toBe(2);
     expect(event.bytes_gathered).toBeGreaterThan(0);
+  });
+
+  // CR-02 (35-REVIEW.md) + IN-07. `GitHubClient.getRepoFileOrNull` returns null ONLY on 404 and
+  // THROWS on everything else — including a 200 whose payload has no string `content`, which is what
+  // the contents API returns for a DIRECTORY. A GitHubError is not a NextPhaseError, not
+  // `isRetryableModelError` and not `isSubrequestBudgetError`, so before the fix it fell through
+  // `runReviewJob`'s outer catch to `failJobAndCheckRun`: the model asking to read a directory —
+  // ordinary exploratory behaviour — terminally failed the review and marked the check run failed,
+  // which is strictly a regression against the same PR with the toggle OFF.
+  it('CR-02 / D-11: a read_file provider throw is reported to the model, the loop continues, and the job still advances to review', async () => {
+    const repo = `repo-ag-toolthrow-${Date.now()}`;
+    await seedRepoWithAgenticToggle(repo, true);
+    // The directory case, verbatim from core/github.ts:500-507.
+    mocks.fileContentErrors.set('src/server/core', 'GitHub repo file fetch succeeded but content is not a string');
+    mocks.fileContents.set('src/after.ts', 'export const AFTER_MARKER = 1;\n');
+    mocks.verifierScript.push(
+      readFileAction('src/server/core'),
+      readFileAction('src/after.ts'),
+      doneAction(),
+    );
+
+    await runPrepare(repo);
+    const { job, result } = await runPhase(repo, 'agentic_context');
+
+    // The phase is ADVISORY: it hands off, it does not fail the job or the check run.
+    expect(result).toMatchObject({ action: 'next_phase', phase: 'review' });
+    const detail = await getJobDetail(env, job.id);
+    expect(detail?.status).not.toBe('failed');
+
+    // The failure consumed its hop and the loop KEPT GOING, so the later read still happened.
+    expect(mocks.verifierCalls).toHaveLength(3);
+    expect(mocks.fileContentCalls.map((call) => call.path)).toEqual(['src/server/core', 'src/after.ts']);
+
+    const blob = await readBlob(job.id);
+    expect(blob).not.toBeNull();
+    expect(blob!.stopReason).toBe('done');
+    expect(blob!.context).toContain('this read_file call failed');
+    expect(blob!.context).toContain('AFTER_MARKER');
+
+    // Gathered context plus a clean exit is `completed`, not `failed`: nothing about this run is an
+    // incident, and 35-AI-SPEC.md §7 alerts on `status: 'failed' > 5%`.
+    const event = await theLoopExitAuditEvent(job.id);
+    expect(event.status).toBe('completed');
+    expect(event.bytes_gathered).toBeGreaterThan(0);
+  });
+
+  it('CR-02 / D-11: a seed-read failure records a REDACTED failed audit event and still advances to review', async () => {
+    // The other half of CR-02: `vcs.getPullRequest` / `getJobDiffFiles` run BEFORE the loop and were
+    // also unguarded. This drives the phase-level handler in review.ts rather than the loop's own.
+    const repo = `repo-ag-seedthrow-${Date.now()}`;
+    await seedRepoWithAgenticToggle(repo, true);
+    await runPrepare(repo);
+    mocks.getPullRequestDiff.mockImplementation(() => {
+      throw new Error('GitHub diff fetch failed with 502: upstream connect error');
+    });
+
+    const { job, result } = await runPhase(repo, 'agentic_context');
+
+    expect(result).toMatchObject({ action: 'next_phase', phase: 'review' });
+    const detail = await getJobDetail(env, job.id);
+    expect(detail?.status).not.toBe('failed');
+    // Nothing was gathered, so nothing is persisted — an empty blob would satisfy the D-12 gate on
+    // re-entry while carrying no context.
+    expect(await readBlob(job.id)).toBeNull();
+    expect(mocks.verifierCalls).toHaveLength(0);
+
+    // The reason is a CLOSED machine token from redactErrorMessage, never the provider's message —
+    // this is the first error-driven producer for the event and the reason MACHINE_ERROR_REASONS is
+    // part of AGENTIC_CONTEXT_AUDIT_REASONS at all.
+    const event = await theAgenticAuditEvent(job.id);
+    expect(event.status).toBe('failed');
+    expect(['provider_5xx', 'model_transient', 'model_timeout', 'network_reset', 'unknown']).toContain(event.reason);
+    expect(JSON.stringify(event)).not.toContain('upstream connect error');
   });
 
   it('D-11 / T-35-04: a drained subrequest budget stops the loop before hop 1 — zero model calls, zero fetches, no thrown error, still advances to review', async () => {
