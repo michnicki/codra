@@ -307,7 +307,18 @@ export const agenticActionSchema = z.discriminatedUnion('action', [
       .string()
       .min(1)
       .max(AGENTIC_MAX_QUERY_CHARS)
-      .transform((raw) => raw.replace(/[\s\u0000-\u001f]+/g, ' ').trim())
+      .transform((raw) => {
+        // WR-01: Strip GitHub code-search qualifiers (repo:, org:, user:) to prevent
+        // cross-repository disclosure. GitHub treats multiple repo: qualifiers as OR —
+        // a model-supplied "repo:a/b repo:c/d" would return results from both repos.
+        // The provider always appends the correct repo: qualifier from job context, so
+        // any model-supplied qualifier is either redundant or an injection attempt.
+        const stripped = raw.replace(
+          /\b(?:repo|org|user):[^\s]*(?:\s+|$)/gi,
+          '',
+        );
+        return stripped.replace(/[\s\u0000-\u001f]+/g, ' ').trim();
+      })
       .refine((query) => query.length > 0, { message: 'empty query' }),
   }),
   z.object({
