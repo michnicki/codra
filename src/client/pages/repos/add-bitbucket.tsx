@@ -75,7 +75,14 @@ export function AddBitbucketRepoPage() {
               <p>
                 Before submitting: (1) Create a Repository Access Token at repo settings → Security
                 with at least <code>pullrequest:write</code> scope. (2) At repo settings → Webhooks,
-                add a webhook pointing to <code>{webhookUrl}</code> with the secret above.
+                add a webhook pointing to <code>{webhookUrl}</code> with the secret above. When
+                choosing the webhook&apos;s triggers, include the repository push event alongside
+                the pull request events.
+              </p>
+              <p>
+                If you already created this webhook, edit the existing subscription to add the push
+                event: Bitbucket webhook subscriptions are created by hand, and without the push
+                event the codebase index will silently never refresh when the default branch moves.
               </p>
             </div>
           </Alert>

@@ -15,12 +15,19 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
+  AGENTIC_CONTEXT_AUDIT_REASONS,
+  buildAgenticContextAuditEvent,
   buildCriticDecisionsAuditEvent,
   buildFinalizeDropEvents,
   buildWalkthroughEnrichmentAuditEvent,
+  buildYamlConfigParseFailedEvent,
+  isAgenticContextAuditReason,
+  recordAgenticContextAudit,
   recordCriticAudit,
   recordWalkthroughAudit,
 } from '@server/core/audit';
+import { MACHINE_ERROR_REASONS } from '@server/core/audit-redact';
+import { agenticStopReasons } from '@server/core/agentic-tools';
 import { appendJobAuditEvents } from '@server/db/jobs';
 import * as jobsModule from '@server/db/jobs';
 import { logger } from '@server/core/logger';
@@ -511,5 +518,250 @@ describe('BLOCKER 5: hand-crafted skipped event schema-validates', () => {
     };
     const parsed = jobAuditEventSchema.safeParse(event);
     expect(parsed.success).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 34 (PRD-05 / D-12): the yaml_config_parse_failed audit arm. The builder
+// (34-03 Task 1) produces the event shape locked by 34-01's schema arm; this block
+// pins it via the builder so a producer-side drift is caught at the source.
+// ---------------------------------------------------------------------------
+
+describe('buildYamlConfigParseFailedEvent (Phase 34 / PRD-05, D-12)', () => {
+  it('accepts yaml_config_parse_failed event', () => {
+    const event = buildYamlConfigParseFailedEvent('Invalid YAML syntax at line 3');
+    const parsed = jobAuditEventSchema.parse(event);
+    expect(parsed.stage).toBe('yaml_config_parse_failed');
+    expect(parsed.reason).toBe('Invalid YAML syntax at line 3');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 35 (PRD-06 / FR-131 / FR-132, D-05/D-11/D-14): the agentic_context audit arm,
+// its pure builder and its best-effort recorder.
+//
+// The builder is the ONLY producer of this event, so the closed machine-token reason
+// vocabulary is pinned here at the source: it is what 35-AI-SPEC.md §7's alert thresholds
+// and an operator's SQL / `wrangler tail` greps match on, and a builder that let arbitrary
+// text through would break both AND the T-35-21 counts-not-content boundary.
+// ---------------------------------------------------------------------------
+
+describe('buildAgenticContextAuditEvent (PRD-06 / T-35-21)', () => {
+  it('emits a completed event carrying the status, the reason and every count and flag', () => {
+    const event = buildAgenticContextAuditEvent('completed', {
+      reason: 'done',
+      hopsUsed: 3,
+      filesRead: 2,
+      grepsRun: 1,
+      bytesGathered: 4_096,
+      truncated: false,
+      grepSupported: true,
+      budgetHeadroom: 7,
+    });
+
+    expect(event.stage).toBe('agentic_context');
+    expect(event.status).toBe('completed');
+    expect(event.reason).toBe('done');
+    expect(event.hops_used).toBe(3);
+    expect(event.files_read).toBe(2);
+    expect(event.greps_run).toBe(1);
+    expect(event.bytes_gathered).toBe(4_096);
+    expect(event.truncated).toBe(false);
+    expect(event.grep_supported).toBe(true);
+    expect(event.budget_headroom).toBe(7);
+    expect(event.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  it('returns the passed status for each member of the arm enum', () => {
+    for (const status of ['completed', 'partial', 'skipped', 'failed'] as const) {
+      expect(buildAgenticContextAuditEvent(status).status).toBe(status);
+    }
+  });
+
+  it('OMITS absent optional fields entirely rather than setting them to undefined', () => {
+    // Matches the sibling buildCrossFileSecurityAuditEvent behaviour: the viewer distinguishes
+    // "absent" (the phase never got that far) from "zero" (it did and the answer was zero), so an
+    // explicit `undefined` key would be a third, meaningless state.
+    const event = buildAgenticContextAuditEvent('skipped', { reason: 'index_present' });
+
+    expect(Object.keys(event).sort()).toEqual(['reason', 'stage', 'status', 'timestamp']);
+    expect('hops_used' in event).toBe(false);
+    expect('grep_supported' in event).toBe(false);
+    expect('budget_headroom' in event).toBe(false);
+  });
+
+  it('KEEPS a present zero / false — the diagnostic values 35-AI-SPEC.md §7 samples at 100%', () => {
+    // `bytes_gathered == 0 && hops_used >= 2` is the FM-5 "paid for nothing" shape and
+    // `grep_supported: false` is the whole D-05 degradation signal. A truthiness gate anywhere in
+    // this pipeline deletes exactly the readings the fields exist for.
+    const event = buildAgenticContextAuditEvent('skipped', {
+      reason: 'no_content',
+      hopsUsed: 0,
+      filesRead: 0,
+      grepsRun: 0,
+      bytesGathered: 0,
+      truncated: false,
+      grepSupported: false,
+      budgetHeadroom: 0,
+    });
+
+    expect(event.hops_used).toBe(0);
+    expect(event.files_read).toBe(0);
+    expect(event.greps_run).toBe(0);
+    expect(event.bytes_gathered).toBe(0);
+    expect(event.truncated).toBe(false);
+    expect(event.grep_supported).toBe(false);
+    expect(event.budget_headroom).toBe(0);
+  });
+
+  it('validates against the schema-authoritative agentic_context arm', () => {
+    const event = buildAgenticContextAuditEvent('partial', {
+      reason: 'model_call_failed',
+      hopsUsed: 6,
+      filesRead: 4,
+      grepsRun: 0,
+      bytesGathered: 12_000,
+      truncated: true,
+      grepSupported: false,
+      budgetHeadroom: 3,
+    });
+    const parsed = jobAuditEventSchema.safeParse(event);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect(parsed.data.stage).toBe('agentic_context');
+  });
+
+  it('REJECTS a status outside the arm enum at the schema boundary', () => {
+    const bogus = {
+      stage: 'agentic_context',
+      status: 'degraded',
+      timestamp: new Date().toISOString(),
+    };
+    expect(jobAuditEventSchema.safeParse(bogus).success).toBe(false);
+  });
+
+  it('declares grep_supported as an optional boolean on the arm (OpenCode #5)', () => {
+    // Named verbatim rather than trusting the prose field list: this field IS the D-05 degradation
+    // signal and is the one 35-AI-SPEC.md §7's Bitbucket-must-not-alert rule reads.
+    const withFlag = jobAuditEventSchema.safeParse({
+      stage: 'agentic_context',
+      status: 'completed',
+      grep_supported: false,
+      timestamp: new Date().toISOString(),
+    });
+    expect(withFlag.success).toBe(true);
+    const withoutFlag = jobAuditEventSchema.safeParse({
+      stage: 'agentic_context',
+      status: 'completed',
+      timestamp: new Date().toISOString(),
+    });
+    expect(withoutFlag.success).toBe(true);
+    const wrongType = jobAuditEventSchema.safeParse({
+      stage: 'agentic_context',
+      status: 'completed',
+      grep_supported: 'no',
+      timestamp: new Date().toISOString(),
+    });
+    expect(wrongType.success).toBe(false);
+  });
+});
+
+describe('AGENTIC_CONTEXT_AUDIT_REASONS — the closed machine-token vocabulary', () => {
+  it('contains EVERY loop stop reason, so no exit can produce an off-vocabulary token', () => {
+    // Enumerated from the loop's own union rather than a hand-copied list: a seventh stop reason
+    // added to `agenticStopReasons` must widen this vocabulary or this assertion fails.
+    for (const stopReason of agenticStopReasons) {
+      expect(AGENTIC_CONTEXT_AUDIT_REASONS).toContain(stopReason);
+    }
+  });
+
+  it('contains the two skip reasons and the no-content token', () => {
+    expect(AGENTIC_CONTEXT_AUDIT_REASONS).toContain('toggle_off');
+    expect(AGENTIC_CONTEXT_AUDIT_REASONS).toContain('index_present');
+    expect(AGENTIC_CONTEXT_AUDIT_REASONS).toContain('no_content');
+  });
+
+  it('contains every redactErrorMessage output, so an error-derived reason is always in-vocabulary', () => {
+    for (const machineReason of MACHINE_ERROR_REASONS) {
+      expect(AGENTIC_CONTEXT_AUDIT_REASONS).toContain(machineReason);
+    }
+  });
+
+  it('is a CLOSED set — free text, a path, a query and provider prose are all outside it', () => {
+    for (const outsider of [
+      'src/server/core/review.ts',
+      'grep for authenticateUser',
+      'Provider returned 500 Internal Server Error: upstream pool exhausted',
+      'the model produced an unparseable tool call',
+    ]) {
+      expect(isAgenticContextAuditReason(outsider)).toBe(false);
+    }
+  });
+
+  it('DROPS an off-vocabulary reason at the builder instead of writing it through', () => {
+    // Second line of defence behind the parameter type. The builder is the audit boundary: an
+    // untyped call site (a cast, a JS caller, a future refactor) must not be able to smuggle
+    // provider text or a repository path into a durable operator-facing record.
+    const event = buildAgenticContextAuditEvent('failed', {
+      reason: 'ENOENT: no such file src/secret/config.ts' as never,
+    });
+    expect('reason' in event).toBe(false);
+    expect(JSON.stringify(event)).not.toContain('src/secret/config.ts');
+  });
+});
+
+describe('recordAgenticContextAudit best-effort recorder (T-35-19)', () => {
+  it('FAILED-WRITE: resolves (never throws) and warns when appendJobAuditEvents rejects', async () => {
+    // The phase's entire contract is that it cannot fail the job (D-11), so a failing audit append
+    // must degrade to a log line — not turn an advisory phase into a failed review.
+    const env = { HYPERDRIVE: { connectionString: 'postgres://test' } } as any;
+    const appendSpy = vi
+      .spyOn(jobsModule, 'appendJobAuditEvents')
+      .mockRejectedValue(new Error('simulated audit-write failure'));
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    await expect(
+      recordAgenticContextAudit(env, 'job-id', [buildAgenticContextAuditEvent('completed')]),
+    ).resolves.toBeUndefined();
+
+    expect(warnSpy).toHaveBeenCalled();
+    appendSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it('EMPTY-INPUT: is a no-op and never calls appendJobAuditEvents', async () => {
+    const env = { HYPERDRIVE: { connectionString: 'postgres://test' } } as any;
+    const appendSpy = vi.spyOn(jobsModule, 'appendJobAuditEvents');
+    await recordAgenticContextAudit(env, 'job-id', []);
+    expect(appendSpy).not.toHaveBeenCalled();
+    appendSpy.mockRestore();
+  });
+
+  it('SUCCESS: appends exactly one agentic_context event in ONE call', async () => {
+    const env = { HYPERDRIVE: { connectionString: 'postgres://test' } } as any;
+    const appendSpy = vi.spyOn(jobsModule, 'appendJobAuditEvents').mockResolvedValue(undefined);
+    const event = buildAgenticContextAuditEvent('completed', { reason: 'done', hopsUsed: 2 });
+
+    await recordAgenticContextAudit(env, 'job-id', [event]);
+
+    expect(appendSpy).toHaveBeenCalledTimes(1);
+    expect(appendSpy).toHaveBeenCalledWith(env, 'job-id', [
+      expect.objectContaining({ stage: 'agentic_context', status: 'completed', hops_used: 2 }),
+    ]);
+    appendSpy.mockRestore();
+  });
+
+  it('stamps a timestamp on an event that arrived without one', async () => {
+    const env = { HYPERDRIVE: { connectionString: 'postgres://test' } } as any;
+    const appendSpy = vi.spyOn(jobsModule, 'appendJobAuditEvents').mockResolvedValue(undefined);
+    const eventWithoutTimestamp = {
+      stage: 'agentic_context' as const,
+      status: 'skipped' as const,
+    } as unknown as Parameters<typeof recordAgenticContextAudit>[2][number];
+
+    await recordAgenticContextAudit(env, 'job-id', [eventWithoutTimestamp]);
+
+    expect(appendSpy).toHaveBeenCalledTimes(1);
+    expect(appendSpy.mock.calls[0][2][0].timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    appendSpy.mockRestore();
   });
 });

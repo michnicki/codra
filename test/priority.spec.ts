@@ -109,6 +109,10 @@ describe('priority keyword constants (D-07: hardcoded, not config-extensible)', 
       'deploy',
       'infra',
       'terraform',
+      // Appended by SEC-XDIFF-01 (D-14) in Phase 27 for cross-file security prioritization.
+      'middleware',
+      'routes',
+      'session',
     ]);
     expect(LOW_PRIORITY_KEYWORDS).toEqual(['test', 'docs', 'example', 'generated', 'dist', 'build']);
     expect(NEVER_REVIEW_KEYWORDS).toEqual(['.lock', 'package-lock', '-lock.', '.min.', '.map']);

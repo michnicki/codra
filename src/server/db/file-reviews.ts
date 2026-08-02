@@ -84,15 +84,19 @@ export async function insertFileReview(
       const bodies = input.parsedComments.map(c => c.body);
       const codeSuggestions = input.parsedComments.map(c => c.codeSuggestion ?? null);
       const confidences = input.parsedComments.map(c => c.confidence ?? null);
+      const existingCodes = input.parsedComments.map(c => c.existingCode ?? null);
+      // SEC-XDIFF-01: JSON.stringify each entry (or null) rather than the array itself — UNNEST
+      // needs one jsonb value per row, not one jsonb[] shared across rows.
+      const crossReferences = input.parsedComments.map(c => c.cross_references ? JSON.stringify(c.cross_references) : null);
 
       await tx.query(
         `
           INSERT INTO review_comments (
-            file_review_id, path, line, position, severity, category, title, body, code_suggestion, confidence
+            file_review_id, path, line, position, severity, category, title, body, code_suggestion, confidence, existing_code, cross_references
           )
-          SELECT $1::uuid, * FROM UNNEST($2::text[], $3::int[], $4::int[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], $10::real[])
+          SELECT $1::uuid, * FROM UNNEST($2::text[], $3::int[], $4::int[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], $10::real[], $11::text[], $12::jsonb[])
         `,
-        [review.id, paths, lines, positions, severities, categories, titles, bodies, codeSuggestions, confidences]
+        [review.id, paths, lines, positions, severities, categories, titles, bodies, codeSuggestions, confidences, existingCodes, crossReferences]
       );
     }
   });
@@ -125,6 +129,12 @@ export async function upsertFileReview(
     // 'pending'), cleared (null) once the batch completes and a terminal review is persisted.
     asyncRequestId?: string | null;
     asyncModel?: string | null;
+    // modelLineCap: set-once at submit time, preserved through subsequent upserts via COALESCE
+    // in the DO UPDATE SET clause. Unlike asyncRequestId/asyncModel (which persistCompletedReview
+    // explicitly nulls), modelLineCap is NEVER nulled after being set — the COALESCE ensures
+    // subsequent upserts that omit it (persistCompletedReview, persistFailedFileReview, inherited
+    // path) keep the original value.
+    modelLineCap?: number | null;
   },
 ) {
   await queryTransaction(env, async (tx) => {
@@ -149,9 +159,10 @@ export async function upsertFileReview(
           model_provider,
           async_request_id,
           async_model,
+          model_line_cap,
           pass
         )
-        VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+        VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
         ON CONFLICT (job_id, file_path, pass) DO UPDATE SET
           file_status = EXCLUDED.file_status,
           model_used = EXCLUDED.model_used,
@@ -169,6 +180,7 @@ export async function upsertFileReview(
           model_provider = EXCLUDED.model_provider,
           async_request_id = EXCLUDED.async_request_id,
           async_model = EXCLUDED.async_model,
+          model_line_cap = COALESCE(EXCLUDED.model_line_cap, file_reviews.model_line_cap),
           transient_error_count = 0
         RETURNING id
       `,
@@ -191,6 +203,7 @@ export async function upsertFileReview(
         input.modelProvider ?? null,
         input.asyncRequestId ?? null,
         input.asyncModel ?? null,
+        input.modelLineCap ?? null,
         input.pass ?? 'main',
       ],
     );
@@ -201,9 +214,9 @@ export async function upsertFileReview(
       await tx.query(
         `
           INSERT INTO review_comments (
-            file_review_id, path, line, position, severity, category, title, body, code_suggestion, confidence
+            file_review_id, path, line, position, severity, category, title, body, code_suggestion, confidence, existing_code, cross_references
           )
-          SELECT $1::uuid, * FROM UNNEST($2::text[], $3::int[], $4::int[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], $10::real[])
+          SELECT $1::uuid, * FROM UNNEST($2::text[], $3::int[], $4::int[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], $10::real[], $11::text[], $12::jsonb[])
         `,
         [
           review.id,
@@ -216,6 +229,9 @@ export async function upsertFileReview(
           input.parsedComments.map(c => c.body),
           input.parsedComments.map(c => c.codeSuggestion ?? null),
           input.parsedComments.map(c => c.confidence ?? null),
+          input.parsedComments.map(c => c.existingCode ?? null),
+          // SEC-XDIFF-01: one jsonb value per row via UNNEST, not a single jsonb[] literal.
+          input.parsedComments.map(c => c.cross_references ? JSON.stringify(c.cross_references) : null),
         ],
       );
     }
@@ -349,9 +365,9 @@ export async function bulkInheritFileReviews(
       await tx.query(
         `
           INSERT INTO review_comments (
-            file_review_id, path, line, position, severity, category, title, body, code_suggestion, confidence
+            file_review_id, path, line, position, severity, category, title, body, code_suggestion, confidence, cross_references
           )
-          SELECT nw.new_id, rc.path, rc.line, rc.position, rc.severity, rc.category, rc.title, rc.body, rc.code_suggestion, rc.confidence
+          SELECT nw.new_id, rc.path, rc.line, rc.position, rc.severity, rc.category, rc.title, rc.body, rc.code_suggestion, rc.confidence, rc.cross_references
           FROM UNNEST($1::uuid[], $2::text[], $3::text[]) AS nw(new_id, file_path, pass)
           JOIN file_reviews pf ON pf.job_id = $4::uuid AND pf.file_path = nw.file_path AND pf.pass = nw.pass
           JOIN review_comments rc ON rc.file_review_id = pf.id
@@ -458,7 +474,7 @@ export async function getFileReviewsForJobs(env: Pick<AppBindings, 'HYPERDRIVE'>
     id: string;
     job_id: string;
     file_path: string;
-    pass: 'main' | 'security';
+    pass: FileReviewPass;
     file_status: 'pending' | 'done' | 'skipped' | 'failed';
     model_used: string;
     diff_line_count: number;
@@ -477,6 +493,7 @@ export async function getFileReviewsForJobs(env: Pick<AppBindings, 'HYPERDRIVE'>
     transient_error_count: number;
     async_request_id: string | null;
     async_model: string | null;
+    model_line_cap: number | null;
     // Phase 19 (PASS-02): per-file ensemble result (ensemble_resultSchema) — read alongside the
     // other columns so a downstream review-flow consumer can read the durable cursor in one
     // round-trip. Defaulted to null (parseJsonColumn degrades) for the runs:1 inert path.
@@ -489,7 +506,22 @@ export async function getFileReviewsForJobs(env: Pick<AppBindings, 'HYPERDRIVE'>
         COALESCE(
           (
             SELECT JSON_AGG(
-              JSON_BUILD_OBJECT(
+              -- JSON_STRIP_NULLS: cross_references is parsedReviewCommentSchema's ONLY bare
+              -- optional() field (not nullable().optional() like line/position/confidence/
+              -- existingCode above) -- an explicit JSON null fails that schema (optional() accepts
+              -- undefined, not null), which silently broke re-validation of persisted comments
+              -- (e.g. criticResultSchema.kept) for every row that never set cross_references.
+              -- Stripping null keys turns "present with null" into "absent" (= undefined), which is
+              -- schema-legal for every field here, nullable or not.
+              JSON_STRIP_NULLS(JSON_BUILD_OBJECT(
+                -- WR-06: the stable identifier for this comment, projected so a comment skipped at
+                -- the posting boundary can be joined back to its row from the audit trail.
+                -- CAST TO TEXT DELIBERATELY: rc.id is BIGSERIAL (64-bit) and a JSON number loses
+                -- precision above 2^53 -- verified against this database, where
+                -- 9007199254740993::bigint projects back as 9007199254740992. An audit identifier
+                -- that is silently off by one points at a DIFFERENT comment. The text cast is
+                -- exact, and it is also the form an operator pastes straight into a WHERE clause.
+                'commentId', rc.id::text,
                 'path', rc.path,
                 'line', rc.line,
                 'position', rc.position,
@@ -498,8 +530,10 @@ export async function getFileReviewsForJobs(env: Pick<AppBindings, 'HYPERDRIVE'>
                 'title', rc.title,
                 'body', rc.body,
                 'codeSuggestion', rc.code_suggestion,
-                'confidence', rc.confidence
-              )
+                'confidence', rc.confidence,
+                'existingCode', rc.existing_code,
+                'cross_references', rc.cross_references
+              ))
             ORDER BY rc.id ASC
             ) FROM review_comments rc WHERE rc.file_review_id = fr.id
           ),

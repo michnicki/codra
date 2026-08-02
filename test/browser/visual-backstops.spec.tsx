@@ -45,6 +45,9 @@ const LONG_TITLE = `Reject the unsafe fallback because ${'the-authorization-boun
 const LONG_FILE_PATH = `src/${'provider-boundary/'.repeat(28)}review-handler-with-a-long-name.ts`;
 const LONG_AUDIT_PATH = `src/${'audit-boundary/'.repeat(30)}decision-recorder.ts`;
 const LONG_AUDIT_REASON = `provider_rejected_${'bounded_structural_metadata_'.repeat(7)}without_retry`;
+// Phase 35 backstop B-1: the agentic_context arm bounds `reason` to 200 characters, so this is the
+// worst legal value that surface can ever be asked to render.
+const LONG_AGENTIC_REASON = `budget_exhausted_${'x'.repeat(200 - 'budget_exhausted_'.length)}`;
 
 // Phase 20.1 WARNING 1 closure: load the production Vite/Tailwind build instead of injecting
 // hardcoded utility CSS. The vitest server has a Vite plugin (`test/support/visual-backstop-vite-plugin.ts`)
@@ -220,6 +223,77 @@ describe('audit-trail-viewer-long-text', () => {
     expect(filePath).toHaveClass('break-all');
     expect(getComputedStyle(reason).wordBreak).toBe('break-all');
     expect(getComputedStyle(filePath).wordBreak).toBe('break-all');
+  });
+});
+
+// Phase 35 (PRD-06 / 35-06) backstop B-1. The `agentic_context` row copies its token-only utilities
+// verbatim from the `cross_file_security` case, so BOTH themes should invert with no extra
+// declaration and the schema-bounded 200-character `reason` should wrap inside the row via
+// `MetricLine`'s `break-all` — but that is an INFERENCE until it is rendered against the real
+// production Tailwind build, which is exactly what this suite loads.
+describe('audit-trail-agentic-context-row', () => {
+  it.each(THEMES)('wraps a 200-char reason inside the row and stays achromatic in %s mode', async (theme) => {
+    setTheme(theme);
+    const job = {
+      audit: [
+        {
+          stage: 'agentic_context',
+          status: 'failed',
+          reason: LONG_AGENTIC_REASON,
+          hops_used: 0,
+          files_read: 0,
+          greps_run: 0,
+          bytes_gathered: 0,
+          truncated: false,
+          grep_supported: false,
+          budget_headroom: 0,
+          timestamp: new Date().toISOString(),
+        },
+      ],
+      auditTruncated: false,
+    } as unknown as JobDetail;
+
+    renderPage(<AuditTrailViewer job={job} />);
+    const user = userEvent.setup();
+    await user.click(screen.getByText('Audit trail'));
+
+    const reason = screen.getByText(LONG_AGENTIC_REASON);
+    expect(reason).toHaveClass('break-all');
+    expect(getComputedStyle(reason).wordBreak).toBe('break-all');
+
+    // The row must not grow wider than the group shell that contains it — a 200-char token that
+    // stretched the viewer is the failure mode B-1 exists to rule out.
+    const row = reason.closest('li') as HTMLElement;
+    const group = row.closest('div.rounded-md') as HTMLElement;
+    expect(row.getBoundingClientRect().width).toBeLessThanOrEqual(
+      group.getBoundingClientRect().width + 1,
+    );
+
+    // Achromatic in BOTH themes: `failed` here is a D-11 fail-open, not a job failure, and
+    // `grep_supported: false` is the expected Bitbucket steady state. Neither may be coloured, and
+    // the row must carry no inline style of its own (the trail's only inline-style element is the
+    // truncation banner).
+    expect(row.getAttribute('style')).toBeNull();
+    expect(row.querySelector('svg')).toBeNull();
+    // Indexed by position rather than by text: `truncated: false` and `grep supported: false`
+    // render the same token, so a text query is ambiguous by construction.
+    const values = Array.from(row.querySelectorAll('span.font-mono'));
+    expect(values.map((el) => el.textContent)).toEqual([
+      'failed',
+      LONG_AGENTIC_REASON,
+      '0',
+      '0',
+      '0',
+      '0',
+      'false',
+      'false',
+      '0',
+    ]);
+    const statusValue = values[0] as HTMLElement;
+    const grepValue = values[7] as HTMLElement;
+    expect(getComputedStyle(statusValue).color).toBe(getComputedStyle(grepValue).color);
+    // Same colour as an ordinary neutral value in the same row — no severity map anywhere.
+    expect(getComputedStyle(statusValue).color).toBe(getComputedStyle(reason).color);
   });
 });
 

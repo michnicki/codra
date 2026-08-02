@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import {
+  ANNOTATION_SEVERITY_VALUES,
   BUILD_STATUS_STATE,
   LINE_TYPES,
   REPORT_RESULT,
@@ -88,10 +89,63 @@ export const pullRequestCommentCreatedPayloadSchema = bitbucketPullRequestWebhoo
   comment: bitbucketWebhookCommentSchema,
 }).passthrough();
 
+// Phase 29 (QA-IDX-01, D-08): the `repo:push` webhook variant — the Bitbucket half of index
+// freshness. A push to the repository's main branch triggers an incremental index build carrying
+// the old/new target hashes; the changed-file set is derived from the existing `getCompareDiff`
+// primitive, not from the payload's `commits[]` list.
+//
+// ASSUMPTION A2 — the `push.changes[]` field shape is COMMUNITY-SOURCED rather than confirmed by
+// the official Atlassian docs (the docs page is truncated), which is exactly why the inbound
+// convention here is `z.looseObject`: an unexpected extra field does not fail the parse. The
+// residual risk is a RENAMED field (e.g. `new.target.hash` under a different path), which degrades
+// to a parse failure and an ignored acknowledgement — indistinguishable from a correctly-ignored
+// delivery. The first real delivery in acceptance testing is what confirms the guess.
+//
+// `new` is null on a ref deletion, `old` is null on a ref creation (no ancestor to compare
+// against), and `repo:push` fires for tags too — consumers must filter on `new.type === 'branch'`
+// plus the branch name. The repository sub-object keeps the shape the base schema already uses.
+const repoPushRefSchema = z.looseObject({
+  type: z.string().min(1),
+  name: z.string().min(1),
+  target: z.looseObject({
+    hash: z.string().min(1),
+  }),
+});
+
+const repoPushChangeSchema = z.looseObject({
+  new: repoPushRefSchema.nullable().optional(),
+  old: repoPushRefSchema.nullable().optional(),
+  created: z.boolean().optional(),
+  closed: z.boolean().optional(),
+  forced: z.boolean().optional(),
+  truncated: z.boolean().optional(),
+});
+
+export const repoPushPayloadSchema = z
+  .object({
+    eventName: z.literal('repo:push'),
+    repository: repositorySchema,
+    push: z.looseObject({
+      changes: z.array(repoPushChangeSchema),
+    }),
+  })
+  // NOTE on the catchall: the plan's inbound convention is `z.looseObject` ("an unexpected extra
+  // field does not fail the parse"), and this catchall is RUNTIME-IDENTICAL to it — unknown keys
+  // are validated against `z.any()` (always succeeds) and preserved in the output. It is not
+  // written as `z.looseObject(...)` for one type-level reason: `z.looseObject` infers an
+  // `[k: string]: unknown` index signature, and adding a member with that signature to the
+  // discriminated union below degrades every UNNARROWED union property access (e.g.
+  // `result.data.pullrequest` in test/bitbucket-schema.spec.ts, which must pass unmodified) to
+  // `unknown`, failing the typecheck. The `z.any()` catchall infers `[k: string]: any` instead, so
+  // the union access resolves exactly as it did with three members. The inner objects keep the
+  // `z.looseObject` convention; only the union-member top level needs this.
+  .catchall(z.any());
+
 export const pullRequestWebhookPayloadSchema = z.discriminatedUnion('eventName', [
   pullRequestCreatedPayloadSchema,
   pullRequestUpdatedPayloadSchema,
   pullRequestCommentCreatedPayloadSchema,
+  repoPushPayloadSchema,
 ]);
 
 const commentContentSchema = z.object({
@@ -146,10 +200,35 @@ export const commitBuildStatusSchema = z.object({
   url: z.url(),
 }).strict();
 
+// Phase 30 (ANNO-01, D-01/D-04/D-05/D-06): the outbound per-annotation payload posted to
+// Bitbucket's Code Insights bulk annotations endpoint. `.strict()` mirrors codeInsightsReportSchema/
+// commitBuildStatusSchema's outbound-write convention so a future caller cannot smuggle unexpected
+// keys into the wire payload. `annotation_type` and `result` reuse the existing REPORT_TYPE_VALUES/
+// REPORT_RESULT enums (D-05/D-02) rather than inventing new ones; `severity` imports its literal
+// value set from ANNOTATION_SEVERITY_VALUES (bitbucket/constants.ts) so the client and schema
+// cannot drift apart. `path`/`line` are optional — an overview-modal annotation (no inline anchor)
+// omits both, per 30-RESEARCH.md. No `.max()` length bound on title/summary/details/external_id:
+// Bitbucket's swagger.json does not document one (30-RESEARCH.md Assumptions Log).
+export const reportAnnotationSchema = z.object({
+  external_id: z.string().min(1),
+  title: z.string().optional(),
+  annotation_type: z.enum(REPORT_TYPE_VALUES).optional(),
+  summary: z.string().optional(),
+  details: z.string().optional(),
+  result: z.enum(REPORT_RESULT).optional(),
+  severity: z.enum(ANNOTATION_SEVERITY_VALUES),
+  path: z.string().optional(),
+  line: z.number().int().positive().optional(),
+  link: z.url().optional(),
+}).strict();
+
+export type ReportAnnotation = z.infer<typeof reportAnnotationSchema>;
+
 export type BitbucketPullRequestWebhookBase = z.infer<typeof bitbucketPullRequestWebhookBaseSchema>;
 export type PullRequestCreatedPayload = z.infer<typeof pullRequestCreatedPayloadSchema>;
 export type PullRequestUpdatedPayload = z.infer<typeof pullRequestUpdatedPayloadSchema>;
 export type PullRequestCommentCreatedPayload = z.infer<typeof pullRequestCommentCreatedPayloadSchema>;
+export type RepoPushPayload = z.infer<typeof repoPushPayloadSchema>;
 export type PullRequestWebhookPayload = z.infer<typeof pullRequestWebhookPayloadSchema>;
 export type PrComment = z.infer<typeof prCommentSchema>;
 export type CodeInsightsReport = z.infer<typeof codeInsightsReportSchema>;
@@ -187,3 +266,39 @@ export const addBitbucketRepoInputSchema = z.object({
 
 export type BitbucketOAuthProfile = z.infer<typeof bitbucketOAuthProfileSchema>;
 export type AddBitbucketRepoInput = z.infer<typeof addBitbucketRepoInputSchema>;
+
+// Phase 31 (WS-01, D-05): outbound workspace-discovery input. `.strict()` rejects unknown keys,
+// mirroring `addBitbucketRepoInputSchema` above. Discovery is a live, read-only, add-time-only
+// call -- this schema carries no persisted-record fields (no repoSlug, no webhookSecret).
+export const discoverBitbucketWorkspaceInputSchema = z.object({
+  workspace: z.string().trim().toLowerCase().min(1).max(100),
+  accessToken: z.string().trim().min(1).max(4096),
+}).strict();
+
+// Phase 31 (WS-01, D-04): one entry in the discover response's repo list. `alreadyOnboarded` is
+// computed server-side (a `repositories` table read), never supplied by Bitbucket.
+export const workspaceRepoListItemSchema = z.object({
+  slug: z.string(),
+  name: z.string(),
+  alreadyOnboarded: z.boolean(),
+});
+
+export type DiscoverBitbucketWorkspaceInput = z.infer<typeof discoverBitbucketWorkspaceInputSchema>;
+export type WorkspaceRepoListItem = z.infer<typeof workspaceRepoListItemSchema>;
+
+// Phase 31 (WS-01): outbound finalize input for `POST /api/repos/bitbucket/workspaces`. `.strict()`
+// mirrors `addBitbucketRepoInputSchema`'s outbound-write convention. `tokenExpiresAt`'s
+// `z.union([z.iso.date(), z.iso.datetime({ offset: true })])` shape is copied VERBATIM from
+// `addBitbucketRepoInputSchema` above -- same two accepted input formats, same nullable/optional
+// wrapping (OpenCode review finding #9 -- confirmed non-issue, no change needed).
+// `selectedRepoSlugs.min(1)` is the server-side zero-selection guard (D-07); `.max(500)` bounds
+// the per-request `getOrCreateRepository` onboarding loop (T-31-03-03).
+export const addBitbucketWorkspaceInputSchema = z.object({
+  workspace: z.string().trim().toLowerCase().min(1).max(100),
+  accessToken: z.string().trim().min(1).max(4096),
+  webhookSecret: z.string().trim().min(1).max(4096),
+  tokenExpiresAt: z.union([z.iso.date(), z.iso.datetime({ offset: true })]).nullable().optional(),
+  selectedRepoSlugs: z.array(z.string().trim().toLowerCase().min(1).max(100)).min(1).max(500),
+}).strict();
+
+export type AddBitbucketWorkspaceInput = z.infer<typeof addBitbucketWorkspaceInputSchema>;

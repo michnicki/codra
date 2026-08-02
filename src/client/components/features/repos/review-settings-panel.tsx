@@ -252,6 +252,7 @@ export function ReviewSettingsPanel({ repo, onChange }: ReviewSettingsPanelProps
 
   // Passes
   const [securityEnabled, setSecurityEnabled] = useState(current.passes.security.enabled);
+  const [crossFileEnabled, setCrossFileEnabled] = useState(current.passes.security.cross_file);
   const [criticEnabled, setCriticEnabled] = useState(current.passes.critic.enabled);
   const [walkthroughEnabled, setWalkthroughEnabled] = useState(current.walkthrough.enabled);
   const [seqDiagramEnabled, setSeqDiagramEnabled] = useState(current.walkthrough.sequence_diagram.enabled);
@@ -274,6 +275,10 @@ export function ReviewSettingsPanel({ repo, onChange }: ReviewSettingsPanelProps
   const [autoResolve, setAutoResolve] = useState(current.threads.auto_resolve);
   const [roundsIncremental, setRoundsIncremental] = useState(current.rounds.incremental);
   const [escalateFloors, setEscalateFloors] = useState(current.rounds.escalate_floors);
+  const [evidenceHardDrop, setEvidenceHardDrop] = useState(current.evidence?.hard_drop ?? false);
+  const [evidenceExemptCategories, setEvidenceExemptCategories] = useState<string[]>(
+    current.evidence?.hard_drop_exempt_categories ?? ['security'],
+  );
 
   const draftMentionTrigger: false | string = mentionEnabled ? mentionValue : false;
   const draftCategoryConfidence = buildCategoryConfidence(categoryInputs);
@@ -299,7 +304,7 @@ export function ReviewSettingsPanel({ repo, onChange }: ReviewSettingsPanelProps
     category_confidence: draftCategoryConfidence,
     passes: {
       ...current.passes,
-      security: { ...current.passes.security, enabled: securityEnabled },
+      security: { ...current.passes.security, enabled: securityEnabled, cross_file: crossFileEnabled },
       critic: { ...current.passes.critic, enabled: criticEnabled },
       ensemble: { ...current.passes.ensemble, runs: parseNum(ensembleRuns) },
     },
@@ -313,6 +318,10 @@ export function ReviewSettingsPanel({ repo, onChange }: ReviewSettingsPanelProps
     file_selection: { ...current.file_selection, enabled: fileSelectionEnabled },
     threads: { ...current.threads, verify_fixes: verifyFixes, auto_resolve: autoResolve },
     rounds: { ...current.rounds, incremental: roundsIncremental, escalate_floors: escalateFloors },
+    evidence: {
+      hard_drop: evidenceHardDrop,
+      hard_drop_exempt_categories: evidenceExemptCategories,
+    },
   };
 
   // Enable-but-empty mention_trigger is INVALID (REVIEW #8): a whitespace-only value
@@ -340,6 +349,7 @@ export function ReviewSettingsPanel({ repo, onChange }: ReviewSettingsPanelProps
     !stringSetEqual(focus, current.focus) ||
     !categoryConfidenceEqual(draftCategoryConfidence, current.category_confidence) ||
     securityEnabled !== current.passes.security.enabled ||
+    crossFileEnabled !== current.passes.security.cross_file ||
     criticEnabled !== current.passes.critic.enabled ||
     parseNum(ensembleRuns) !== current.passes.ensemble.runs ||
     walkthroughEnabled !== current.walkthrough.enabled ||
@@ -350,7 +360,9 @@ export function ReviewSettingsPanel({ repo, onChange }: ReviewSettingsPanelProps
     verifyFixes !== current.threads.verify_fixes ||
     autoResolve !== current.threads.auto_resolve ||
     roundsIncremental !== current.rounds.incremental ||
-    escalateFloors !== current.rounds.escalate_floors;
+    escalateFloors !== current.rounds.escalate_floors ||
+    evidenceHardDrop !== (current.evidence?.hard_drop ?? false) ||
+    !orderedListEqual(evidenceExemptCategories, current.evidence?.hard_drop_exempt_categories ?? ['security']);
 
   // Report the draft up to the modal (single-Apply). Deps mirror InteractivePanel:266-288 —
   // re-report whenever an editable field or a derived flag changes, so a post-save repo refresh
@@ -374,6 +386,7 @@ export function ReviewSettingsPanel({ repo, onChange }: ReviewSettingsPanelProps
     customRules,
     focus,
     securityEnabled,
+    crossFileEnabled,
     criticEnabled,
     walkthroughEnabled,
     seqDiagramEnabled,
@@ -386,6 +399,8 @@ export function ReviewSettingsPanel({ repo, onChange }: ReviewSettingsPanelProps
     autoResolve,
     roundsIncremental,
     escalateFloors,
+    evidenceHardDrop,
+    evidenceExemptCategories,
     dirty,
     valid,
   ]);
@@ -575,6 +590,13 @@ export function ReviewSettingsPanel({ repo, onChange }: ReviewSettingsPanelProps
           ariaLabel="Toggle security pass"
         />
         <ToggleRow
+          label="Cross-file security"
+          description="Analyze security implications across file boundaries (e.g., auth changes + unprotected routes)."
+          checked={crossFileEnabled}
+          onCheckedChange={setCrossFileEnabled}
+          ariaLabel="Toggle cross-file security"
+        />
+        <ToggleRow
           label="Critic pass"
           description="Prune low-value findings with a second-opinion critic pass."
           checked={criticEnabled}
@@ -719,6 +741,28 @@ export function ReviewSettingsPanel({ repo, onChange }: ReviewSettingsPanelProps
               checked={escalateFloors}
               onCheckedChange={setEscalateFloors}
               ariaLabel="Toggle escalate floors"
+            />
+            <ToggleRow
+              label="Evidence hard-drop"
+              description="Drop findings whose existing_code evidence is not found in the hunk (hallucinated evidence)."
+              checked={evidenceHardDrop}
+              onCheckedChange={setEvidenceHardDrop}
+              ariaLabel="Toggle evidence hard-drop"
+            />
+            <ListEditor
+              title="Exempt categories"
+              hint="Categories that always post findings regardless of evidence quality. Default: security."
+              items={evidenceExemptCategories}
+              onChange={(newItems) => {
+                // REVIEWS FINDING #10: normalize exempt categories to lowercase on save to prevent silent
+                // case-sensitivity mismatches between the config value (e.g., 'Security') and the
+                // reviewCategories enum value ('security'). Lowercasing at the input boundary ensures the
+                // checkEvidence comparison (which lowercases both sides) always matches.
+                setEvidenceExemptCategories(newItems.map((item) => item.toLowerCase()));
+              }}
+              placeholder="e.g. correctness"
+              addAriaLabel="New exempt category"
+              emptyHint="All categories are subject to hard-drop. No exemptions."
             />
           </div>
         )}

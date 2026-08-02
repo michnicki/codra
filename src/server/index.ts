@@ -1,5 +1,6 @@
 import { createApp } from './app';
 import { ReviewWorkflow } from './workflows/review';
+import { IndexWorkflow } from './workflows/index-build';
 import type { AppBindings } from './env';
 import { reviewJobMessageSchema } from '@shared/schema';
 import { logger } from '@server/core/logger';
@@ -129,7 +130,11 @@ async function dispatchInteractiveMessage(
 
 const app = createApp();
 
-export { ReviewWorkflow };
+// Both Workflow classes are re-exported from the Worker's entry module so the `class_name` values in
+// wrangler.jsonc's `workflows` array resolve. Phase 29 / QA-IDX-01 (D-06-R): `IndexWorkflow` is bound as
+// INDEX_WORKFLOW / `codra-index-workflow`, a second Workflow provisioned by `wrangler deploy` alongside
+// the review one -- NOT a new payload kind inside ReviewWorkflow.
+export { ReviewWorkflow, IndexWorkflow };
 
 export default {
   fetch(request: Request, env: AppBindings, ctx: ExecutionContext) {

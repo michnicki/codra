@@ -7,9 +7,16 @@ import { installBitbucketFetchMock } from './bitbucket-fetch-mock';
 
 // Mock the credential-read + decrypt path so we don't depend on Postgres or the encryption key.
 const getVcsCredentialSecretsMock = vi.fn();
+// Phase 31 (WS-01): BitbucketAdapter.create now resolves the bot-posting credential via
+// resolveBitbucketBotCredential (D-03 per-repo-wins), which falls back to this workspace-level
+// lookup only when the per-repo lookup above resolves null.
+const getVcsWorkspaceCredentialSecretsMock = vi.fn();
 const decryptSecretMock = vi.fn();
 vi.mock('@server/db/vcs-credentials', () => ({
   getVcsCredentialSecrets: (...args: unknown[]) => getVcsCredentialSecretsMock(...args),
+}));
+vi.mock('@server/db/vcs-workspace-credentials', () => ({
+  getVcsWorkspaceCredentialSecrets: (...args: unknown[]) => getVcsWorkspaceCredentialSecretsMock(...args),
 }));
 vi.mock('@server/core/crypto', () => ({
   decryptSecret: (...args: unknown[]) => decryptSecretMock(...args),
@@ -42,6 +49,9 @@ describe('VcsService.forRepo', () => {
 
   it('returns a BitbucketAdapter when repositoryVcsProvider is "bitbucket" AND credential is present', async () => {
     const env = createTestEnv();
+    // Not consulted in this test (per-repo credential resolves first), but set explicitly so
+    // this test doesn't depend on default vi.fn() behavior or leftover state from another test.
+    getVcsWorkspaceCredentialSecretsMock.mockResolvedValue(null);
     getVcsCredentialSecretsMock.mockResolvedValue({
       vcsProvider: 'bitbucket',
       workspace: 'ws-foo',
@@ -87,6 +97,9 @@ describe('VcsService.forRepo', () => {
   it('throws when repositoryVcsProvider is "bitbucket" but no credential row exists', async () => {
     const env = createTestEnv();
     getVcsCredentialSecretsMock.mockResolvedValue(null);
+    // BOTH the per-repo and the workspace-level lookup resolve null -- resolveBitbucketBotCredential
+    // still throws the same "Bitbucket credential not configured" error (D-03 fallback exhausted).
+    getVcsWorkspaceCredentialSecretsMock.mockResolvedValue(null);
 
     await expect(
       VcsService.forRepo(
@@ -105,6 +118,9 @@ describe('VcsService.forRepo', () => {
 
   it('throws when repositoryVcsProvider is "bitbucket" but encryptedAccessToken is null', async () => {
     const env = createTestEnv();
+    // Not consulted in this test (per-repo row is present, just missing the token), but set
+    // explicitly for hermeticity.
+    getVcsWorkspaceCredentialSecretsMock.mockResolvedValue(null);
     getVcsCredentialSecretsMock.mockResolvedValue({
       vcsProvider: 'bitbucket',
       workspace: 'ws-foo',
@@ -130,6 +146,86 @@ describe('VcsService.forRepo', () => {
         },
       ),
     ).rejects.toThrow(/Bitbucket credential not configured/);
+  });
+
+  // Phase 31 (WS-01, Plan 31-04, Task 2): BitbucketAdapter.create resolves the bot-posting
+  // credential via resolveBitbucketBotCredential (D-03 per-repo-wins precedence).
+  it('falls back to the workspace-level credential when no per-repo credential row exists', async () => {
+    const env = createTestEnv();
+    getVcsCredentialSecretsMock.mockResolvedValue(null);
+    getVcsWorkspaceCredentialSecretsMock.mockResolvedValue({
+      vcsProvider: 'bitbucket',
+      workspace: 'ws-foo',
+      hasToken: true,
+      hasWebhookSecret: false,
+      tokenExpiresAt: null,
+      label: null,
+      status: 'valid',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      encryptedAccessToken: 'v1:iv:ct-workspace',
+      encryptedWebhookSecret: null,
+    });
+    decryptSecretMock.mockResolvedValue('plaintext-token-from-workspace');
+
+    const adapter = await VcsService.forRepo(
+      env,
+      {
+        installationId: null,
+        repositoryVcsProvider: 'bitbucket',
+        repositoryWorkspace: 'ws-foo',
+      },
+    );
+
+    expect(adapter).toBeInstanceOf(BitbucketAdapter);
+    expect((adapter as BitbucketAdapter).name).toBe('bitbucket');
+    expect(decryptSecretMock).toHaveBeenCalledWith(expect.anything(), 'v1:iv:ct-workspace');
+  });
+
+  it('prefers the per-repo credential over the workspace credential when both exist (D-03)', async () => {
+    const env = createTestEnv();
+    getVcsCredentialSecretsMock.mockResolvedValue({
+      vcsProvider: 'bitbucket',
+      workspace: 'ws-foo',
+      repoSlug: 'repo-bar',
+      hasToken: true,
+      hasWebhookSecret: false,
+      tokenExpiresAt: null,
+      label: null,
+      status: 'valid',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      encryptedAccessToken: 'v1:iv:ct-per-repo',
+      encryptedWebhookSecret: null,
+    });
+    getVcsWorkspaceCredentialSecretsMock.mockResolvedValue({
+      vcsProvider: 'bitbucket',
+      workspace: 'ws-foo',
+      hasToken: true,
+      hasWebhookSecret: false,
+      tokenExpiresAt: null,
+      label: null,
+      status: 'valid',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      encryptedAccessToken: 'v1:iv:ct-workspace',
+      encryptedWebhookSecret: null,
+    });
+    decryptSecretMock.mockResolvedValue('plaintext-token-per-repo');
+
+    const adapter = await VcsService.forRepo(
+      env,
+      {
+        installationId: null,
+        repositoryVcsProvider: 'bitbucket',
+        repositoryWorkspace: 'ws-foo',
+      },
+    );
+
+    expect(adapter).toBeInstanceOf(BitbucketAdapter);
+    // The PER-REPO ciphertext was decrypted, never the workspace one (D-03 per-repo wins).
+    expect(decryptSecretMock).toHaveBeenCalledWith(expect.anything(), 'v1:iv:ct-per-repo');
+    expect(decryptSecretMock).not.toHaveBeenCalledWith(expect.anything(), 'v1:iv:ct-workspace');
   });
 });
 

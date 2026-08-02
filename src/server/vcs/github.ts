@@ -1,12 +1,17 @@
 import { GitHubService } from '../services/github';
+import { GitHubError } from '../core/github';
 import type { AppBindings } from '../env';
 import type {
   VcsCapabilities,
+  VcsCodeSearchHit,
+  VcsCommitEntry,
   VcsCreateStatusCheckInput,
   VcsProvider,
   VcsPullRequest,
   VcsReviewThread,
+  VcsSkippedComment,
   VcsSubmitReviewInput,
+  VcsTreeListing,
   VcsUpdateStatusCheckInput,
 } from './types';
 
@@ -81,6 +86,100 @@ export class GithubAdapter implements VcsProvider {
   // passes through as `''`; non-2xx throws GitHubError.
   async getCompareDiff(owner: string, repo: string, base: string, head: string): Promise<string> {
     return this.gh.getCompareDiff(owner, repo, base, head);
+  }
+
+  // PRD-04 (FR-114): per-touched-file commit history (review HIGH-1). Pure delegation — `ref`
+  // arrives as a parameter from the prepare-phase caller (which passes `pr.headSha` in 34-03);
+  // this adapter NEVER resolves refs from its own state and never references an out-of-scope
+  // `pr` object.
+  async getFileHistory?(
+    owner: string,
+    repo: string,
+    path: string,
+    ref: string,
+    maxCommits: number,
+  ): Promise<VcsCommitEntry[]> {
+    return this.gh.getFileHistory(owner, repo, path, ref, maxCommits);
+  }
+
+  // PRD-06 (FR-131, D-05): repository code search backing `grep_repo`. Pure delegation -- the query
+  // composition, the `per_page` clamp, the text-match media type and the three-valued status handling
+  // all live in `GitHubClient.searchCode`; nothing about them is re-decided here.
+  //
+  // Declared with the OPTIONAL class-method form `async searchCode?(`, the same shape `getFileHistory?`
+  // above uses, so it satisfies `VcsProvider.searchCode?` exactly and callers keep feature-detecting
+  // with `vcs.searchCode?.(...) ?? null`. Its presence -- not a capability flag -- is what tells the
+  // executor that grep_repo is available on this provider (see the `VcsCapabilities` note in
+  // `./types`: no `supportsCodeSearch` flag is added, deliberately).
+  //
+  // The three-valued return passes through untouched: `null` = the capability is unavailable for this
+  // repository or credential (rate-limited), `[]` = the search ran and found nothing, entries =
+  // matches with the provider's fragment untruncated and a D-07 default-branch ref label.
+  async searchCode?(
+    owner: string,
+    repo: string,
+    query: string,
+    maxHits: number,
+  ): Promise<VcsCodeSearchHit[] | null> {
+    return this.gh.searchCode(owner, repo, query, maxHits);
+  }
+
+  // QA-IDX-01 (D-09): default-branch blob listing. Thin delegation -- no new REST logic lives here.
+  //
+  // The WHOLE enumeration costs 3 SUBREQUESTS on GitHub regardless of repository size: one repository
+  // read for the default branch, one branch read for its COMMIT sha, and one recursive tree read (the
+  // `git/trees` `tree_sha` segment accepts a ref name, so the branch name goes straight in). That
+  // fixed cost is why the GitHub side needs no page budget at all while the Bitbucket side does.
+  //
+  // The branch read is NOT redundant: the tree response's `sha` is the TREE object id, and
+  // `code_index_state.indexed_sha` means "the commit the content was read at" (migration 018).
+  // Persisting a tree sha there would put a value in the column that no compare/refresh path can use.
+  //
+  // Only `type === 'blob'` entries survive: `'tree'` entries are directories (nothing to index) and
+  // `'commit'` entries are SUBMODULE pointers whose content lives in a different repository, so
+  // fetching them as files would 404 or -- worse -- index a gitlink sha as source text.
+  async listDefaultBranchTree(owner: string, repo: string): Promise<VcsTreeListing> {
+    const metadata = await this.gh.getRepositoryMetadata(owner, repo);
+    const branch = metadata.default_branch ?? metadata.master_branch;
+    if (typeof branch !== 'string' || branch.length === 0) {
+      // Throw rather than guessing 'main'/'master'. Indexing a branch the operator did not choose is
+      // a worse failure than a loud one, and it is symmetric with the Bitbucket adapter's
+      // absent-`mainbranch` behavior (NREG-02).
+      throw new GitHubError(
+        502,
+        JSON.stringify({ default_branch: metadata.default_branch, master_branch: metadata.master_branch }),
+        `/repos/${owner}/${repo}`,
+        `GitHub repository ${owner}/${repo} reported no default branch (neither default_branch nor master_branch)`,
+      );
+    }
+
+    const sha = await this.gh.getBranchCommitSha(owner, repo, branch);
+    if (!sha) {
+      throw new GitHubError(
+        502,
+        JSON.stringify({ branch }),
+        `/repos/${owner}/${repo}/branches/${branch}`,
+        `GitHub branch ${branch} on ${owner}/${repo} reported no head commit sha`,
+      );
+    }
+
+    const tree = await this.gh.getTree(owner, repo, branch);
+    const paths: string[] = [];
+    for (const entry of tree.tree ?? []) {
+      if (entry?.type !== 'blob') continue;
+      if (typeof entry.path !== 'string' || entry.path.length === 0) continue;
+      paths.push(entry.path);
+    }
+
+    return {
+      ref: branch,
+      // The COMMIT sha from the branch read, never `tree.sha` (which is the tree object id).
+      sha,
+      paths,
+      // Surfaced from the provider response, NEVER hardcoded false: `truncated: true` means the
+      // returned set is an arbitrary prefix, not the whole tree (see vcs/types.ts).
+      truncated: tree.truncated === true,
+    };
   }
 
   // PROV-02 (D-05/D-06/D-07): unresolved-bot-thread listing. Pulls every page from the GraphQL
@@ -237,7 +336,7 @@ export class GithubAdapter implements VcsProvider {
     repo: string,
     prNumber: number,
     input: VcsSubmitReviewInput,
-  ): Promise<{ ref: string }> {
+  ): Promise<{ ref: string; skippedComments?: VcsSkippedComment[] }> {
     // Relocated toReviewEvent (formerly services/formatter.ts:6-8).
     // REV-M-5: `jobIdHint` is intentionally IGNORED here -- the GitHub submitReview flow composes
     // a single createReview POST that does not embed the job id in its body. The field exists on
@@ -245,7 +344,7 @@ export class GithubAdapter implements VcsProvider {
     // marker+summary comment. Reference it once so the linter doesn't flag an unused parameter.
     void input.jobIdHint;
     const event = input.verdict === 'approve' ? ('APPROVE' as const) : ('COMMENT' as const);
-    const { id } = await this.gh.createReview(owner, repo, prNumber, {
+    const { id, skippedComments } = await this.gh.createReview(owner, repo, prNumber, {
       commitSha: input.commitSha,
       event,
       body: input.summaryBody,
@@ -256,7 +355,20 @@ export class GithubAdapter implements VcsProvider {
     if (typeof id !== 'number' || !Number.isFinite(id)) {
       throw new Error(`createReview returned a non-numeric id for ${owner}/${repo}#${prNumber}: ${String(id)}`);
     }
-    return { ref: String(id) };
+    // Phase 33 (FR-031, D-01): the client's per-comment fallback skips carry a DIFF POSITION.
+    // WR-01: it stays in `position`, and `line` is null. Writing the position into `line` made the
+    // audit trail render a fabricated head-side line number ("src/foo.ts:3" for a finding at
+    // POSITION 3) -- the exact G-28-3 defect documented on `VcsSkippedComment` and on
+    // `getInlineCommentDetails` in vcs/types.ts. Omitted entirely on a clean run so the returned
+    // shape stays byte-identical to the pre-Phase-33 contract (REVIEWS R1).
+    const skipped = skippedComments?.map((s) => ({
+      path: s.path,
+      line: null,
+      position: s.position,
+      // WR-06: the persisted review_comments.id, the identifier the audit trail joins on.
+      commentId: s.commentId,
+    }));
+    return skipped && skipped.length > 0 ? { ref: String(id), skippedComments: skipped } : { ref: String(id) };
   }
 
   async findExistingReviewForCommit(
@@ -360,6 +472,22 @@ export class GithubAdapter implements VcsProvider {
       results.push({ ref: String(c.id), body: c.body, author: { id: String(c.user.id), login: c.user.login ?? '' } });
     }
     return results;
+  }
+
+  async getInlineCommentDetails(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    commentRef: string,
+  ): Promise<{ path: string; line: number | null; position: number | null; body: string } | null> {
+    // `position` is GitHub's DIFF OFFSET — the coordinate createReview posts by — and flows through
+    // this adapter unchanged; do not remap or drop it (G-28-3).
+    void prNumber; // GitHub's GET /pulls/comments/{id} doesn't need the PR number.
+    const commentId = Number(commentRef);
+    if (!Number.isFinite(commentId) || commentId <= 0) {
+      return null;
+    }
+    return this.gh.getReviewComment(owner, repo, commentId);
   }
 
   async getUserRepoPermission(

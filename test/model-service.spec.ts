@@ -154,31 +154,40 @@ describe('ModelService', () => {
   });
 
   it('retries Google once for transient 524 edge timeouts', async () => {
-    const fetchMock = vi.spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({ error: { code: 524, message: 'A timeout occurred.' } }),
-          { status: 524, headers: { 'content-type': 'application/json' } },
-        ),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            candidates: [{ content: { parts: [{ text: '{"findings":[],"overall_correctness":"patch is correct","overall_explanation":"ok","overall_confidence_score":0.9}' }] } }],
-            usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1 },
-          }),
-          { status: 200, headers: { 'content-type': 'application/json' } },
-        ),
+    // Exercises withRetry exponential backoff — use fake timers to avoid real ~1s delay.
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({ error: { code: 524, message: 'A timeout occurred.' } }),
+            { status: 524, headers: { 'content-type': 'application/json' } },
+          ),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              candidates: [{ content: { parts: [{ text: '{"findings":[],"overall_correctness":"patch is correct","overall_explanation":"ok","overall_confidence_score":0.9}' }] } }],
+              usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1 },
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        );
+
+      const promise = reviewWithGoogle(
+        { apiKey: 'test-key' },
+        'gemma-4-31b-it',
+        { systemPrompt: 'system', userPrompt: 'user' },
       );
+      promise.catch(() => {});
+      await vi.runAllTimersAsync();
+      const response = await promise;
 
-    const response = await reviewWithGoogle(
-      { apiKey: 'test-key' },
-      'gemma-4-31b-it',
-      { systemPrompt: 'system', userPrompt: 'user' },
-    );
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(response.rawText).toContain('"findings"');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(response.rawText).toContain('"findings"');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('caps the Retry-After sleep for Google 429 responses at the max in-call retry delay', async () => {
@@ -540,10 +549,14 @@ describe('ModelService', () => {
               command: 'npm run lint',
             },
             walkthrough: { enabled: false, sequence_diagram: { enabled: true } },
-            passes: { security: { enabled: false }, critic: { enabled: false }, ensemble: { runs: 1, temperature: 0.7 } },
+            passes: { security: { enabled: false, cross_file: false }, critic: { enabled: false }, ensemble: { runs: 1, temperature: 0.7 } },
             interactive: {
               commands: { enabled: false, bitbucket_allowed_account_ids: [], bitbucket_bot_account_id: null },
-              qa: { enabled: false, rate_limit_per_hour: 10 },
+              qa: {
+                enabled: false,
+                rate_limit_per_hour: 10,
+                index: { enabled: false, max_files: 500, chunk_lines: 50, top_k: 8 },
+              },
             },
             severity_engine: { enabled: true },
             dedup: { enabled: true },
@@ -551,6 +564,12 @@ describe('ModelService', () => {
             category_confidence: {},
             threads: { verify_fixes: false, auto_resolve: false },
             rounds: { incremental: false, escalate_floors: true },
+            evidence: { hard_drop: false, hard_drop_exempt_categories: ['security'] },
+            learning: { enabled: false, learned_rules: [] },
+            bitbucket: { annotations_enabled: false },
+            file_history: { enabled: false },
+            yaml_config: { enabled: false },
+            agentic_tools: { enabled: false },
           },
           model: {
             main: '@cf/zai-org/glm-4.7-flash',

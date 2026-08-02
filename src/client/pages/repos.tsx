@@ -38,6 +38,8 @@ import {
   type ProviderOption,
 } from '@client/components/features/models/model-chain';
 import { ReviewSettingsPanel } from '@client/components/features/repos/review-settings-panel';
+import { LearnedRulesPanel } from '@client/components/features/repos/learned-rules-panel';
+import { CodeIndexPanel } from '@client/components/features/repos/code-index-panel';
 import { mergeReviewPatch, type ReviewSettingsDraft } from '@client/lib/review-config-draft';
 
 const EMPTY_MODEL_ROUTE: ModelRouteConfig = {
@@ -277,7 +279,12 @@ function InteractivePanel({ repo, onChange }: InteractivePanelProps) {
           // Editable Bitbucket bot account_id (D-06): report the trimmed value, empty→null.
           bitbucket_bot_account_id: normalizedBotAccountId,
         },
+        // Spread the current `qa` FIRST so keys this panel does not edit — notably the QA-IDX-01
+        // `index` block (Phase 29) — survive the round-trip. mergeReviewPatch applies `interactive`
+        // LAST (Phase 16 decision), so a draft that rebuilt `qa` from scratch would silently drop
+        // the operator's index configuration on every Interactive-panel Apply.
         qa: {
+          ...interactive.qa,
           enabled: qaEnabled,
           rate_limit_per_hour: rateLimitValid ? rateLimitNum : interactive.qa.rate_limit_per_hour,
         },
@@ -447,6 +454,8 @@ interface RepoModelModalProps {
   onModelApplied: (repo: RepoConfigRecord, route: ModelRouteConfig) => void;
   onModelReset: (repo: RepoConfigRecord) => void;
   onReviewSaved: (repo: RepoConfigRecord, review: RepoConfig['review']) => void;
+  /** Re-fetches the repo config from the server (used by LearnedRulesPanel after synthesis/rule changes). */
+  onRepoRefreshed: (repo: RepoConfigRecord) => void;
 }
 
 function RepoModelModal({
@@ -459,6 +468,7 @@ function RepoModelModal({
   onModelApplied,
   onModelReset,
   onReviewSaved,
+  onRepoRefreshed,
 }: RepoModelModalProps) {
   const selectedRepoId = repo ? repoId(repo) : null;
   const globalRouteKey = useMemo(
@@ -471,6 +481,10 @@ function RepoModelModal({
   const [error, setError] = useState<string | null>(null);
   const [interactiveDraft, setInteractiveDraft] = useState<InteractiveDraft | null>(null);
   const [reviewSettingsDraft, setReviewSettingsDraft] = useState<ReviewSettingsDraft | null>(null);
+  const [learningDraft, setLearningDraft] = useState<RepoConfig['review']['learning'] | null>(null);
+  // QA-IDX-01: the code-index toggle is lifted as a dirty-tracked config edit, exactly like the
+  // learning draft — the panel never posts the toggle directly.
+  const [indexDraft, setIndexDraft] = useState<RepoConfig['review']['interactive']['qa']['index'] | null>(null);
 
   useEffect(() => {
     if (!repo) return;
@@ -481,6 +495,8 @@ function RepoModelModal({
     setError(null);
     setInteractiveDraft(null);
     setReviewSettingsDraft(null);
+    setLearningDraft(null);
+    setIndexDraft(null);
   }, [selectedRepoId, globalRouteKey]);
 
   const modelDirty = useMemo(() => !routesEqual(route, initialRoute), [initialRoute, route]);
@@ -488,7 +504,9 @@ function RepoModelModal({
   const interactiveValid = interactiveDraft?.valid ?? true;
   const reviewSettingsDirty = reviewSettingsDraft?.dirty ?? false;
   const reviewSettingsValid = reviewSettingsDraft?.valid ?? true;
-  const dirty = modelDirty || interactiveDirty || reviewSettingsDirty;
+  const learningDirty = learningDraft !== null;
+  const indexDirty = indexDraft !== null;
+  const dirty = modelDirty || interactiveDirty || reviewSettingsDirty || learningDirty || indexDirty;
   const canApply = !!repo && dirty && interactiveValid && reviewSettingsValid && saving === null;
   const hasStoredStrategy = repo ? hasStoredModelStrategy(repo) : false;
 
@@ -505,12 +523,37 @@ function RepoModelModal({
       // the full current review first, overlays the settings draft, then applies the fresh
       // interactive draft LAST so a simultaneous Interactive edit wins over the settings draft's
       // own (stale) interactive block (REVIEW #4). Null when neither sub-editor is dirty.
+      // LRN-01: learning toggle changes are merged into settingsFields so they flow through
+      // the same PATCH path as other review settings.
+      const settingsFields =
+        reviewSettingsDirty || learningDirty
+          ? {
+              ...(reviewSettingsDirty && reviewSettingsDraft ? reviewSettingsDraft.review : {}),
+              ...(learningDirty && learningDraft ? { learning: learningDraft } : {}),
+            }
+          : null;
+      // QA-IDX-01: the index toggle lives at review.interactive.qa.index, so it merges through the
+      // `interactive` argument — and it is overlaid LAST because the InteractivePanel's draft spreads
+      // `interactive.qa` from the repo prop, which predates an index edit made afterwards in the same
+      // modal session (the same stale-draft clobber class as REVIEW #4).
+      const effectiveInteractive =
+        interactiveDirty || indexDirty
+          ? (() => {
+              const base =
+                interactiveDirty && interactiveDraft
+                  ? interactiveDraft.interactive
+                  : repo.parsedJson.review.interactive;
+              return indexDraft
+                ? { ...base, qa: { ...base.qa, index: indexDraft } }
+                : base;
+            })()
+          : null;
       const nextReview =
-        interactiveDirty || reviewSettingsDirty
+        effectiveInteractive || settingsFields
           ? mergeReviewPatch(
               repo.parsedJson.review,
-              interactiveDirty && interactiveDraft ? interactiveDraft.interactive : null,
-              reviewSettingsDirty && reviewSettingsDraft ? reviewSettingsDraft.review : null,
+              effectiveInteractive,
+              settingsFields,
             )
           : null;
       const patch: Parameters<typeof api.updateRepoConfig>[2] = {};
@@ -613,6 +656,48 @@ function RepoModelModal({
                 <InteractivePanel key={selectedRepoId} repo={repo} onChange={setInteractiveDraft} />
                 <div className="my-6 border-t border-border" />
                 <ReviewSettingsPanel key={`${selectedRepoId}-review`} repo={repo} onChange={setReviewSettingsDraft} />
+                <div className="my-6 border-t border-border" />
+                <LearnedRulesPanel
+                  key={`${selectedRepoId}-learning`}
+                  config={learningDraft ?? repo.parsedJson.review.learning}
+                  onLearningChange={setLearningDraft}
+                  onSynthesized={async () => {
+                    // C7: re-fetch config from server to get fresh rules after synthesis/rule change
+                    try {
+                      const fresh = await api.getRepo(repo.owner, repo.repo, repo.vcsProvider);
+                      if (fresh?.repo) {
+                        onRepoRefreshed(fresh.repo);
+                      }
+                    } catch {
+                      // best-effort — stale data is acceptable until next modal open
+                    }
+                  }}
+                  repoId={selectedRepoId ?? ''}
+                  owner={repo.owner}
+                  repo={repo.repo}
+                  vcsProvider={repo.vcsProvider}
+                />
+                <div className="my-6 border-t border-border" />
+                <CodeIndexPanel
+                  key={`${selectedRepoId}-code-index`}
+                  owner={repo.owner}
+                  repo={repo.repo}
+                  vcsProvider={repo.vcsProvider}
+                  config={indexDraft ?? repo.parsedJson.review.interactive.qa.index}
+                  onIndexChange={setIndexDraft}
+                  onRefreshed={async () => {
+                    // Re-read config from the server after a build press (same C7 pattern as the
+                    // learned-rules panel) — best-effort, stale data is acceptable until next open.
+                    try {
+                      const fresh = await api.getRepo(repo.owner, repo.repo, repo.vcsProvider);
+                      if (fresh?.repo) {
+                        onRepoRefreshed(fresh.repo);
+                      }
+                    } catch {
+                      // best-effort
+                    }
+                  }}
+                />
               </>
             )}
           </div>
@@ -739,6 +824,9 @@ export function ReposPage() {
   const handleReviewSaved = (repo: RepoConfigRecord, review: RepoConfig['review']) =>
     mergeRepo(repoId(repo), { parsedJson: { ...repo.parsedJson, review } });
 
+  const handleRepoRefreshed = (repo: RepoConfigRecord) =>
+    mergeRepo(repoId(repo), { parsedJson: repo.parsedJson });
+
   const handleSync = async () => {
     if (syncing) return;
     setSyncing(true);
@@ -816,6 +904,13 @@ export function ReposPage() {
                   <BitbucketMark size={14} />
                   Add Bitbucket repository
                 </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="py-2"
+                  onClick={() => navigate('/repos/add/bitbucket-workspace')}
+                >
+                  <BitbucketMark size={14} />
+                  Add Bitbucket workspace
+                </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
           </div>
@@ -869,6 +964,7 @@ export function ReposPage() {
         onModelApplied={handleModelApplied}
         onModelReset={handleModelReset}
         onReviewSaved={handleReviewSaved}
+        onRepoRefreshed={handleRepoRefreshed}
       />
     </section>
   );
