@@ -1,22 +1,33 @@
 import type { AppBindings } from '@server/env';
 import { logger } from '@server/core/logger';
-import { BitbucketClient } from '@server/core/bitbucket';
+import { BitbucketClient, BitbucketError } from '@server/core/bitbucket';
 import { decryptSecret } from '@server/core/crypto';
 import { parseUnifiedDiff, getValidNewLines, type FileDiff } from '@server/core/diff';
-import { getVcsCredentialSecrets } from '@server/db/vcs-credentials';
+import { resolveBitbucketBotCredential } from '@server/core/bitbucket-credential-resolution';
 import {
   REPORT_TYPE,
   REPORT_RESULT,
+  ANNOTATION_REPORT_ID,
+  ANNOTATION_TYPE,
+  ANNOTATION_SEVERITY_MAP,
+  ANNOTATION_BATCH_SIZE,
 } from '@server/bitbucket/constants';
-import type { RepoConfig } from '@shared/schema';
+import type { ReportAnnotation } from '@shared/bitbucket';
+import type { RepoConfig, ParsedReviewComment } from '@shared/schema';
 import type {
   VcsCapabilities,
+  VcsCodeSearchHit,
+  VcsCommitEntry,
   VcsCreateStatusCheckInput,
+  VcsPostAnnotationsInput,
+  VcsPostedComment,
   VcsProvider,
   VcsPullRequest,
   VcsReviewComment,
   VcsReviewThread,
+  VcsSkippedComment,
   VcsSubmitReviewInput,
+  VcsTreeListing,
   VcsUpdateStatusCheckInput,
 } from './types';
 
@@ -74,7 +85,15 @@ type TrackerLike = { incrementSubrequests(count?: number): void; hasRemainingSaf
 // per submitReview call — the API list is paginated by pagelen=100 which already covers all PRs
 // Codra is realistically asked to review. Stored on `this` so multiple inline-comment dedup checks
 // share the same lookup within a single submitReview invocation.
-type CommentListingItem = { id: number; body: string; inline?: { path: string; to?: number; from?: number } };
+type CommentListingItem = {
+  id: number;
+  body: string;
+  inline?: { path: string; to?: number; from?: number };
+  // Phase 30 (ANNO-01, D-11/Pitfall 2): a comment's PR-visible permalink, additive and optional --
+  // absent on any response shape that doesn't carry it (NREG-01 byte-compat). Threaded through
+  // buildDedupIndex/submitReview so postAnnotations can link an annotation back to its comment.
+  links?: { html?: { href?: string } };
+};
 
 // Stable machine token for the review summary comment's dedup anchor. Bitbucket Cloud has no hidden
 // HTML comments (a GitHub-style `<!-- ... -->` renders visibly and its inner HTML is sanitized), so
@@ -127,6 +146,17 @@ export class BitbucketAdapter implements VcsProvider {
   // class getter so the mutable field can be read through the immutable interface shape. Plan
   // 17-02 wires the real POST /resolve plumbing behind the neutral stub.
   private threadResolutionSupported = true;
+  // PRD-06 (FR-131, D-05): the code-search capability's OBSERVED-DOWNGRADE backing field, the same
+  // mechanic as `threadResolutionSupported` above. Starts optimistic (true) and flips to false the
+  // first time the client answers `null`, after which every later call short-circuits WITHOUT
+  // spending a subrequest.
+  //
+  // Deliberately NOT exposed on `capabilities` (unlike `threadResolutionSupported`): the executor
+  // already branches on the `null` return — it sets its own `grepSupported` false, tells the model
+  // once that `grep_repo` is unavailable for this repository, and stops offering the tool. A second
+  // flag no consumer reads would be a second source of truth, which is exactly what the
+  // `VcsCapabilities` doc comment in ./types warns against.
+  private codeSearchSupported = true;
   get capabilities(): VcsCapabilities {
     return {
       supportsMermaid: false,
@@ -163,8 +193,9 @@ export class BitbucketAdapter implements VcsProvider {
       throw new Error(`Bitbucket job ${job.id} is missing repositoryWorkspace`);
     }
 
-    const secrets = await getVcsCredentialSecrets(env, {
-      vcsProvider: 'bitbucket',
+    // Phase 31 (WS-01, D-03): resolves the per-repo credential when present, falling back to the
+    // workspace-level credential only when no per-repo row exists (per-repo wins).
+    const secrets = await resolveBitbucketBotCredential(env, {
       workspace,
       repoSlug: job.repo,
     });
@@ -202,6 +233,105 @@ export class BitbucketAdapter implements VcsProvider {
   // (R-5). Empty success passes through as `''`; non-2xx throws BitbucketError.
   async getCompareDiff(owner: string, repo: string, base: string, head: string): Promise<string> {
     return this.client.getCompareDiff(owner, repo, base, head);
+  }
+
+  // PRD-04 (FR-114): per-touched-file commit history (review HIGH-1). Pure delegation — `ref`
+  // arrives as a parameter from the prepare-phase caller (which passes `pr.headSha` in 34-03);
+  // this adapter never references a `pr` object. The client property is `this.client` (never
+  // `this.bitbucket`), and the client itself documents its deliberate path-before-ref ordering.
+  async getFileHistory?(
+    owner: string,
+    repo: string,
+    path: string,
+    ref: string,
+    maxCommits: number,
+  ): Promise<VcsCommitEntry[]> {
+    return this.client.getFileHistory(owner, repo, path, ref, maxCommits);
+  }
+
+  /**
+   * PRD-06 (FR-131, D-05): repository code search backing `grep_repo`. Delegation plus ONE piece of
+   * adapter-local state — the per-invocation observed downgrade.
+   *
+   * WHY THE DOWNGRADE IS LOAD-BEARING HERE AND NOT ON GITHUB: Bitbucket's workspace code-search
+   * endpoint is DEPRECATED WITH REMOVAL ON 2026-11-01, and Atlassian has confirmed it does not
+   * accept Workspace or Repository Access Tokens (BCLOUD-22586) — the only credential class Codra
+   * stores. A `null` answer is therefore the EXPECTED STEADY STATE on this provider, not a rare
+   * refusal, so short-circuiting after the first one turns "one wasted subrequest per grep attempt"
+   * into "one wasted subrequest per job, at most" (T-35-12). The client's own doc block carries the
+   * full caveat; it is restated here so a maintainer reading the adapter does not have to open the
+   * client to learn why this method is expected to degrade.
+   *
+   * ONLY a `null` return flips the flag. An empty array is a REAL result (search ran, zero matches)
+   * and leaves the capability intact; a thrown error is a transport/5xx failure, which propagates
+   * untouched and must never be latched as "search unavailable for this workspace" (T-35-13). This
+   * is the same discipline as `resolveThread`, where only 403/404/501 flip the resolution flag.
+   *
+   * Declared with the OPTIONAL class-method form `async searchCode?(`, the shape `getFileHistory?`
+   * above uses, so it satisfies `VcsProvider.searchCode?` exactly and callers keep feature-detecting
+   * with `vcs.searchCode?.(...) ?? null`. Its PRESENCE — not a capability flag — is what tells the
+   * executor that grep_repo exists on this provider.
+   */
+  async searchCode?(
+    owner: string,
+    repo: string,
+    query: string,
+    maxHits: number,
+  ): Promise<VcsCodeSearchHit[] | null> {
+    // Downgrade short-circuit: once the capability has answered `null` once, every later call in this
+    // invocation returns `null` without a request.
+    if (!this.codeSearchSupported) return null;
+    const hits = await this.client.searchCode(owner, repo, query, maxHits);
+    if (hits === null) {
+      this.codeSearchSupported = false;
+      return null;
+    }
+    return hits;
+  }
+
+  // QA-IDX-01 (D-09): default-branch blob listing. Thin delegation -- three client reads, no walk
+  // logic here: `mainbranch.name`, that branch's commit hash, then the paginated `/src` walk.
+  //
+  // Cost asymmetry versus GitHub is REAL and is what `truncated` exists to express: GitHub finishes
+  // in 2 subrequests, Bitbucket needs 2 + one page per ~100 entries per directory level. The walk
+  // owns its own page cap and live-budget check, so this method never needs a capability flag
+  // (NREG-02) -- see the contract in vcs/types.ts.
+  async listDefaultBranchTree(owner: string, repo: string): Promise<VcsTreeListing> {
+    const metadata = await this.client.getRepositoryMetadata(owner, repo);
+    const branch = metadata.mainbranch?.name;
+    if (typeof branch !== 'string' || branch.length === 0) {
+      // Throw rather than guessing 'main'/'master'. Deliberately SYMMETRIC with the GitHub adapter,
+      // which also throws rather than guessing: indexing a branch the operator did not choose is a
+      // worse failure than a loud one.
+      throw new BitbucketError(
+        502,
+        JSON.stringify({ mainbranch: metadata.mainbranch ?? null }),
+        `/repositories/${owner}/${repo}`,
+        `Bitbucket repository ${owner}/${repo} reported no mainbranch name`,
+      );
+    }
+
+    const sha = await this.client.getBranchCommitSha(owner, repo, branch);
+    if (!sha) {
+      throw new BitbucketError(
+        502,
+        JSON.stringify({ branch }),
+        `/repositories/${owner}/${repo}/refs/branches/${branch}`,
+        `Bitbucket branch ${branch} on ${owner}/${repo} reported no target commit hash`,
+      );
+    }
+
+    const { paths, truncated } = await this.client.listSrcTree(owner, repo, branch, this.tracker);
+    return { ref: branch, sha, paths, truncated };
+  }
+
+  // QA-IDX-01 (D-08): repository metadata read, narrowed to `mainbranch`. Thin delegation — the
+  // same client read `listDefaultBranchTree` resolves its default branch through, surfaced so the
+  // `repo:push` webhook branch can learn the main branch name without reaching into the private
+  // client. Declared OPTIONAL on the interface (the `labels?` pattern): only this adapter
+  // implements it, because only Bitbucket's push payload lacks a default-branch field.
+  async getRepositoryMetadata(owner: string, repo: string): Promise<{ mainbranch?: { name?: string } }> {
+    return this.client.getRepositoryMetadata(owner, repo);
   }
 
   // PROV-02 (D-05/D-06/D-07): unresolved-bot-thread listing. Walks paginated comments, filters to
@@ -397,7 +527,7 @@ export class BitbucketAdapter implements VcsProvider {
     repo: string,
     prNumber: number,
     input: VcsSubmitReviewInput,
-  ): Promise<{ ref: string }> {
+  ): Promise<{ ref: string; postedComments: VcsPostedComment[]; skippedComments?: VcsSkippedComment[] }> {
     const workspace = this.job.repositoryWorkspace;
 
     // REV-R-A step 1: fetch existing comments to seed the dedup index BEFORE posting anything.
@@ -407,27 +537,79 @@ export class BitbucketAdapter implements VcsProvider {
     // Walk the cached diff once so we can translate `position -> { to | from, line_type }`.
     const files = await this.loadCachedDiffFiles();
 
+    // Phase 30 (ANNO-01, D-11): collect a VcsPostedComment for BOTH the freshly-posted branch AND
+    // the dedup-matched (already-existing) branch below, so postAnnotations (called after this
+    // method returns) can link every current-round finding's annotation back to its comment --
+    // including findings whose comment already existed from a prior round (Pitfall 1).
+    const postedComments: VcsPostedComment[] = [];
+    // Phase 33 (PRD-01 / FR-031, D-02): inline comments rejected with a 422 are skipped with a
+    // warning instead of failing the whole review. `skippedComments` is omitted from the return
+    // when empty so clean runs stay byte-identical (REVIEWS R1).
+    const skippedComments: VcsSkippedComment[] = [];
+
     // REV-R-A step 2: post inline comments (or skip if a matching comment already exists).
     for (const comment of input.comments) {
       const anchor = anchorForComment(comment, files);
       if (!anchor) {
         logger.warn(`BitbucketAdapter: no anchor found for comment on ${comment.path} position ${comment.position}; skipping`);
+        // WR-04: this drop path used to `continue` with only a log line, so a finding that could
+        // not be anchored was unanswerable from the audit trail -- exactly what the skippedComments
+        // seam exists to prevent. `line` is null because there IS no resolved anchor line.
+        skippedComments.push({
+          path: comment.path,
+          line: null,
+          position: null,
+          commentId: comment.commentId,
+        });
         continue;
       }
 
-      if (dedup.has(deDupKey(comment.path, anchor, comment.body))) {
-        // Existing matching comment on this PR for this anchor + body — skip.
+      const key = deDupKey(comment.path, anchor, comment.body);
+      const existingMatch = dedup.get(key);
+      if (existingMatch) {
+        // Existing matching comment on this PR for this anchor + body — skip the POST, but still
+        // record its link (Pitfall 1 fix).
+        postedComments.push({ path: comment.path, line: anchor.line, body: comment.body, link: existingMatch.link });
         continue;
       }
 
-      await this.client.postPullRequestComment(workspace, repo, prNumber, {
-        path: comment.path,
-        line: anchor.line,
-        line_type: anchor.line_type,
-        content: { raw: comment.body },
-      });
-      // Add to the in-memory set so subsequent comments with the same key are also dedup'd.
-      dedup.add(deDupKey(comment.path, anchor, comment.body));
+      // FR-031 (D-02): a per-comment 422 is SKIPPED with a warning, never rethrown -- one bad
+      // comment must not fail the whole review. The catch wraps ONLY the inline POST: the
+      // `postedComments.push` below stays on the SUCCESS path, and `dedup.set` stays inside it so
+      // a skipped comment is never dedup-indexed (REVIEWS R3). The summary post and approve call
+      // stay fail-hard (D-02) -- they are NOT wrapped in this try/catch.
+      try {
+        const postedInline = await this.client.postPullRequestComment(workspace, repo, prNumber, {
+          path: comment.path,
+          line: anchor.line,
+          line_type: anchor.line_type,
+          content: { raw: comment.body },
+        });
+        postedComments.push({ path: comment.path, line: anchor.line, body: comment.body, link: postedInline.links?.html?.href });
+        // Add to the in-memory map so subsequent comments with the same key are also dedup'd.
+        dedup.set(key, { id: postedInline.id, link: postedInline.links?.html?.href });
+      } catch (error) {
+        if (error instanceof BitbucketError && error.status === 422) {
+          logger.warn(`BitbucketAdapter: inline comment rejected with 422, skipping`, {
+            workspace,
+            repo,
+            path: comment.path,
+            line: anchor.line,
+            // WR-05/WR-06: the model-supplied title is no longer carried, so there is nothing to
+            // redact -- the review_comments.id is title-free by construction.
+            commentId: comment.commentId,
+          });
+          // WR-01: Bitbucket anchors by LINE and has no diff offset at all, so `position` is null.
+          skippedComments.push({
+            path: comment.path,
+            line: anchor.line,
+            position: null,
+            commentId: comment.commentId,
+          });
+          continue;
+        }
+        throw error;
+      }
     }
 
     // REV-R-A step 3: the summary as the SINGLE final post. The dedup anchor is a clean Bitbucket
@@ -445,7 +627,9 @@ export class BitbucketAdapter implements VcsProvider {
       await this.client.approvePullRequest(workspace, repo, prNumber);
     }
     void owner;
-    return { ref: String(posted.id) };
+    return skippedComments.length > 0
+      ? { ref: String(posted.id), postedComments, skippedComments }
+      : { ref: String(posted.id), postedComments };
   }
 
   async findExistingReviewForCommit(
@@ -466,6 +650,95 @@ export class BitbucketAdapter implements VcsProvider {
     );
     void owner;
     return matched ? { ref: String(matched.id) } : null;
+  }
+
+  /**
+   * ANNO-01: bulk-create-or-replace the dedicated Code Insights annotation report, mirroring the
+   * exact set of findings already posted as inline comments (D-07/D-08 -- no independent
+   * selection/cap logic here).
+   *
+   * D-09 full-replace: DELETE the report (idempotent -- 404 on round 1 is swallowed inside the
+   * client) then recreate it via PUT, THEN bulk-POST the current round's annotations. This is
+   * stateless -- no persisted external_id bookkeeping across rounds is needed, since Bitbucket's
+   * report deletion is documented (and, per this phase's blocking human-check, confirmed live) to
+   * cascade to the report's child annotations.
+   *
+   * D-11 FIFO-per-key join: `input.postedComments` and `input.findings` are assumed to be
+   * populated from the SAME underlying array in the SAME relative order upstream -- Plan 30-04's
+   * `runFinalizePhase` passes the SAME `finalComments` array to both `submitReview` and
+   * `postAnnotations`, which is what keeps the two arrays' relative ordering aligned
+   * (30-REVIEWS.md OpenCode Concern #2). A FIFO-per-key `.shift()` (not a plain `.find()`)
+   * correctly disambiguates the rare case of two findings sharing one `(path, line)` pair.
+   *
+   * Fail-open (D per RESEARCH.md Open Questions #3): this method does NOT catch its own errors --
+   * the caller (Plan 30-04's finalize wiring) wraps the whole call in its own best-effort
+   * try/catch, matching the walkthrough-edit posture elsewhere in finalize.
+   */
+  async postAnnotations(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    input: VcsPostAnnotationsInput,
+  ): Promise<void> {
+    const workspace = this.job.repositoryWorkspace;
+    const commit = input.commitSha;
+
+    // D-09: full replace every round. Delete-then-recreate; the DELETE 404-swallow (round 1, no
+    // prior report) lives inside deleteCodeInsightsReport (core/bitbucket.ts, Plan 30-02).
+    await this.client.deleteCodeInsightsReport(workspace, repo, commit, ANNOTATION_REPORT_ID);
+    await this.client.upsertCodeInsightsReport(
+      workspace,
+      repo,
+      commit,
+      {
+        title: 'Codra Annotations',
+        details: 'Per-line severity markers mirroring inline review comments.',
+        report_type: REPORT_TYPE,
+        result: REPORT_RESULT[0], // 'PASSED' — ALWAYS, per D-02 (informational only, never merge-gating).
+      },
+      ANNOTATION_REPORT_ID,
+    );
+
+    // FIFO-per-key join: findings and postedComments are matched by `${path}|${line}` and the
+    // matched queue entry is shift()'d off so a rare same-(path,line) collision consumes entries
+    // in the same relative order they were produced (see the class-level doc comment above).
+    const postedByKey = new Map<string, VcsPostedComment[]>();
+    for (const comment of input.postedComments ?? []) {
+      const key = `${comment.path}|${comment.line}`;
+      const queue = postedByKey.get(key);
+      if (queue) {
+        queue.push(comment);
+      } else {
+        postedByKey.set(key, [comment]);
+      }
+    }
+
+    const annotations = input.findings.map((finding) => {
+      const key = `${finding.path}|${finding.line}`;
+      const queue = postedByKey.get(key);
+      const matchedComment = queue?.shift();
+      return buildAnnotation(finding, matchedComment);
+    });
+
+    // Pitfall 3: chunk at Bitbucket's documented maxItems (100 per POST); log a per-batch-index
+    // warning naming the failing chunk before rethrowing (additive diagnostics only -- fail-open
+    // is preserved by the caller's own try/catch).
+    const totalChunks = Math.ceil(annotations.length / ANNOTATION_BATCH_SIZE);
+    for (let i = 0; i < annotations.length; i += ANNOTATION_BATCH_SIZE) {
+      const chunk = annotations.slice(i, i + ANNOTATION_BATCH_SIZE);
+      try {
+        await this.client.bulkUpsertAnnotations(workspace, repo, commit, ANNOTATION_REPORT_ID, chunk);
+      } catch (error) {
+        logger.warn(
+          `BitbucketAdapter.postAnnotations: batch ${i / ANNOTATION_BATCH_SIZE} of ${totalChunks} (size ${chunk.length}) failed`,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+        throw error;
+      }
+    }
+
+    void owner;
+    void prNumber;
   }
 
   /**
@@ -572,6 +845,38 @@ export class BitbucketAdapter implements VcsProvider {
     return this.client.resolveBotUserIdentity();
   }
 
+  async getInlineCommentDetails(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    commentRef: string,
+  ): Promise<{ path: string; line: number | null; position: number | null; body: string } | null> {
+    void owner; // Bitbucket's workspace is canonical (this.job.repositoryWorkspace).
+    const commentId = Number(commentRef);
+    if (!Number.isFinite(commentId) || commentId <= 0) {
+      return null;
+    }
+    const comment = await this.client.getPullRequestComment(this.job.repositoryWorkspace, repo, prNumber, commentId);
+    if (!comment) {
+      return null;
+    }
+    // Not an inline comment — no path/line to resolve.
+    if (!comment.inline) {
+      return null;
+    }
+    return {
+      path: comment.inline.path,
+      line: comment.inline.to ?? comment.inline.from ?? null,
+      // Bitbucket has NO diff offset to report, so `position` is always null here. The write path
+      // (`postPullRequestComment`) sends `inline: { path, to | from }` and this read path returns
+      // `inline.to ?? inline.from` — a LINE on both sides. The asymmetry with GitHub (which anchors
+      // by diff `position`) is intentional: each provider is matched on the coordinate it actually
+      // anchors by, so Bitbucket enrichment resolves on `review_comments.line` (NREG-02, G-28-3).
+      position: null,
+      body: comment.content?.raw ?? '',
+    };
+  }
+
   /**
    * Loads the cached diff for this job from KV and parses it once. Mirrors the diff-cache shape
    * that core/review.ts uses (key `diff:<jobId>`). Falls back to a freshly-fetched diff if no
@@ -634,8 +939,15 @@ function deDupKey(path: string, anchor: AnchorShape, body: string) {
   return `${path}|${anchor.line_type}|${anchor.line}|${body}`;
 }
 
+/**
+ * Phase 30 (ANNO-01, D-11/Pitfall 1): widened from a `Set<string>` to a `Map<string, {id, link}>`
+ * so a dedup-matched comment on a re-review round still carries its id/link forward -- a bare Set
+ * only answered "does this need posting," discarding the id/link a later annotation-linking step
+ * needs. Both the freshly-posted and dedup-matched branches of submitReview's posting loop now
+ * populate `postedComments` from this map (closes RESEARCH.md Pitfall 1).
+ */
 function buildDedupIndex(items: CommentListingItem[]) {
-  const set = new Set<string>();
+  const map = new Map<string, { id: number; link?: string }>();
   for (const item of items) {
     if (!item.inline) continue;
     const anchor: AnchorShape = {
@@ -643,7 +955,55 @@ function buildDedupIndex(items: CommentListingItem[]) {
       line: item.inline.to ?? item.inline.from ?? 0,
       line_type: item.inline.from !== undefined ? 'removed' : 'added',
     };
-    set.add(deDupKey(item.inline.path, anchor, item.body));
+    map.set(deDupKey(item.inline.path, anchor, item.body), { id: item.id, link: item.links?.html?.href });
   }
-  return set;
+  return map;
+}
+
+/**
+ * Phase 30 (ANNO-01): a small, synchronous, deterministic 32-bit FNV-1a string hash. Exists
+ * purely so two DIFFERENT finding titles at the same `(path, line, category)` never collide on
+ * `buildAnnotation`'s `external_id` (30-REVIEWS.md OpenCode Concern #4 / Suggestion #2) --
+ * non-cryptographic, not used for any security property. `Math.imul` keeps the multiplication
+ * within 32-bit semantics without needing `BigInt`; this needs no crypto import, matching this
+ * file's zero-new-dependency posture.
+ */
+function fnv1aHash(input: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+/**
+ * Phase 30 (ANNO-01): builds one Bitbucket `report_annotation` from a Codra finding.
+ *
+ * - `external_id` combines `path`/`line`/`category` AND a deterministic `fnv1aHash(finding.title)`
+ *   suffix -- two findings sharing the SAME `(path, line, category)` but DIFFERENT titles (e.g.
+ *   two P0 security issues on the same line) must never collide and silently overwrite each
+ *   other via Bitbucket's create-or-update semantics (30-REVIEWS.md OpenCode Concern #4).
+ * - `title`/`summary` are `finding.title` VERBATIM -- D-10/D-12: no redaction, no category/
+ *   confidence padding, no audit-trail metadata. Annotations are posted PR content with the same
+ *   visibility as the inline comment they mirror, NOT the `jobs.audit` operator surface AUD-01
+ *   governs (review-feedback prohibition against expanded disclosure).
+ * - `result` is the LITERAL string `'PASSED'`, never derived from `finding.severity` or any other
+ *   signal (D-02) -- this is intentionally hardcoded so the informational annotation surface can
+ *   never silently become an unexpected new merge-gating signal alongside the existing
+ *   `codra-review` summary report.
+ * - `link` is OMITTED (not fabricated) when `matchedComment` has no `link` (Pitfall 4).
+ */
+function buildAnnotation(finding: ParsedReviewComment, matchedComment: VcsPostedComment | undefined): ReportAnnotation {
+  return {
+    external_id: `codra-${finding.path}-${finding.line ?? 0}-${finding.category}-${fnv1aHash(finding.title)}`,
+    title: finding.title,
+    annotation_type: ANNOTATION_TYPE,
+    severity: ANNOTATION_SEVERITY_MAP[finding.severity],
+    summary: finding.title,
+    result: 'PASSED',
+    path: finding.path,
+    line: finding.line ?? undefined,
+    link: matchedComment?.link,
+  };
 }

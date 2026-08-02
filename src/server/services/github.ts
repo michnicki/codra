@@ -4,7 +4,7 @@ import type { AppBindings } from '../env';
 export class GitHubService {
   private client: GitHubClient;
 
-  constructor(env: AppBindings, installationId: string, tracker?: { incrementSubrequests(count?: number): void }) {
+  constructor(env: AppBindings, installationId: string, tracker?: { incrementSubrequests(count?: number): void; hasRemainingSafeBudget?(needed?: number): boolean }) {
     // Fail fast on a missing/blank installation id: a misconfigured (empty) value must not
     // silently reach the GitHub App auth flow and risk authenticating the wrong installation.
     // Presence-only — installation ids are opaque strings here, not necessarily numeric.
@@ -31,6 +31,39 @@ export class GitHubService {
   // PROV-01 (D-09): compare-diff primitive. BASE...HEAD with `application/vnd.github.diff`.
   async getCompareDiff(owner: string, repo: string, base: string, head: string) {
     return this.client.getCompareDiff(owner, repo, base, head);
+  }
+
+  // PRD-04 (FR-114): per-touched-file commit history. One-line passthrough so the adapter can
+  // reach the client (the GithubAdapter holds a GitHubService, never a GitHubClient).
+  async getFileHistory(owner: string, repo: string, path: string, ref: string, maxCommits: number) {
+    return this.client.getFileHistory(owner, repo, path, ref, maxCommits);
+  }
+
+  // PRD-06 (FR-131, D-05): repository code search backing the agentic `grep_repo` tool. One-line
+  // passthrough, and it MUST exist here: `GithubAdapter` holds a `GitHubService`, never a
+  // `GitHubClient`, so a method present only on the client is unreachable from the adapter -- the
+  // same load-bearing module boundary the QA-IDX-01 comment below spells out. The three-valued return
+  // (`null` = capability unavailable, `[]` = ran with zero matches, entries = matches) passes straight
+  // through; do not coalesce it here.
+  async searchCode(owner: string, repo: string, query: string, maxHits: number) {
+    return this.client.searchCode(owner, repo, query, maxHits);
+  }
+
+  // QA-IDX-01 (D-09): the two reads the index build's tree enumeration needs. Declared HERE and not
+  // only on GitHubClient because `GithubAdapter` holds a `GitHubService`, never a `GitHubClient` --
+  // that module boundary is load-bearing for the three specs that `vi.mock('@server/services/github')`
+  // (see the GithubAdapter class comment). A method missing from this pass-through seam is
+  // unreachable from the adapter.
+  async getRepositoryMetadata(owner: string, repo: string) {
+    return this.client.getRepositoryMetadata(owner, repo);
+  }
+
+  async getBranchCommitSha(owner: string, repo: string, branch: string) {
+    return this.client.getBranchCommitSha(owner, repo, branch);
+  }
+
+  async getTree(owner: string, repo: string, treeIsh: string) {
+    return this.client.getTree(owner, repo, treeIsh);
   }
 
   // PROV-02: GraphQL thread listing (D-05..D-07, R-2). Cursor-paged via the client; the optional
@@ -84,6 +117,13 @@ export class GitHubService {
 
   async updateIssueComment(owner: string, repo: string, commentId: number, body: string) {
     return this.client.updateIssueComment(owner, repo, commentId, body);
+  }
+
+  // Phase 28 (LRN-01): fetch a single pull request review comment by id. Pass-through to the
+  // client's getReviewComment. REQUIRED here so the vi.mock('@server/services/github') seam
+  // intercepts (same pattern as the other comment-primitive pass-throughs above).
+  async getReviewComment(owner: string, repo: string, commentId: number) {
+    return this.client.getReviewComment(owner, repo, commentId);
   }
 
   // Command-authorization pass-through (Phase 11, CMD-08): the adapter re-verifies the returned

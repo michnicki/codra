@@ -31,6 +31,21 @@ export class TokenTracker {
     return this.subrequests + needed <= this.MAX_SUBREQUESTS;
   }
 
+  /**
+   * Confirmed live during the 29-09 UAT checkpoint: `core/bitbucket.ts`'s paginated walks call
+   * `tracker?.hasRemainingSafeBudget?.(needed)` and silently skip the guard when the method is
+   * missing (optional chaining makes the whole check a no-op), which is exactly what happened here
+   * before this method existed -- the tree walk paginated with no budget awareness at all, some
+   * invocations consumed the ENTIRE per-invocation subrequest budget just enumerating the tree, and
+   * the file-processing loop that runs afterward got zero budget and threw "too many subrequests"
+   * before fetching a single file. Bounded by the same safety margin as `remainingSafeBudget()`, not
+   * the raw `hasRemainingSubrequests`, so pagination backs off before the DB writes later in the same
+   * invocation would themselves start hitting the cap.
+   */
+  hasRemainingSafeBudget(needed = 1) {
+    return this.remainingSafeBudget() >= needed;
+  }
+
   isNearLimit() {
     return this.subrequests >= this.MAX_SUBREQUESTS - this.SAFE_MARGIN;
   }

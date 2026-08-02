@@ -2,6 +2,17 @@
 // a plain types module (no logic) that every per-provider adapter (`vcs/github.ts`,
 // and a future `vcs/bitbucket.ts`) implements. Lives in `vcs/`, not `src/shared/`,
 // because these shapes do not cross the worker/client boundary this phase.
+//
+// Phase 30 (ANNO-01): imports ParsedReviewComment from @shared/schema for
+// VcsPostAnnotationsInput.findings. This is a type-only import from a module that has no imports
+// back from vcs/types.ts, so no circular import is introduced.
+import type { ParsedReviewComment } from '@shared/schema';
+// Phase 34 (PRD-04 / FR-114): the per-touched-file commit-history entry, landed as the Wave-1
+// contract in @shared/schema (34-01) and consumed by the optional `getFileHistory?` seam below.
+// Imported, never re-defined — @shared/schema is the single source of truth for the shape.
+// Re-exported so both adapters can import `VcsCommitEntry` from this seam module.
+import type { VcsCommitEntry } from '@shared/schema';
+export type { VcsCommitEntry };
 
 /**
  * Flattened PR metadata. Deliberately NOT the nested `{ head: { sha, ref }, base: {...},
@@ -57,6 +68,11 @@ export type VcsReviewComment = {
   path: string;
   position?: number;
   body: string;
+  // WR-06: the persisted `review_comments.id` (as text), carried so a comment that is NOT posted
+  // can be identified in the audit trail. NEVER reaches the wire — see the fixed 4-key body in
+  // `core/github.ts::createReviewComment`. This replaces the former `title` field, which was inert
+  // at every sink because `redactFindingTitle` collapses every title to one fixed marker.
+  commentId?: string | null;
 };
 
 export type VcsSubmitReviewInput = {
@@ -69,6 +85,64 @@ export type VcsSubmitReviewInput = {
   // composes a single createReview POST that does not need the job id embedded in the body. The
   // field is optional so existing GitHub call sites continue to type-check unchanged.
   jobIdHint?: string;
+};
+
+/**
+ * Phase 30 (ANNO-01, D-11): the shape `submitReview`'s widened return threads per posted-or-
+ * matched comment -- populated for BOTH a freshly-posted comment and a dedup-matched (already
+ * existing) comment, so a re-review round's dedup-skipped comments still carry a `link` (closes
+ * RESEARCH.md Pitfall 1). `link` is optional because a comment's `links.html.href` is not
+ * guaranteed present on every response shape.
+ */
+export type VcsPostedComment = { path: string; line: number; body: string; link?: string };
+
+/**
+ * Phase 33 (PRD-01 / FR-031, D-03/D-04): populated when an inline comment was NOT posted during
+ * `submitReview` -- a per-comment 422 skip (GitHub + Bitbucket), budget exhaustion (GitHub's
+ * per-comment fallback loop), or a comment with no usable anchor at all.
+ *
+ * WR-01 -- COORDINATE SYSTEMS ARE NOT INTERCHANGEABLE ACROSS PROVIDERS (G-28-3, and see the long
+ * note on `getInlineCommentDetails` below). `line` is a HEAD-SIDE LINE NUMBER and `position` is a
+ * DIFF OFFSET; the two fields are separate because they are not the same quantity:
+ *   - Bitbucket anchors by line, so it fills `line` and leaves `position` null.
+ *   - GitHub anchors by diff position, so it fills `position` and leaves `line` null.
+ * This type previously had only `line`, and the GitHub adapter wrote its `position` into it -- so
+ * the viewer rendered "src/foo.ts:3" for a finding at POSITION 3, i.e. a fabricated line number.
+ * Do NOT re-collapse these into one field.
+ *
+ * WR-06: `commentId` is the persisted `review_comments.id` (as text) and is THE identifier here --
+ * it is what lets an operator join a skipped entry back to the exact finding
+ * (`SELECT * FROM review_comments WHERE id = <commentId>`). It replaces a former `title` field that
+ * was inert at every sink: `redactFindingTitle` maps every non-empty title to one fixed marker, so
+ * the audit sample always read `[title-redacted]` no matter what was threaded.
+ *
+ * A DIGEST of the title was considered and rejected: `redactFindingTitle`'s own contract forbids
+ * retaining a "source-derived prefix, digest, length, or other title content", and finding titles
+ * are formulaic enough to be dictionary-attackable over a small plausible-title space. The row id
+ * is not title-derived at all, so it restores operator value at no privacy cost.
+ *
+ * It is a STRING because `review_comments.id` is BIGSERIAL (64-bit) and a JSON number silently
+ * loses precision above 2^53. Do not "simplify" it to a number.
+ *
+ * Consumers (Plan 33-03's aggregate audit event) admit ONLY { path, line, position, commentId } --
+ * body and title never cross this seam (T-13-03-03).
+ */
+export type VcsSkippedComment = {
+  path: string;
+  line: number | null;
+  position?: number | null;
+  commentId?: string | null;
+};
+
+/**
+ * Phase 30 (ANNO-01): input to `postAnnotations?`. `postedComments` is OPTIONAL because a
+ * finalize retry that reuses an already-posted review has none from THIS invocation -- the
+ * caller (Plan 30-04) handles that branch via a type guard.
+ */
+export type VcsPostAnnotationsInput = {
+  commitSha: string;
+  findings: ParsedReviewComment[];
+  postedComments?: VcsPostedComment[];
 };
 
 /**
@@ -89,6 +163,44 @@ export type VcsReviewThread = {
   lineEnd: number;
   rootBody: string;
   outdated: boolean;
+};
+
+/**
+ * Provider-agnostic default-branch tree listing (QA-IDX-01, D-09). Flat by design: the codebase
+ * index only ever needs "which blobs exist, at which commit", so the shape deliberately does NOT
+ * expose per-entry modes, sizes or a nested directory structure that would leak GitHub's
+ * `git/trees` payload (or Bitbucket's `/src` entry shape) into the shared contract.
+ *
+ * `ref` is the resolved default-branch NAME; `sha` is the commit that branch pointed at when the
+ * listing was taken. See `VcsProvider.listDefaultBranchTree` for the `truncated` semantics.
+ */
+export type VcsTreeListing = {
+  ref: string;
+  sha: string;
+  paths: string[];
+  truncated: boolean;
+};
+
+/**
+ * PRD-06 (FR-131): one provider code-search match, as returned by `VcsProvider.searchCode?`.
+ *
+ * `fragment` is the provider's match text UNTRUNCATED. The FR-132 240-byte-per-hit bound is applied
+ * exactly once, in `core/agentic-tools.ts`'s executor, so the bound lives in ONE testable place
+ * instead of being re-implemented per adapter.
+ *
+ * `line` is `number | null`: GitHub's `text_matches[].fragment` carries NO line number, and a
+ * fabricated one would be worse than an absent one (the model would cite a line the provider never
+ * reported). Never guess it.
+ *
+ * `ref` is the ref the hit came from — a LABEL for the prompt, not a fetchable pin. Both providers
+ * index the DEFAULT BRANCH (D-07), so a hit can be stale relative to the pull-request head; the
+ * prompt discloses that and the model re-reads at head with `read_file` when it needs exact content.
+ */
+export type VcsCodeSearchHit = {
+  path: string;
+  fragment: string;
+  line: number | null;
+  ref: string;
 };
 
 /**
@@ -144,6 +256,135 @@ export interface VcsProvider {
    * `context=3&topic=true` (R-5).
    */
   getCompareDiff(owner: string, repo: string, base: string, head: string): Promise<string>;
+
+  /**
+   * PRD-04 (FR-114): fetch recent commits touching a single file for decision-archaeology
+   * context. Returns up to `maxCommits` entries (short hash, subject line, other files
+   * changed in the same commit). The caller filters budget + gates on the config toggle;
+   * this method performs the raw provider call only.
+   *
+   * OPTIONAL, following the `getRepositoryMetadata?` / `postAnnotations?` / `labels?`
+   * feature-detect pattern. A missing method = no history (fail-open, D-06).
+   */
+  getFileHistory?(
+    owner: string,
+    repo: string,
+    path: string,
+    ref: string,
+    maxCommits: number,
+  ): Promise<VcsCommitEntry[]>;
+
+  /**
+   * PRD-06 (FR-131, D-05): literal keyword code search across the repository, backing the
+   * `grep_repo` tool of the bounded agentic-context pass. Returns at most `maxHits` matches.
+   *
+   * OPTIONAL, following the `getFileHistory?` / `getRepositoryMetadata?` / `postAnnotations?`
+   * feature-detect pattern. Callers write `vcs.searchCode?.(...) ?? null`.
+   *
+   * THE RETURN IS THREE-VALUED, and the distinction is load-bearing:
+   *   - `null`  = the capability is UNAVAILABLE for this repository or credential. That covers a
+   *               missing method, an auth-class refusal (401/403), a 404 "search not enabled for this
+   *               repository", and a rate-limit refusal. The caller degrades to `read_file`-only and
+   *               STATES the degradation to the model rather than pretending zero matches (the
+   *               `transparency` prohibition of PRD-06).
+   *   - `[]`    = search RAN and found nothing. A real result, not a failure — same convention as
+   *               `getCompareDiff`'s empty-string return (D-09).
+   *   - entries = matches, newest-provider-order, `fragment` untruncated.
+   *
+   * Throws ONLY on transport failures and 5xx, so a genuine provider outage is never masked as
+   * "unsupported".
+   *
+   * D-07 REF SEMANTICS: both providers index the repository's DEFAULT BRANCH, never the pull-request
+   * head. `VcsCodeSearchHit.ref` is therefore a disclosure label; the agentic prompt says so and the
+   * model re-reads a file at head via `getFileContent` before asserting anything about exact content.
+   *
+   * There is deliberately NO `supportsCodeSearch` flag on `VcsCapabilities`: the optional method plus
+   * the `null` return already express both the static capability and its runtime downgrade, and a flag
+   * no consumer branches on is exactly what that type's doc comment warns against.
+   */
+  searchCode?(
+    owner: string,
+    repo: string,
+    query: string,
+    maxHits: number,
+  ): Promise<VcsCodeSearchHit[] | null>;
+
+  /**
+   * List the blob paths of the repository's DEFAULT branch (QA-IDX-01, D-09).
+   *
+   * The adapter RESOLVES THE DEFAULT BRANCH ITSELF. There is no webhook payload on the
+   * dashboard-triggered index-build path (D-07: the build is started by a button, not by a push),
+   * so the caller has no branch to supply. The resolved commit sha is returned ALONGSIDE the paths
+   * so the caller can persist `indexed_sha` (D-12) without a second round trip.
+   *
+   * `paths` contains BLOBS ONLY -- no directories -- as repo-root-absolute paths, UNSORTED. GitHub
+   * `tree` entries (directories) and `commit` entries (submodules) are dropped; Bitbucket
+   * `commit_directory` entries are dropped. A submodule's content is not in this repository, so an
+   * indexer must never try to read it as a file.
+   *
+   * `truncated` is true when the provider could not return the whole tree within its own limits:
+   * GitHub sets it above 100 000 entries or 7 MB on the recursive `git/trees` endpoint; the
+   * Bitbucket adapter sets it when its internal page budget is exhausted. A truncated result is
+   * USABLE but PARTIAL -- never returned silently, mirroring the D-09 "empty string is a real
+   * result" convention on `getCompareDiff`.
+   *
+   * ORDERING CONSEQUENCE OF TRUNCATION (read this before adding a max-files cap). The PROVIDER
+   * chooses which prefix of the tree to return, and that choice is ARBITRARY -- it is not
+   * priority-ordered in any way the consumer can influence. A consumer's priority sort (`scorePath`)
+   * therefore runs AFTER the truncation, so on a repository large enough to truncate, a
+   * high-priority path (an auth or crypto file) can be absent from the candidate pool ENTIRELY and
+   * no amount of downstream ranking recovers it. Two alternatives were considered and rejected:
+   * reordering the prefix server-side is impossible because the provider already made the cut, and
+   * re-walking per directory to beat truncation would cost thousands of subrequests against a
+   * 50-per-invocation budget. The ACCEPTED MITIGATION is disclosure -- `truncated` is persisted on
+   * the build-state row and rendered by the dashboard panel as a partial-index indication -- so an
+   * operator on a very large repository knows the index is a partial view rather than believing it
+   * is complete.
+   *
+   * Throws on any non-2xx that is NOT a documented degradation, so a real failure is not masked.
+   * That includes a provider that reports no default branch at all: both adapters throw rather than
+   * guessing a conventional branch name, because indexing a branch the operator did not choose is a
+   * worse failure than a loud one.
+   *
+   * BOTH adapters implement this (NREG-02) and there is deliberately NO capability flag. Neither
+   * provider LACKS the capability -- GitHub does it in one recursive call, Bitbucket in a paginated
+   * `/src` walk -- so they differ only in COST, which `truncated` plus the adapter-internal page
+   * budget already express. A flag here would be a flag no consumer ever branches on, exactly what
+   * the `VcsCapabilities` doc comment warns against.
+   */
+  listDefaultBranchTree(owner: string, repo: string): Promise<VcsTreeListing>;
+
+  /**
+   * Repository metadata read narrowed to `mainbranch` (QA-IDX-01, D-08). The `repo:push` webhook
+   * branch resolves the repository's main branch through this method — Bitbucket's push payload
+   * carries no default-branch field (unlike GitHub's, which carries `default_branch` on the
+   * payload), so the Bitbucket route spends one subrequest to learn it.
+   *
+   * OPTIONAL, following the `labels?` feature-detect pattern: only the Bitbucket adapter implements
+   * it today. GitHub's push branch reads the default branch off the payload and has no use for the
+   * call, so callers must feature-detect with `provider.getRepositoryMetadata?.(...)` rather than
+   * assume it. `mainbranch` may be absent on the response (a repository with no main branch
+   * configured) — the caller treats that as "cannot resolve" rather than guessing a conventional
+   * branch name, the same discipline `listDefaultBranchTree` throws on.
+   */
+  getRepositoryMetadata?(owner: string, repo: string): Promise<{ mainbranch?: { name?: string } }>;
+
+  /**
+   * ANNO-01: bulk-create-or-replace Code Insights annotations mirroring the findings already
+   * posted as inline comments (D-07/D-08 -- exact mirror, no independent selection/cap).
+   *
+   * OPTIONAL, following the `getRepositoryMetadata?`/`labels?` feature-detect pattern: GitHub has
+   * no Code Insights concept (NREG-02 by exclusion) and MUST NOT implement this method -- callers
+   * feature-detect with `vcs.postAnnotations?.(...)` (mirroring the `labels?` block's
+   * `if (vcs.labels && ...)` convention at `core/review.ts:2797`) rather than assume every
+   * provider has it.
+   */
+  postAnnotations?(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    input: VcsPostAnnotationsInput,
+  ): Promise<void>;
 
   /**
    * Resolve the bot's own immutable identity for the comment self-filter (Phase 11, CMD-07). Returns
@@ -203,7 +444,7 @@ export interface VcsProvider {
    */
   updateStatusCheck(owner: string, repo: string, ref: string, input: VcsUpdateStatusCheckInput): Promise<void>;
 
-  submitReview(owner: string, repo: string, prNumber: number, input: VcsSubmitReviewInput): Promise<{ ref: string }>;
+  submitReview(owner: string, repo: string, prNumber: number, input: VcsSubmitReviewInput): Promise<{ ref: string; postedComments?: VcsPostedComment[]; skippedComments?: VcsSkippedComment[] }>;
   findExistingReviewForCommit(owner: string, repo: string, prNumber: number, commitSha: string): Promise<{ ref: string } | null>;
 
   /**
@@ -286,6 +527,42 @@ export interface VcsProvider {
     authorId: string,
     authorLogin?: string,
   ): Promise<'admin' | 'write' | 'read' | 'none' | null>;
+
+  /**
+   * Fetch the details of an inline PR review comment by its provider-opaque ref (LRN-01, D-01).
+   * Returns the comment's file path, line number, and body text, or null if the comment doesn't
+   * exist (404), was deleted, or is not an inline comment (no `inline` object on Bitbucket, no
+   * `path` on GitHub issue comments).
+   *
+   * Used by the reject handler to resolve finding metadata at reject time: the `finding_ref` in
+   * `reject_feedback` is the provider's comment id, and this method translates it to the
+   * (path, line, body) triple needed to join against `review_comments`.
+   *
+   * `commentRef` is PROVIDER-OPAQUE — the adapter alone interprets it. GitHub uses the bare
+   * numeric `pull_request_review_comment.id`; Bitbucket uses the comment id from the PR comments
+   * endpoint.
+   *
+   * COORDINATE SYSTEMS ARE NOT INTERCHANGEABLE ACROSS PROVIDERS (G-28-3). GitHub anchors an inline
+   * comment by its diff `position` — `core/github.ts createReview` posts `{ path, position, body }`
+   * and never sends `line`, and the `line` GitHub reports back is re-derived from that position
+   * against the CURRENT diff, so it drifts from the line Codra persisted. Bitbucket has no diff
+   * offset at all: it anchors by `inline.to ?? inline.from`, i.e. a LINE, on both the post and the
+   * read path, and therefore reports `position: null`.
+   *
+   * Consequence for consumers: select the coordinate PER PROVIDER (GitHub -> `position`,
+   * Bitbucket -> `line`) rather than assuming `line` is comparable across providers. Matching a
+   * GitHub comment on `line` is the exact defect G-28-3 documents.
+   *
+   * Error handling: returns null on 404/deleted/comment-not-found (never throws for missing
+   * comments). Throws on auth errors, 5xx, or network failures so the caller can distinguish
+   * "comment doesn't exist" from "provider is down".
+   */
+  getInlineCommentDetails(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    commentRef: string,
+  ): Promise<{ path: string; line: number | null; position: number | null; body: string } | null>;
 
   labels?: {
     ensure(owner: string, repo: string, name: string, color: string): Promise<void>;

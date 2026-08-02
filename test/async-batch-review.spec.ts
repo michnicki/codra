@@ -35,7 +35,7 @@ const reviewFileSpy = vi.fn();
 vi.mock('@server/services/model', () => {
   class MockModelService {
     async submitReviewBatch() {
-      return { requestId: 'req-async-1', model: '@cf/moonshotai/kimi-k2.6' };
+      return { requestId: 'req-async-1', model: '@cf/moonshotai/kimi-k2.6', modelLineCap: 800 };
     }
     async pollReviewBatch() {
       pollCalls.count += 1;

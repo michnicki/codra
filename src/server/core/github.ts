@@ -2,6 +2,14 @@ import type { AppBindings } from '@server/env';
 import { withTimeout } from '@server/core/timeout';
 import { logger } from '@server/core/logger';
 import type { BotIdentityResolver } from '@server/core/bot-identity';
+// Phase 34 (PRD-04 / FR-114): Wave-1 contract from @shared/schema (34-01). Imported, never
+// re-defined — the shape is shared with the prompt builder and both providers' adapters.
+import type { VcsCommitEntry } from '@shared/schema';
+// Phase 35 (PRD-06 / FR-131): the code-search hit shape, declared on the provider seam by 35-01.
+// Imported, never re-defined, so `searchCode`'s return type IS the seam's return type. Type-only and
+// therefore erased at runtime -- and `vcs/types.ts` has no import back from here, so the module graph
+// stays acyclic (`vcs/github.ts` -> `core/github.ts` remains the only edge between these two areas).
+import type { VcsCodeSearchHit } from '@server/vcs/types';
 
 export class GitHubError extends Error {
   constructor(
@@ -71,6 +79,18 @@ const GITHUB_TIMEOUT_MS = 30_000;
 const GITHUB_APP_INSTALL_URL_CACHE_KEY = 'github:app_installation_url';
 const GITHUB_REPOSITORIES_PER_PAGE = 100;
 const GITHUB_REPOSITORY_PAGE_LIMIT = 100;
+/** PRD-06 (FR-131): the code-search endpoint. Global, NOT under `/repos/{owner}/{repo}` -- the
+ * repository is pinned by the `repo:owner/name` qualifier inside `q` (see `GitHubClient.searchCode`). */
+const GITHUB_CODE_SEARCH_PATH = '/search/code';
+/**
+ * D-07 disclosure label carried on every code-search hit's `ref`.
+ *
+ * A LABEL, deliberately not a resolvable ref and never a SHA: GitHub indexes only the repository's
+ * DEFAULT BRANCH, so a hit can be stale relative to the pull-request head. Resolving the real
+ * default-branch name would cost a second subrequest per grep for a string the model only uses as a
+ * staleness warning, and the model re-reads at head via `read_file` when it needs exact content.
+ */
+const GITHUB_CODE_SEARCH_REF_LABEL = 'default branch';
 
 type InstallationTokenCacheRecord = {
   token: string;
@@ -96,7 +116,36 @@ export type GitHubReviewComment = {
   path: string;
   position?: number;
   body: string;
+  // WR-06: the persisted `review_comments.id` (as text), used ONLY to identify a comment that was
+  // not posted. Never on the wire — `createReviewComment` sends a fixed 4-key body.
+  commentId?: string | null;
 };
+
+/**
+ * FR-031 (D-01) skip record. `position` is the comment's DIFF OFFSET, null when the comment had no
+ * usable position at all (WR-04's batch-filter drop path). It is deliberately NOT called `line`:
+ * a GitHub diff position is not a head-side line number, and conflating the two is the exact
+ * defect G-28-3 documents (see the COORDINATE SYSTEMS note on `vcs/types.ts::getInlineCommentDetails`).
+ *
+ * WR-06: `commentId` is the persisted `review_comments.id`, the identifier an operator joins on.
+ */
+export type GitHubSkippedComment = {
+  path: string;
+  position: number | null;
+  commentId?: string | null;
+};
+
+/**
+ * WR-04: THE predicate for "GitHub can anchor this comment", shared by the batch body and the
+ * per-comment fallback. GitHub diff positions are 1-based, so 0 is not a valid anchor and the
+ * `> 0` check makes the two former predicates (`comment.position` truthiness vs.
+ * `typeof comment.position === 'number'`) agree on every input.
+ */
+function hasReviewPosition(
+  comment: GitHubReviewComment,
+): comment is GitHubReviewComment & { position: number } {
+  return typeof comment.position === 'number' && comment.position > 0;
+}
 
 type GitHubIssueLabel = {
   name?: string;
@@ -199,7 +248,7 @@ export class GitHubClient {
       'APP_KV' | 'APP_PRIVATE_KEY' | 'GITHUB_APP_ID' | 'BOT_USERNAME' | 'GITHUB_APP_SLUG'
     >,
     private readonly installationId: string,
-    private readonly tracker?: { incrementSubrequests(count?: number): void },
+    private readonly tracker?: { incrementSubrequests(count?: number): void; hasRemainingSafeBudget?(needed?: number): boolean },
   ) {}
 
   // In-memory token cache scoped to this client instance (i.e. one Worker invocation). Without it,
@@ -489,6 +538,223 @@ export class GitHubClient {
     });
   }
 
+  // PRD-04 (FR-114): per-touched-file commit history for decision-archaeology context. One
+  // subrequest per file. Any non-2xx (including 404 for a path with no commits on this ref)
+  // throws GitHubError; the caller catches and skips that file's history (fail-open, D-06).
+  //
+  // CR-01 (34-REVIEW): `filesAvailable` is DERIVED from the response, never asserted. GitHub's
+  // LIST-commits endpoint (`GET /repos/{o}/{r}/commits`) does NOT return `files[]` or `stats` —
+  // only the single-commit (`GET /commits/{ref}`) and compare endpoints do. The earlier
+  // hardcoded `filesAvailable: true` therefore made every production entry claim "this commit
+  // touched only this file" (`buildFileHistoryBlock` renders `(none — only this file)` for an
+  // empty list when the flag is true), which is exactly the misdirection `filesAvailable: false`
+  // was introduced for on Bitbucket (T-34-02-03). Deriving the flag makes GitHub render the
+  // honest "(files list not available)". Populating the manifest for real would cost one extra
+  // `GET /commits/{sha}` subrequest PER COMMIT and must be budget-gated — a feature decision,
+  // deliberately not taken here.
+  async getFileHistory(owner: string, repo: string, path: string, ref: string, maxCommits: number): Promise<VcsCommitEntry[]> {
+    const query = `path=${encodeURIComponent(path)}&sha=${encodeURIComponent(ref)}&per_page=${maxCommits}`;
+    return withRetry(`getFileHistory ${owner}/${repo} ${path}@${ref}`, async () => {
+      const response = await this.requestAndCheck(
+        `${repoApiPath(owner, repo)}/commits?${query}`,
+      );
+      const commits = (await response.json()) as Array<{
+        sha: string;
+        commit: { message: string };
+        files?: Array<{ filename: string }>;
+      }>;
+      return commits.map((c) => {
+        // `null` = the response carried no manifest at all (the list endpoint's real shape);
+        // `[]` = the response carried an EMPTY manifest (a commit that genuinely touched
+        // nothing else, only reachable via a response shape that does include `files`).
+        const manifest = Array.isArray(c.files) ? c.files : null;
+        return {
+          hash: c.sha.slice(0, 7),
+          message: c.commit.message.split('\n')[0] ?? '',
+          files: (manifest ?? []).map((f) => f.filename).filter((f) => f !== path),
+          filesAvailable: manifest !== null,
+        };
+      });
+    });
+  }
+
+  // PRD-06 (FR-131, D-05): repository code search backing the agentic `grep_repo` tool. ONE
+  // subrequest per call regardless of repository size -- that fixed cost is the whole reason grep_repo
+  // is API-backed rather than a fetch-and-scan, which would cost one subrequest PER FILE SCANNED and
+  // could consume the entire 50-per-invocation Cloudflare budget in a single grep.
+  //
+  // NOT WRAPPED IN `withRetry`, DELIBERATELY, unlike every sibling method on this client.
+  // `/search/code` is rate-limited to 10 requests per MINUTE per installation (a third of every other
+  // GitHub search endpoint). `withRetry` retries a 429 and any 5xx with a 2s/4s backoff, which on this
+  // endpoint would spend the invocation's remaining budget hammering a limit that cannot be cleared
+  // inside one job, and several concurrent jobs on one installation would compound it (T-35-12). A
+  // failed search degrades one tool call; it is never worth a retry storm.
+  //
+  // Uses `this.request` (NOT `requestAndCheck`) so the status is a CONTROL-FLOW SIGNAL -- the third
+  // instance of that idiom on this client, after `getRepoFileOrNull` and `updateIssueComment`.
+  // Do NOT call `tracker.incrementSubrequests` here: `request` already self-increments (:406).
+  //
+  // GITHUB-SIDE LIMITATIONS, stated here because a caller cannot infer them from the return shape:
+  //   - only the repository's DEFAULT BRANCH is indexed, so a hit can be stale relative to the
+  //     pull-request head. Every hit is labelled accordingly (D-07) and never as head content.
+  //   - only files under 384 KB are searchable at all; a larger file simply never matches.
+  //   - the 10-requests-per-minute limit is per INSTALLATION, not per repository or per job.
+  //   - the query is KEYWORD-plus-qualifier, not a regex, and is capped at 256 characters and five
+  //     boolean operators.
+  async searchCode(
+    owner: string,
+    repo: string,
+    query: string,
+    maxHits: number,
+  ): Promise<VcsCodeSearchHit[] | null> {
+    // T-35-07: the repository-scoping qualifier is built from the pinned owner/repo the job already
+    // resolved and is NEVER model-supplied; `query` is the only model-supplied part, and it arrives
+    // already length-clamped and newline-stripped by the executor (AGENTIC_MAX_QUERY_CHARS).
+    const q = `${query} repo:${owner}/${repo}`;
+    // GitHub's `per_page` is a closed 1..100 range; anything outside it is a 422.
+    const perPage = Math.min(Math.max(maxHits, 1), 100);
+    const response = await this.request(
+      `${GITHUB_CODE_SEARCH_PATH}?q=${encodeURIComponent(q)}&per_page=${perPage}`,
+      {},
+      // REQUIRED, not an optimisation: without this media type the response carries no `text_matches`
+      // key at all, so there is no fragment to show the model and the call returns nothing useful.
+      'application/vnd.github.text-match+json',
+    );
+
+    if (response.status === 403 || response.status === 429) {
+      // Rate limiting on a 10-per-minute-per-installation endpoint. `null` stands the capability DOWN
+      // for the rest of the invocation (the executor flips `grepSupported` false and tells the model),
+      // which is strictly better than spending more subrequests on a limit this job cannot clear.
+      return null;
+    }
+    if (response.status === 422) {
+      // A QUERY problem, not a capability problem: over 256 characters, more than five boolean
+      // operators, no search TERM at all (a bare `repo:o/n language:ts` is invalid), or a repository
+      // qualifier the installation token cannot access. Returning `null` here would wrongly kill
+      // grep_repo for the whole run over one bad query, so this branch returns `[]` -- capability intact.
+      //
+      // THIS IS ALSO THE DOCUMENTED BACKSTOP for the one case `AGENTIC_MAX_QUERY_CHARS = 120` cannot
+      // cover by arithmetic: 120 leaves 130 characters of owner+repo headroom under the 256-character
+      // `q` limit once ` repo:{owner}/{repo}` is appended (6 characters plus owner plus repo), and a
+      // pathological 39-character owner with a 100-character repository name exceeds that. If a future
+      // maintainer raises that constant, this branch absorbs the overflow as one degraded query rather
+      // than as a production capability outage (35-REVIEWS.md, OpenCode Suggestion #6).
+      return [];
+    }
+    if (!response.ok) {
+      // Everything else -- including 5xx -- THROWS, so a genuine GitHub outage is never reported to the
+      // operator (or to the model) as "search unavailable for this repository" (T-35-13).
+      const errText = await response.text();
+      throw new GitHubError(
+        response.status,
+        errText,
+        GITHUB_CODE_SEARCH_PATH,
+        `GitHub code search failed with ${response.status}: ${errText}`,
+      );
+    }
+
+    // T-35-11: an untrusted provider payload is being mapped into a type that reaches a prompt. Only
+    // `path` and `fragment` are read, both are type-checked before use, and a malformed entry is
+    // SKIPPED rather than trusted -- no provider payload shape escapes this method into core/.
+    const data = (await response.json()) as {
+      items?: Array<{ path?: unknown; text_matches?: Array<{ fragment?: unknown }> }>;
+    };
+    const hits: VcsCodeSearchHit[] = [];
+    for (const item of data.items ?? []) {
+      if (hits.length >= maxHits) break;
+      if (typeof item.path !== 'string') continue;
+      for (const match of item.text_matches ?? []) {
+        // Checked BEFORE the push, not after, so a `maxHits` of 0 returns an empty array rather than
+        // one hit -- the returned array never exceeds maxHits even though `per_page` clamps up to 1.
+        if (hits.length >= maxHits) break;
+        if (typeof match.fragment !== 'string') continue;
+        hits.push({
+          path: item.path,
+          // UNTRUNCATED ON PURPOSE. The FR-132 240-bytes-per-hit bound is applied exactly once, in
+          // `core/agentic-tools.ts`'s executor, so the bound lives in ONE testable place instead of
+          // being re-implemented per adapter. Do not slice here.
+          fragment: match.fragment,
+          // GitHub's text-match fragments carry NO line number. A fabricated one would be worse than
+          // an absent one -- the model would cite a line the provider never reported. Never guess it.
+          line: null,
+          // D-07: a LABEL for the prompt, not a fetchable pin, and never the pull-request head SHA.
+          ref: GITHUB_CODE_SEARCH_REF_LABEL,
+        });
+      }
+    }
+    return hits;
+  }
+
+  // QA-IDX-01 (D-09): repository metadata read, used ONLY to resolve the default branch for the
+  // index build. Narrowed to the two branch fields on purpose -- the endpoint returns ~100 keys and
+  // the seam has no business carrying any of the rest. `master_branch` is the legacy alias some
+  // very old repositories still report; the adapter prefers `default_branch` and falls back.
+  async getRepositoryMetadata(owner: string, repo: string) {
+    return withRetry(`getRepositoryMetadata ${owner}/${repo}`, async () => {
+      const response = await this.requestAndCheck(repoApiPath(owner, repo));
+      return (await response.json()) as { default_branch?: string; master_branch?: string };
+    });
+  }
+
+  // QA-IDX-01 (D-12): resolve a branch name to the COMMIT it points at.
+  //
+  // This exists because `getTree` below CANNOT supply it. The trees endpoint echoes back the TREE
+  // sha, never the commit sha -- passing a branch name resolves to that branch head's root tree and
+  // `response.sha` is that tree's object id. A tree sha is not a valid `compare` operand and is not
+  // what `code_index_state.indexed_sha` means ("the commit the window's content was read at",
+  // migration 018), so returning it would put a value in that column that the incremental-refresh
+  // path cannot use. One extra subrequest buys a correct commit sha; it also makes the GitHub adapter
+  // structurally symmetric with the Bitbucket one, which needs the same read for the same reason.
+  //
+  // Returns null on 404 (no such branch) so the adapter can distinguish that from a transport
+  // failure; any other non-2xx throws.
+  async getBranchCommitSha(owner: string, repo: string, branch: string): Promise<string | null> {
+    return withRetry(`getBranchCommitSha ${owner}/${repo}@${branch}`, async () => {
+      try {
+        const response = await this.requestAndCheck(
+          `${repoApiPath(owner, repo)}/branches/${encodeGitHubContentPath(branch)}`,
+        );
+        const data = (await response.json()) as { commit?: { sha?: string } };
+        const sha = data.commit?.sha;
+        return typeof sha === 'string' && sha.length > 0 ? sha : null;
+      } catch (error) {
+        if (error instanceof GitHubError && error.status === 404) {
+          return null;
+        }
+        throw error;
+      }
+    });
+  }
+
+  // QA-IDX-01 (D-09): one recursive tree read enumerates the whole default branch.
+  //
+  // The `tree_sha` path segment ACCEPTS A REF NAME, not just a SHA1 [CITED:
+  // docs.github.com/en/rest/git/trees -- "Returns a single tree using the SHA1 value or ref name for
+  // that tree"], so the branch name works directly and no separate ref-resolution call is needed.
+  // That is what keeps the whole GitHub enumeration at 2 subrequests (one repo read for the default
+  // branch, this one tree read).
+  //
+  // `recursive=1` is what makes it ONE call instead of a per-directory walk, and it is also what
+  // introduces the truncation case: the recursive endpoint sets `truncated: true` above 100 000
+  // entries or 7 MB and returns an arbitrary prefix. The flag is surfaced verbatim to the adapter --
+  // see the `listDefaultBranchTree` doc comment in vcs/types.ts for why swallowing it would be a
+  // silent partial index.
+  //
+  // NOTE the returned `sha` is the TREE sha, NOT the commit sha -- see `getBranchCommitSha` above.
+  // The adapter deliberately discards it.
+  async getTree(owner: string, repo: string, treeIsh: string) {
+    return withRetry(`getTree ${owner}/${repo}@${treeIsh}`, async () => {
+      const response = await this.requestAndCheck(
+        `${repoApiPath(owner, repo)}/git/trees/${encodeURIComponent(treeIsh)}?recursive=1`,
+      );
+      return (await response.json()) as {
+        sha: string;
+        truncated: boolean;
+        tree: Array<{ path: string; type: 'blob' | 'tree' | 'commit'; sha: string; size?: number }>;
+      };
+    });
+  }
+
   // --- PROV-02 GraphQL plumbing (review-thread listing + resolution) ---
   //
   // The thread family (D-05..D-07) is exposed only via GraphQL -- the REST review-comment endpoint
@@ -770,22 +1036,48 @@ export class GitHubClient {
       body: string;
       comments: GitHubReviewComment[];
     },
-  ) {
-    return withRetry(`createReview ${owner}/${repo}#${pullNumber}`, async () => {
+  ): Promise<{ id: number; skippedComments?: GitHubSkippedComment[] }> {
+    // WR-04: ONE predicate for "this comment can be posted", used by BOTH the batch body and the
+    // per-comment fallback. The two sites previously disagreed on `position === 0` -- truthiness
+    // excluded it from the batch while `typeof === 'number'` included it in the fallback -- so the
+    // same comment was simultaneously un-postable and postable depending on which path ran.
+    const positionedComments = input.comments.filter(hasReviewPosition);
+    // WR-04: comments GitHub can never anchor were silently filtered out of the batch body and
+    // never recorded anywhere. They are findings that did not post, which is exactly what the
+    // `skippedComments` seam exists to answer, so they are surfaced with `position: null`.
+    const unpositionedSkips: GitHubSkippedComment[] = input.comments
+      .filter((comment) => !hasReviewPosition(comment))
+      .map((comment) => ({ path: comment.path, position: null, commentId: comment.commentId }));
+    if (unpositionedSkips.length > 0) {
+      logger.warn(`GitHub review comments dropped: no usable diff position`, {
+        owner,
+        repo,
+        pullNumber,
+        reason: 'no_position',
+        count: unpositionedSkips.length,
+      });
+    }
+
+    const reviewPath = `${repoApiPath(owner, repo)}/pulls/${pullNumber}/reviews`;
+
+    // CR-02: the RETRIED unit is ONLY the idempotent `/reviews` POST(s). The per-comment fallback
+    // loop used to live inside this closure, so one transient 5xx/timeout on the k-th per-comment
+    // POST replayed the ENTIRE operation: a duplicate summary review on the PR plus k-1 duplicate
+    // inline comments. Nothing in that replay was idempotent -- the GitHub path has no dedup index
+    // (unlike Bitbucket's buildDedupIndex) and the loop has no persisted cursor. Hoisting the loop
+    // out keeps the retry semantics the endpoint actually supports.
+    const { id, needsFallback } = await withRetry(`createReview ${owner}/${repo}#${pullNumber}`, async () => {
       const body = {
         commit_id: input.commitSha,
         event: input.event,
         body: input.body,
-        comments: input.comments
-          .filter((comment) => comment.position)
-          .map((comment) => ({
-            path: comment.path,
-            position: comment.position,
-            body: comment.body,
-          })),
+        comments: positionedComments.map((comment) => ({
+          path: comment.path,
+          position: comment.position,
+          body: comment.body,
+        })),
       };
 
-      const reviewPath = `${repoApiPath(owner, repo)}/pulls/${pullNumber}/reviews`;
       let response = await this.request(reviewPath, {
         method: 'POST',
         headers: {
@@ -794,7 +1086,9 @@ export class GitHubClient {
         body: JSON.stringify(body),
       });
 
+      let batchWas422 = false;
       if (response.status === 422 && body.comments.length > 0) {
+        batchWas422 = true;
         logger.warn(`GitHub review creation failed with 422, retrying without inline comments`, {
           owner,
           repo,
@@ -824,8 +1118,82 @@ export class GitHubClient {
         );
       }
 
-      return (await response.json()) as { id: number };
+      const review = (await response.json()) as { id: number };
+      return { id: review.id, needsFallback: batchWas422 };
     });
+
+    // FR-031 (D-01): the summary-only retry is the base; when it SUCCEEDS and there were inline
+    // comments, post each positioned comment individually. Worst case N+1 subrequests (1 summary
+    // retry + N per-comment posts), all tracker-accounted via `request()`/`requestAndCheck`.
+    const skipped = needsFallback
+      ? await this.postCommentsIndividually(owner, repo, pullNumber, input.commitSha, positionedComments)
+      : [];
+    const allSkipped = [...unpositionedSkips, ...skipped];
+
+    return allSkipped.length > 0 ? { id, skippedComments: allSkipped } : { id };
+  }
+
+  /**
+   * FR-031 (D-01) batch-422 fallback: post each positioned comment on its own.
+   *
+   * CR-02: deliberately NOT wrapped in `withRetry`. Every iteration is a side-effecting POST with
+   * no dedup key and no cursor, so replaying the loop double-posts everything that already
+   * succeeded. `createReviewComment` keeps its OWN inner retry, which is safe because that retries
+   * a single un-acknowledged POST rather than a partially-applied sequence.
+   *
+   * The `hasRemainingSafeBudget` guard (SAFE_MARGIN = 25, core/token-tracker.ts:20) stops the loop
+   * before the invocation budget is exhausted, so the fallback can never strand an already-posted
+   * summary review behind a "too many subrequests" failure.
+   */
+  private async postCommentsIndividually(
+    owner: string,
+    repo: string,
+    pullNumber: number,
+    commitSha: string,
+    positionedComments: (GitHubReviewComment & { position: number })[],
+  ): Promise<GitHubSkippedComment[]> {
+    const skipped: GitHubSkippedComment[] = [];
+    for (let i = 0; i < positionedComments.length; i++) {
+      const comment = positionedComments[i];
+      if (this.tracker?.hasRemainingSafeBudget?.(1) === false) {
+        const remaining = positionedComments.length - i;
+        logger.warn(`GitHub per-comment review comment loop stopped: subrequest budget exhausted`, {
+          owner,
+          repo,
+          pullNumber,
+          reason: 'budget_exhausted',
+          remaining,
+        });
+        skipped.push(
+          ...positionedComments
+            .slice(i)
+            .map((c) => ({ path: c.path, position: c.position, commentId: c.commentId })),
+        );
+        break;
+      }
+      try {
+        await this.createReviewComment(owner, repo, pullNumber, commitSha, comment);
+      } catch (error) {
+        if (error instanceof GitHubError && error.status === 422) {
+          logger.warn(`GitHub per-comment review comment failed with 422, skipping`, {
+            owner,
+            repo,
+            pullNumber,
+            path: comment.path,
+            position: comment.position,
+            // WR-05/WR-06: the model-supplied title is no longer carried at all, so there is
+            // nothing here to redact -- the `review_comments.id` is title-free by construction and
+            // is what an operator actually needs to find the finding.
+            commentId: comment.commentId,
+            reason: 'unprocessable',
+          });
+          skipped.push({ path: comment.path, position: comment.position, commentId: comment.commentId });
+        } else {
+          throw error;
+        }
+      }
+    }
+    return skipped;
   }
 
   // Returns a review this app already posted on the given commit, if one exists. Used by finalize
@@ -892,6 +1260,36 @@ export class GitHubClient {
     });
   }
 
+  // Per-comment POST used by createReview's batch-422 fallback (FR-031, D-01). Mirrors
+  // createReviewCommentReply EXACTLY but targets the pull comments route with the comment's own
+  // anchor. `position` is REQUIRED at the signature level (`& { position: number }`): GitHub's
+  // review-comments API rejects a payload without it, and an undefined position would itself 422.
+  // The body is a fixed 4-key literal -- `title` is NEVER on the wire (GitHub rejects unknown
+  // keys on this endpoint), and no extraneous GitHubReviewComment property can reach it either.
+  async createReviewComment(
+    owner: string,
+    repo: string,
+    pullNumber: number,
+    commitSha: string,
+    comment: GitHubReviewComment & { position: number },
+  ): Promise<{ id: number }> {
+    return withRetry(`createReviewComment ${owner}/${repo}#${pullNumber}`, async () => {
+      const response = await this.requestAndCheck(`${repoApiPath(owner, repo)}/pulls/${pullNumber}/comments`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          body: comment.body,
+          commit_id: commitSha,
+          path: comment.path,
+          position: comment.position,
+        }),
+      });
+      return (await response.json()) as { id: number };
+    });
+  }
+
   // Single page of 100 issue comments. Two caveats (review F7):
   //   (a) 100-cap: the first 100 comments suffice for any realistic PR (same rationale as
   //       findBotReviewForCommit); a PR needing >100 scanned is pathological.
@@ -940,6 +1338,41 @@ export class GitHubClient {
         );
       }
       return (await response.json()) as { id: number };
+    });
+  }
+
+  // Phase 28 (LRN-01): fetch a single pull request review comment by its id. Returns the comment's
+  // `path`, `line`, `position` and `body`, or null on 404 (deleted comment). Uses this.request (NOT
+  // requestAndCheck) so 404 returns null instead of throwing — same pattern as updateIssueComment
+  // and getRepoFileOrNull. Any OTHER non-2xx still throws a GitHubError.
+  //
+  // `position` is the DIFF OFFSET the comment was posted at — the coordinate `createReview` above
+  // actually sends (`{ path, position, body }`) and therefore the only coordinate that round-trips
+  // against `review_comments.position`. `line` is re-derived by GitHub from that position against
+  // the current diff and drifts from the line Codra persisted, so it must NOT be used to join
+  // enrichment lookups (G-28-3). Both are surfaced; the consumer picks per provider.
+  async getReviewComment(owner: string, repo: string, commentId: number) {
+    return withRetry(`getReviewComment ${owner}/${repo} comment#${commentId}`, async () => {
+      const commentPath = `${repoApiPath(owner, repo)}/pulls/comments/${commentId}`;
+      const response = await this.request(commentPath);
+      if (response.status === 404) {
+        return null;
+      }
+      if (!response.ok) {
+        let errText: string;
+        try {
+          errText = await response.text();
+        } catch {
+          errText = String(response.status);
+        }
+        throw new GitHubError(
+          response.status,
+          errText,
+          commentPath,
+          `GitHub review comment fetch failed with ${response.status}: ${errText}`,
+        );
+      }
+      return (await response.json()) as { path: string; line: number | null; position: number | null; body: string };
     });
   }
 

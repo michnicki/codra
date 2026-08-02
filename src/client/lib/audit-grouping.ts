@@ -12,17 +12,56 @@ import type { JobAuditEvent } from '@shared/schema';
 // adds `ensemble` (one per `ensemble.voted` event) and `walkthrough` (one per `walkthrough.enrichment`
 // event).
 export const STAGE_ORDER = [
+  // WR-03: `yaml_config_parse_failed` (Phase 34) had NO display group, so `groupAuditByStage`
+  // dropped it silently. Config resolution runs before file selection, hence first.
+  'yaml_config_parse_failed',
+  // Phase 34 WR-03/WR-07 (34-REVIEW): the success-path counterpart — a .review.yaml was found and
+  // merged. Sits next to its failure sibling because both belong to config resolution, which runs
+  // before file selection.
+  'yaml_config_applied',
+  // quick-k31 (WR-03): the PR edited .review.yaml but config is read from the base branch, so the
+  // edit was ignored for this review. Config resolution, hence next to its two siblings.
+  'yaml_config_head_ignored',
   'file_skipped',
+  // Phase 35 (PRD-06 / FR-131, D-09): the bounded agentic-context pass. Its position is DERIVED,
+  // not chosen — the phase runs between prepare and review (D-09), `file_skipped` is emitted inside
+  // prepare (review.ts:1364 comments it "Prepare-only") and `drafted` onward are review-time, so
+  // after `file_skipped` and before `drafted` is the only position true to execution order.
+  // This entry is also the ONLY thing stopping `groupAuditByStage`'s `STAGE_ORDER.filter` from
+  // discarding the event entirely — the WR-03 defect recorded in the catch-all comment below.
+  'agentic_context',
   'drafted',
   'severity_adjusted',
   'filtered',
   'deduped',
   'evidence_missing',
+  'learned_rule_suppressed',
+  // Phase 33 (PRD-02 / FR-153, D-08): FR-153 parse-drop aggregate; its own display group
+  // (learned_rule_suppressed precedent — a DIFFERENT gate than the evidence/learned-rule
+  // groups; sample shape is { path, line, title } without reason/matched_rule).
+  'suggestion_dropped',
   'rounds',
   'threads',
   'critic',
   'ensemble',
   'walkthrough',
+  // WR-03: `cross_file_security` had NO display group either. It is a late whole-diff pass, so it
+  // sits after walkthrough and before the posting-boundary group.
+  'cross_file_security',
+  // Phase 33 (PRD-01 / FR-031, D-03/D-04): posting-boundary aggregate event; its own display
+  // group (learned_rule_suppressed precedent — a DIFFERENT gate than the parse-drop groups).
+  'inline_comment_skipped',
+  // WR-03 CATCH-ALL, DELIBERATELY LAST. Every `jobAuditEventSchema` stage that has no dedicated
+  // display group above lands here instead of being silently dropped by the `groupAuditByStage`
+  // filter. Before this entry existed, `normalizeAuditDisplayStage`'s unchecked
+  // `return stage as AuditDisplayStage` produced buckets whose key was not in STAGE_ORDER, and
+  // `STAGE_ORDER.filter((stage) => buckets.has(stage))` discarded them with no trace — so the
+  // viewer's header badge (`job.audit.length`) did not match the sum of the rendered group
+  // counts, and events like `cross_file_security` / `yaml_config_parse_failed` were invisible.
+  // `audit-grouping.spec.ts` asserts every schema stage literal resolves to a STAGE_ORDER entry,
+  // so a new stage still cannot be added without a display home — it just fails loudly in a test
+  // rather than vanishing at runtime.
+  'other',
 ] as const;
 
 /**
@@ -32,6 +71,10 @@ export const STAGE_ORDER = [
  * phase needs ZERO viewer changes: just normalize the new stage via `normalizeAuditDisplayStage`
  * and it lands in the `rounds` group. The original `event.stage` is preserved on each event so
  * the viewer / future per-variant switch can still distinguish them.
+ *
+ * Phase 24: the synthetic `evidence_missing` display group now also covers
+ * `evidence_missing_summary` aggregate events alongside the legacy per-finding
+ * `evidence_missing` events.
  *
  * Closed union matching STAGE_ORDER. Non-round stages pass through unchanged.
  */
@@ -57,13 +100,39 @@ export type AuditDisplayStage = typeof STAGE_ORDER[number];
  * phase-19 event names — they are mapped to a synthetic display stage so the `groupAuditByStage`
  * filter (which iterates over STAGE_ORDER) and the `DecisionEvent` renderer (which switches on the
  * event's stage) can route them through the same machinery as the existing synthetic groups.
+ *
+ * Phase 28 (LRN-01) / gap G-28-4 — DELIBERATELY NOT NORMALIZED: `learned_rule_suppressed` is its
+ * OWN display group (its STAGE_ORDER entry, between `evidence_missing` and `rounds`), exactly like
+ * `critic` / `ensemble` / `walkthrough` each wrap their single bounded aggregate. It is NOT a member
+ * of the `evidence_missing` group. Do NOT "helpfully" re-add a collapse branch for it:
+ *   - It is a DIFFERENT GATE with a DIFFERENT SAMPLE SHAPE. `evidence_hard_dropped` earns its
+ *     collapse because it shares the evidence gate's own reason enum (`'absent' | 'not_in_hunk'`);
+ *     `learned_rule_suppressed` samples carry `matched_rule` (a rule id) instead. The sample-shape
+ *     divergence is the tell.
+ *   - SEPARATE GROUPS KEEP THE COUNT BADGE HONEST. The viewer renders each group's `count` as a
+ *     badge, so collapsing suppressions into `evidence_missing` inflates "Evidence missing: N" with
+ *     events from an unrelated gate — a reader scanning the badge gets a false read of evidence-gate
+ *     health, and an operator reading the row gets the WRONG ROOT CAUSE (a model hallucinating a
+ *     line number vs. their own approved rule suppressing the finding). That is the defect G-28-4
+ *     documents; the collapse branch that used to sit here was its cause.
  */
+// WR-03: the set form of STAGE_ORDER, used to validate the pass-through branch below instead of
+// asserting it with an unchecked `as`.
+const DISPLAY_STAGES: ReadonlySet<string> = new Set<string>(STAGE_ORDER);
+
 export function normalizeAuditDisplayStage(stage: JobAuditEvent['stage']): AuditDisplayStage {
   if (stage.startsWith('rounds.')) return 'rounds';
   if (stage.startsWith('threads.')) return 'threads';
   if (stage === 'critic.decisions') return 'critic';
   if (stage === 'ensemble.voted') return 'ensemble';
   if (stage === 'walkthrough.enrichment') return 'walkthrough';
+  // Phase 24: evidence_missing_summary maps to the existing evidence_missing display stage
+  // so the aggregate event lands in the same Evidence missing group as legacy per-finding events.
+  if (stage === 'evidence_missing_summary') return 'evidence_missing';
+  if (stage === 'evidence_hard_dropped') return 'evidence_missing';
+  // WR-03: a stage with no dedicated group falls into the catch-all rather than producing a
+  // bucket that `groupAuditByStage`'s STAGE_ORDER filter would silently discard.
+  if (!DISPLAY_STAGES.has(stage)) return 'other';
   return stage as AuditDisplayStage;
 }
 

@@ -225,7 +225,7 @@ dbDescribe('Severity + audit trail through a REAL job run (engine + DB round tri
     ...defaultRepoConfig,
     review: {
       ...defaultRepoConfig.review,
-      passes: { ...defaultRepoConfig.review.passes, security: { enabled: true } },
+      passes: { ...defaultRepoConfig.review.passes, security: { enabled: true, cross_file: false } },
     },
   });
 
@@ -287,7 +287,7 @@ dbDescribe('Severity + audit trail through a REAL job run (engine + DB round tri
 
     const submitSpy = vi
       .spyOn(ModelService.prototype as any, 'submitReviewBatch')
-      .mockResolvedValue({ requestId: 'req-async-on', model: 'test-model' });
+      .mockResolvedValue({ requestId: 'req-async-on', model: 'test-model', modelLineCap: 800 });
     // pollReviewBatch receives `config` ONLY because review.ts:994 threads it (Task 1). Building the
     // parsed result off params.config proves config reached the async parse path (config-reaches-code).
     const pollSpy = vi.spyOn(ModelService.prototype as any, 'pollReviewBatch').mockImplementation(async (params: any) => {
@@ -370,7 +370,7 @@ dbDescribe('Severity + audit trail through a REAL job run (engine + DB round tri
 
     const submitSpy = vi
       .spyOn(ModelService.prototype as any, 'submitReviewBatch')
-      .mockResolvedValue({ requestId: 'req-async-off', model: 'test-model' });
+      .mockResolvedValue({ requestId: 'req-async-off', model: 'test-model', modelLineCap: 800 });
     const pollSpy = vi.spyOn(ModelService.prototype as any, 'pollReviewBatch').mockImplementation(async (params: any) => {
       // params.config.review.severity_engine.enabled === false MUST reach the engine here (not merely
       // compile) -- this is the D-02 escape hatch on the async path (finding #1, config-reaches-code).

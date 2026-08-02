@@ -109,6 +109,11 @@ export function createTestEnv(overrides: Partial<AppBindings> = {}): AppBindings
     APP_KV: new MemoryKV() as unknown as KVNamespace,
     REVIEW_QUEUE: new MockQueue() as any,
     REVIEW_WORKFLOW: new MockWorkflow() as any,
+    // Phase 29 / QA-IDX-01 (D-06). Load-bearing Wave-0 scaffolding: the binding is not USED until
+    // plan 29-05, but every later plan that constructs the full binding set reads createTestEnv(),
+    // and adding the key in the wave that first uses it would make three later plans edit this
+    // shared helper concurrently. Deliberately added early (29-REVIEWS.md, OpenCode 29-01 LOW).
+    INDEX_WORKFLOW: new MockWorkflow() as any,
     ASSETS: new MockAssets() as any,
     HYPERDRIVE: {
       connectionString: getTestDatabaseUrl(),

@@ -1,5 +1,7 @@
-import { normalizeForEvidence, parseCriticPruneResponse, parseFileReviewResponse, parseWalkthroughDiagram, parseWalkthroughEnrichmentResponse } from '@server/core/model-output';
+import { parseCriticPruneResponse, parseFileReviewResponse, parseWalkthroughDiagram, parseWalkthroughEnrichmentResponse, stringifyJsonForLog } from '@server/core/model-output';
+import { normalizeForEvidence } from '@server/core/evidence';
 import { truncateFileDiff, type FileDiff } from '@server/core/diff';
+import { vi } from 'vitest';
 
 describe('Model Output Parsing Deep Dive', () => {
   const mockFile: FileDiff = {
@@ -250,7 +252,291 @@ export function nextOwner(owner: string) {
   });
 });
 
-describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
+describe('FR-153/FR-154 parse normalization (PRD-02)', () => {
+  // Same shape as the parent describe's mockFile (hunk line 2 = the add line "new line", position
+  // 2) so a finding anchored at line 2 survives the orphan check and becomes a persisted comment.
+  const mockFile: FileDiff = {
+    path: 'test.ts',
+    previousPath: null,
+    isNew: false,
+    isDeleted: false,
+    isBinary: false,
+    lineCount: 10,
+    hunks: [
+      {
+        header: '@@ -1,5 +1,5 @@',
+        lines: [
+          { kind: 'context', content: 'older', newLineNumber: 1, position: 1 },
+          { kind: 'add', content: 'new line', newLineNumber: 2, position: 2 },
+          { kind: 'context', content: 'older', newLineNumber: 3, position: 3 },
+        ],
+      },
+    ],
+  };
+
+  const dropEvents = (r: ReturnType<typeof parseFileReviewResponse>) =>
+    r.severityAuditEvents.filter((e) => e.stage === 'suggestion_dropped');
+
+  const rawWith = (finding: Record<string, unknown>) =>
+    JSON.stringify({
+      findings: [{ ...finding, code_location: finding.code_location ?? { absolute_file_path: 'test.ts', line: 2 } }],
+      overall_correctness: 'patch is incorrect',
+      overall_explanation: 'Found an issue',
+    });
+
+  it('suggestion == existingCode clears codeSuggestion to null and strips the fence from the body (D-06)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({ title: 'finding', body: 'the issue', priority: 1, code_suggestion: 'same', existing_code: 'same' }),
+      mockFile,
+    );
+    expect(result.comments).toHaveLength(1);
+    expect(result.comments[0].codeSuggestion).toBeNull();
+    expect(result.comments[0].body).not.toContain('```suggestion');
+    expect(result.comments[0].body).toBe('the issue');
+  });
+
+  it('a FENCED suggestion identical to existingCode still clears (D-07 — the fence cannot dodge the check)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({
+        title: 'finding',
+        body: 'the issue',
+        priority: 1,
+        code_suggestion: '```suggestion\nsame\n```',
+        existing_code: 'same',
+      }),
+      mockFile,
+    );
+    expect(result.comments).toHaveLength(1);
+    expect(result.comments[0].codeSuggestion).toBeNull();
+    expect(result.comments[0].body).not.toContain('```suggestion');
+    expect(result.comments[0].body).toBe('the issue');
+  });
+
+  it('a suggestion differing from existingCode stays unchanged with the fence intact', () => {
+    const result = parseFileReviewResponse(
+      rawWith({ title: 'finding', body: 'the issue', priority: 1, code_suggestion: 'x', existing_code: 'y' }),
+      mockFile,
+    );
+    expect(result.comments).toHaveLength(1);
+    expect(result.comments[0].codeSuggestion).toBe('x');
+    expect(result.comments[0].body).toContain('```suggestion');
+  });
+
+  it('non-empty suggestion + whitespace-only body drops the comment and audits suggestion_dropped (D-05/D-08)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({ title: 'finding', body: '   ', priority: 1, code_suggestion: 'x' }),
+      mockFile,
+    );
+    expect(result.comments).toHaveLength(0);
+    const events = dropEvents(result);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ stage: 'suggestion_dropped', droppedCount: 1 });
+  });
+
+  // CR-01: the body-prefix de-duplication strip erased the ENTIRE body whenever the body opened by
+  // restating its title (cleanText flattens newlines, so `body.split('\n')[0]` IS the whole body).
+  // The FR-153 drop clause then read that erased value and deleted a complete, on-diff finding with
+  // an actionable suggestion — invisible in the PR, absent from the orphan bucket, and
+  // unidentifiable in the audit trail (redactFindingTitle collapses every title to a fixed marker).
+  // The whitespace-only-body test above never exercised this path.
+  it('a title-echoing body + a code_suggestion still POSTS — the strip never empties the body (CR-01)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({
+        title: 'Missing null check on user input',
+        body: 'Missing null check on user input. This can crash the worker when req.body is undefined. Add a guard.',
+        priority: 1,
+        code_suggestion: 'if (!req.body) return;',
+      }),
+      mockFile,
+    );
+
+    expect(result.comments).toHaveLength(1);
+    // The finding is NOT audit-dropped: the model DID supply an explanation.
+    expect(dropEvents(result)).toHaveLength(0);
+    // The surviving body keeps the model's explanation and carries the suggestion fence.
+    expect(result.comments[0].body).toContain('crash the worker');
+    expect(result.comments[0].body).toContain('```suggestion');
+    expect(result.comments[0].codeSuggestion).toBe('if (!req.body) return;');
+  });
+
+  it('a title-echoing body with NO suggestion also keeps its body rather than emptying it (CR-01)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({ title: 'Missing null check', body: 'Missing null check', priority: 1 }),
+      mockFile,
+    );
+
+    expect(result.comments).toHaveLength(1);
+    expect(result.comments[0].body).toBe('Missing null check');
+  });
+
+  it('a body that merely PREFIXES the title still strips down to the remainder (strip preserved)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({ title: 'finding', body: 'finding\nthe real explanation', priority: 1 }),
+      mockFile,
+    );
+
+    expect(result.comments).toHaveLength(1);
+    // cleanText flattens the newline, so the whole line is the prefix and stripping it would empty
+    // the body — the CR-01 guard keeps the full text instead of deleting the explanation.
+    expect(result.comments[0].body).toContain('the real explanation');
+  });
+
+  // WR-09: `withSuggestion('', undefined)` returns '', which parsedReviewCommentSchema.body
+  // (z.string().min(1)) rejects — and that .parse() sits inside .map() with no try/catch, while
+  // parseFileReviewResponse's only try/catch covers JSON extraction. So an empty body threw out of
+  // the whole function and failed the ENTIRE file's review instead of dropping one comment. The
+  // empty-body + no-suggestion combination is the trivially reachable case (the clear clause is
+  // gated on hasSuggestion, so it never runs here to supply a fallback).
+  it('an empty body with NO suggestion falls back to the title instead of throwing the file parse (WR-09)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({ title: 'a bare finding', body: '   ', priority: 1 }),
+      mockFile,
+    );
+
+    expect(result.comments).toHaveLength(1);
+    expect(result.comments[0].body.length).toBeGreaterThan(0);
+    expect(result.comments[0].body).toBe('a bare finding');
+  });
+
+  it('an empty-bodied finding does not take the rest of the file down with it (WR-09)', () => {
+    const raw = JSON.stringify({
+      findings: [
+        { title: 'empty one', body: '  ', priority: 1, code_location: { absolute_file_path: 'test.ts', line: 2 } },
+        { title: 'good one', body: 'a real explanation', priority: 1, code_location: { absolute_file_path: 'test.ts', line: 2 } },
+      ],
+      overall_correctness: 'patch is incorrect',
+      overall_explanation: 'Found an issue',
+    });
+
+    const result = parseFileReviewResponse(raw, mockFile);
+
+    // Both survive: the empty one via the title fallback, the good one untouched.
+    expect(result.comments.map((c) => c.title)).toEqual(['empty one', 'good one']);
+  });
+
+  // IN-03: the suggestion_dropped sample records the model's CITED line, matching the adjacent
+  // evidence accumulators' EVID-04 convention rather than the post-remap line.
+  it('the suggestion_dropped sample carries the model-cited line, not the remapped one (IN-03)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({
+        title: 'finding',
+        body: '   ',
+        priority: 1,
+        code_suggestion: 'x',
+        // Line 5 is off-diff; findClosestValidLine remaps it onto the hunk (line 3).
+        code_location: { absolute_file_path: 'test.ts', line: 5 },
+      }),
+      mockFile,
+    );
+
+    expect(result.comments).toHaveLength(0);
+    const events = dropEvents(result);
+    expect(events).toHaveLength(1);
+    expect(events[0].sample[0].line).toBe(5);
+  });
+
+  it('code_suggestion: "" is treated as absent — the per-file parse never throws (fail-open hardening)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({ title: 'finding', body: 'the issue', priority: 1, code_suggestion: '' }),
+      mockFile,
+    );
+    expect(result.comments).toHaveLength(1);
+    expect(result.comments[0].codeSuggestion).toBeUndefined();
+  });
+
+  it('code_suggestion: "   " (whitespace-only) is also treated as absent', () => {
+    const result = parseFileReviewResponse(
+      rawWith({ title: 'finding', body: 'the issue', priority: 1, code_suggestion: '   ' }),
+      mockFile,
+    );
+    expect(result.comments).toHaveLength(1);
+    expect(result.comments[0].codeSuggestion).toBeUndefined();
+  });
+
+  it('an 81-char title truncates to exactly 80 chars; an exactly-80-char title is unchanged (D-09/D-10)', () => {
+    const longTitle = 'A'.repeat(81);
+    const result = parseFileReviewResponse(
+      rawWith({ title: longTitle, body: 'the issue', priority: 1 }),
+      mockFile,
+    );
+    expect(result.comments).toHaveLength(1);
+    expect(result.comments[0].title).toHaveLength(80);
+    expect(result.comments[0].title).toBe(longTitle.slice(0, 80));
+
+    const exactly80 = 'B'.repeat(80);
+    const result80 = parseFileReviewResponse(
+      rawWith({ title: exactly80, body: 'the issue', priority: 1 }),
+      mockFile,
+    );
+    expect(result80.comments[0].title).toBe(exactly80);
+  });
+
+  it('truncation happens AFTER the severity/category engine saw the full title (D-10)', () => {
+    const longTitle = 'A'.repeat(81);
+    const longResult = parseFileReviewResponse(
+      rawWith({ title: longTitle, body: 'the issue', priority: 1 }),
+      mockFile,
+    );
+    const shortResult = parseFileReviewResponse(
+      rawWith({ title: longTitle.slice(0, 80), body: 'the issue', priority: 1 }),
+      mockFile,
+    );
+    expect(longResult.comments[0].severity).toBe(shortResult.comments[0].severity);
+    expect(longResult.comments[0].category).toBe(shortResult.comments[0].category);
+  });
+
+  it('an off-diff 81-char title lands in the orphan bucket truncated to 80 chars (D-11)', () => {
+    const longTitle = 'A'.repeat(81);
+    const result = parseFileReviewResponse(
+      rawWith({ title: longTitle, body: 'the issue', priority: 1, code_location: { absolute_file_path: 'test.ts', line: 999 } }),
+      mockFile,
+    );
+    expect(result.comments).toHaveLength(0);
+    expect(result.fileSummary).toContain(longTitle.slice(0, 80));
+    // The 81-char full title must NOT appear — the orphan entry carries exactly the truncated form.
+    expect(result.fileSummary).not.toContain(longTitle);
+  });
+
+  it('an off-diff title with a QUALITY: prefix strips the prefix before truncation (consensus fold-in (c))', () => {
+    const result = parseFileReviewResponse(
+      rawWith({
+        title: `QUALITY: ${'A'.repeat(81)}`,
+        body: 'the issue',
+        priority: 1,
+        code_location: { absolute_file_path: 'test.ts', line: 999 },
+      }),
+      mockFile,
+    );
+    expect(result.comments).toHaveLength(0);
+    // cleanText strips the QUALITY: prefix, then slice(0, 80) applies to the cleaned title.
+    expect(result.fileSummary).toContain('A'.repeat(80));
+    expect(result.fileSummary).not.toContain('QUALITY');
+  });
+
+  it('a clean finding round-trips byte-identically (NREG-01, REVIEWS R12)', () => {
+    const result = parseFileReviewResponse(
+      rawWith({ title: 'finding', body: 'the issue', priority: 1 }),
+      mockFile,
+    );
+    expect(result.comments).toEqual([
+      {
+        path: 'test.ts',
+        line: 2,
+        position: 2,
+        severity: 'P1',
+        category: 'correctness',
+        title: 'finding',
+        body: 'the issue',
+        codeSuggestion: undefined,
+        existingCode: null,
+        confidence: undefined,
+      },
+    ]);
+    expect(dropEvents(result)).toHaveLength(0);
+  });
+});
+
+describe('EVID-01/EVID-03 soft evidence gate (evidence_missing_summary aggregate)', () => {
   // mockFile hunk line 2 is the add line "new line" (position 2), so a finding at line 2 survives the
   // orphan check and becomes a persisted comment. Evidence is checked against the cleaned-hunk
   // haystack = "older\nnew line\nother".
@@ -291,7 +577,7 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     });
 
   const evidenceEvents = (r: ReturnType<typeof parseFileReviewResponse>) =>
-    r.severityAuditEvents.filter((e) => e.stage === 'evidence_missing');
+    r.severityAuditEvents.filter((e) => e.stage === 'evidence_missing_summary');
 
   it('exact substring match: no evidence_missing event, comment still posts', () => {
     const result = parseFileReviewResponse(rawWith('const Value = compute();'), evidenceFile);
@@ -311,49 +597,49 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     expect(evidenceEvents(result)).toHaveLength(0);
   });
 
-  it('non-substring evidence: one evidence_missing{not_in_hunk}, comment still posts', () => {
+  it('non-substring evidence: one evidence_missing_summary with not_in_hunk entry, comment still posts', () => {
     const result = parseFileReviewResponse(rawWith('someTotallyUnrelatedIdentifier()'), evidenceFile);
     expect(result.comments).toHaveLength(1);
     const events = evidenceEvents(result);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'not_in_hunk', path: 'src/evid.ts', line: 2 });
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing_summary', notInHunkCount: 1, file: 'src/evid.ts' });
   });
 
-  it('BLOCKER 1 (D-06): evidence_missing redacts title without changing parsed finding', () => {
+  it('BLOCKER 1 (D-06): evidence_missing_summary redacts sample title without changing parsed finding', () => {
     const result = parseFileReviewResponse(rawWith('someTotallyUnrelatedIdentifier()'), evidenceFile);
     expect(result.comments).toHaveLength(1);
     expect(result.comments[0].title).toBe('Uses computed value');
     const events = evidenceEvents(result);
     expect(events).toHaveLength(1);
-    expect(events[0].title).toBe('[title-redacted]');
-    expect(events[0].title).not.toBe(result.comments[0].title);
-    expect(events[0].title).not.toContain(result.comments[0].title);
+    expect(events[0].sample[0].title).toBe('[title-redacted]');
+    expect(events[0].sample[0].title).not.toBe(result.comments[0].title);
+    expect(events[0].sample[0].title).not.toContain(result.comments[0].title);
   });
 
-  it('omitted existing_code: one evidence_missing{absent}, comment still posts', () => {
+  it('omitted existing_code: one evidence_missing_summary with absent entry, comment still posts', () => {
     const result = parseFileReviewResponse(rawWith('__OMIT__'), evidenceFile);
     expect(result.comments).toHaveLength(1);
     const events = evidenceEvents(result);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'absent' });
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing_summary', absentCount: 1 });
   });
 
-  it('empty-string existing_code: one evidence_missing{absent}, comment still posts', () => {
+  it('empty-string existing_code: one evidence_missing_summary with absent entry, comment still posts', () => {
     const result = parseFileReviewResponse(rawWith('   '), evidenceFile);
     expect(result.comments).toHaveLength(1);
     expect(evidenceEvents(result)).toEqual([
-      expect.objectContaining({ stage: 'evidence_missing', reason: 'absent' }),
+      expect.objectContaining({ stage: 'evidence_missing_summary', absentCount: 1 }),
     ]);
   });
 
-  it('JSON null existing_code: no parse throw, comment still posts, one evidence_missing{absent}', () => {
+  it('JSON null existing_code: no parse throw, comment still posts, one evidence_missing_summary with absent entry', () => {
     // Codex 15-01 HIGH: existing_code is nullable().optional(), so a JSON null must NOT throw the
     // per-file parse before the evidence check runs.
     const result = parseFileReviewResponse(rawWith(null), evidenceFile);
     expect(result.comments).toHaveLength(1);
     const events = evidenceEvents(result);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'absent' });
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing_summary', absentCount: 1 });
   });
 
   it('array existing_code: no parse throw, joined + evidence-checked, comment still posts (CR-01, D-14)', () => {
@@ -378,7 +664,7 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     expect(result.comments).toHaveLength(1);
     const events = evidenceEvents(result);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'not_in_hunk' });
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing_summary', notInHunkCount: 1 });
   });
 
   it('number existing_code: no parse throw, degrades to absent, comment still posts (CR-01, D-14)', () => {
@@ -386,7 +672,7 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     expect(result.comments).toHaveLength(1);
     const events = evidenceEvents(result);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'absent' });
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing_summary', absentCount: 1 });
     // Non-string scalar coerced to undefined -> parsed comment existingCode is null (schema fail-open).
     expect(result.comments[0].existingCode == null).toBe(true);
   });
@@ -396,7 +682,7 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     expect(result.comments).toHaveLength(1);
     const events = evidenceEvents(result);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'absent' });
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing_summary', absentCount: 1 });
     expect(result.comments[0].existingCode == null).toBe(true);
   });
 
@@ -417,7 +703,7 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     expect(result.comments).toHaveLength(1);
     const events = evidenceEvents(result);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'not_in_hunk' });
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing_summary', notInHunkCount: 1 });
   });
 
   it('maps existing_code into the parsed comment existingCode field', () => {
@@ -425,7 +711,7 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     expect(result.comments[0].existingCode).toBe('const Value = compute();');
   });
 
-  it('the evidence_missing event carries NO body/diff/existingCode/codeSuggestion (privacy)', () => {
+  it('the evidence_missing_summary event carries NO body/diff/existingCode/codeSuggestion (privacy)', () => {
     const result = parseFileReviewResponse(rawWith('someTotallyUnrelatedIdentifier()'), evidenceFile);
     const event = evidenceEvents(result)[0];
     const keys = Object.keys(event);
@@ -433,7 +719,7 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     expect(keys).not.toContain('diff');
     expect(keys).not.toContain('existingCode');
     expect(keys).not.toContain('codeSuggestion');
-    expect(keys.sort()).toEqual(['line', 'path', 'reason', 'stage', 'timestamp', 'title']);
+    expect(keys.sort()).toEqual(['absentCount', 'file', 'notInHunkCount', 'pass', 'sample', 'stage', 'timestamp']);
   });
 
   it('off-diff finding contributes NO evidence_missing event (checked only after orphan survival)', () => {
@@ -454,6 +740,56 @@ describe('EVID-01 soft evidence gate (D-14/D-16/D-17/D-18)', () => {
     const result = parseFileReviewResponse(raw, evidenceFile);
     expect(result.comments).toHaveLength(0);
     expect(evidenceEvents(result)).toHaveLength(0);
+  });
+
+  it('multiple findings: both absent and not_in_hunk produce aggregate with correct counts and ordered sample', () => {
+    const multiRaw = JSON.stringify({
+      findings: [
+        { title: 'No evidence', body: 'x', priority: 2, code_location: { absolute_file_path: 'src/evid.ts', line: 2 }, existing_code: '   ' },
+        { title: 'Wrong evidence', body: 'y', priority: 3, code_location: { absolute_file_path: 'src/evid.ts', line: 5 }, existing_code: 'someTotallyUnrelatedIdentifier()' },
+      ],
+      overall_correctness: 'patch is incorrect',
+      overall_explanation: 'Issues found',
+      overall_confidence_score: 0.8,
+    });
+    const result = parseFileReviewResponse(multiRaw, evidenceFile);
+    expect(result.comments).toHaveLength(2);
+    const events = evidenceEvents(result);
+    expect(events).toHaveLength(1);
+    expect(events[0].absentCount).toBe(1);
+    expect(events[0].notInHunkCount).toBe(1);
+    expect(events[0].sample[0].reason).toBe('absent');
+    expect(events[0].sample[1].reason).toBe('not_in_hunk');
+  });
+
+  it('evidence_missing_summary sample entry carries the original model-cited line, not the orphan-remap line (EVID-04)', () => {
+    // Model cites line 5, which is outside valid diff lines {1,2,3}. The orphan remap moves it to the
+    // closest valid line (3), so the finding survives the orphan check. The evidence_missing_summary
+    // sample must carry the ORIGINAL line (5), NOT the remapped line (3), while the comment itself
+    // uses the remapped line (proving remap logic is untouched).
+    const raw = JSON.stringify({
+      findings: [
+        {
+          title: 'Off-diff evidence',
+          body: 'This finding cites a line just outside the diff.',
+          priority: 2,
+          code_location: { absolute_file_path: 'src/evid.ts', line: 5 },
+          existing_code: '   ',
+        },
+      ],
+      overall_correctness: 'patch is incorrect',
+      overall_explanation: 'Found an issue',
+    });
+    const result = parseFileReviewResponse(raw, evidenceFile);
+    expect(result.comments).toHaveLength(1);
+    // Comment line is remapped (orphan remap is untouched per D-01)
+    expect(result.comments[0].line).toBe(3);
+    const events = evidenceEvents(result);
+    expect(events).toHaveLength(1);
+    expect(events[0].sample).toHaveLength(1);
+    // Sample entry carries the original model-cited line (5), not the remapped line (3)
+    expect(events[0].sample[0].line).toBe(5);
+    expect(events[0].sample[0].reason).toBe('absent');
   });
 });
 
@@ -505,7 +841,7 @@ describe('EVID-01 async-path bounded reconstruction (Task 4, Codex 15-04 HIGH)',
   });
 
   const evidenceEvents = (r: ReturnType<typeof parseFileReviewResponse>) =>
-    r.severityAuditEvents.filter((e) => e.stage === 'evidence_missing');
+    r.severityAuditEvents.filter((e) => e.stage === 'evidence_missing_summary');
 
   it('FULL file: evidence in the tail falsely passes (no not_in_hunk)', () => {
     const result = parseFileReviewResponse(raw, bigFile);
@@ -519,7 +855,7 @@ describe('EVID-01 async-path bounded reconstruction (Task 4, Codex 15-04 HIGH)',
     expect(result.comments).toHaveLength(1);
     const events = evidenceEvents(result);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ stage: 'evidence_missing', reason: 'not_in_hunk' });
+    expect(events[0]).toMatchObject({ stage: 'evidence_missing_summary', notInHunkCount: 1 });
   });
 });
 
@@ -596,6 +932,76 @@ describe('parseWalkthroughDiagram (WT-04)', () => {
   it('returns null for garbage / non-diagram output', () => {
     expect(parseWalkthroughDiagram('{"foo": "bar"}')).toBeNull();
     expect(parseWalkthroughDiagram('graph TD; A-->B;')).toBeNull();
+  });
+
+  // --- Phase 33 (FR-155, PRD-03): sanitizeMermaidLabels nested-quote repair ---
+
+  it('repairs the canonical nested-quote label in a bare payload (FR-155, D-12)', () => {
+    const out = parseWalkthroughDiagram('sequenceDiagram\n  participant engine["core/"engine.py""]\n  A->>B: hi');
+    noFence(out);
+    expect(out).toBe('sequenceDiagram\n  participant engine["core/engine.py"]\n  A->>B: hi');
+  });
+
+  it('repairs the canonical nested-quote label inside a ```mermaid fence (fence unwrap runs first)', () => {
+    const out = parseWalkthroughDiagram(
+      '```mermaid\nsequenceDiagram\n  participant engine["core/"engine.py""]\n  A->>B: hi\n```',
+    );
+    noFence(out);
+    expect(out).toBe('sequenceDiagram\n  participant engine["core/engine.py"]\n  A->>B: hi');
+  });
+
+  it('returns a repaired broken-label-only diagram instead of omitting it (D-14)', () => {
+    const out = parseWalkthroughDiagram('sequenceDiagram\n  participant engine["core/"engine.py""]');
+    noFence(out);
+    expect(out).toContain('engine["core/engine.py"]');
+  });
+
+  it('leaves message-quote text untouched (NREG-01, D-13)', () => {
+    const out = parseWalkthroughDiagram('sequenceDiagram\n  A->>B: say "hi"');
+    noFence(out);
+    expect(out).toBe('sequenceDiagram\n  A->>B: say "hi"');
+  });
+
+  it('round-trips a clean multi-label line byte-identically (NREG-01, REVIEWS R7)', () => {
+    const out = parseWalkthroughDiagram('sequenceDiagram\n  A["x"]->>B["y"]');
+    noFence(out);
+    expect(out).toBe('sequenceDiagram\n  A["x"]->>B["y"]');
+  });
+
+  it('strips interior quotes inside a label token (A["x"y"z"] -> A["xyz"])', () => {
+    const out = parseWalkthroughDiagram('sequenceDiagram\n  A["x"y"z"]->>B');
+    noFence(out);
+    expect(out).toBe('sequenceDiagram\n  A["xyz"]->>B');
+  });
+
+  it('copies an unterminated label token verbatim without hanging or crashing (REVIEWS R7)', () => {
+    const out = parseWalkthroughDiagram('sequenceDiagram\n  A["unterminated');
+    noFence(out);
+    expect(out).toBe('sequenceDiagram\n  A["unterminated');
+  });
+
+  it('does not close a label token on a ] inside the label text (consensus fold-in (b))', () => {
+    const out = parseWalkthroughDiagram('sequenceDiagram\n  A["file]name"]');
+    noFence(out);
+    expect(out).toBe('sequenceDiagram\n  A["file]name"]');
+  });
+
+  it('strips an interior quote while keeping an interior ] (A["x"y]z"] -> A["xy]z"])', () => {
+    const out = parseWalkthroughDiagram('sequenceDiagram\n  A["x"y]z"]');
+    noFence(out);
+    expect(out).toBe('sequenceDiagram\n  A["xy]z"]');
+  });
+
+  // WR-02: the close-scan must stop at the end of the current line. Before the fix an
+  // unterminated `["` in note/message prose consumed everything up to the NEXT line's `"]`
+  // and rewrote a previously-VALID label (A["alpha"] -> A[alpha"]), turning a repairable
+  // diagram into a broken one -- the opposite of FR-155's purpose.
+  it('does not let an unterminated token on one line corrupt a valid label on the next (WR-02)', () => {
+    const out = parseWalkthroughDiagram(
+      'sequenceDiagram\n  Note over A: see cfg["key\n  A["alpha"] ->> B["beta"]: go',
+    );
+    noFence(out);
+    expect(out).toBe('sequenceDiagram\n  Note over A: see cfg["key\n  A["alpha"] ->> B["beta"]: go');
   });
 });
 
@@ -768,5 +1174,122 @@ describe('parseWalkthroughEnrichmentResponse — Phase 20 D-05 malformedFields p
       expect(result.confidence).toBeNull();
       expect(result.effort).not.toBeNull();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// quick-gn1: raw model output must not reach the log sink unbounded.
+//
+// (1) `logger.redact()` is KEY-NAME based (api_key, secret, token, …) plus a set of
+//     embedded-credential regexes. It covers neither `parsedJson` nor `extracted`, which is exactly
+//     why those two call sites in model-output.ts have to bound their own values.
+// (2) Truncation is NOT redaction. The first MAX_LOGGED_JSON_CHARS (2,000) characters of the
+//     payload still carry real finding content from a private repo. These tests pin the BOUND —
+//     they do not claim the logged value is safe.
+// ---------------------------------------------------------------------------------------------
+describe('model-output log payload bounding (quick-gn1)', () => {
+  type Captured = Record<string, any>;
+
+  // The logger emits one JSON string per call, so reading the emitted payload means spying on
+  // console.* and re-parsing that string. (test/setup.ts replaces console.* with filtering
+  // wrappers; vi.spyOn binds to the CURRENT function, so the spy still intercepts.)
+  function captureConsole() {
+    const outputs: Captured[] = [];
+    const record = (args: any[]) => {
+      const first = args[0];
+      if (typeof first === 'string') {
+        try {
+          outputs.push(JSON.parse(first));
+        } catch {
+          // Not a JSON log line — ignore.
+        }
+      }
+    };
+    const spies = [
+      vi.spyOn(console, 'log').mockImplementation((...args: any[]) => record(args)),
+      vi.spyOn(console, 'warn').mockImplementation((...args: any[]) => record(args)),
+      vi.spyOn(console, 'error').mockImplementation((...args: any[]) => record(args)),
+    ];
+    return { outputs, restore: () => spies.forEach((s) => s.mockRestore()) };
+  }
+
+  const file: FileDiff = {
+    path: 'test.ts',
+    previousPath: null,
+    isNew: false,
+    isDeleted: false,
+    isBinary: false,
+    lineCount: 10,
+    hunks: [
+      {
+        header: '@@ -1,5 +1,5 @@',
+        lines: [
+          { kind: 'context', content: 'older', newLineNumber: 1, position: 1 },
+          { kind: 'add', content: 'new line', newLineNumber: 2, position: 2 },
+          { kind: 'context', content: 'older', newLineNumber: 3, position: 3 },
+        ],
+      },
+    ],
+  };
+
+  let cap: ReturnType<typeof captureConsole>;
+
+  beforeEach(() => {
+    cap = captureConsole();
+  });
+
+  afterEach(() => {
+    cap.restore();
+  });
+
+  it('bounds the schema-validation log payload so the tail of the model output never reaches the log', () => {
+    // Unique token parked at the END of a ~5,000-char body. Once the parsed object is serialized
+    // this token sits far past the 2,000-char cap, so its ABSENCE from the emitted line is direct
+    // evidence the payload was actually truncated rather than merely stringified.
+    const TAIL_MARKER = 'TAILMARKERq7x2v9';
+
+    // `fileReviewModelOutputSchema.findings[].title` is z.string().max(100) and `normalizeFinding`
+    // passes a long title through untouched, so a 150-char title is the cleanest way to reach a
+    // REAL schema-validation failure through the public entry point.
+    const raw = JSON.stringify({
+      findings: [
+        {
+          title: 'T'.repeat(150),
+          body: `${'B'.repeat(5000)} ${TAIL_MARKER}`,
+          priority: 1,
+          code_location: { absolute_file_path: 'test.ts', line: 2 },
+        },
+      ],
+      overall_correctness: 'patch is correct',
+      overall_explanation: 'ok',
+    });
+
+    // The thrown contract is unchanged by the logging fix.
+    expect(() => parseFileReviewResponse(raw, file)).toThrow(/Response schema mismatch/);
+
+    const entry = cap.outputs.find((o) => o.message === 'Model response failed schema validation');
+    expect(entry).toBeDefined();
+
+    // The value under the `parsedJson` key is now a bounded STRING, not a serialized object graph.
+    expect(typeof entry!.data.parsedJson).toBe('string');
+    expect(entry!.data.parsedJson.length).toBeLessThan(2_200); // 2,000 cap + truncation marker
+    expect(entry!.data.parsedJson).toContain('[truncated');
+
+    // The tail of the private-repo body never left the process.
+    expect(JSON.stringify(entry)).not.toContain(TAIL_MARKER);
+  });
+
+  it('returns a fallback marker instead of throwing for values JSON.stringify cannot serialize', () => {
+    // Direct call: this branch is NOT reachable through parseFileReviewResponse, whose `parsedJson`
+    // always comes from JSON.parse and therefore can never be circular or hold a BigInt. It is
+    // defense-in-depth for the guard sitting inside an active catch block.
+    const circular: any = { a: 1 };
+    circular.self = circular;
+
+    expect(() => stringifyJsonForLog(circular)).not.toThrow();
+    expect(stringifyJsonForLog(circular)).toBe('[unserializable]');
+
+    expect(() => stringifyJsonForLog({ n: BigInt(1) })).not.toThrow();
+    expect(stringifyJsonForLog({ n: BigInt(1) })).toBe('[unserializable]');
   });
 });

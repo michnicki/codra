@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { GithubAdapter } from '@server/vcs/github';
 import { BitbucketAdapter } from '@server/vcs/bitbucket';
 import { BitbucketClient } from '@server/core/bitbucket';
+import type { VcsProvider } from '@server/vcs/types';
 import { createTestEnv } from './helpers';
 
 // NREG-02: Phase 17 widens the VcsProvider seam with four new methods + a thread-listing
@@ -84,5 +85,20 @@ describe('NREG-02: both-provider VcsProvider seam parity', () => {
         ['supportsMermaid', 'supportsThreadListing', 'supportsThreadResolution'].sort(),
       );
     }
+  });
+});
+
+describe('ANNO-01: postAnnotations is Bitbucket-only (NREG-02 by exclusion)', () => {
+  it('postAnnotations is undefined on GithubAdapter', () => {
+    // Typed as the VcsProvider interface (not the concrete GithubAdapter class) so accessing the
+    // OPTIONAL `postAnnotations?` member type-checks -- GithubAdapter's own class type has no
+    // knowledge of interface members it deliberately omits.
+    const github: VcsProvider = buildGitHubAdapter();
+    expect(github.postAnnotations).toBeUndefined();
+  });
+
+  it('postAnnotations is a function on BitbucketAdapter', () => {
+    const bitbucket: VcsProvider = buildBitbucketAdapter();
+    expect(typeof bitbucket.postAnnotations).toBe('function');
   });
 });

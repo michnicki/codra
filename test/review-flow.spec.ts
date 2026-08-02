@@ -13,7 +13,9 @@ import { defaultRepoConfig, REVIEW_CONCURRENCY_LIMITS, type ParsedReviewComment,
 import { runWithDb, queryRows } from '@server/db/client';
 import { buildWalkthroughData, editWalkthroughComment, postWalkthroughPlaceholder, type WalkthroughReviewRow } from '@server/core/walkthrough';
 import { FormatterService } from '@server/services/formatter';
+import { renderFileDiff } from '@server/prompts/file-review';
 import type { VcsProvider } from '@server/vcs/types';
+import { logger } from '@server/core/logger';
 
 const sha = (char: string) => char.repeat(40);
 
@@ -129,6 +131,20 @@ vi.mock('@server/services/model', () => {
             return {
                 rawText: '{"prune": []}',
                 modelUsed: 'critic-model',
+                inputTokens: 5,
+                outputTokens: 2,
+            };
+        }
+        // Phase 19 (verify-fixes) and Phase 27 SEC-XDIFF-01 (cross-file security) both route their
+        // single whole-set model call through callVerifierRaw. It MUST exist on this mock even though
+        // every consuming test overrides it: those tests use vi.spyOn(ModelService.prototype, ...),
+        // which throws "property is not defined on the object" when the method is absent rather than
+        // falling back to the real module. Default returns an empty finding set — the inert, fail-safe
+        // shape parseCrossFileSecurityResponse expects, mirroring critiqueFindings' empty-prune default.
+        async callVerifierRaw() {
+            return {
+                rawText: '{"findings": []}',
+                modelUsed: 'verifier-model',
                 inputTokens: 5,
                 outputTokens: 2,
             };
@@ -815,7 +831,7 @@ dbDescribe('Review Flow Lifecycle', () => {
         ...defaultRepoConfig.review,
         passes: {
           ...defaultRepoConfig.review.passes,
-          security: { enabled: true },
+          security: { enabled: true, cross_file: false },
         },
       },
     });
@@ -1012,7 +1028,7 @@ dbDescribe('Review Flow Lifecycle', () => {
         ...defaultRepoConfig.review,
         passes: {
           ...defaultRepoConfig.review.passes,
-          security: { enabled: overrides?.security ?? false },
+          security: { enabled: overrides?.security ?? false, cross_file: false },
           critic: {
             enabled: true,
             ...(overrides?.skip_threshold !== undefined ? { skip_threshold: overrides.skip_threshold } : {}),
@@ -2932,6 +2948,197 @@ dbDescribe('Review Flow Lifecycle', () => {
     getDiffSpy.mockRestore();
   }, REVIEW_FLOW_TIMEOUT_MS);
 
+  it('records an inline_comment_skipped aggregate audit event when submitReview returns skippedComments (PRD-01, D-03/D-04)', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const repo = `test-repo-${Date.now()}-skipped`;
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+    );
+    const findSpy = vi.spyOn(GitHubService.prototype, 'findBotReviewForCommit');
+    // The CLIENT shape: `position` (the coordinate createReview posts by). WR-01: GithubAdapter
+    // submitReview keeps it in `position` and leaves `line` null — a GitHub diff offset is NOT a
+    // head-side line number, and writing it into `line` made the audit trail (and the viewer)
+    // report a fabricated line for every GitHub skip (G-28-3).
+    const createSpy = vi
+      .spyOn(GitHubService.prototype, 'createReview')
+      .mockResolvedValue({ id: 456, skippedComments: [{ path: 'src/foo.ts', position: 3, commentId: '4242' }] } as any);
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 10,
+      prTitle: 'Skipped Comments Test',
+      prAuthor: 'author',
+      commitSha: sha('e1'),
+      baseSha: sha('f1'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: defaultRepoConfig,
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+    await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+    await upsertFileReview(env, job.id, {
+      filePath: 'src/app.ts',
+      fileStatus: 'done',
+      modelUsed: 'test-model',
+      modelProvider: 'test-provider',
+      diffLineCount: 1,
+      diffInput: 'diff',
+      rawAiOutput: '{}',
+      parsedComments: [],
+      inputTokens: 1,
+      outputTokens: 1,
+      durationMs: 1,
+      verdict: 'approve',
+      fileSummary: 'ok',
+      errorMessage: null,
+    });
+
+    await runWithDb(env, async () => {
+      const result = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-skipped', phase: 'finalize' });
+      expect(result).toEqual({ action: 'ack' });
+    });
+
+    expect(createSpy).toHaveBeenCalledTimes(1);
+    const finalJob = await getJobForProcessing(env, job.id);
+    expect(finalJob?.status).toBe('done');
+
+    const detail = await getJobDetail(env, job.id);
+    const skipEvents: any[] = (detail?.audit ?? []).filter((e: any) => e.stage === 'inline_comment_skipped');
+    expect(skipEvents).toHaveLength(1);
+    expect(skipEvents[0]).toMatchObject({ stage: 'inline_comment_skipped', count: 1 });
+    // WR-01: the diff offset lands in `position` (3) with `line` null — NOT `line: 3`, which would
+    // be a line number the finding was never on. WR-06: the sample identifies the comment by its
+    // persisted review_comments.id, not by a title that would always read '[title-redacted]'.
+    expect(skipEvents[0].sample).toEqual([
+      { path: 'src/foo.ts', line: null, position: 3, commentId: '4242' },
+    ]);
+
+    findSpy.mockRestore();
+    createSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
+
+  // WR-06 END-TO-END: the whole point of replacing the inert '[title-redacted]' marker with
+  // review_comments.id is that an operator can join a skipped entry back to the EXACT finding.
+  // Carrying "some string" through the seam would satisfy a shape assertion while still being
+  // useless, so this test resolves the recorded id against the real table and proves it names the
+  // right row. It also proves the id survives the full path:
+  //   review_comments INSERT -> getFileReviewsForJobs' rc.id::text projection -> finalComments
+  //   -> submitReview's comment payload -> skippedComments -> inline_comment_skipped audit sample.
+  it('the recorded commentId resolves to the skipped comment\'s own review_comments row (WR-06)', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const repo = `test-repo-${Date.now()}-skipid`;
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);\nconsole.log(2);' }]),
+    );
+    const findSpy = vi.spyOn(GitHubService.prototype, 'findBotReviewForCommit');
+
+    // Skip the SECOND comment, using whatever commentId finalize actually threaded for it. The id
+    // is never hardcoded here -- it is read back out of the call the production code made.
+    let skippedIdFromCall: string | undefined;
+    const createSpy = vi
+      .spyOn(GitHubService.prototype, 'createReview')
+      .mockImplementation(async (_owner: any, _repo: any, _pr: any, params: any) => {
+        const target = params.comments.find((c: any) => c.path === 'src/second.ts');
+        skippedIdFromCall = target?.commentId;
+        return {
+          id: 456,
+          skippedComments: [{ path: target.path, position: target.position, commentId: target.commentId }],
+        } as any;
+      });
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 11,
+      prTitle: 'Skipped Comment Id Test',
+      prAuthor: 'author',
+      commitSha: sha('e2'),
+      baseSha: sha('f2'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: defaultRepoConfig,
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+    await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+    // TWO persisted comments so a wrong-row bug (off-by-one, first-row-always) is detectable —
+    // a single-comment fixture would pass even if the id resolution were broken.
+    await upsertFileReview(env, job.id, {
+      filePath: 'src/app.ts',
+      fileStatus: 'done',
+      modelUsed: 'test-model',
+      modelProvider: 'test-provider',
+      diffLineCount: 2,
+      diffInput: 'diff',
+      rawAiOutput: '{}',
+      parsedComments: [
+        {
+          path: 'src/first.ts',
+          line: 1,
+          position: 1,
+          severity: 'P2',
+          category: 'quality',
+          title: 'the FIRST finding',
+          body: 'first body',
+        },
+        {
+          path: 'src/second.ts',
+          line: 2,
+          position: 2,
+          severity: 'P1',
+          category: 'correctness',
+          title: 'the SECOND finding',
+          body: 'second body',
+        },
+      ],
+      inputTokens: 1,
+      outputTokens: 1,
+      durationMs: 1,
+      verdict: 'comment',
+      fileSummary: 'ok',
+      errorMessage: null,
+    });
+
+    await runWithDb(env, async () => {
+      const result = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-skipid', phase: 'finalize' });
+      expect(result).toEqual({ action: 'ack' });
+    });
+
+    // finalize actually threaded a real id (not undefined) into the provider call.
+    expect(skippedIdFromCall).toMatch(/^\d+$/);
+
+    const detail = await getJobDetail(env, job.id);
+    const skipEvents: any[] = (detail?.audit ?? []).filter((e: any) => e.stage === 'inline_comment_skipped');
+    expect(skipEvents).toHaveLength(1);
+    const recordedId: string = skipEvents[0].sample[0].commentId;
+    expect(recordedId).toBe(skippedIdFromCall);
+
+    // THE ASSERTION THAT MATTERS: the recorded id names the second comment's row, not the first's
+    // and not a nonexistent one.
+    await runWithDb(env, async () => {
+      const rows = await queryRows<{ path: string; title: string; body: string }>(
+        env,
+        `SELECT path, title, body FROM review_comments WHERE id = $1::bigint`,
+        [recordedId],
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0].path).toBe('src/second.ts');
+      expect(rows[0].title).toBe('the SECOND finding');
+      expect(rows[0].title).not.toBe('the FIRST finding');
+    });
+
+    findSpy.mockRestore();
+    createSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
+
   // --- Phase 9 streaming walkthrough (WT-01/WT-02/WT-05, NREG-01/02) ------------------------------
   describe('streaming walkthrough', () => {
     const walkthroughConfig = (): RepoConfig => ({
@@ -3646,7 +3853,7 @@ dbDescribe('Review Flow Lifecycle', () => {
       ...defaultRepoConfig,
       review: {
         ...defaultRepoConfig.review,
-        passes: { ...defaultRepoConfig.review.passes, security: { enabled: true }, critic: { enabled: false } },
+        passes: { ...defaultRepoConfig.review.passes, security: { enabled: true, cross_file: false }, critic: { enabled: false } },
       },
     });
 
@@ -3655,7 +3862,7 @@ dbDescribe('Review Flow Lifecycle', () => {
       ...defaultRepoConfig,
       review: {
         ...defaultRepoConfig.review,
-        passes: { ...defaultRepoConfig.review.passes, security: { enabled: security }, critic: { enabled: true } },
+        passes: { ...defaultRepoConfig.review.passes, security: { enabled: security, cross_file: false }, critic: { enabled: true } },
       },
     });
 
@@ -3665,7 +3872,7 @@ dbDescribe('Review Flow Lifecycle', () => {
       review: {
         ...defaultRepoConfig.review,
         walkthrough: { enabled: true, sequence_diagram: { enabled: false } },
-        passes: { ...defaultRepoConfig.review.passes, security: { enabled: security }, critic: { enabled: false } },
+        passes: { ...defaultRepoConfig.review.passes, security: { enabled: security, cross_file: false }, critic: { enabled: false } },
       },
     });
 
@@ -4061,6 +4268,157 @@ dbDescribe('Review Flow Lifecycle', () => {
       expect(bb.some((c: any) => c.body.includes('<img'))).toBe(false);
     }, REVIEW_FLOW_TIMEOUT_MS);
 
+    // withBitbucketAnnotations mirrors securityConfig's shape while additionally opting into the
+    // ANNO-01 toggle -- kept local to this block since no other describe needs it.
+    const withBitbucketAnnotations = (enabled: boolean): RepoConfig => ({
+      ...defaultRepoConfig,
+      review: { ...defaultRepoConfig.review, bitbucket: { annotations_enabled: enabled } },
+    });
+
+    it('ANNO-01: postAnnotations is called AFTER submitReview when bitbucket.annotations_enabled is true and the provider is bitbucket', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { VcsService } = await import('@server/services/vcs');
+      const repo = `test-repo-${Date.now()}-anno01-order`;
+
+      const order: string[] = [];
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+      );
+      const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+        async () => { order.push('submitReview'); return { id: 456 }; },
+      );
+      const postAnnotationsSpy = vi.fn(async (..._args: unknown[]) => { order.push('postAnnotations'); });
+      const forRepoSpy = vi.spyOn(VcsService, 'forRepo').mockImplementation(async (e: any, j: any, t: any) => {
+        const { GithubAdapter } = await import('@server/vcs/github');
+        const adapter = new GithubAdapter(e, j.installationId ?? '', t);
+        Object.defineProperty(adapter, 'name', { value: 'bitbucket', configurable: true });
+        Object.defineProperty(adapter, 'capabilities', { value: { supportsMermaid: false }, configurable: true });
+        Object.defineProperty(adapter, 'postAnnotations', { value: postAnnotationsSpy, configurable: true });
+        return adapter;
+      });
+
+      const job = await seedReadyJob(repo, 78, {
+        config: withBitbucketAnnotations(true),
+        mainComments: [finding({ title: 'SQL injection', line: 1, position: 1 })],
+      });
+
+      await runWithDb(env, async () => {
+        const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-anno01-order', phase: 'finalize' });
+        expect(res).toEqual({ action: 'ack' });
+      });
+
+      expect(order).toEqual(['submitReview', 'postAnnotations']);
+      expect(postAnnotationsSpy).toHaveBeenCalledTimes(1);
+      const callArgs = postAnnotationsSpy.mock.calls[0] as unknown as [string, string, number, { commitSha: string; findings: unknown[] }];
+      expect(callArgs[3].commitSha).toBeTruthy();
+      expect(callArgs[3].findings).toHaveLength(1);
+
+      createSpy.mockRestore();
+      getDiffSpy.mockRestore();
+      forRepoSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('ANNO-01 (NREG-01): postAnnotations is never called when bitbucket.annotations_enabled is false (default)', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { VcsService } = await import('@server/services/vcs');
+      const repo = `test-repo-${Date.now()}-anno01-nreg01`;
+
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+      );
+      const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockResolvedValue({ id: 456 } as any);
+      const postAnnotationsSpy = vi.fn(async () => {});
+      const forRepoSpy = vi.spyOn(VcsService, 'forRepo').mockImplementation(async (e: any, j: any, t: any) => {
+        const { GithubAdapter } = await import('@server/vcs/github');
+        const adapter = new GithubAdapter(e, j.installationId ?? '', t);
+        Object.defineProperty(adapter, 'name', { value: 'bitbucket', configurable: true });
+        Object.defineProperty(adapter, 'capabilities', { value: { supportsMermaid: false }, configurable: true });
+        Object.defineProperty(adapter, 'postAnnotations', { value: postAnnotationsSpy, configurable: true });
+        return adapter;
+      });
+
+      // Plain defaultRepoConfig -- annotations_enabled defaults to false per Plan 30-01.
+      const job = await seedReadyJob(repo, 79, {
+        config: defaultRepoConfig,
+        mainComments: [finding({ title: 'SQL injection', line: 1, position: 1 })],
+      });
+
+      await runWithDb(env, async () => {
+        const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-anno01-nreg01', phase: 'finalize' });
+        expect(res).toEqual({ action: 'ack' });
+      });
+
+      expect(postAnnotationsSpy).not.toHaveBeenCalled();
+
+      createSpy.mockRestore();
+      getDiffSpy.mockRestore();
+      forRepoSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('ANNO-01 (NREG-02): a real GitHub provider never crashes finalize even if annotations_enabled is set true', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const repo = `test-repo-${Date.now()}-anno01-nreg02`;
+
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+      );
+      const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockResolvedValue({ id: 456 } as any);
+
+      // No VcsService.forRepo override -- the real, unmodified GithubAdapter path (name === 'github')
+      // is exercised, with annotations_enabled forced true anyway.
+      const job = await seedReadyJob(repo, 80, {
+        config: withBitbucketAnnotations(true),
+        mainComments: [finding({ title: 'SQL injection', line: 1, position: 1 })],
+      });
+
+      await runWithDb(env, async () => {
+        const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-anno01-nreg02', phase: 'finalize' });
+        expect(res).toEqual({ action: 'ack' });
+      });
+
+      createSpy.mockRestore();
+      getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('ANNO-01 (fail-open): a postAnnotations rejection never fails the finalize job', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { VcsService } = await import('@server/services/vcs');
+      const repo = `test-repo-${Date.now()}-anno01-failopen`;
+
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+      );
+      const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockResolvedValue({ id: 456 } as any);
+      const postAnnotationsSpy = vi.fn(async () => { throw new Error('simulated Bitbucket API failure'); });
+      const forRepoSpy = vi.spyOn(VcsService, 'forRepo').mockImplementation(async (e: any, j: any, t: any) => {
+        const { GithubAdapter } = await import('@server/vcs/github');
+        const adapter = new GithubAdapter(e, j.installationId ?? '', t);
+        Object.defineProperty(adapter, 'name', { value: 'bitbucket', configurable: true });
+        Object.defineProperty(adapter, 'capabilities', { value: { supportsMermaid: false }, configurable: true });
+        Object.defineProperty(adapter, 'postAnnotations', { value: postAnnotationsSpy, configurable: true });
+        return adapter;
+      });
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+      const job = await seedReadyJob(repo, 81, {
+        config: withBitbucketAnnotations(true),
+        mainComments: [finding({ title: 'SQL injection', line: 1, position: 1 })],
+      });
+
+      await runWithDb(env, async () => {
+        const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-anno01-failopen', phase: 'finalize' });
+        expect(res).toEqual({ action: 'ack' });
+      });
+
+      expect(postAnnotationsSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy.mock.calls.some((call) => String(call[0]).toLowerCase().includes('annotation'))).toBe(true);
+
+      warnSpy.mockRestore();
+      createSpy.mockRestore();
+      getDiffSpy.mockRestore();
+      forRepoSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
     // Phase 14 (14-03) finalize-wiring cases A-F. Each seeds a ready job and runs the finalize phase
     // through the reworked applyNoiseFilter wiring in runFinalizePhase.
     const withDedup = (config: RepoConfig, enabled: boolean): RepoConfig => ({
@@ -4073,7 +4431,7 @@ dbDescribe('Review Flow Lifecycle', () => {
       review: {
         ...defaultRepoConfig.review,
         dedup: { enabled: dedupEnabled },
-        passes: { ...defaultRepoConfig.review.passes, security: { enabled: false }, critic: { enabled: false } },
+        passes: { ...defaultRepoConfig.review.passes, security: { enabled: false, cross_file: false }, critic: { enabled: false } },
         ...over,
       },
     });
@@ -4222,7 +4580,7 @@ dbDescribe('Review Flow Lifecycle', () => {
           max_comments: 2,
           category_confidence: { security: 0.85 },
           dedup: { enabled: true },
-          passes: { ...defaultRepoConfig.review.passes, security: { enabled: true }, critic: { enabled: false } },
+          passes: { ...defaultRepoConfig.review.passes, security: { enabled: true, cross_file: false }, critic: { enabled: false } },
         },
       };
       const secDrop = finding({ category: 'security', severity: 'P1', confidence: 0.8, title: 'Auth bypass sec', line: 10, position: 10, body: 'auth check missing' });
@@ -4534,4 +4892,1249 @@ dbDescribe('Review Flow Lifecycle', () => {
       getDiffSpy.mockRestore();
     }, REVIEW_FLOW_TIMEOUT_MS);
   });
+
+  // --- Phase 27 SEC-XDIFF-01: cross-file security integration tests ----------------------------
+  describe('cross-file security integration', () => {
+    const crossFileConfig = (): RepoConfig => ({
+      ...defaultRepoConfig,
+      review: {
+        ...defaultRepoConfig.review,
+        passes: {
+          ...defaultRepoConfig.review.passes,
+          security: { enabled: true, cross_file: true },
+        },
+      },
+    });
+
+    const insertCrossFileJob = (repo: string, config: RepoConfig, commitChar: string) =>
+      insertJob(env, {
+        installationId: '123',
+        owner: 'test-owner',
+        repo,
+        prNumber: 10,
+        prTitle: 'Cross-file Security Test',
+        prAuthor: 'author',
+        commitSha: sha(commitChar),
+        baseSha: sha('0'),
+        trigger: 'auto',
+        headRef: 'feature',
+        baseRef: 'main',
+        configSnapshot: config,
+      });
+
+    it('cross_file: true on multi-file PR produces cross-file findings in posted review', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { ModelService } = await import('@server/services/model');
+      const repo = `test-repo-${Date.now()}-xf-e2e`;
+      const config = crossFileConfig();
+
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([
+          { path: 'src/auth/middleware.ts', content: 'export function auth() {}' },
+          { path: 'src/routes/api.ts', content: 'router.get("/data", handler)' },
+        ]),
+      );
+
+      // Mock reviewFile to return per-file findings
+      const reviewSpy = vi.spyOn(ModelService.prototype as any, 'reviewFile').mockImplementation(async (params: any) => ({
+        parsed: {
+          comments: [{
+            path: params.file.path,
+            line: 1,
+            position: 1,
+            severity: 'P2',
+            category: 'security',
+            title: `Finding in ${params.file.path}`,
+            body: `Security issue in ${params.file.path}`,
+          }],
+          verdict: 'comment' as const,
+            fileSummary: `Reviewed ${params.file.path}`,
+            overallCorrectness: 'issues found',
+            confidenceScore: 0.8,
+          },
+          modelUsed: 'test-model',
+          provider: 'test-provider',
+          inputTokens: 10,
+          outputTokens: 5,
+          rawText: '{}',
+          // review.ts persists `diffInput: response.userPrompt`, and the cross-file phase
+          // re-parses that column with parseUnifiedDiff to rebuild its whole-diff input. An empty
+          // string here leaves every main row with no diff_input, so the phase short-circuits on
+          // its `no_diff_input` skip branch and never reaches the model call under test.
+          userPrompt: renderFileDiff(params.file),
+        }));
+
+      // Mock callVerifierRaw to return cross-file findings with cross_references
+      const verifierSpy = vi.spyOn(ModelService.prototype as any, 'callVerifierRaw').mockResolvedValue({
+        rawText: JSON.stringify({
+          findings: [{
+            title: 'Auth bypass via middleware gap',
+            body: 'The auth middleware does not protect the API route.',
+            severity: 'P0',
+            category: 'security',
+            // `path` is REQUIRED by crossFileSecurityFindingSchema and `confidence` is the key it
+            // reads (not `confidence_score`). Without `path` the finding is dropped by the parser's
+            // per-item tolerant filter and the phase persists 'skipped'/all_findings_invalid.
+            // line 5 is deliberately DIFFERENT from the per-file middleware.ts finding's line 1:
+            // FILT-03 dedup (rule1) collapses same-path/same-line/same-category findings
+            // regardless of title, which would otherwise merge this cross-file finding into the
+            // per-file finding and silently drop its cross_references before finalize — masking
+            // both the no-duplication and "Also affects" assertions below.
+            path: 'src/auth/middleware.ts',
+            line: 5,
+            confidence: 0.95,
+            cross_references: [
+              { path: 'src/routes/api.ts', line: 1, relationship: 'missing_auth_guard' },
+              { path: 'src/auth/middleware.ts', line: 1, relationship: 'weak_auth_check' },
+            ],
+          }],
+        }),
+        modelUsed: 'cross-file-model',
+        inputTokens: 100,
+        outputTokens: 50,
+      });
+
+      // MP-02-style spy on createReview to capture what actually gets posted, so the
+      // cross-file finding's presence/uniqueness in the real posted output is proven, not
+      // inferred from the DB row alone (27-02-PLAN.md Verification Criterion #9).
+      let captured: any[] = [];
+      const createReviewSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+        async (_o: any, _r: any, _p: any, input: any) => { captured = input.comments; return { id: 456 }; },
+      );
+
+      const job = await insertCrossFileJob(repo, config, 'x');
+      await updateJobFileCount(env, job.id, 2);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+
+      await runAndDrain({ jobId: job.id, deliveryId: 'delivery-xf-e2e', phase: 'review' });
+
+      // Verify the __cross_file__ file_review row exists
+      const reviews = await getFileReviewsForJobs(env, [job.id]);
+      const crossFileRow = reviews.find((r) => r.file_path === '__cross_file__' && r.pass === 'cross_file_security');
+      expect(crossFileRow).toBeDefined();
+      expect(crossFileRow!.file_status).toBe('done');
+      expect(crossFileRow!.parsed_comments).toHaveLength(1);
+
+      // Verify audit events include cross_file_security completed
+      const detail = await getJobDetail(env, job.id);
+      const audit: any[] = detail!.audit;
+      const xfEvents = audit.filter((e: any) => e.stage === 'cross_file_security');
+      expect(xfEvents.length).toBeGreaterThan(0);
+      expect(xfEvents.some((e: any) => e.status === 'completed')).toBe(true);
+
+      // Verification Criterion #9: the cross-file finding appears EXACTLY ONCE in the posted
+      // review — no duplication from automatic reviews.flatMap inclusion. The per-file findings
+      // (2, one per file) plus the single cross-file finding = 3 total posted comments.
+      const crossFileFindings = captured.filter((c: any) =>
+        c.body.includes('The auth middleware does not protect the API route.'),
+      );
+      expect(crossFileFindings).toHaveLength(1);
+      expect(captured).toHaveLength(3);
+
+      // Verification Criterion #5 / 27-02-PLAN.md Task 2 step 1: the cross-file finding is
+      // posted under its primary file (src/auth/middleware.ts) with an "Also affects" link
+      // pointing at the cross-referenced file (src/routes/api.ts) — not just asserted via the
+      // pure formatter unit tests, but proven through the real finalize pipeline.
+      const crossFileComment = crossFileFindings[0];
+      expect(crossFileComment.path).toBe('src/auth/middleware.ts');
+      expect(crossFileComment.body).toContain('Also affects');
+      expect(crossFileComment.body).toContain('src/routes/api.ts');
+
+      reviewSpy.mockRestore();
+      getDiffSpy.mockRestore();
+      verifierSpy.mockRestore();
+      createReviewSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('cross_file: true + walkthrough enabled posts a Cross-file Security section', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { ModelService } = await import('@server/services/model');
+      const repo = `test-repo-${Date.now()}-xf-walkthrough`;
+      // Same cross-file config, PLUS walkthrough.enabled so editWalkthroughComment actually
+      // runs (review.ts:2637 gates the whole walkthrough block on this). 27-02-PLAN.md Task 2
+      // step 1 requires proving the "Cross-file Security" section reaches real posted output,
+      // not just buildWalkthroughData called directly with hand-built mock data.
+      const config: RepoConfig = {
+        ...crossFileConfig(),
+        review: {
+          ...crossFileConfig().review,
+          walkthrough: { enabled: true, sequence_diagram: { enabled: false } },
+        },
+      };
+
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([
+          { path: 'src/auth/middleware.ts', content: 'export function auth() {}' },
+          { path: 'src/routes/api.ts', content: 'router.get("/data", handler)' },
+        ]),
+      );
+
+      const reviewSpy = vi.spyOn(ModelService.prototype as any, 'reviewFile').mockImplementation(async (params: any) => ({
+        parsed: {
+          comments: [{
+            path: params.file.path,
+            line: 1,
+            position: 1,
+            severity: 'P2',
+            category: 'security',
+            title: `Finding in ${params.file.path}`,
+            body: `Security issue in ${params.file.path}`,
+          }],
+          verdict: 'comment' as const,
+          fileSummary: `Reviewed ${params.file.path}`,
+          overallCorrectness: 'issues found',
+          confidenceScore: 0.8,
+        },
+        modelUsed: 'test-model',
+        provider: 'test-provider',
+        inputTokens: 10,
+        outputTokens: 5,
+        rawText: '{}',
+        userPrompt: renderFileDiff(params.file),
+      }));
+
+      const verifierSpy = vi.spyOn(ModelService.prototype as any, 'callVerifierRaw').mockResolvedValue({
+        rawText: JSON.stringify({
+          findings: [{
+            title: 'Auth bypass via middleware gap',
+            body: 'The auth middleware does not protect the API route.',
+            severity: 'P0',
+            category: 'security',
+            // line 5 (distinct from the per-file middleware.ts finding's line 1) — see the
+            // dedup-collision note in the e2e test above.
+            path: 'src/auth/middleware.ts',
+            line: 5,
+            confidence: 0.95,
+            cross_references: [
+              { path: 'src/routes/api.ts', line: 1, relationship: 'missing_auth_guard' },
+            ],
+          }],
+        }),
+        modelUsed: 'cross-file-model',
+        inputTokens: 100,
+        outputTokens: 50,
+      });
+
+      vi.spyOn(GitHubService.prototype, 'createReview').mockResolvedValue({ id: 456 } as any);
+
+      // No walkthrough placeholder ref exists on this fresh job, so editWalkthroughComment's
+      // defensive "no ref -> create" branch fires (walkthrough.ts:574), calling
+      // vcs.createPrComment -> GitHubService.createIssueComment. Spy there to capture the
+      // rendered body actually posted, proving the wiring end-to-end rather than unit-testing
+      // buildWalkthroughData/formatWalkthrough in isolation.
+      let walkthroughBody: string | undefined;
+      const createCommentSpy = vi.spyOn(GitHubService.prototype, 'createIssueComment').mockImplementation(
+        async (_o: any, _r: any, _n: any, body: string) => { walkthroughBody = body; return { id: 789 } as any; },
+      );
+
+      const job = await insertCrossFileJob(repo, config, 'w');
+      await updateJobFileCount(env, job.id, 2);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+
+      await runAndDrain({ jobId: job.id, deliveryId: 'delivery-xf-walkthrough', phase: 'review' });
+
+      expect(createCommentSpy).toHaveBeenCalled();
+      expect(walkthroughBody).toBeDefined();
+      expect(walkthroughBody).toContain('Cross-file Security');
+      expect(walkthroughBody).toContain('src/routes/api.ts');
+
+      reviewSpy.mockRestore();
+      getDiffSpy.mockRestore();
+      verifierSpy.mockRestore();
+      createCommentSpy.mockRestore();
+      vi.restoreAllMocks();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('cross_file: true on single-file PR skips cross-file pass', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { ModelService } = await import('@server/services/model');
+      const repo = `test-repo-${Date.now()}-xf-skip`;
+      const config = crossFileConfig();
+
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+      );
+
+      const reviewSpy = vi.spyOn(ModelService.prototype as any, 'reviewFile').mockImplementation(async (params: any) => ({
+        parsed: {
+          comments: [],
+          verdict: 'approve' as const,
+          fileSummary: 'Looks good',
+          overallCorrectness: 'no issues',
+          confidenceScore: 0.9,
+        },
+        modelUsed: 'test-model',
+        provider: 'test-provider',
+        inputTokens: 10,
+        outputTokens: 5,
+        rawText: '{}',
+        userPrompt: '',
+      }));
+
+      const job = await insertCrossFileJob(repo, config, 'y');
+      await updateJobFileCount(env, job.id, 1);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+
+      await runAndDrain({ jobId: job.id, deliveryId: 'delivery-xf-skip', phase: 'review' });
+
+      // Verify the __cross_file__ row exists with skipped status
+      const reviews = await getFileReviewsForJobs(env, [job.id]);
+      const crossFileRow = reviews.find((r) => r.file_path === '__cross_file__' && r.pass === 'cross_file_security');
+      expect(crossFileRow).toBeDefined();
+      expect(crossFileRow!.file_status).toBe('skipped');
+
+      // Verify skip audit event
+      const detail = await getJobDetail(env, job.id);
+      const audit: any[] = detail!.audit;
+      const xfEvents = audit.filter((e: any) => e.stage === 'cross_file_security');
+      expect(xfEvents.some((e: any) => e.status === 'skipped')).toBe(true);
+
+      // Verify finalize still completes (no cross-file findings in output)
+      expect(detail!.status).toBe('done');
+
+      reviewSpy.mockRestore();
+      getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('cross_file: true + model error fails open (per-file findings still posted)', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { ModelService } = await import('@server/services/model');
+      const repo = `test-repo-${Date.now()}-xf-fail`;
+      const config = crossFileConfig();
+
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([
+          { path: 'src/auth.ts', content: 'export function auth() {}' },
+          { path: 'src/routes.ts', content: 'router.get("/data", handler)' },
+        ]),
+      );
+
+      // Per-file reviews succeed
+      const reviewSpy = vi.spyOn(ModelService.prototype as any, 'reviewFile').mockImplementation(async (params: any) => ({
+        parsed: {
+          comments: [{
+            path: params.file.path,
+            line: 1,
+            position: 1,
+            severity: 'P2',
+            category: 'quality',
+            title: `Issue in ${params.file.path}`,
+            body: `Found issue in ${params.file.path}`,
+          }],
+          verdict: 'comment' as const,
+          fileSummary: `Reviewed ${params.file.path}`,
+          overallCorrectness: 'issues found',
+          confidenceScore: 0.8,
+        },
+        modelUsed: 'test-model',
+        provider: 'test-provider',
+        inputTokens: 10,
+        outputTokens: 5,
+        rawText: '{}',
+        // Must be a re-parseable diff (see the multi-file test above): the phase needs to reach
+        // the model call for the fail-open path under test to be exercised at all.
+        userPrompt: renderFileDiff(params.file),
+      }));
+
+      // Cross-file model call throws
+      const verifierSpy = vi.spyOn(ModelService.prototype as any, 'callVerifierRaw').mockRejectedValue(
+        new Error('Model rate limited'),
+      );
+
+      const job = await insertCrossFileJob(repo, config, 'z');
+      await updateJobFileCount(env, job.id, 2);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+
+      await runAndDrain({ jobId: job.id, deliveryId: 'delivery-xf-fail', phase: 'review' });
+
+      // Verify __cross_file__ row exists with failed/skipped status
+      const reviews = await getFileReviewsForJobs(env, [job.id]);
+      const crossFileRow = reviews.find((r) => r.file_path === '__cross_file__' && r.pass === 'cross_file_security');
+      expect(crossFileRow).toBeDefined();
+      expect(crossFileRow!.file_status).toBe('failed');
+
+      // Verify failed audit event
+      const detail = await getJobDetail(env, job.id);
+      const audit: any[] = detail!.audit;
+      const xfEvents = audit.filter((e: any) => e.stage === 'cross_file_security');
+      expect(xfEvents.some((e: any) => e.status === 'failed')).toBe(true);
+
+      // Verify finalize still completes with per-file findings
+      expect(detail!.status).toBe('done');
+
+      reviewSpy.mockRestore();
+      getDiffSpy.mockRestore();
+      verifierSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+
+    it('cross_file: false (default) produces no __cross_file__ row or audit events (NREG-01)', async () => {
+      const { GitHubService } = await import('@server/services/github');
+      const { ModelService } = await import('@server/services/model');
+      const repo = `test-repo-${Date.now()}-xf-nreg`;
+      // Default config — cross_file is false
+      const config: RepoConfig = {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          passes: {
+            ...defaultRepoConfig.review.passes,
+            security: { enabled: true, cross_file: false },
+          },
+        },
+      };
+
+      const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+        generateMockDiff([
+          { path: 'src/auth.ts', content: 'export function auth() {}' },
+          { path: 'src/routes.ts', content: 'router.get("/data", handler)' },
+        ]),
+      );
+
+      const reviewSpy = vi.spyOn(ModelService.prototype as any, 'reviewFile').mockImplementation(async (params: any) => ({
+        parsed: {
+          comments: [],
+          verdict: 'approve' as const,
+          fileSummary: 'Looks good',
+          overallCorrectness: 'no issues',
+          confidenceScore: 0.9,
+        },
+        modelUsed: 'test-model',
+        provider: 'test-provider',
+        inputTokens: 10,
+        outputTokens: 5,
+        rawText: '{}',
+        userPrompt: '',
+      }));
+
+      const job = await insertCrossFileJob(repo, config, 'n');
+      await updateJobFileCount(env, job.id, 2);
+      await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+
+      await runAndDrain({ jobId: job.id, deliveryId: 'delivery-xf-nreg', phase: 'review' });
+
+      // Verify NO __cross_file__ row exists
+      const reviews = await getFileReviewsForJobs(env, [job.id]);
+      const crossFileRow = reviews.find((r) => r.file_path === '__cross_file__');
+      expect(crossFileRow).toBeUndefined();
+
+      // Verify NO cross_file_security audit events
+      const detail = await getJobDetail(env, job.id);
+      const audit: any[] = detail!.audit;
+      const xfEvents = audit.filter((e: any) => e.stage === 'cross_file_security');
+      expect(xfEvents).toHaveLength(0);
+
+      // Verify job completes normally
+      expect(detail!.status).toBe('done');
+
+      reviewSpy.mockRestore();
+      getDiffSpy.mockRestore();
+    }, REVIEW_FLOW_TIMEOUT_MS);
+  });
+
+});
+
+/**
+ * modelLineCap persistence integration test — verifies the full submit-poll roundtrip
+ * persists model_line_cap and that it survives persistCompletedReview despite a change
+ * in transient_error_count between submit and poll.
+ */
+dbDescribe('modelLineCap persistence across submit-poll roundtrip', () => {
+  const env = createTestEnv();
+
+  it('uses persisted model_line_cap in poll path even when transient_error_count changes between submit and poll', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const { ModelService } = await import('@server/services/model');
+
+    const repo = `mlc-persistence-${Date.now()}`;
+    const headSha = sha('m');
+
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+    );
+
+    // Spy on submitReviewBatch to return a defined modelLineCap
+    const submitSpy = vi
+      .spyOn(ModelService.prototype as any, 'submitReviewBatch')
+      .mockResolvedValue({ requestId: 'req-mlc', model: '@cf/moonshotai/kimi-k2.6', modelLineCap: 800 });
+
+    // pollReviewBatch: first call returns pending, second call returns done
+    let pollCallCount = 0;
+    const pollSpy = vi
+      .spyOn(ModelService.prototype as any, 'pollReviewBatch')
+      .mockImplementation(async () => {
+        pollCallCount += 1;
+        if (pollCallCount < 2) return { status: 'pending' as const };
+        return {
+          status: 'done' as const,
+          response: {
+            modelUsed: '@cf/moonshotai/kimi-k2.6',
+            provider: 'Cloudflare',
+            inputTokens: 10,
+            outputTokens: 5,
+            rawText: '{"findings":[]}',
+            userPrompt: '',
+            parsed: { comments: [], verdict: 'approve' as const, fileSummary: 'ok', overallCorrectness: 'patch is correct', confidenceScore: 0.9 },
+          },
+        };
+      });
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 1,
+      prTitle: 'MLC persistence test',
+      prAuthor: 'author',
+      commitSha: headSha,
+      baseSha: sha('n'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: defaultRepoConfig,
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+
+    // (1) Run the review phase — submits async batch, creates 'pending' file_review row
+    await runWithDb(env, async () => {
+      const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-mlc-1', phase: 'review' });
+      expect(res).toBeDefined();
+    });
+
+    // (2) Manually mutate transient_error_count on the pending row to simulate compact-mode activation
+    await queryRows(
+      env,
+      `UPDATE file_reviews SET transient_error_count = 1 WHERE async_request_id = $1`,
+      ['req-mlc'],
+    );
+
+    // (3) Run the review phase again — polls the async batch, completes via persistCompletedReview
+    await runWithDb(env, async () => {
+      const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-mlc-2', phase: 'review' });
+      expect(res).toBeDefined();
+    });
+
+    // (4) Assert model_line_cap survived persistCompletedReview at 800 (NOT null, NOT clobbered)
+    await runWithDb(env, async () => {
+      const rows = await queryRows<{ model_line_cap: number | null }>(
+        env,
+        `SELECT model_line_cap FROM file_reviews WHERE async_request_id = $1`,
+        ['req-mlc'],
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0].model_line_cap).toBe(800);
+    });
+
+    submitSpy.mockRestore();
+    pollSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
+});
+
+// --- Phase 26 (EVID-02) evidence hard-drop gate ------------------------------------------------
+dbDescribe('evidence hard-drop', () => {
+  const env = createTestEnv();
+
+  // Helper to create a ParsedReviewComment with optional existingCode.
+  const comment = (over: Partial<ParsedReviewComment>): ParsedReviewComment => ({
+    path: 'src/app.ts',
+    line: 1,
+    position: 1,
+    severity: 'P3',
+    category: 'quality',
+    title: 'Test finding',
+    body: 'test body',
+    confidence: 0.9,
+    ...over,
+  });
+
+  it('drops findings with hallucinated existing_code when hard_drop=true', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const repo = `test-repo-${Date.now()}-evid02-drop`;
+    const headSha = sha('d');
+
+    // Diff contains 'console.log(1);' — findings that reference this text should be kept.
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+    );
+
+    let captured: any[] = [];
+    let createReviewArgs: any[] = [];
+    const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+      async (...args: any[]) => { createReviewArgs = args; captured = args[3]?.comments ?? []; return { id: 456 }; },
+    );
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 1,
+      prTitle: 'Evidence hard-drop test',
+      prAuthor: 'author',
+      commitSha: headSha,
+      baseSha: sha('0'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          evidence: { hard_drop: true, hard_drop_exempt_categories: [] },
+        },
+      },
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+    await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+
+    // Finding A: genuine existingCode matching diff content -> should survive
+    // Finding B: hallucinated existingCode not in diff -> should be dropped
+    // Finding C: null existingCode -> should be dropped (absent)
+    await upsertFileReview(env, job.id, {
+      filePath: 'src/app.ts',
+      pass: 'main',
+      fileStatus: 'done',
+      modelUsed: 'test-model',
+      modelProvider: 'test-provider',
+      diffLineCount: 1,
+      diffInput: 'diff',
+      rawAiOutput: '{}',
+      parsedComments: [
+        comment({ title: 'Genuine finding', existingCode: 'console.log(1);' }),
+        comment({ title: 'Hallucinated finding', existingCode: 'nonexistent.code.here' }),
+        comment({ title: 'Null evidence', existingCode: null }),
+      ],
+      inputTokens: 10,
+      outputTokens: 5,
+      durationMs: 1,
+      verdict: 'comment',
+      fileSummary: 'summary',
+      overallCorrectness: 'issues found',
+      confidenceScore: 0.9,
+      errorMessage: null,
+    });
+
+    await runWithDb(env, async () => {
+      const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-evid02-1', phase: 'finalize' });
+      expect(res).toEqual({ action: 'ack' });
+    });
+
+    // Only the genuine finding should have been posted
+    expect(captured).toHaveLength(1);
+    expect(captured[0].body).toContain('Genuine finding');
+    expect(captured[0].body).not.toContain('Hallucinated finding');
+    expect(captured[0].body).not.toContain('Null evidence');
+
+    // Verify audit trail contains evidence_hard_dropped event
+    const detail = await getJobDetail(env, job.id);
+    const audit: any[] = detail!.audit;
+    const hardDropEvents = audit.filter((e: any) => e.stage === 'evidence_hard_dropped');
+    expect(hardDropEvents).toHaveLength(1);
+    expect(hardDropEvents[0].droppedCount).toBe(2);
+    expect(hardDropEvents[0].file).toBe('src/app.ts');
+
+    createSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
+
+  it('exempt categories bypass hard-drop', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const repo = `test-repo-${Date.now()}-evid02-exempt`;
+    const headSha = sha('e');
+
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+    );
+
+    let captured: any[] = [];
+    const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+      async (_o: any, _r: any, _p: any, input: any) => { captured = input.comments; return { id: 456 }; },
+    );
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 2,
+      prTitle: 'Evidence exempt test',
+      prAuthor: 'author',
+      commitSha: headSha,
+      baseSha: sha('0'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          // 'security' is the default exempt category; 'quality' is NOT exempt
+          evidence: { hard_drop: true, hard_drop_exempt_categories: ['security'] },
+        },
+      },
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+    await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+
+    // Finding A: quality category with hallucinated evidence -> dropped (not exempt)
+    // Finding B: security category with hallucinated evidence -> kept (exempt)
+    // Finding C: security category with genuine evidence -> kept
+    // Each finding uses a different line so dedup does not collapse them (rule1 fires on same-path +
+    // same-line + same-category, which would suppress the second security finding).
+    await upsertFileReview(env, job.id, {
+      filePath: 'src/app.ts',
+      pass: 'main',
+      fileStatus: 'done',
+      modelUsed: 'test-model',
+      modelProvider: 'test-provider',
+      diffLineCount: 3,
+      diffInput: 'diff',
+      rawAiOutput: '{}',
+      parsedComments: [
+        comment({ category: 'quality', title: 'Quality bad evidence', existingCode: 'fake.code', line: 1, position: 1 }),
+        comment({ category: 'security', title: 'Security bad evidence', existingCode: 'fake.code', line: 2, position: 2 }),
+        comment({ category: 'security', title: 'Security good evidence', existingCode: 'console.log(1);', line: 3, position: 3 }),
+      ],
+      inputTokens: 10,
+      outputTokens: 5,
+      durationMs: 1,
+      verdict: 'comment',
+      fileSummary: 'summary',
+      overallCorrectness: 'issues found',
+      confidenceScore: 0.9,
+      errorMessage: null,
+    });
+
+    await runWithDb(env, async () => {
+      const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-evid02-2', phase: 'finalize' });
+      expect(res).toEqual({ action: 'ack' });
+    });
+
+    // Both security findings should survive (exempt + genuine); quality finding dropped
+    expect(captured).toHaveLength(2);
+    const capturedBodies = captured.map((c: any) => c.body).join(' ');
+    expect(capturedBodies).toContain('Security bad evidence');
+    expect(capturedBodies).toContain('Security good evidence');
+    expect(capturedBodies).not.toContain('Quality bad evidence');
+
+    // Verify audit trail: only 1 dropped (the quality finding)
+    const detail = await getJobDetail(env, job.id);
+    const audit: any[] = detail!.audit;
+    const hardDropEvents = audit.filter((e: any) => e.stage === 'evidence_hard_dropped');
+    expect(hardDropEvents).toHaveLength(1);
+    expect(hardDropEvents[0].droppedCount).toBe(1);
+
+    createSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
+
+  it('byte-identical output when hard_drop=false (NREG-01)', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const repo = `test-repo-${Date.now()}-evid02-nreg`;
+    const headSha = sha('f');
+
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+    );
+
+    let captured: any[] = [];
+    const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+      async (_o: any, _r: any, _p: any, input: any) => { captured = input.comments; return { id: 456 }; },
+    );
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 3,
+      prTitle: 'Evidence NREG-01 test',
+      prAuthor: 'author',
+      commitSha: headSha,
+      baseSha: sha('0'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      // Use default config — hard_drop defaults to false, evidence key may not even be present
+      configSnapshot: defaultRepoConfig,
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+    await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+
+    // All three findings have bad evidence, but hard_drop is false so ALL should post.
+    // Each finding uses a different line so dedup does not collapse them (rule1 fires on same-path +
+    // same-line + same-category).
+    await upsertFileReview(env, job.id, {
+      filePath: 'src/app.ts',
+      pass: 'main',
+      fileStatus: 'done',
+      modelUsed: 'test-model',
+      modelProvider: 'test-provider',
+      diffLineCount: 3,
+      diffInput: 'diff',
+      rawAiOutput: '{}',
+      parsedComments: [
+        comment({ title: 'Finding A', existingCode: 'fake.code', line: 1, position: 1 }),
+        comment({ title: 'Finding B', existingCode: 'another.fake', line: 2, position: 2 }),
+        comment({ title: 'Finding C', existingCode: null, line: 3, position: 3 }),
+      ],
+      inputTokens: 10,
+      outputTokens: 5,
+      durationMs: 1,
+      verdict: 'comment',
+      fileSummary: 'summary',
+      overallCorrectness: 'issues found',
+      confidenceScore: 0.9,
+      errorMessage: null,
+    });
+
+    await runWithDb(env, async () => {
+      const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-evid02-3', phase: 'finalize' });
+      expect(res).toEqual({ action: 'ack' });
+    });
+
+    // All three findings still post (hard_drop is false)
+    expect(captured).toHaveLength(3);
+    expect(captured[0].body).toContain('Finding');
+
+    // Verify NO evidence_hard_dropped audit events
+    const detail = await getJobDetail(env, job.id);
+    const audit: any[] = detail!.audit;
+    const hardDropEvents = audit.filter((e: any) => e.stage === 'evidence_hard_dropped');
+    expect(hardDropEvents).toHaveLength(0);
+
+    createSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
+});
+
+// --- Phase 28 (LRN-01) learned-rule suppression in finalize ----------------------------------
+dbDescribe('learned rule suppression', () => {
+  const env = createTestEnv();
+
+  const comment = (over: Partial<ParsedReviewComment>): ParsedReviewComment => ({
+    path: 'src/app.ts',
+    line: 1,
+    position: 1,
+    severity: 'P3',
+    category: 'quality',
+    title: 'Test finding',
+    body: 'test body',
+    confidence: 0.9,
+    ...over,
+  });
+
+  it('active learned rule suppresses matching finding in finalize', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const repo = `test-repo-${Date.now()}-lrn-suppress`;
+    const headSha = sha('l');
+
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+    );
+
+    let captured: any[] = [];
+    const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+      async (...args: any[]) => { captured = args[3]?.comments ?? []; return { id: 789 }; },
+    );
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 1,
+      prTitle: 'Learned rule suppression test',
+      prAuthor: 'author',
+      commitSha: headSha,
+      baseSha: sha('0'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          learning: {
+            enabled: true,
+            learned_rules: [
+              {
+                // `learnedRuleSchema.id` is `z.uuid()` (production ids come from
+                // crypto.randomUUID), so a readable slug here fails configSnapshot
+                // validation inside insertJob before the test body ever runs.
+                id: '11111111-1111-4111-8111-111111111111',
+                category: 'quality',
+                file_pattern: 'src/app.ts',
+                status: 'active',
+                source_rejection_ids: ['rej-1', 'rej-2'],
+                created_at: '2026-01-01T00:00:00.000Z',
+              },
+            ],
+          },
+        },
+      },
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+    await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+
+    // Finding A: matches active rule (quality + src/app.ts) -> should be suppressed
+    // Finding B: different category (security) -> should be kept
+    await upsertFileReview(env, job.id, {
+      filePath: 'src/app.ts',
+      pass: 'main',
+      fileStatus: 'done',
+      modelUsed: 'test-model',
+      modelProvider: 'test-provider',
+      diffLineCount: 1,
+      diffInput: 'diff',
+      rawAiOutput: '{}',
+      parsedComments: [
+        comment({ title: 'Quality finding', category: 'quality', line: 1, position: 1 }),
+        comment({ title: 'Security finding', category: 'security', severity: 'P1', line: 2, position: 2 }),
+      ],
+      inputTokens: 10,
+      outputTokens: 5,
+      durationMs: 1,
+      verdict: 'comment',
+      fileSummary: 'summary',
+      overallCorrectness: 'issues found',
+      confidenceScore: 0.9,
+      errorMessage: null,
+    });
+
+    await runWithDb(env, async () => {
+      const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-lrn-1', phase: 'finalize' });
+      expect(res).toEqual({ action: 'ack' });
+    });
+
+    // Only the security finding should have been posted (quality was suppressed)
+    expect(captured).toHaveLength(1);
+    expect(captured[0].body).toContain('Security finding');
+    expect(captured[0].body).not.toContain('Quality finding');
+
+    // Verify audit trail contains learned_rule_suppressed event
+    const detail = await getJobDetail(env, job.id);
+    const audit: any[] = detail!.audit;
+    const suppressedEvents = audit.filter((e: any) => e.stage === 'learned_rule_suppressed');
+    expect(suppressedEvents.length).toBeGreaterThanOrEqual(1);
+    expect(suppressedEvents[0].droppedCount).toBe(1);
+    expect(suppressedEvents[0].sample[0].matched_rule).toBe('11111111-1111-4111-8111-111111111111');
+
+    createSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
+
+  it('learning.enabled=false does not suppress findings', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const repo = `test-repo-${Date.now()}-lrn-disabled`;
+    const headSha = sha('m');
+
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+    );
+
+    let captured: any[] = [];
+    const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+      async (...args: any[]) => { captured = args[3]?.comments ?? []; return { id: 790 }; },
+    );
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 2,
+      prTitle: 'Learning disabled test',
+      prAuthor: 'author',
+      commitSha: headSha,
+      baseSha: sha('0'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          learning: {
+            enabled: false, // disabled
+            learned_rules: [
+              {
+                // `learnedRuleSchema.id` is `z.uuid()` (production ids come from
+                // crypto.randomUUID), so a readable slug here fails configSnapshot
+                // validation inside insertJob before the test body ever runs.
+                id: '11111111-1111-4111-8111-111111111111',
+                category: 'quality',
+                file_pattern: 'src/app.ts',
+                status: 'active',
+                source_rejection_ids: ['rej-1', 'rej-2'],
+                created_at: '2026-01-01T00:00:00.000Z',
+              },
+            ],
+          },
+        },
+      },
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+    await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+
+    await upsertFileReview(env, job.id, {
+      filePath: 'src/app.ts',
+      pass: 'main',
+      fileStatus: 'done',
+      modelUsed: 'test-model',
+      modelProvider: 'test-provider',
+      diffLineCount: 1,
+      diffInput: 'diff',
+      rawAiOutput: '{}',
+      parsedComments: [
+        comment({ title: 'Quality finding', category: 'quality', line: 1, position: 1 }),
+      ],
+      inputTokens: 10,
+      outputTokens: 5,
+      durationMs: 1,
+      verdict: 'comment',
+      fileSummary: 'summary',
+      overallCorrectness: 'issues found',
+      confidenceScore: 0.9,
+      errorMessage: null,
+    });
+
+    await runWithDb(env, async () => {
+      const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-lrn-2', phase: 'finalize' });
+      expect(res).toEqual({ action: 'ack' });
+    });
+
+    // All findings should post — learning is disabled
+    expect(captured).toHaveLength(1);
+    expect(captured[0].body).toContain('Quality finding');
+
+    // No learned_rule_suppressed audit events
+    const detail = await getJobDetail(env, job.id);
+    const audit: any[] = detail!.audit;
+    const suppressedEvents = audit.filter((e: any) => e.stage === 'learned_rule_suppressed');
+    expect(suppressedEvents).toHaveLength(0);
+
+    createSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
+
+  it('no active rules (all pending/disabled) does not suppress', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const repo = `test-repo-${Date.now()}-lrn-pending`;
+    const headSha = sha('n');
+
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+    );
+
+    let captured: any[] = [];
+    const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+      async (...args: any[]) => { captured = args[3]?.comments ?? []; return { id: 791 }; },
+    );
+
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 3,
+      prTitle: 'Pending rules test',
+      prAuthor: 'author',
+      commitSha: headSha,
+      baseSha: sha('0'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          learning: {
+            enabled: true,
+            learned_rules: [
+              {
+                id: '22222222-2222-4222-8222-222222222222',
+                category: 'quality',
+                file_pattern: 'src/app.ts',
+                status: 'pending', // pending, not active
+                source_rejection_ids: ['rej-1'],
+                created_at: '2026-01-01T00:00:00.000Z',
+              },
+            ],
+          },
+        },
+      },
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+    await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+
+    await upsertFileReview(env, job.id, {
+      filePath: 'src/app.ts',
+      pass: 'main',
+      fileStatus: 'done',
+      modelUsed: 'test-model',
+      modelProvider: 'test-provider',
+      diffLineCount: 1,
+      diffInput: 'diff',
+      rawAiOutput: '{}',
+      parsedComments: [
+        comment({ title: 'Quality finding', category: 'quality', line: 1, position: 1 }),
+      ],
+      inputTokens: 10,
+      outputTokens: 5,
+      durationMs: 1,
+      verdict: 'comment',
+      fileSummary: 'summary',
+      overallCorrectness: 'issues found',
+      confidenceScore: 0.9,
+      errorMessage: null,
+    });
+
+    await runWithDb(env, async () => {
+      const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-lrn-3', phase: 'finalize' });
+      expect(res).toEqual({ action: 'ack' });
+    });
+
+    // Finding should post — rule is pending, not active
+    expect(captured).toHaveLength(1);
+    expect(captured[0].body).toContain('Quality finding');
+
+    // No learned_rule_suppressed audit events
+    const detail = await getJobDetail(env, job.id);
+    const audit: any[] = detail!.audit;
+    const suppressedEvents = audit.filter((e: any) => e.stage === 'learned_rule_suppressed');
+    expect(suppressedEvents).toHaveLength(0);
+
+    createSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
+
+  // D-14 ordering: EVID-02 hard-drop runs BEFORE learned-rule suppression, so a finding that fails
+  // BOTH gates is attributed to the STRICTER one. Lexical statement order in review.ts is trivially
+  // readable, but which audit stage a doubly-failing finding actually lands in — and whether the
+  // learned_rule_suppressed droppedCount double-counts it — is a runtime consequence. 28-VERIFICATION.md
+  // listed this as behavior-unverified (UAT test 6); this is the assertion that pins it.
+  it('attributes a doubly-failing finding to EVID-02, not the learned rule (D-14)', async () => {
+    const { GitHubService } = await import('@server/services/github');
+    const repo = `test-repo-${Date.now()}-lrn-evid02-order`;
+    const headSha = sha('o');
+
+    // Only 'console.log(1);' exists in the diff — any other existingCode is hallucinated evidence.
+    const getDiffSpy = vi.spyOn(GitHubService.prototype, 'getPullRequestDiff').mockResolvedValue(
+      generateMockDiff([{ path: 'src/app.ts', content: 'console.log(1);' }]),
+    );
+
+    let captured: any[] = [];
+    const createSpy = vi.spyOn(GitHubService.prototype, 'createReview').mockImplementation(
+      async (...args: any[]) => { captured = args[3]?.comments ?? []; return { id: 790 }; },
+    );
+
+    const ruleId = '55555555-5555-4555-8555-555555555555';
+    const job = await insertJob(env, {
+      installationId: '123',
+      owner: 'test-owner',
+      repo,
+      prNumber: 1,
+      prTitle: 'LRN-01 vs EVID-02 ordering test',
+      prAuthor: 'author',
+      commitSha: headSha,
+      baseSha: sha('0'),
+      trigger: 'auto',
+      headRef: 'feature',
+      baseRef: 'main',
+      configSnapshot: {
+        ...defaultRepoConfig,
+        review: {
+          ...defaultRepoConfig.review,
+          // Both gates armed simultaneously. Empty exempt list so the security finding is
+          // evidence-checked too — otherwise the default ['security'] would mask the comparison.
+          evidence: { hard_drop: true, hard_drop_exempt_categories: [] },
+          learning: {
+            enabled: true,
+            learned_rules: [
+              {
+                id: ruleId,
+                category: 'quality',
+                file_pattern: 'src/app.ts',
+                status: 'active',
+                source_rejection_ids: ['rej-1', 'rej-2'],
+                created_at: '2026-01-01T00:00:00.000Z',
+              },
+            ],
+          },
+        },
+      },
+    });
+    await updateJobFileCount(env, job.id, 1);
+    await updateJobStep(env, job.id, 'Preparation', { status: 'done' });
+    await updateJobStep(env, job.id, 'Reviewing Files', { status: 'done' });
+
+    // Distinct lines/positions throughout so dedup never merges two of these findings and
+    // confounds the attribution being measured.
+    //   A "Doubly failing"  — quality + src/app.ts (matches rule) AND hallucinated evidence.
+    //                         Must be attributed to EVID-02 only.
+    //   B "Rule only"       — quality + src/app.ts (matches rule), evidence genuine.
+    //                         Must be attributed to the learned rule only.
+    //   C "Survivor"        — security (no rule match), evidence genuine. Must post.
+    await upsertFileReview(env, job.id, {
+      filePath: 'src/app.ts',
+      pass: 'main',
+      fileStatus: 'done',
+      modelUsed: 'test-model',
+      modelProvider: 'test-provider',
+      diffLineCount: 1,
+      diffInput: 'diff',
+      rawAiOutput: '{}',
+      parsedComments: [
+        comment({ title: 'Doubly failing', category: 'quality', existingCode: 'nonexistent.code.here', line: 1, position: 1 }),
+        comment({ title: 'Rule only', category: 'quality', existingCode: 'console.log(1);', line: 2, position: 2 }),
+        comment({ title: 'Survivor', category: 'security', severity: 'P1', existingCode: 'console.log(1);', line: 3, position: 3 }),
+      ],
+      inputTokens: 10,
+      outputTokens: 5,
+      durationMs: 1,
+      verdict: 'comment',
+      fileSummary: 'summary',
+      overallCorrectness: 'issues found',
+      confidenceScore: 0.9,
+      errorMessage: null,
+    });
+
+    await runWithDb(env, async () => {
+      const res = await runReviewJob(env, { jobId: job.id, deliveryId: 'delivery-lrn-order-1', phase: 'finalize' });
+      expect(res).toEqual({ action: 'ack' });
+    });
+
+    // Only the survivor posts.
+    expect(captured).toHaveLength(1);
+    expect(captured[0].body).toContain('Survivor');
+    expect(captured[0].body).not.toContain('Doubly failing');
+    expect(captured[0].body).not.toContain('Rule only');
+
+    const detail = await getJobDetail(env, job.id);
+    const audit: any[] = detail!.audit;
+
+    // Audit sample titles pass through redactFindingTitle (privacy boundary T-26-02 / D-06), so
+    // attribution is keyed on `line` — the one per-finding discriminator the sample preserves
+    // verbatim. Line 1 = "Doubly failing", line 2 = "Rule only", line 3 = "Survivor".
+    const sampleLines = (events: any[]) => events.flatMap((e: any) => e.sample.map((s: any) => s.line));
+
+    // EVID-02 claims the doubly-failing finding — it never reaches the suppression pass.
+    const hardDropEvents = audit.filter((e: any) => e.stage === 'evidence_hard_dropped');
+    expect(hardDropEvents).toHaveLength(1);
+    expect(hardDropEvents[0].droppedCount).toBe(1);
+    expect(sampleLines(hardDropEvents)).toEqual([1]);
+
+    // The learned rule claims ONLY the evidence-clean match. droppedCount must not double-count
+    // the finding EVID-02 already removed, and line 1 must not appear in this stage at all.
+    const suppressedEvents = audit.filter((e: any) => e.stage === 'learned_rule_suppressed');
+    expect(suppressedEvents).toHaveLength(1);
+    expect(suppressedEvents[0].droppedCount).toBe(1);
+    expect(sampleLines(suppressedEvents)).toEqual([2]);
+    expect(suppressedEvents[0].sample[0].matched_rule).toBe(ruleId);
+
+    createSpy.mockRestore();
+    getDiffSpy.mockRestore();
+  }, REVIEW_FLOW_TIMEOUT_MS);
 });

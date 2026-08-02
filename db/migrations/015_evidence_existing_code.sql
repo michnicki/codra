@@ -1,0 +1,11 @@
+-- Adds review_comments.existing_code, the model-emitted `existing_code` field for each parsed
+-- review comment. This column is required by the EVID-02 hard evidence drop gate (Phase 26):
+-- at finalize time, the gate re-checks each finding's existingCode against the diff hunks to
+-- decide which findings are hallucinated. Without this column the field is lost at persist time
+-- and every finding appears as `existingCode: undefined` (treated as 'absent' by checkEvidence),
+-- which would drop all findings unconditionally.
+--
+-- The column is nullable/optional (matching `parsedReviewCommentSchema.existingCode` which is
+-- `z.string().nullable().optional()`): existing rows and rows from providers that never emit
+-- existing_code default to NULL without schema migration.
+ALTER TABLE review_comments ADD COLUMN IF NOT EXISTS existing_code TEXT COMPRESSION lz4;

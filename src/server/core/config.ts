@@ -87,6 +87,11 @@ export async function loadRepoConfig(
     };
   }
 
+  // REVIEWS CRITICAL FIX #1: re-parse through repoConfigSchema to inject Zod defaults for any keys
+  // added after this config was stored (e.g., the evidence block from EVID-02). Without this, old
+  // DB configs would have undefined for new keys and runtime lookups like `?? false` would no-op.
+  parsedJson = repoConfigSchema.parse(parsedJson);
+
   const finalConfig: CachedConfig = {
     parsedJson,
     enabled,
